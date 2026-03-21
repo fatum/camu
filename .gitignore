@@ -1,0 +1,11 @@
+# Built binaries
+/camu
+/cmd/camu/camu
+
+# Test cache
+*.test
+
+# IDE
+.idea/
+.vscode/
+*.swp

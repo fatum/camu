@@ -1,0 +1,24 @@
+server:
+  address: ":8080"
+  instance_id: ""
+storage:
+  bucket: "camu-data"
+  region: "us-east-1"
+  endpoint: ""
+  credentials:
+    access_key: ""
+    secret_key: ""
+wal:
+  directory: "/var/lib/camu/wal"
+  fsync: true
+segments:
+  max_size: 8388608
+  max_age: "5s"
+  compression: "snappy"
+cache:
+  directory: "/var/lib/camu/cache"
+  max_size: 10737418240
+coordination:
+  lease_ttl: "10s"
+  heartbeat_interval: "3s"
+  rebalance_delay: "5s"
