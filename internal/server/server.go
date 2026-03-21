@@ -6,10 +6,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/consumer"
+	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -22,8 +25,17 @@ type Server struct {
 	topicStore       *meta.TopicStore
 	partitionManager *PartitionManager
 	fetcher          *consumer.Fetcher
+	leaseStore       *coordination.LeaseStore
 	instanceID       string
 	listener         net.Listener
+
+	// leaseMu protects ownedLeases.
+	leaseMu     sync.RWMutex
+	ownedLeases map[string]map[int]coordination.Lease // topic -> partitionID -> Lease
+
+	// leaseStop signals the background lease renewal goroutine to stop.
+	leaseStop chan struct{}
+	leaseWg   sync.WaitGroup
 }
 
 // New creates a new Server, initializing the S3 client from config.
@@ -64,7 +76,10 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		topicStore:       meta.NewTopicStore(s3Client),
 		partitionManager: pm,
 		fetcher:          consumer.NewFetcher(s3Client, pm.GetDiskCache()),
+		leaseStore:       coordination.NewLeaseStore(s3Client),
 		instanceID:       instanceID,
+		ownedLeases:      make(map[string]map[int]coordination.Lease),
+		leaseStop:        make(chan struct{}),
 	}
 
 	s.httpServer = &http.Server{
@@ -79,6 +94,8 @@ func (s *Server) Start() error {
 	if err := s.initExistingTopics(); err != nil {
 		return fmt.Errorf("init existing topics: %w", err)
 	}
+	s.acquireAllLeases()
+	s.startLeaseRenewal()
 	ln, err := net.Listen("tcp", s.cfg.Server.Address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.Server.Address, err)
@@ -93,6 +110,8 @@ func (s *Server) StartOnPort(port int) error {
 	if err := s.initExistingTopics(); err != nil {
 		return fmt.Errorf("init existing topics: %w", err)
 	}
+	s.acquireAllLeases()
+	s.startLeaseRenewal()
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -105,6 +124,13 @@ func (s *Server) StartOnPort(port int) error {
 
 // Shutdown gracefully shuts down the HTTP server and partition manager.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Stop lease renewal goroutine.
+	close(s.leaseStop)
+	s.leaseWg.Wait()
+
+	// Release all owned leases.
+	s.releaseAllLeases(ctx)
+
 	httpErr := s.httpServer.Shutdown(ctx)
 	pmErr := s.partitionManager.Shutdown(ctx)
 	if httpErr != nil {
@@ -141,4 +167,149 @@ func (s *Server) initExistingTopics() error {
 		}
 	}
 	return nil
+}
+
+const leaseTTL = 30 * time.Second
+const leaseRenewalInterval = 10 * time.Second
+
+// acquireAllLeases acquires leases for all partitions of all initialized topics.
+func (s *Server) acquireAllLeases() {
+	ctx := context.Background()
+	topics, err := s.topicStore.List(ctx)
+	if err != nil {
+		slog.Error("acquireAllLeases: list topics", "error", err)
+		return
+	}
+
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	for _, tc := range topics {
+		if _, exists := s.ownedLeases[tc.Name]; !exists {
+			s.ownedLeases[tc.Name] = make(map[int]coordination.Lease)
+		}
+		for pid := 0; pid < tc.Partitions; pid++ {
+			lease, err := s.leaseStore.Acquire(ctx, tc.Name, pid, s.instanceID, leaseTTL)
+			if err != nil {
+				slog.Debug("acquireAllLeases: skipping partition", "topic", tc.Name, "partition", pid, "error", err)
+				continue
+			}
+			s.ownedLeases[tc.Name][pid] = lease
+		}
+	}
+}
+
+// AcquireLeasesForTopic acquires leases for all partitions of a specific topic.
+// Called after topic creation so the creating instance owns its partitions.
+func (s *Server) AcquireLeasesForTopic(topic string, numPartitions int) {
+	ctx := context.Background()
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	if _, exists := s.ownedLeases[topic]; !exists {
+		s.ownedLeases[topic] = make(map[int]coordination.Lease)
+	}
+	for pid := 0; pid < numPartitions; pid++ {
+		lease, err := s.leaseStore.Acquire(ctx, topic, pid, s.instanceID, leaseTTL)
+		if err != nil {
+			slog.Debug("AcquireLeasesForTopic: skipping", "topic", topic, "partition", pid, "error", err)
+			continue
+		}
+		s.ownedLeases[topic][pid] = lease
+	}
+}
+
+// startLeaseRenewal starts a background goroutine that renews owned leases.
+func (s *Server) startLeaseRenewal() {
+	s.leaseWg.Add(1)
+	go func() {
+		defer s.leaseWg.Done()
+		ticker := time.NewTicker(leaseRenewalInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.leaseStop:
+				return
+			case <-ticker.C:
+				s.renewLeases()
+			}
+		}
+	}()
+}
+
+// renewLeases renews all owned leases by re-acquiring them.
+func (s *Server) renewLeases() {
+	ctx := context.Background()
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	for topic, partitions := range s.ownedLeases {
+		for pid, lease := range partitions {
+			newLease, err := s.leaseStore.Acquire(ctx, lease.Topic, lease.PartitionID, s.instanceID, leaseTTL)
+			if err != nil {
+				slog.Warn("renewLeases: lost lease", "topic", topic, "partition", pid, "error", err)
+				delete(partitions, pid)
+				continue
+			}
+			partitions[pid] = newLease
+		}
+	}
+}
+
+// releaseAllLeases releases all owned leases.
+func (s *Server) releaseAllLeases(ctx context.Context) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	for topic, partitions := range s.ownedLeases {
+		for pid, lease := range partitions {
+			if err := s.leaseStore.Release(ctx, lease); err != nil {
+				slog.Warn("releaseAllLeases: failed", "topic", topic, "partition", pid, "error", err)
+			}
+		}
+	}
+	s.ownedLeases = make(map[string]map[int]coordination.Lease)
+}
+
+// isOwnedPartition checks if this instance owns the given partition via leases.
+func (s *Server) isOwnedPartition(topic string, partitionID int) bool {
+	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+
+	topicLeases, ok := s.ownedLeases[topic]
+	if !ok {
+		return false
+	}
+	lease, ok := topicLeases[partitionID]
+	if !ok {
+		return false
+	}
+	return time.Now().Before(lease.ExpiresAt)
+}
+
+// getRoutingMap builds the routing response for a topic by checking leases in S3.
+func (s *Server) getRoutingMap(topic string) routingResponse {
+	ctx := context.Background()
+	resp := routingResponse{
+		Partitions: make(map[string]routingPartitionInfo),
+	}
+
+	leases, err := s.leaseStore.ListForTopic(ctx, topic)
+	if err != nil {
+		slog.Error("getRoutingMap: list leases", "topic", topic, "error", err)
+		return resp
+	}
+
+	now := time.Now()
+	for _, lease := range leases {
+		if now.Before(lease.ExpiresAt) {
+			key := fmt.Sprintf("%d", lease.PartitionID)
+			resp.Partitions[key] = routingPartitionInfo{
+				InstanceID: lease.InstanceID,
+				Address:    "", // address not stored in lease; could be extended
+			}
+		}
+	}
+
+	return resp
 }

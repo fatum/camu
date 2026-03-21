@@ -94,6 +94,15 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 
+	// Check ownership of all target partitions before writing.
+	for partitionID := range byPartition {
+		if !s.isOwnedPartition(topicName, partitionID) {
+			routing := s.getRoutingMap(topicName)
+			writeJSON(w, 421, routing)
+			return
+		}
+	}
+
 	// Append each partition's batch with a single WAL fsync.
 	offsets := make([]offsetInfo, len(msgs))
 	for partitionID, group := range byPartition {
@@ -142,6 +151,13 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	if partitionID < 0 || partitionID >= tc.Partitions {
 		writeError(w, http.StatusBadRequest, "partition ID out of range")
+		return
+	}
+
+	// Check partition ownership.
+	if !s.isOwnedPartition(topicName, partitionID) {
+		routing := s.getRoutingMap(topicName)
+		writeJSON(w, 421, routing)
 		return
 	}
 

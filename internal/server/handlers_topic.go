@@ -91,6 +91,9 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Acquire leases for the new topic's partitions.
+	s.AcquireLeasesForTopic(tc.Name, tc.Partitions)
+
 	writeJSON(w, http.StatusCreated, topicToResponse(tc))
 }
 

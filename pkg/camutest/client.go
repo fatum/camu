@@ -300,6 +300,41 @@ func (c *Client) StreamSSE(topic string, partition int, offset uint64, maxEvents
 	return events, nil
 }
 
+// RoutingResponse holds the routing response for a topic.
+type RoutingResponse struct {
+	Partitions map[string]RoutingPartitionInfo `json:"partitions"`
+}
+
+// RoutingPartitionInfo holds routing info for a single partition.
+type RoutingPartitionInfo struct {
+	InstanceID string `json:"instance_id"`
+	Address    string `json:"address"`
+}
+
+// GetRouting returns the partition routing map for a topic.
+func (c *Client) GetRouting(topic string) (*RoutingResponse, error) {
+	resp, err := c.httpClient.Get(c.baseURL + "/v1/topics/" + topic + "/routing")
+	if err != nil {
+		return nil, fmt.Errorf("GetRouting request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("topic %q not found", topic)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var ae apiError
+		json.NewDecoder(resp.Body).Decode(&ae)
+		return nil, fmt.Errorf("GetRouting: status %d: %s", resp.StatusCode, ae.Error)
+	}
+
+	var routing RoutingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&routing); err != nil {
+		return nil, fmt.Errorf("GetRouting decode: %w", err)
+	}
+	return &routing, nil
+}
+
 // ClusterStatus returns the cluster status.
 func (c *Client) ClusterStatus() (*ClusterStatusResponse, error) {
 	resp, err := c.httpClient.Get(c.baseURL + "/v1/cluster/status")
