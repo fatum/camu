@@ -86,6 +86,19 @@ func (r *Registry) ActiveInstances(ctx context.Context) ([]string, error) {
 	return active, nil
 }
 
+// GetInstanceInfo reads an instance's registration from S3.
+func (r *Registry) GetInstanceInfo(ctx context.Context, instanceID string) (InstanceInfo, error) {
+	data, err := r.s3Client.Get(ctx, registryKey(instanceID))
+	if err != nil {
+		return InstanceInfo{}, fmt.Errorf("registry: get instance %s: %w", instanceID, err)
+	}
+	var info InstanceInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return InstanceInfo{}, fmt.Errorf("registry: unmarshal instance %s: %w", instanceID, err)
+	}
+	return info, nil
+}
+
 // InstanceID returns the instanceID this registry represents.
 func (r *Registry) InstanceID() string { return r.instanceID }
 

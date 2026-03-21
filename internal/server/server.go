@@ -27,22 +27,21 @@ type Server struct {
 	topicStore       *meta.TopicStore
 	partitionManager *PartitionManager
 	fetcher          *consumer.Fetcher
-	leaseStore       *coordination.LeaseStore
-	registry         *coordination.Registry
-	offsetStore      *storage.OffsetStore
-	instanceID       string
-	listener         net.Listener
+	registry    *coordination.Registry
+	offsetStore *storage.OffsetStore
+	instanceID  string
+	listener    net.Listener
 
 	// Leader-based coordination.
 	leaderElection  *coordination.LeaderElection
 	assignmentStore *coordination.AssignmentStore
 	leaderLease     coordination.LeaderLease
 
-	// leaseMu protects ownedLeases.
-	leaseMu     sync.RWMutex
-	ownedLeases map[string]map[int]coordination.Lease // topic -> partitionID -> Lease
+	// assignmentsMu protects myPartitions.
+	assignmentsMu sync.RWMutex
+	myPartitions  map[string]map[int]bool // topic -> partitionID -> owned
 
-	// leaseStop signals the background lease renewal goroutine to stop.
+	// leaseStop signals the background coordination goroutine to stop.
 	leaseStop chan struct{}
 	leaseWg   sync.WaitGroup
 
@@ -89,18 +88,17 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		topicStore:       meta.NewTopicStore(s3Client),
 		partitionManager: pm,
 		fetcher:          consumer.NewFetcher(s3Client, pm.GetDiskCache()),
-		leaseStore:       coordination.NewLeaseStore(s3Client),
-		offsetStore:      storage.NewOffsetStore(s3Client),
-		leaderElection:   coordination.NewLeaderElection(s3Client, instanceID, leaseTTL),
-		assignmentStore:  coordination.NewAssignmentStore(s3Client),
-		instanceID:       instanceID,
-		ownedLeases:      make(map[string]map[int]coordination.Lease),
-		leaseStop:        make(chan struct{}),
+		offsetStore:     storage.NewOffsetStore(s3Client),
+		leaderElection:  coordination.NewLeaderElection(s3Client, instanceID, leaseTTL),
+		assignmentStore: coordination.NewAssignmentStore(s3Client),
+		instanceID:      instanceID,
+		myPartitions:    make(map[string]map[int]bool),
+		leaseStop:       make(chan struct{}),
 	}
 
-	// Wire lease check into partition manager — verifies from S3 at flush time.
+	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
-	pm.SetLeaseChecker(s.verifyLeaseFromS3)
+	pm.SetLeaseChecker(s.verifyOwnershipFromS3)
 
 	s.httpServer = &http.Server{
 		Handler: s.routes(),
@@ -158,10 +156,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// 3. Flush batcher / close WALs.
 	pmErr := s.partitionManager.Shutdown(ctx)
 
-	// 4. Stop lease renewal goroutine and release leases.
+	// 4. Stop coordination goroutine.
 	close(s.leaseStop)
 	s.leaseWg.Wait()
-	s.releaseAllLeases(ctx)
 
 	// 5. Deregister from cluster.
 	s.registry.Deregister(ctx)
@@ -203,15 +200,17 @@ func (s *Server) initExistingTopics() error {
 	return nil
 }
 
-// getOwnedEpochs returns a map of partitionID -> epoch for owned leases of a topic.
+// getOwnedEpochs returns a map of partitionID -> epoch for owned partitions of a topic.
+// Uses the assignment version as the epoch for all owned partitions.
 func (s *Server) getOwnedEpochs(topic string) map[int]uint64 {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-
+	assigned, err := s.assignmentStore.Read(context.Background(), topic)
+	if err != nil {
+		return nil
+	}
 	epochs := make(map[int]uint64)
-	if partitions, ok := s.ownedLeases[topic]; ok {
-		for pid, lease := range partitions {
-			epochs[pid] = lease.Epoch
+	for pid, instanceID := range assigned.Partitions {
+		if instanceID == s.instanceID {
+			epochs[pid] = assigned.Version
 		}
 	}
 	return epochs
@@ -323,65 +322,33 @@ func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.To
 	}
 }
 
-// applyAssignmentsForTopic reads assignments for a single topic and acquires
-// or releases partition leases accordingly.
+// applyAssignmentsForTopic reads assignments for a single topic and updates
+// the local ownership cache.
 func (s *Server) applyAssignmentsForTopic(ctx context.Context, topic string, numPartitions int) {
 	assigned, err := s.assignmentStore.Read(ctx, topic)
 	if err != nil {
-		slog.Debug("applyAssignmentsForTopic: no assignments found", "topic", topic, "error", err)
+		// No assignments yet — single-instance fallback: own all partitions.
+		s.assignmentsMu.Lock()
+		s.myPartitions[topic] = make(map[int]bool)
+		for i := 0; i < numPartitions; i++ {
+			s.myPartitions[topic][i] = true
+		}
+		s.assignmentsMu.Unlock()
 		return
 	}
 
-	// Determine which partitions are assigned to us.
-	var myPartitions []int
+	owned := make(map[int]bool)
 	for pid, instanceID := range assigned.Partitions {
 		if instanceID == s.instanceID {
-			myPartitions = append(myPartitions, pid)
+			owned[pid] = true
 		}
 	}
 
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
+	s.assignmentsMu.Lock()
+	s.myPartitions[topic] = owned
+	s.assignmentsMu.Unlock()
 
-	if _, exists := s.ownedLeases[topic]; !exists {
-		s.ownedLeases[topic] = make(map[int]coordination.Lease)
-	}
-
-	// Acquire leases for assigned partitions.
-	for _, pid := range myPartitions {
-		if _, alreadyOwned := s.ownedLeases[topic][pid]; alreadyOwned {
-			continue // already own this partition
-		}
-		lease, err := s.leaseStore.Acquire(ctx, topic, pid, s.instanceID, s.Address(), leaseTTL)
-		if err != nil {
-			slog.Debug("applyAssignmentsForTopic: skipping", "topic", topic, "partition", pid, "error", err)
-			continue
-		}
-		s.ownedLeases[topic][pid] = lease
-	}
-
-	// Release leases for partitions no longer assigned to us.
-	assignedSet := make(map[int]bool, len(myPartitions))
-	for _, pid := range myPartitions {
-		assignedSet[pid] = true
-	}
-	for pid, lease := range s.ownedLeases[topic] {
-		if !assignedSet[pid] {
-			if err := s.leaseStore.Release(ctx, lease); err != nil {
-				slog.Debug("applyAssignmentsForTopic: release", "topic", topic, "partition", pid, "error", err)
-			}
-			delete(s.ownedLeases[topic], pid)
-		}
-	}
-
-	if len(s.ownedLeases[topic]) == 0 {
-		delete(s.ownedLeases, topic)
-	}
-
-	slog.Debug("partition assignment",
-		"topic", topic,
-		"instance", s.instanceID,
-		"assigned", myPartitions)
+	slog.Debug("partition assignment", "topic", topic, "instance", s.instanceID, "owned", len(owned))
 }
 
 // startLeaseRenewal starts a background goroutine that renews owned leases.
@@ -446,116 +413,90 @@ func (s *Server) renewLeases() {
 		s.publishAssignmentsForTopics(ctx, topics)
 	}
 
-	// All: read assignments and acquire/release leases.
+	// All: read assignments and update local ownership cache.
 	s.applyAssignmentsForTopics(ctx, topics)
-
-	// Renew leases we still own.
-	s.renewOwnedLeases(ctx)
 }
 
-// renewOwnedLeases renews all currently held leases.
-func (s *Server) renewOwnedLeases(ctx context.Context) {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-
-	for topic, partitions := range s.ownedLeases {
-		for pid, lease := range partitions {
-			newLease, err := s.leaseStore.Acquire(ctx, lease.Topic, lease.PartitionID, s.instanceID, s.Address(), leaseTTL)
-			if err != nil {
-				slog.Warn("renewLeases: lost lease", "topic", topic, "partition", pid, "error", err)
-				delete(partitions, pid)
-				continue
-			}
-			partitions[pid] = newLease
-		}
-	}
-}
-
-// releaseAllLeases releases all owned leases.
-func (s *Server) releaseAllLeases(ctx context.Context) {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-
-	for topic, partitions := range s.ownedLeases {
-		for pid, lease := range partitions {
-			if err := s.leaseStore.Release(ctx, lease); err != nil {
-				slog.Warn("releaseAllLeases: failed", "topic", topic, "partition", pid, "error", err)
-			}
-		}
-	}
-	s.ownedLeases = make(map[string]map[int]coordination.Lease)
-}
-
-// isOwnedPartition checks if this instance owns the given partition via leases.
+// isOwnedPartition checks if this instance owns the given partition.
+// Pure local check — no S3 I/O on write path.
 func (s *Server) isOwnedPartition(topic string, partitionID int) bool {
-	s.leaseMu.RLock()
-	defer s.leaseMu.RUnlock()
-
-	topicLeases, ok := s.ownedLeases[topic]
-	if !ok {
-		return false
+	s.assignmentsMu.RLock()
+	defer s.assignmentsMu.RUnlock()
+	if parts, ok := s.myPartitions[topic]; ok {
+		return parts[partitionID]
 	}
-	lease, ok := topicLeases[partitionID]
-	if !ok {
-		return false
-	}
-	// Pure local check — no S3 I/O on write path.
-	return time.Now().Before(lease.ExpiresAt)
+	return false
 }
 
-// verifyLeaseFromS3 re-checks lease ownership from S3 (used at flush time).
-// If the lease has been taken by another instance, removes it from ownedLeases
-// so all future writes are rejected immediately.
-func (s *Server) verifyLeaseFromS3(topic string, partitionID int) bool {
-	s3Lease, err := s.leaseStore.Get(context.Background(), topic, partitionID)
+// verifyOwnershipFromS3 re-checks partition ownership from the assignment store
+// (used at flush time). If ownership has been reassigned to another instance,
+// revokes the partition so all future writes are rejected immediately.
+func (s *Server) verifyOwnershipFromS3(topic string, partitionID int) bool {
+	assigned, err := s.assignmentStore.Read(context.Background(), topic)
 	if err != nil {
-		slog.Warn("verifyLeaseFromS3: failed, revoking ownership",
-			"topic", topic, "partition", partitionID, "error", err)
+		slog.Warn("verifyOwnership: failed", "topic", topic, "partition", partitionID, "error", err)
 		s.revokePartition(topic, partitionID)
 		return false
 	}
-
-	if s3Lease.InstanceID != s.instanceID || !time.Now().Before(s3Lease.ExpiresAt) {
-		slog.Warn("verifyLeaseFromS3: lost ownership",
-			"topic", topic, "partition", partitionID,
-			"owner", s3Lease.InstanceID, "self", s.instanceID)
+	if assigned.Partitions[partitionID] != s.instanceID {
+		slog.Warn("verifyOwnership: lost", "topic", topic, "partition", partitionID,
+			"owner", assigned.Partitions[partitionID], "self", s.instanceID)
 		s.revokePartition(topic, partitionID)
 		return false
 	}
 	return true
 }
 
-// revokePartition removes a partition from ownedLeases so all future writes
+// revokePartition removes a partition from myPartitions so all future writes
 // to it are rejected via isOwnedPartition.
 func (s *Server) revokePartition(topic string, partitionID int) {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-	if topicLeases, ok := s.ownedLeases[topic]; ok {
-		delete(topicLeases, partitionID)
+	s.assignmentsMu.Lock()
+	defer s.assignmentsMu.Unlock()
+	if parts, ok := s.myPartitions[topic]; ok {
+		delete(parts, partitionID)
 	}
 }
 
-// getRoutingMap builds the routing response for a topic by checking leases in S3.
+// getRoutingMap builds the routing response for a topic from the assignment store.
 func (s *Server) getRoutingMap(topic string) routingResponse {
 	ctx := context.Background()
 	resp := routingResponse{
 		Partitions: make(map[string]routingPartitionInfo),
 	}
 
-	leases, err := s.leaseStore.ListForTopic(ctx, topic)
+	assigned, err := s.assignmentStore.Read(ctx, topic)
 	if err != nil {
-		slog.Error("getRoutingMap: list leases", "topic", topic, "error", err)
+		slog.Error("getRoutingMap: read assignments", "topic", topic, "error", err)
 		return resp
 	}
 
-	now := time.Now()
-	for _, lease := range leases {
-		if now.Before(lease.ExpiresAt) {
-			key := fmt.Sprintf("%d", lease.PartitionID)
-			resp.Partitions[key] = routingPartitionInfo{
-				InstanceID: lease.InstanceID,
-				Address:    lease.Address,
-			}
+	// Collect unique instance IDs and resolve their addresses from the registry.
+	addressCache := make(map[string]string)
+	for _, instanceID := range assigned.Partitions {
+		if _, ok := addressCache[instanceID]; ok {
+			continue
+		}
+		if instanceID == s.instanceID {
+			addressCache[instanceID] = "http://" + s.Address()
+			continue
+		}
+		info, err := s.registry.GetInstanceInfo(ctx, instanceID)
+		if err != nil {
+			slog.Debug("getRoutingMap: resolve instance", "instance", instanceID, "error", err)
+			continue
+		}
+		addressCache[instanceID] = "http://" + info.Address
+	}
+
+	for pid, instanceID := range assigned.Partitions {
+		addr, ok := addressCache[instanceID]
+		if !ok {
+			continue
+		}
+		key := fmt.Sprintf("%d", pid)
+		resp.Partitions[key] = routingPartitionInfo{
+			InstanceID: instanceID,
+			Address:    addr,
 		}
 	}
 
