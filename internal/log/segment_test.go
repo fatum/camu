@@ -104,6 +104,42 @@ func TestSegmentEmpty(t *testing.T) {
 	}
 }
 
+func TestSegmentRoundTrip_Snappy(t *testing.T) {
+	msgs := []Message{
+		{Offset: 0, Timestamp: 1000, Key: []byte("k"), Value: []byte("hello world")},
+	}
+	var buf bytes.Buffer
+	err := WriteSegment(&buf, msgs, CompressionSnappy)
+	if err != nil {
+		t.Fatalf("WriteSegment(snappy) error: %v", err)
+	}
+	got, err := ReadSegment(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("ReadSegment(snappy) error: %v", err)
+	}
+	if string(got[0].Value) != "hello world" {
+		t.Errorf("value = %q, want %q", string(got[0].Value), "hello world")
+	}
+}
+
+func TestSegmentRoundTrip_Zstd(t *testing.T) {
+	msgs := []Message{
+		{Offset: 0, Timestamp: 1000, Key: []byte("k"), Value: []byte("hello world")},
+	}
+	var buf bytes.Buffer
+	err := WriteSegment(&buf, msgs, CompressionZstd)
+	if err != nil {
+		t.Fatalf("WriteSegment(zstd) error: %v", err)
+	}
+	got, err := ReadSegment(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("ReadSegment(zstd) error: %v", err)
+	}
+	if string(got[0].Value) != "hello world" {
+		t.Errorf("value = %q, want %q", string(got[0].Value), "hello world")
+	}
+}
+
 // TestSegmentReadFromOffset writes messages with offsets 10,11,12 and reads from offset 11.
 func TestSegmentReadFromOffset(t *testing.T) {
 	msgs := []Message{
