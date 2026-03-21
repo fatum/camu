@@ -126,41 +126,101 @@ curl http://localhost:8080/v1/cluster/status
 
 ## Architecture
 
+### Write Path
+
 ```
-Producer Request
+Producer HTTP Request
        |
-  [HTTP Server]
+  [Partition Router]     hash(key) % N  or  round-robin
        |
-  [Partition Router]  -- hash(key) % N or round-robin
+  [WAL Append + fsync]   durable on local disk before ack
        |
-  [WAL Append + fsync]  -- crash-safe, durable on local disk
+  [Batcher]              tracks size, triggers flush on threshold
+       |                 (no in-memory message copies — WAL is source of truth)
+  [Flush: WAL → S3]      reads WAL, serializes segment, uploads
        |
-  [In-Memory Buffer]  -- serves real-time consumer reads
+  [Disk Cache Write]     segment cached locally at flush time
        |
-  [Batcher]  -- flushes to S3 on size (8MB) or time (5s) threshold
+  [Index Update]         conditional put to S3 index.json
        |
-  [S3 Segment Upload]  -- immutable segment + index update
-       |
-  [Disk Cache]  -- cached locally for fast consumer reads
+  [WAL Truncate]         remove flushed entries
 ```
 
-**Read path (tiered):**
-1. In-memory buffer (unflushed data, owner instance only)
-2. Disk segment cache (local, no S3 round-trip)
-3. S3 fetch (cached on disk for next read)
+**Write flow per message:**
+1. HTTP request arrives, routed to partition owner
+2. Message appended to WAL file + fsynced (~30μs)
+3. HTTP response sent — write is durable on local disk
+4. Batcher tracks accumulated size; when threshold hit (8MB or 5s):
+   - Reads unflushed messages from WAL
+   - Serializes into immutable segment (binary format, optional snappy/zstd)
+   - Uploads segment to S3
+   - Writes segment to local disk cache
+   - Updates partition index in S3 (conditional put)
+   - Truncates WAL
 
-Any instance can serve reads. Non-owners see data up to the last flush (5s delay).
+**No in-memory message buffering.** The WAL on disk is the single source of truth. The batcher only tracks size counters — at flush time it reads directly from the WAL.
+
+### Read Path
+
+```
+Consumer HTTP Request
+       |
+  [Partition Index]     lookup offset → segment key
+       |
+  [Disk Cache]          local segment file?
+       |                  yes → read from disk
+       |                  no  → fetch from S3, cache to disk
+       |
+  [Segment Parse]       deserialize from offset, return messages
+```
+
+**Read flow:**
+1. Look up which segment contains the requested offset (from index)
+2. Check local disk cache for the segment
+3. Cache miss → fetch from S3, write to disk cache
+4. Parse segment binary, return messages from requested offset
+
+All instances use the same read path — no special owner logic. Consumers see data after it's flushed to S3 (default 5s delay).
+
+### Throughput
+
+Benchmarked on Apple M3 Pro, single instance, in-memory S3:
+
+| Operation | Throughput | Latency |
+|-----------|-----------|---------|
+| Produce (single message) | ~14,000 msgs/sec | 71 μs/msg |
+| Produce (batch of 100) | ~89,000 msgs/sec | 11 μs/msg |
+| Consume (100 msgs/poll) | ~320,000 msgs/sec | 3 μs/msg |
+
+**Bottlenecks:** Single produce is bound by HTTP round-trip + WAL fsync. Batching amortizes both — 6x improvement. Consume is fast because segments are served from disk cache.
+
+**With real S3:** Produce throughput is unchanged (WAL is local). Consume cold-reads add S3 GET latency (~50-100ms per segment), then cached.
+
+**Scaling:** Throughput scales linearly with partitions × instances. 3 instances with 12 partitions → ~270K single msgs/sec or ~1M batched msgs/sec theoretical max.
 
 ## Multi-Instance
 
-Multiple camu instances share the same S3 bucket. Partitions are owned via S3-based leases with epoch fencing.
+Multiple camu instances share the same S3 bucket. Partitions are distributed evenly via the rebalancer.
 
-- Lease TTL: 10s (configurable), heartbeat every 3s
-- On instance failure: lease expires, another instance takes over
-- Epoch fencing prevents stale instances from writing after recovery
-- Clients discover partition owners via `GET /v1/topics/{topic}/routing`
+**Partition ownership:**
+- Round-robin assignment across sorted instance IDs
+- S3-based leases with epoch fencing (10s TTL, 3s heartbeat)
+- Automatic rebalance when nodes join or leave (~6-10s convergence)
 
-Writes to a non-owning instance return `421 Misdirected Request` with the current routing map.
+**Node join:**
+1. New node starts, discovers active instances from existing leases
+2. Rebalancer computes fair partition assignment
+3. New node acquires leases for its share
+4. Existing nodes release excess partitions on next renewal cycle (~3s)
+
+**Node failure:**
+1. Instance dies, lease expires after TTL (10s)
+2. Surviving instances detect expired leases on renewal
+3. Rebalancer redistributes orphaned partitions
+
+**Epoch fencing:** Each lease acquisition increments an epoch. If a killed instance recovers after another has taken over, the stale instance sees the advanced epoch and discards its unflushed WAL.
+
+Clients discover partition owners via `GET /v1/topics/{topic}/routing`. Writes to a non-owning instance return `421 Misdirected Request` with the current routing map.
 
 ## Configuration
 
@@ -254,9 +314,10 @@ camu/
 
 ## Trade-offs
 
-- **Unflushed data loss on crash** — if an instance dies before flushing to S3, unflushed WAL data is lost when another instance takes over (equivalent to Kafka `acks=1`). The WAL is recoverable if the same instance restarts.
-- **5s visibility delay on non-owner reads** — consumers reading from a non-owning instance only see data up to the last S3 flush.
+- **Unflushed data loss on failover** — if an instance dies before flushing to S3, unflushed WAL entries are lost when another instance takes over (equivalent to Kafka `acks=1`). The WAL is recoverable if the same instance restarts.
+- **5s visibility delay** — consumers see data after S3 flush (configurable via `segments.max_age`). There is no in-memory read path — all reads go through disk cache or S3.
 - **S3 latency for offset commits** — offset checkpoints go to S3 (acceptable since commits are infrequent).
+- **Rebalance convergence** — 6-10s for partitions to redistribute after a node join/leave (2 renewal cycles).
 
 ## License
 
