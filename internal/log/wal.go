@@ -82,6 +82,61 @@ func (w *WAL) Append(msg Message) error {
 	return nil
 }
 
+// AppendBatch writes multiple messages to the WAL with a single fsync.
+// This is much more efficient than calling Append in a loop for batch produces.
+func (w *WAL) AppendBatch(msgs []Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	// Pre-serialize all entries before taking the lock.
+	type entry struct {
+		frameBytes []byte
+		checksum   uint32
+	}
+	entries := make([]entry, len(msgs))
+	for i, msg := range msgs {
+		var frameBuf bytes.Buffer
+		if err := writeMessageFrame(&frameBuf, msg); err != nil {
+			return fmt.Errorf("WAL serialize message %d: %w", i, err)
+		}
+		fb := frameBuf.Bytes()
+		entries[i] = entry{
+			frameBytes: fb,
+			checksum:   crc32.ChecksumIEEE(fb),
+		}
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if _, err := w.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("WAL seek end: %w", err)
+	}
+
+	for _, e := range entries {
+		entryLen := uint32(len(e.frameBytes))
+		if err := binary.Write(w.file, binary.BigEndian, entryLen); err != nil {
+			return fmt.Errorf("WAL write entry length: %w", err)
+		}
+		if _, err := w.file.Write(e.frameBytes); err != nil {
+			return fmt.Errorf("WAL write frame: %w", err)
+		}
+		if err := binary.Write(w.file, binary.BigEndian, e.checksum); err != nil {
+			return fmt.Errorf("WAL write CRC: %w", err)
+		}
+	}
+
+	if w.fsync {
+		if err := w.file.Sync(); err != nil {
+			return fmt.Errorf("WAL fsync: %w", err)
+		}
+	}
+
+	w.buf = append(w.buf, msgs...)
+	return nil
+}
+
 // Replay reads all valid entries from the beginning of the WAL file.
 // Entries with a bad CRC or that are truncated (from a crash mid-write) are
 // silently skipped — only entries that trail the last valid entry can be

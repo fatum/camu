@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/storage"
@@ -71,31 +70,50 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	offsets := make([]offsetInfo, 0, len(msgs))
-	for _, m := range msgs {
+	// Group messages by partition for batch WAL writes (single fsync per partition).
+	type indexedMsg struct {
+		idx       int // original position in the request
+		partition int
+		msg       log.Message
+	}
+	byPartition := make(map[int][]indexedMsg)
+	for i, m := range msgs {
 		var key []byte
 		if m.Key != "" {
 			key = []byte(m.Key)
 		}
 		partitionID := router.Route(key)
+		byPartition[partitionID] = append(byPartition[partitionID], indexedMsg{
+			idx:       i,
+			partition: partitionID,
+			msg: log.Message{
+				Key:     key,
+				Value:   []byte(m.Value),
+				Headers: m.Headers,
+			},
+		})
+	}
 
-		msg := log.Message{
-			Timestamp: time.Now().UnixNano(),
-			Key:       key,
-			Value:     []byte(m.Value),
-			Headers:   m.Headers,
+	// Append each partition's batch with a single WAL fsync.
+	offsets := make([]offsetInfo, len(msgs))
+	for partitionID, group := range byPartition {
+		batch := make([]log.Message, len(group))
+		for i, im := range group {
+			batch[i] = im.msg
 		}
 
-		offset, err := s.partitionManager.Append(r.Context(), topicName, partitionID, msg)
+		assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 			return
 		}
 
-		offsets = append(offsets, offsetInfo{
-			Partition: partitionID,
-			Offset:    offset,
-		})
+		for i, im := range group {
+			offsets[im.idx] = offsetInfo{
+				Partition: partitionID,
+				Offset:    assignedOffsets[i],
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, produceResponse{Offsets: offsets})
@@ -148,29 +166,31 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	offsets := make([]offsetInfo, 0, len(msgs))
-	for _, m := range msgs {
+	batch := make([]log.Message, len(msgs))
+	for i, m := range msgs {
 		var key []byte
 		if m.Key != "" {
 			key = []byte(m.Key)
 		}
-		msg := log.Message{
-			Timestamp: time.Now().UnixNano(),
-			Key:       key,
-			Value:     []byte(m.Value),
-			Headers:   m.Headers,
+		batch[i] = log.Message{
+			Key:     key,
+			Value:   []byte(m.Value),
+			Headers: m.Headers,
 		}
+	}
 
-		offset, err := s.partitionManager.Append(r.Context(), topicName, partitionID, msg)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
-			return
-		}
+	assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
+		return
+	}
 
-		offsets = append(offsets, offsetInfo{
+	offsets := make([]offsetInfo, len(assignedOffsets))
+	for i, o := range assignedOffsets {
+		offsets[i] = offsetInfo{
 			Partition: partitionID,
-			Offset:    offset,
-		})
+			Offset:    o,
+		}
 	}
 
 	writeJSON(w, http.StatusOK, produceResponse{Offsets: offsets})

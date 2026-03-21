@@ -194,3 +194,67 @@ func TestWAL_CorruptEntrySkipped(t *testing.T) {
 		t.Errorf("unexpected value: %q", replayed[0].Value)
 	}
 }
+
+func TestWAL_AppendBatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "batch.wal")
+
+	w, err := OpenWAL(path, true)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+
+	msgs := []Message{
+		{Offset: 0, Timestamp: 1000, Key: []byte("k0"), Value: []byte("v0")},
+		{Offset: 1, Timestamp: 2000, Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 2, Timestamp: 3000, Key: []byte("k2"), Value: []byte("v2")},
+	}
+
+	if err := w.AppendBatch(msgs); err != nil {
+		t.Fatalf("AppendBatch() error: %v", err)
+	}
+
+	// Verify in-memory buffer
+	unflushed := w.UnflushedFrom(0)
+	if len(unflushed) != 3 {
+		t.Fatalf("UnflushedFrom(0) = %d messages, want 3", len(unflushed))
+	}
+
+	w.Close()
+
+	// Verify replay after reopen
+	w2, err := OpenWAL(path, true)
+	if err != nil {
+		t.Fatalf("OpenWAL() reopen error: %v", err)
+	}
+	defer w2.Close()
+
+	replayed, err := w2.Replay()
+	if err != nil {
+		t.Fatalf("Replay() error: %v", err)
+	}
+	if len(replayed) != 3 {
+		t.Fatalf("Replay() = %d messages, want 3", len(replayed))
+	}
+	if string(replayed[2].Key) != "k2" {
+		t.Errorf("replayed[2].Key = %q, want %q", string(replayed[2].Key), "k2")
+	}
+}
+
+func TestWAL_AppendBatchEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty-batch.wal")
+
+	w, err := OpenWAL(path, true)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.AppendBatch(nil); err != nil {
+		t.Fatalf("AppendBatch(nil) error: %v", err)
+	}
+	if err := w.AppendBatch([]Message{}); err != nil {
+		t.Fatalf("AppendBatch([]) error: %v", err)
+	}
+}

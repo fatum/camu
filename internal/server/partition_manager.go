@@ -250,6 +250,54 @@ func (pm *PartitionManager) Append(ctx context.Context, topic string, partitionI
 	return offset, nil
 }
 
+// AppendBatch writes multiple messages to the same partition with a single WAL fsync.
+// Returns the assigned offsets for each message.
+func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, partitionID int, msgs []log.Message) ([]uint64, error) {
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+
+	pm.mu.RLock()
+	topicPartitions, ok := pm.partitions[topic]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil, fmt.Errorf("topic %q not initialized", topic)
+	}
+	ps, ok := topicPartitions[partitionID]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+	}
+	pm.mu.RUnlock()
+
+	// Assign offsets for the entire batch.
+	pm.mu.Lock()
+	offsets := make([]uint64, len(msgs))
+	now := time.Now().UnixNano()
+	for i := range msgs {
+		offsets[i] = ps.nextOffset
+		msgs[i].Offset = ps.nextOffset
+		ps.nextOffset++
+		if msgs[i].Timestamp == 0 {
+			msgs[i].Timestamp = now
+		}
+	}
+	pm.mu.Unlock()
+
+	// Write entire batch to WAL with a single fsync.
+	if err := ps.wal.AppendBatch(msgs); err != nil {
+		return nil, fmt.Errorf("WAL append batch: %w", err)
+	}
+
+	// Add all to batcher.
+	globalID := pm.getGlobalID(topic, partitionID)
+	for _, msg := range msgs {
+		pm.batcher.Append(globalID, msg)
+	}
+
+	return offsets, nil
+}
+
 // IsOwned returns true — in single-instance mode all partitions are owned.
 func (pm *PartitionManager) IsOwned(topic string, partitionID int) bool {
 	return true
