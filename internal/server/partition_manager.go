@@ -38,6 +38,9 @@ type PartitionManager struct {
 	walDir     string
 	segmentsCfg config.SegmentsConfig
 
+	// leaseChecker validates partition ownership before flushing to S3.
+	leaseChecker func(topic string, partitionID int) bool
+
 	// globalID maps a unique int to (topic, partitionID) for the batcher callback.
 	globalIDMu   sync.Mutex
 	nextGlobalID int
@@ -385,6 +388,12 @@ func (pm *PartitionManager) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
+// SetLeaseChecker sets a callback to verify partition ownership before flushing.
+// The server sets this after creating the partition manager.
+func (pm *PartitionManager) SetLeaseChecker(fn func(topic string, partitionID int) bool) {
+	pm.leaseChecker = fn
+}
+
 // onFlush is the batcher's flush callback. It reads unflushed messages from the
 // WAL, serializes them into a segment, uploads to S3, writes to disk cache,
 // updates the index, and truncates the WAL.
@@ -392,6 +401,14 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	topic, partitionID, ok := pm.resolveGlobalID(globalPartitionID)
 	if !ok {
 		return fmt.Errorf("unknown global partition ID %d", globalPartitionID)
+	}
+
+	// Check lease validity before flushing — prevents writing to S3
+	// after another instance has taken over this partition.
+	if pm.leaseChecker != nil && !pm.leaseChecker(topic, partitionID) {
+		slog.Warn("onFlush: lease expired, skipping flush",
+			"topic", topic, "partition", partitionID)
+		return nil
 	}
 
 	pm.mu.RLock()

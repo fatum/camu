@@ -89,6 +89,10 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		leaseStop:        make(chan struct{}),
 	}
 
+	// Wire lease check into partition manager so flushes are rejected
+	// when this instance no longer owns the partition.
+	pm.SetLeaseChecker(s.isOwnedPartition)
+
 	s.httpServer = &http.Server{
 		Handler: s.routes(),
 	}
