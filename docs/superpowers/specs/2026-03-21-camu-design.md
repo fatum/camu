@@ -40,7 +40,9 @@ If `Key` is omitted, messages are round-robined across partitions.
 
 The storage unit. A partition's log is split into segments, each stored as a single S3 object. A segment contains a batch of messages serialized together. Segments are immutable once flushed to S3.
 
-S3 key: `{bucket}/{topic}/{partition_id}/{base_offset}.segment`
+S3 key: `{bucket}/{topic}/{partition_id}/{base_offset}-{epoch}.segment`
+
+The `epoch` is the lease epoch under which the segment was written (see Lease Fencing below).
 
 ### Partition Index
 
@@ -58,7 +60,7 @@ An S3 object per partition for ownership coordination.
 
 S3 key: `{bucket}/_coordination/leases/{topic}/{partition_id}.lease`
 
-Contains the owning instance ID, lease expiry timestamp, and an ETag for conditional updates. Instances renew leases before expiry; expired leases are claimable by any instance.
+Contains the owning instance ID, lease epoch, lease expiry timestamp, and an ETag for conditional updates. Each lease acquisition increments the epoch. Instances renew leases before expiry; expired leases are claimable by any instance.
 
 ## Storage Layer
 
@@ -296,9 +298,24 @@ Each camu instance owns a subset of partitions via S3-based leases. Only the own
 ### Lease Lifecycle
 
 - On startup, instance registers itself and attempts to acquire leases for unowned partitions
-- Leases have a configurable TTL (default 30s), renewed before expiry via heartbeat
-- If an instance dies, its leases expire and other instances claim them during rebalance
+- Leases have a configurable TTL (default 5-10s), renewed before expiry via heartbeat
+- If an instance dies, its leases expire and other instances claim them during rebalance (unavailability window equals the remaining TTL)
 - Rebalance uses round-robin or consistent hashing across live instances
+
+### Lease Fencing
+
+Each lease acquisition increments an epoch number stored in the lease object. The epoch prevents conflicts when a failed instance recovers:
+
+1. Instance A owns partition 3 at epoch 5, has unflushed WAL entries
+2. Instance A dies, lease expires
+3. Instance B acquires partition 3 at epoch 6, reads the index, starts assigning offsets from the last flushed offset
+4. Instance A recovers — for each previously owned partition, it checks the current lease epoch
+5. Epoch has advanced (6 > 5) → Instance A discards its local WAL for that partition (data is stale, those offsets have been reassigned)
+6. If epoch has NOT advanced (instance recovered before lease expired) → replay WAL normally
+
+The epoch is embedded in segment filenames (`{base_offset}-{epoch}.segment`) and validated during index updates via conditional put.
+
+**Trade-off:** unflushed data on a dead instance is lost if another instance takes over. This is accepted behavior for the initial implementation — equivalent to Kafka with `acks=1`. Standby replicas (future work) would replicate the WAL to eliminate this risk.
 
 ### Write Routing
 
@@ -337,8 +354,8 @@ cache:
   segment_cache_size: 536870912
 
 coordination:
-  lease_ttl: "30s"
-  heartbeat_interval: "10s"
+  lease_ttl: "10s"
+  heartbeat_interval: "3s"
   rebalance_delay: "5s"
 
 groups:
