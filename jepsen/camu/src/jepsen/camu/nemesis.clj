@@ -11,10 +11,12 @@
   (c/exec :pkill :-9 :-f "camu" (c/lit "|| true")))
 
 (defn start-camu!
-  "Restarts the camu process on the current node."
+  "Starts camu on the current node (assumes process is not running)."
   []
   (c/exec :bash :-c
-          "nohup /opt/camu/camu serve --config /etc/camu/camu.yaml >> /var/log/camu.log 2>&1 &"))
+          (str "nohup /opt/camu/camu serve --config /etc/camu/camu.yaml "
+               ">> /var/log/camu.log 2>&1 &"))
+  (Thread/sleep 1000))
 
 (defn pause-camu!
   "Sends SIGSTOP to camu on the current node."
@@ -39,19 +41,37 @@
           (c/lit "|| true")))
 
 (defn kill-nemesis
-  "A nemesis that kills and restarts camu processes."
+  "A nemesis that kills and restarts camu processes.
+   Tracks killed nodes; :stop restarts only those that were killed."
   []
-  (reify nemesis/Nemesis
-    (setup! [this test] this)
-    (invoke! [this test op]
-      (let [node (rand-nth (:nodes test))]
+  (let [killed (atom #{})]
+    (reify nemesis/Nemesis
+      (setup! [this test] this)
+      (invoke! [this test op]
         (case (:value op)
-          :start (do (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
-                     (assoc op :value [:killed node]))
-          :stop  (do (c/on-nodes test (:nodes test) (fn [_ _] (start-camu!)))
-                     (assoc op :value :restarted)))))
-    (teardown! [this test]
-      (c/on-nodes test (:nodes test) (fn [_ _] (start-camu!))))))
+          :start (let [node (rand-nth (:nodes test))]
+                   (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
+                   (swap! killed conj node)
+                   (assoc op :value [:killed node]))
+          :stop  (let [to-restart (vec @killed)]
+                   (reset! killed #{})
+                   (when (seq to-restart)
+                     ;; Wait for killed processes to fully release ports
+                     (Thread/sleep 3000)
+                     (doseq [node to-restart]
+                       (try
+                         (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                         (catch Exception e
+                           (info "Failed to restart" node (.getMessage e))))))
+                   (assoc op :value [:restarted to-restart]))))
+      (teardown! [this test]
+        (let [to-restart (vec @killed)]
+          (when (seq to-restart)
+            (Thread/sleep 3000)
+            (doseq [node to-restart]
+              (try
+                (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                (catch Exception _)))))))))
 
 (defn pause-nemesis
   "A nemesis that pauses and resumes camu processes."

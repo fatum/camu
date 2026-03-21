@@ -91,11 +91,11 @@
                (gen/clients
                 (->> (mixed-workload-gen counter)
                      (gen/stagger 1/10)))))
-             ;; Phase 2: stop nemesis, let cluster recover
-             (gen/log "Stopping nemesis...")
+             ;; Phase 2: stop nemesis, restart all nodes
+             (gen/log "Stopping nemesis, restarting all nodes...")
              (gen/nemesis (gen/once {:type :info :f :kill :value :stop}))
-             (gen/log "Recovering — waiting 20s...")
-             (gen/sleep 20)
+             (gen/log "Recovering — waiting 25s for cluster stabilization...")
+             (gen/sleep 25)
              ;; Phase 3: drain ALL partitions
              (gen/log "Draining all partitions for verification...")
              (gen/clients (drain-gen)))})))
