@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/maksim/camu/internal/config"
+	"github.com/maksim/camu/internal/consumer"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -20,6 +21,7 @@ type Server struct {
 	s3Client         *storage.S3Client
 	topicStore       *meta.TopicStore
 	partitionManager *PartitionManager
+	fetcher          *consumer.Fetcher
 	instanceID       string
 	listener         net.Listener
 }
@@ -61,6 +63,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		s3Client:         s3Client,
 		topicStore:       meta.NewTopicStore(s3Client),
 		partitionManager: pm,
+		fetcher:          consumer.NewFetcher(s3Client, pm.GetDiskCache()),
 		instanceID:       instanceID,
 	}
 

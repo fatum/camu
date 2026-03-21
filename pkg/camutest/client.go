@@ -176,6 +176,44 @@ func (c *Client) Produce(topic string, msgs []ProduceMessage) (*ProduceResponse,
 	return &pr, nil
 }
 
+// ConsumeResponse holds the response from a consume request.
+type ConsumeResponse struct {
+	Messages   []ConsumedMessage `json:"messages"`
+	NextOffset uint64            `json:"next_offset"`
+}
+
+// ConsumedMessage holds a single consumed message.
+type ConsumedMessage struct {
+	Offset    uint64            `json:"offset"`
+	Timestamp int64             `json:"timestamp"`
+	Key       string            `json:"key"`
+	Value     string            `json:"value"`
+	Headers   map[string]string `json:"headers,omitempty"`
+}
+
+// Consume reads messages from a topic partition starting at the given offset.
+func (c *Client) Consume(topic string, partition int, offset uint64, limit int) (*ConsumeResponse, error) {
+	url := fmt.Sprintf("%s/v1/topics/%s/partitions/%d/messages?offset=%d&limit=%d",
+		c.baseURL, topic, partition, offset, limit)
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("Consume request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var ae apiError
+		json.NewDecoder(resp.Body).Decode(&ae)
+		return nil, fmt.Errorf("Consume: status %d: %s", resp.StatusCode, ae.Error)
+	}
+
+	var cr ConsumeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return nil, fmt.Errorf("Consume decode: %w", err)
+	}
+	return &cr, nil
+}
+
 // ClusterStatus returns the cluster status.
 func (c *Client) ClusterStatus() (*ClusterStatusResponse, error) {
 	resp, err := c.httpClient.Get(c.baseURL + "/v1/cluster/status")

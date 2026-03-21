@@ -277,6 +277,11 @@ func (pm *PartitionManager) GetRouter(topic string) *producer.Router {
 	return pm.routers[topic]
 }
 
+// GetDiskCache returns the disk cache used by the partition manager.
+func (pm *PartitionManager) GetDiskCache() *log.DiskCache {
+	return pm.diskCache
+}
+
 // GetIndex returns the partition index.
 func (pm *PartitionManager) GetIndex(topic string, partitionID int) *log.Index {
 	pm.mu.RLock()
