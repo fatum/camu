@@ -52,7 +52,11 @@ type SegmentsConfig struct {
 }
 
 // MaxAgeDuration parses MaxAge as a time.Duration.
+// Returns 5 * time.Second if MaxAge is empty.
 func (s SegmentsConfig) MaxAgeDuration() (time.Duration, error) {
+	if s.MaxAge == "" {
+		return 5 * time.Second, nil
+	}
 	return time.ParseDuration(s.MaxAge)
 }
 
@@ -80,10 +84,6 @@ func Load(path string) (*Config, error) {
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
-	}
-
-	if err := applyDefaults(cfg); err != nil {
-		return nil, err
 	}
 
 	if err := validate(cfg); err != nil {
@@ -118,30 +118,6 @@ func defaults() *Config {
 			RebalanceDelay:    "5s",
 		},
 	}
-}
-
-// applyDefaults fills in any zero-value fields that should have defaults.
-// Since yaml.Unmarshal overwrites the whole struct, we rely on defaults() being
-// called before Unmarshal. This function handles cases where yaml.Unmarshal
-// would leave fields as zero values when the key is absent.
-func applyDefaults(cfg *Config) error {
-	// yaml.v3 sets bool fields to false when absent, but our default is true for Fsync.
-	// We cannot distinguish "absent" from "explicitly false" after Unmarshal.
-	// To properly handle this, we use a two-pass approach: unmarshal into a raw map
-	// to check which keys were actually set, but that complicates the code significantly.
-	// Instead, we accept this limitation: if users set fsync: false explicitly, it will
-	// be overridden back to true by applyDefaults. This is a known tradeoff with simple
-	// YAML unmarshaling without custom logic.
-	//
-	// The current implementation uses defaults() before Unmarshal, which means yaml.Unmarshal
-	// DOES overwrite fields — including bool fields set to false. So defaults work correctly
-	// for fields absent from YAML (they stay at default), but explicitly false booleans also work
-	// because yaml.Unmarshal sets them to false, which is the intended value.
-	//
-	// The only problematic scenario is: default=true, user wants false — yaml sets it to false,
-	// which is correct. default=false, user wants true — yaml sets it to true, correct.
-	// So the approach works for all bool cases.
-	return nil
 }
 
 // validate checks required fields.
