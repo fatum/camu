@@ -95,6 +95,8 @@ S3-compatible client using the AWS SDK v2. Works with AWS S3, MinIO, Cloudflare 
       {topic}/{partition_id}.lease
     groups/
       {group_id}/offsets.json
+    consumers/
+      {consumer_id}/offsets.json
   _meta/
     topics/{topic}.json
 ```
@@ -158,7 +160,13 @@ If the in-memory buffer exceeds a high-water mark, the server returns `503 Servi
 GET /v1/topics/{topic}/partitions/{id}/messages?offset=N&limit=100
 ```
 
-Server looks up the partition index, fetches the relevant segment from S3 (or local cache), deserializes, and returns messages from offset N. Response includes `next_offset`.
+Server resolves the requested offset through a tiered read path:
+
+1. **In-memory buffer** — if this instance owns the partition and the offset is in the active (unflushed) buffer, serve directly from memory
+2. **Local segment cache** — check the LRU cache for the segment containing the offset
+3. **S3 fetch** — fetch the segment from S3, cache it locally, then serve
+
+Response includes `next_offset`.
 
 ### SSE (Opt-in)
 
@@ -171,7 +179,7 @@ Server holds the connection open and pushes messages as SSE events. For historic
 
 ### Segment Cache
 
-A local LRU cache holds recently-read segments in memory. Since segments are immutable, no invalidation is needed. Cache size is configurable (default 512MB).
+A local LRU cache holds recently-read segments in memory. Segments fetched from S3 for consumer reads are automatically cached so subsequent reads of the same offset range are served locally. Since segments are immutable once flushed, no invalidation is needed. Cache size is configurable (default 512MB).
 
 ### Consumer Groups
 
@@ -183,9 +191,20 @@ A local LRU cache holds recently-read segments in memory. Since segments are imm
 
 Partition assignment uses range or round-robin strategy. Missed heartbeats trigger rebalance.
 
+### Consumer-Specific Offsets
+
+Individual consumers can manage their own offsets independently of consumer groups:
+
+```
+POST /v1/topics/{topic}/offsets/{consumer_id}   — commit offsets for a standalone consumer
+GET  /v1/topics/{topic}/offsets/{consumer_id}   — get committed offsets for a standalone consumer
+```
+
+This allows consumers to track their position without joining a group — useful for single consumers, reprocessing pipelines, or custom offset management.
+
 ### Offset Storage
 
-Committed offsets go through a pluggable storage interface. Default: S3 at `_coordination/groups/{group_id}/offsets.json`. Users can plug in Redis or DynamoDB for faster commits.
+Committed offsets (both group and consumer-specific) go through a pluggable storage interface. Default: S3 at `_coordination/groups/{group_id}/offsets.json` for groups and `_coordination/consumers/{consumer_id}/offsets.json` for standalone consumers. Users can plug in Redis or DynamoDB for faster commits.
 
 ## HTTP API
 
@@ -232,6 +251,13 @@ POST   /v1/groups/{group_id}/heartbeat                     — heartbeat
 POST   /v1/groups/{group_id}/commit                        — commit offsets
 GET    /v1/groups/{group_id}/offsets                        — get offsets
 POST   /v1/groups/{group_id}/leave                         — leave group
+```
+
+### Consumer-Specific Offsets
+
+```
+POST   /v1/topics/{topic}/offsets/{consumer_id}            — commit offsets
+GET    /v1/topics/{topic}/offsets/{consumer_id}             — get offsets
 ```
 
 ### Cluster
