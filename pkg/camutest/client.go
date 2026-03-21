@@ -300,53 +300,6 @@ func (c *Client) StreamSSE(topic string, partition int, offset uint64, maxEvents
 	return events, nil
 }
 
-// JoinGroupResponse holds the response from joining a consumer group.
-type JoinGroupResponse struct {
-	Partitions []int `json:"partitions"`
-}
-
-// JoinGroup joins a consumer group for a topic.
-func (c *Client) JoinGroup(groupID, topic, consumerID string) (*JoinGroupResponse, error) {
-	body, _ := json.Marshal(map[string]string{
-		"topic":       topic,
-		"consumer_id": consumerID,
-	})
-	resp, err := c.httpClient.Post(c.baseURL+"/v1/groups/"+groupID+"/join", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("JoinGroup request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var ae apiError
-		json.NewDecoder(resp.Body).Decode(&ae)
-		return nil, fmt.Errorf("JoinGroup: status %d: %s", resp.StatusCode, ae.Error)
-	}
-
-	var jr JoinGroupResponse
-	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
-		return nil, fmt.Errorf("JoinGroup decode: %w", err)
-	}
-	return &jr, nil
-}
-
-// Heartbeat sends a heartbeat for a consumer in a group.
-func (c *Client) Heartbeat(groupID, consumerID string) error {
-	body, _ := json.Marshal(map[string]string{"consumer_id": consumerID})
-	resp, err := c.httpClient.Post(c.baseURL+"/v1/groups/"+groupID+"/heartbeat", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("Heartbeat request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var ae apiError
-		json.NewDecoder(resp.Body).Decode(&ae)
-		return fmt.Errorf("Heartbeat: status %d: %s", resp.StatusCode, ae.Error)
-	}
-	return nil
-}
-
 // CommitOffsets commits offsets for a consumer group.
 func (c *Client) CommitOffsets(groupID string, offsets map[int]uint64) error {
 	strOffsets := make(map[string]uint64, len(offsets))
@@ -396,46 +349,6 @@ func (c *Client) GetOffsets(groupID string) (map[int]uint64, error) {
 		offsets[pid] = v
 	}
 	return offsets, nil
-}
-
-// LeaveGroup removes a consumer from a group.
-func (c *Client) LeaveGroup(groupID, consumerID string) error {
-	body, _ := json.Marshal(map[string]string{"consumer_id": consumerID})
-	resp, err := c.httpClient.Post(c.baseURL+"/v1/groups/"+groupID+"/leave", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("LeaveGroup request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var ae apiError
-		json.NewDecoder(resp.Body).Decode(&ae)
-		return fmt.Errorf("LeaveGroup: status %d: %s", resp.StatusCode, ae.Error)
-	}
-	return nil
-}
-
-// ConsumeWithGroup consumes messages using a consumer group assignment.
-func (c *Client) ConsumeWithGroup(topic, groupID, consumerID string) (*ConsumeResponse, error) {
-	url := fmt.Sprintf("%s/v1/topics/%s/consume?group=%s&consumer_id=%s",
-		c.baseURL, topic, groupID, consumerID)
-	resp, err := c.httpClient.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("ConsumeWithGroup request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var ae apiError
-		json.NewDecoder(resp.Body).Decode(&ae)
-		return nil, fmt.Errorf("ConsumeWithGroup: status %d: %s", resp.StatusCode, ae.Error)
-	}
-
-	var cr ConsumeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
-		return nil, fmt.Errorf("ConsumeWithGroup decode: %w", err)
-	}
-	return &cr, nil
 }
 
 // CommitConsumerOffsets commits offsets for a standalone consumer.

@@ -9,71 +9,13 @@ import (
 	"github.com/maksim/camu/pkg/camutest"
 )
 
-func TestConsumerGroup_JoinAndConsume(t *testing.T) {
-	env := camutest.New(t, camutest.WithInstances(1))
-	defer env.Cleanup()
-	client := env.Client()
-
-	topic := "cg-join-test"
-	client.CreateTopic(topic, 4, 24*time.Hour)
-
-	// Produce 10 messages.
-	var msgs []camutest.ProduceMessage
-	for i := 0; i < 10; i++ {
-		msgs = append(msgs, camutest.ProduceMessage{
-			Key:   "k",
-			Value: "msg-" + time.Now().Format("150405.000") + "-" + string(rune('0'+i)),
-		})
-	}
-	_, err := client.Produce(topic, msgs)
-	if err != nil {
-		t.Fatalf("Produce: %v", err)
-	}
-
-	// Join group with one consumer.
-	jr, err := client.JoinGroup("test-group", topic, "consumer-1")
-	if err != nil {
-		t.Fatalf("JoinGroup: %v", err)
-	}
-	if len(jr.Partitions) != 4 {
-		t.Fatalf("expected 4 partitions, got %d", len(jr.Partitions))
-	}
-
-	// Consume with group.
-	cr, err := client.ConsumeWithGroup(topic, "test-group", "consumer-1")
-	if err != nil {
-		t.Fatalf("ConsumeWithGroup: %v", err)
-	}
-
-	if len(cr.Messages) == 0 {
-		t.Fatal("expected messages, got 0")
-	}
-	t.Logf("consumed %d messages via group", len(cr.Messages))
-
-	// Heartbeat should work.
-	if err := client.Heartbeat("test-group", "consumer-1"); err != nil {
-		t.Fatalf("Heartbeat: %v", err)
-	}
-
-	// Leave group.
-	if err := client.LeaveGroup("test-group", "consumer-1"); err != nil {
-		t.Fatalf("LeaveGroup: %v", err)
-	}
-}
-
-func TestConsumerGroup_CommitAndGetOffsets(t *testing.T) {
+func TestGroupOffsets_CommitAndGet(t *testing.T) {
 	env := camutest.New(t, camutest.WithInstances(1))
 	defer env.Cleanup()
 	client := env.Client()
 
 	topic := "cg-offset-test"
 	client.CreateTopic(topic, 4, 24*time.Hour)
-
-	// Join group.
-	_, err := client.JoinGroup("offset-group", topic, "c1")
-	if err != nil {
-		t.Fatalf("JoinGroup: %v", err)
-	}
 
 	// Commit offsets.
 	offsets := map[int]uint64{0: 100, 1: 200, 2: 50, 3: 0}

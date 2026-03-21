@@ -14,15 +14,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
 	mux.HandleFunc("GET /v1/topics/{topic}/partitions/{id}/messages", s.handleConsumeLowLevel)
 	mux.HandleFunc("GET /v1/topics/{topic}/partitions/{id}/stream", s.handleStreamLowLevel)
-	mux.HandleFunc("GET /v1/topics/{topic}/consume", s.handleConsumeHighLevelImpl)
-	mux.HandleFunc("GET /v1/topics/{topic}/stream", s.handleStreamWithGroup)
 	mux.HandleFunc("POST /v1/topics/{topic}/offsets/{consumer_id}", s.handleCommitConsumerOffsets)
 	mux.HandleFunc("GET /v1/topics/{topic}/offsets/{consumer_id}", s.handleGetConsumerOffsets)
-	mux.HandleFunc("POST /v1/groups/{group_id}/join", s.handleJoinGroup)
-	mux.HandleFunc("POST /v1/groups/{group_id}/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("POST /v1/groups/{group_id}/commit", s.handleCommitOffsets)
 	mux.HandleFunc("GET /v1/groups/{group_id}/offsets", s.handleGetOffsets)
-	mux.HandleFunc("POST /v1/groups/{group_id}/leave", s.handleLeaveGroup)
 	return s.withMiddleware(mux)
 }
 
