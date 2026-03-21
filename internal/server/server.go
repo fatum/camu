@@ -26,6 +26,8 @@ type Server struct {
 	partitionManager *PartitionManager
 	fetcher          *consumer.Fetcher
 	leaseStore       *coordination.LeaseStore
+	groupCoordinator *consumer.GroupCoordinator
+	offsetStore      *storage.OffsetStore
 	instanceID       string
 	listener         net.Listener
 
@@ -77,6 +79,8 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		partitionManager: pm,
 		fetcher:          consumer.NewFetcher(s3Client, pm.GetDiskCache()),
 		leaseStore:       coordination.NewLeaseStore(s3Client),
+		groupCoordinator: consumer.NewGroupCoordinator(),
+		offsetStore:      storage.NewOffsetStore(s3Client),
 		instanceID:       instanceID,
 		ownedLeases:      make(map[string]map[int]coordination.Lease),
 		leaseStop:        make(chan struct{}),

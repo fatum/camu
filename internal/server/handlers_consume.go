@@ -90,9 +90,7 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleConsumeHighLevel(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "consumer groups not yet implemented")
-}
+// handleConsumeHighLevel is now implemented as handleConsumeHighLevelImpl in handlers_group.go.
 
 func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
