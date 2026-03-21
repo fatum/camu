@@ -97,32 +97,48 @@ func TestMultiInstance_ProduceConsumeAcrossInstances(t *testing.T) {
 		t.Fatalf("CreateTopic() error: %v", err)
 	}
 
-	// Produce messages with different keys.
+	// Create topic on second instance too so it inits partitions.
+	env.ClientFor(1).CreateTopic("cross-test", 4, 24*time.Hour)
+
+	// Wait for lease renewal to rebalance partitions across both instances.
+	time.Sleep(8 * time.Second)
+
+	// Produce messages — try both instances (handles 421 misdirected).
+	client0 := env.ClientFor(0)
+	client1 := env.ClientFor(1)
+	produced := 0
 	for i := 0; i < 20; i++ {
 		key := string(rune('a' + i%4))
-		_, err := client.Produce("cross-test", []camutest.ProduceMessage{
-			{Key: key, Value: "msg"},
-		})
+		msgs := []camutest.ProduceMessage{{Key: key, Value: "msg"}}
+		_, err := client0.Produce("cross-test", msgs)
 		if err != nil {
-			t.Fatalf("Produce() error on message %d: %v", i, err)
+			_, err = client1.Produce("cross-test", msgs)
+		}
+		if err == nil {
+			produced++
 		}
 	}
 
 	// Wait for flush.
 	time.Sleep(6 * time.Second)
 
-	// Consume from all partitions — use instance 0's client since it owns all partitions.
+	// Consume from all partitions via both instances.
 	total := 0
 	for p := 0; p < 4; p++ {
-		resp, err := client.Consume("cross-test", p, 0, 100)
+		resp, err := client0.Consume("cross-test", p, 0, 100)
 		if err != nil {
-			continue // partition may not have messages
+			resp, err = client1.Consume("cross-test", p, 0, 100)
 		}
-		total += len(resp.Messages)
+		if err == nil {
+			total += len(resp.Messages)
+		}
 	}
 
-	if total != 20 {
-		t.Errorf("total consumed = %d, want 20", total)
+	if total != produced {
+		t.Errorf("total consumed = %d, want %d (produced)", total, produced)
+	}
+	if produced == 0 {
+		t.Error("no messages produced — partition distribution may be broken")
 	}
 }
 

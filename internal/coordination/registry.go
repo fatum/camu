@@ -2,51 +2,88 @@ package coordination
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/maksim/camu/internal/storage"
 )
 
-// Registry provides instance discovery by inspecting active leases in S3.
-// Instances that hold at least one active lease for a topic are considered alive.
+// InstanceInfo represents a registered instance in the cluster.
+type InstanceInfo struct {
+	InstanceID string    `json:"instance_id"`
+	Address    string    `json:"address"`
+	HeartbeatAt time.Time `json:"heartbeat_at"`
+}
+
+// Registry provides instance discovery via S3-based registration.
+// Each instance registers itself at startup and heartbeats periodically.
+// ActiveInstances reads all registrations and filters by heartbeat freshness.
 type Registry struct {
 	s3Client   *storage.S3Client
 	instanceID string
 	address    string
+	ttl        time.Duration
 }
 
 // NewRegistry creates a new Registry.
-func NewRegistry(s3 *storage.S3Client, instanceID, address string) *Registry {
+func NewRegistry(s3 *storage.S3Client, instanceID, address string, ttl time.Duration) *Registry {
 	return &Registry{
 		s3Client:   s3,
 		instanceID: instanceID,
 		address:    address,
+		ttl:        ttl,
 	}
 }
 
-// ActiveInstances returns the set of instanceIDs that hold at least one active
-// (non-expired) lease for the given topic.
-func (r *Registry) ActiveInstances(ctx context.Context, topic string) ([]string, error) {
-	store := NewLeaseStore(r.s3Client)
-	leases, err := store.ListForTopic(ctx, topic)
+func registryKey(instanceID string) string {
+	return fmt.Sprintf("_coordination/instances/%s.json", instanceID)
+}
+
+// Register writes this instance's registration to S3.
+// Should be called at startup and periodically as a heartbeat.
+func (r *Registry) Register(ctx context.Context) error {
+	info := InstanceInfo{
+		InstanceID:  r.instanceID,
+		Address:     r.address,
+		HeartbeatAt: time.Now(),
+	}
+	data, err := json.Marshal(info)
 	if err != nil {
-		return nil, fmt.Errorf("registry: active instances: %w", err)
+		return fmt.Errorf("registry: marshal: %w", err)
+	}
+	return r.s3Client.Put(ctx, registryKey(r.instanceID), data, storage.PutOpts{})
+}
+
+// Deregister removes this instance's registration from S3.
+// Should be called on graceful shutdown.
+func (r *Registry) Deregister(ctx context.Context) error {
+	return r.s3Client.Delete(ctx, registryKey(r.instanceID))
+}
+
+// ActiveInstances returns all instances with a heartbeat within the TTL.
+func (r *Registry) ActiveInstances(ctx context.Context) ([]string, error) {
+	keys, err := r.s3Client.List(ctx, "_coordination/instances/")
+	if err != nil {
+		return nil, fmt.Errorf("registry: list: %w", err)
 	}
 
-	seen := make(map[string]struct{})
 	now := time.Now()
-	for _, l := range leases {
-		if now.Before(l.ExpiresAt) {
-			seen[l.InstanceID] = struct{}{}
+	var active []string
+	for _, key := range keys {
+		data, err := r.s3Client.Get(ctx, key)
+		if err != nil {
+			continue
+		}
+		var info InstanceInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+		if now.Sub(info.HeartbeatAt) < r.ttl {
+			active = append(active, info.InstanceID)
 		}
 	}
-
-	instances := make([]string, 0, len(seen))
-	for id := range seen {
-		instances = append(instances, id)
-	}
-	return instances, nil
+	return active, nil
 }
 
 // InstanceID returns the instanceID this registry represents.
