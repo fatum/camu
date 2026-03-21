@@ -2,8 +2,7 @@
   (:require [clojure.tools.logging :refer [info warn]]
             [jepsen [client :as client]]
             [clj-http.client :as http]
-            [cheshire.core :as json]
-            [slingshot.slingshot :refer [try+]])
+            [cheshire.core :as json])
   (:import (java.net ConnectException SocketTimeoutException)))
 
 (def default-topic "jepsen-test")
@@ -17,60 +16,75 @@
 (defn create-topic!
   "Creates the test topic. Idempotent — ignores 409 Conflict."
   [node topic]
-  (try+
-   (http/post (str (base-url node) "/v1/topics")
-              {:content-type  :json
-               :body          (json/generate-string {:name       topic
-                                                     :partitions 4
-                                                     :retention  "24h"})
-               :socket-timeout  http-timeout-ms
-               :connect-timeout http-timeout-ms})
-   (catch [:status 409] _
-     (info "Topic" topic "already exists"))
-   (catch ConnectException _
-     (warn "Could not connect to" node "to create topic"))
-   (catch SocketTimeoutException _
-     (warn "Timeout creating topic on" node))))
+  (try
+    (let [resp (http/post (str (base-url node) "/v1/topics")
+                          {:content-type      :json
+                           :body              (json/generate-string {:name       topic
+                                                                     :partitions 4
+                                                                     :retention  "24h"})
+                           :socket-timeout    http-timeout-ms
+                           :connect-timeout   http-timeout-ms
+                           :throw-exceptions  false})]
+      (when (not (#{200 201 409} (:status resp)))
+        (warn "Create topic returned" (:status resp))))
+    (catch ConnectException _
+      (warn "Could not connect to" node "to create topic"))
+    (catch SocketTimeoutException _
+      (warn "Timeout creating topic on" node))))
 
 (defn produce!
-  "Produces a message to the given topic. Returns the assigned offset on
-   success, or throws on error."
+  "Produces a message to the given topic. Returns {:partition N :offset M}
+   or throws with a keyword status on failure."
   [node topic key value]
   (let [resp (http/post (str (base-url node) "/v1/topics/" topic "/messages")
-                        {:content-type    :json
-                         :body            (json/generate-string {:key   key
-                                                                 :value value})
-                         :socket-timeout  http-timeout-ms
-                         :connect-timeout http-timeout-ms
-                         :as              :json})]
-    (first (get-in resp [:body :offsets]))))
+                        {:content-type      :json
+                         :body              (json/generate-string {:key   key
+                                                                   :value value})
+                         :socket-timeout    http-timeout-ms
+                         :connect-timeout   http-timeout-ms
+                         :throw-exceptions  false})
+        status (:status resp)]
+    (cond
+      (= status 200) (let [body (json/parse-string (:body resp) true)
+                           info (first (:offsets body))]
+                       {:partition (:partition info) :offset (:offset info)})
+      (= status 421) (throw (ex-info "misdirected" {:type :misdirected}))
+      (= status 503) (throw (ex-info "backpressure" {:type :backpressure}))
+      :else          (throw (ex-info (str "produce failed: " status) {:type :error :status status})))))
 
 (defn consume!
-  "Consumes messages from the given topic and partition, starting at the
-   given offset. Returns a seq of message maps."
+  "Consumes messages from the given topic and partition. Returns a vec of
+   plain serializable message maps."
   [node topic partition offset]
   (let [resp (http/get (str (base-url node) "/v1/topics/" topic
                             "/partitions/" partition "/messages")
-                       {:query-params    {:offset offset
-                                          :limit  1000}
-                        :socket-timeout  http-timeout-ms
-                        :connect-timeout http-timeout-ms
-                        :as              :json})]
-    (get-in resp [:body :messages] [])))
+                       {:query-params     {:offset offset
+                                           :limit  1000}
+                        :socket-timeout   http-timeout-ms
+                        :connect-timeout  http-timeout-ms
+                        :throw-exceptions false})]
+    (if (= 200 (:status resp))
+      (let [body (json/parse-string (:body resp) true)]
+        (vec (map (fn [m] {:offset    (:offset m)
+                           :partition partition
+                           :key       (:key m)
+                           :value     (:value m)})
+                  (:messages body))))
+      [])))
 
 (defn commit-offsets!
   "Commits the consumer offset for the given topic and consumer-id.
    POST /v1/topics/{topic}/offsets/{consumer_id}
    Used to verify offset durability across faults."
   [node topic consumer-id partition offset]
-  (let [resp (http/post (str (base-url node) "/v1/topics/" topic
-                             "/offsets/" consumer-id)
-                        {:content-type    :json
-                         :body            (json/generate-string {:offsets {(str partition) offset}})
-                         :socket-timeout  http-timeout-ms
-                         :connect-timeout http-timeout-ms
-                         :as              :json})]
-    (get-in resp [:body])))
+  (http/post (str (base-url node) "/v1/topics/" topic
+                  "/offsets/" consumer-id)
+             {:content-type      :json
+              :body              (json/generate-string {:offsets {(str partition) offset}})
+              :socket-timeout    http-timeout-ms
+              :connect-timeout   http-timeout-ms
+              :throw-exceptions  false})
+  :ok)
 
 (defn get-offsets!
   "Fetches the committed consumer offset for the given topic and consumer-id.
@@ -79,10 +93,11 @@
   [node topic consumer-id]
   (let [resp (http/get (str (base-url node) "/v1/topics/" topic
                             "/offsets/" consumer-id)
-                       {:socket-timeout  http-timeout-ms
-                        :connect-timeout http-timeout-ms
-                        :as              :json})]
-    (get-in resp [:body])))
+                       {:socket-timeout    http-timeout-ms
+                        :connect-timeout   http-timeout-ms
+                        :throw-exceptions  false})]
+    (when (= 200 (:status resp))
+      (:offsets (json/parse-string (:body resp) true)))))
 
 (defrecord CamuClient [node topic]
   client/Client
@@ -94,7 +109,7 @@
     this)
 
   (invoke! [this test op]
-    (try+
+    (try
      (case (:f op)
        :produce
        (let [{:keys [key value]} (:value op)
@@ -125,14 +140,15 @@
      (catch SocketTimeoutException _
        (assoc op :type :info :error :timeout))
 
-     (catch [:status 500] {:keys [body]}
-       (assoc op :type :fail :error [:server-error body]))
-
-     (catch [:status 503] _
-       (assoc op :type :fail :error :service-unavailable))
+     (catch clojure.lang.ExceptionInfo e
+       (let [t (:type (ex-data e))]
+         (case t
+           :misdirected        (assoc op :type :fail :error :misdirected)
+           :backpressure       (assoc op :type :fail :error :service-unavailable)
+           (assoc op :type :fail :error (str (.getMessage e))))))
 
      (catch Exception e
-       (assoc op :type :info :error (.getMessage e)))))
+       (assoc op :type :info :error (str (.getMessage e))))))
 
   (teardown! [this test])
 

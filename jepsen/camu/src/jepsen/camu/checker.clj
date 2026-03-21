@@ -177,6 +177,4 @@
     :availability        (availability-checker)
     :lease-fencing       (lease-fencing-checker)
     :recovery-time       (recovery-time-checker)
-    :timeline            (checker/timeline)
-    :stats               (checker/stats)
-    :perf                (checker/perf)}))
+    :stats               (checker/stats)}))

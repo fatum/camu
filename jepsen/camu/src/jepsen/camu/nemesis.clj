@@ -154,9 +154,8 @@
          (gen/stagger 5)
          (gen/time-limit time-limit))
     ;; Recovery: stop all active fault types
-    (gen/nemesis
-     (apply gen/seq
-            (for [fault faults]
-              (gen/once {:type :info :f fault :value :stop}))))
+    (apply gen/phases
+           (for [fault faults]
+             (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
     ;; Let the cluster stabilize
     (gen/sleep 15))))
