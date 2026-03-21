@@ -181,21 +181,6 @@ func (w *WAL) replayLocked() ([]Message, error) {
 	return msgs, nil
 }
 
-// ReplayFrom reads all messages with Offset >= startOffset from the WAL file.
-func (w *WAL) ReplayFrom(startOffset uint64) ([]Message, error) {
-	msgs, err := w.Replay()
-	if err != nil {
-		return nil, err
-	}
-	filtered := msgs[:0]
-	for _, m := range msgs {
-		if m.Offset >= startOffset {
-			filtered = append(filtered, m)
-		}
-	}
-	return filtered, nil
-}
-
 // TruncateBefore rewrites the WAL keeping only messages with Offset >= offset.
 // It writes kept entries to a temp file, then atomically renames it over the
 // original. The in-memory buffer is also trimmed accordingly.

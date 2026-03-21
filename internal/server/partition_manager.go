@@ -377,11 +377,11 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	}
 	pm.mu.RUnlock()
 
-	// Read unflushed messages from WAL starting at the index's next offset.
-	startOffset := ps.index.NextOffset()
-	msgs, err := ps.wal.ReplayFrom(startOffset)
+	// Read all messages from WAL — everything in it is unflushed by definition
+	// (TruncateBefore removes flushed entries after each flush).
+	msgs, err := ps.wal.Replay()
 	if err != nil {
-		return fmt.Errorf("WAL replay from offset %d: %w", startOffset, err)
+		return fmt.Errorf("WAL replay: %w", err)
 	}
 	if len(msgs) == 0 {
 		return nil
