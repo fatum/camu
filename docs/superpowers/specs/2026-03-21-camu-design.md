@@ -175,26 +175,25 @@ Any instance can serve consumer reads, not just the partition owner. The read pa
 
 **Note:** Only the owning instance can serve unflushed data (from the in-memory buffer). Consumers reading from a non-owner will only see data up to the last flushed segment. There is a visibility delay equal to the segment flush interval (default 5s) when reading from non-owners. For real-time consumption, consumers should read from the partition owner or use SSE on the owner.
 
-### Consumer Groups
+### Offset Storage API
 
-- `POST /v1/groups/{group_id}/join` — join a group for a topic, server assigns partitions
-- `POST /v1/groups/{group_id}/heartbeat` — maintain membership
-- `POST /v1/groups/{group_id}/commit` — commit offsets for assigned partitions
-- `GET /v1/groups/{group_id}/offsets` — get committed offsets
-- `POST /v1/groups/{group_id}/leave` — leave group, trigger rebalance
+Camu provides stateless, S3-durable offset checkpoints. Consumers manage their own partition assignments using the routing API and track progress via named offset checkpoints. There is no server-side group coordination (no join/leave/heartbeat/rebalance) — this avoids the complexity and durability issues of in-memory group state in a stateless system.
 
-Partition assignment uses round-robin strategy. Each instance that receives a `join` or `heartbeat` request for a group acts as the coordinator for that group. The coordinating instance tracks group membership — if a consumer misses its heartbeat deadline (configurable, default 10s), the coordinator removes it and triggers a rebalance, reassigning its partitions to remaining members. If the coordinating instance itself dies, consumers' heartbeats will fail and they re-join via another instance, which becomes the new coordinator.
-
-### Consumer-Specific Offsets
-
-Individual consumers can manage their own offsets independently of consumer groups:
+**Named group offsets** — shared offset checkpoints for a logical consumer group:
 
 ```
-POST /v1/topics/{topic}/offsets/{consumer_id}   — commit offsets for a standalone consumer
-GET  /v1/topics/{topic}/offsets/{consumer_id}   — get committed offsets for a standalone consumer
+POST /v1/groups/{group_id}/commit              — commit offsets {"offsets": {"0": 100, "1": 200}}
+GET  /v1/groups/{group_id}/offsets             — get committed offsets
 ```
 
-This allows consumers to track their position without joining a group — useful for single consumers, reprocessing pipelines, or custom offset management.
+**Consumer-specific offsets** — per-consumer offset tracking:
+
+```
+POST /v1/topics/{topic}/offsets/{consumer_id}  — commit offsets
+GET  /v1/topics/{topic}/offsets/{consumer_id}  — get committed offsets
+```
+
+Consumers discover partition layout via `GET /v1/topics/{topic}/routing` and read partitions directly via the low-level consume or SSE endpoints.
 
 ### Offset Storage
 
@@ -223,35 +222,20 @@ POST   /v1/topics/{topic}/messages                         — produce, routed b
 POST   /v1/topics/{topic}/partitions/{id}/messages         — produce to specific partition
 ```
 
-### Consuming (Partition-Transparent)
-
-```
-GET    /v1/topics/{topic}/consume?group={g}                — poll with group
-GET    /v1/topics/{topic}/stream?group={g}                 — SSE with group
-```
-
-### Consuming (Low-Level)
+### Consuming
 
 ```
 GET    /v1/topics/{topic}/partitions/{id}/messages?offset=N&limit=100  — poll
 GET    /v1/topics/{topic}/partitions/{id}/stream?offset=N              — SSE
 ```
 
-### Consumer Groups
+### Offset Checkpoints
 
 ```
-POST   /v1/groups/{group_id}/join                          — join group
-POST   /v1/groups/{group_id}/heartbeat                     — heartbeat
-POST   /v1/groups/{group_id}/commit                        — commit offsets
-GET    /v1/groups/{group_id}/offsets                        — get offsets
-POST   /v1/groups/{group_id}/leave                         — leave group
-```
-
-### Consumer-Specific Offsets
-
-```
-POST   /v1/topics/{topic}/offsets/{consumer_id}            — commit offsets
-GET    /v1/topics/{topic}/offsets/{consumer_id}             — get offsets
+POST   /v1/groups/{group_id}/commit                        — commit group offsets
+GET    /v1/groups/{group_id}/offsets                        — get group offsets
+POST   /v1/topics/{topic}/offsets/{consumer_id}            — commit consumer offsets
+GET    /v1/topics/{topic}/offsets/{consumer_id}             — get consumer offsets
 ```
 
 ### Routing
