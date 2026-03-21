@@ -1,7 +1,7 @@
 FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y \
-    openssh-server sudo iproute2 iptables iputils-ping \
+    openssh-server sudo iproute2 iptables iputils-ping procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure SSH

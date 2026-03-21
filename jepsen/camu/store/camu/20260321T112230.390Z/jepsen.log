@@ -1,0 +1,1490 @@
+2026-03-21 11:22:30,405{GMT}	INFO	[jepsen test runner] jepsen.core: Command line:
+lein run test --nodes n1,n2,n3,n4,n5 --ssh-private-key /root/.ssh/id_rsa --time-limit 60 --s3-endpoint http://minio:9000 --camu-binary /jepsen/camu/camu --faults kill
+2026-03-21 11:22:30,439{GMT}	INFO	[jepsen test runner] jepsen.core: Running test:
+{:remote
+ #jepsen.control.retry.Remote{:remote #jepsen.control.scp.Remote{:cmd-remote #jepsen.control.sshj.SSHJRemote{:concurrency-limit 6,
+                                                                                                             :conn-spec nil,
+                                                                                                             :client nil,
+                                                                                                             :semaphore nil},
+                                                                 :conn-spec nil},
+                              :conn nil}
+ :faults #{:kill}
+ :ssh-private-key "/root/.ssh/id_rsa"
+ :concurrency 5
+ :camu-binary "/jepsen/camu/camu"
+ :db
+ #object[jepsen.camu.db$db$reify__2857
+         "0x1dd01876"
+         "jepsen.camu.db$db$reify__2857@1dd01876"]
+ :leave-db-running? false
+ :name "camu"
+ :logging-json? false
+ :start-time
+ #object[org.joda.time.DateTime "0x12d24c43" "2026-03-21T11:22:30.390Z"]
+ :net
+ #object[jepsen.net$reify__12635
+         "0x6bf27411"
+         "jepsen.net$reify__12635@6bf27411"]
+ :client #jepsen.camu.client.CamuClient{:node nil, :topic "jepsen-test"}
+ :barrier
+ #object[java.util.concurrent.CyclicBarrier
+         "0x4a66949a"
+         "java.util.concurrent.CyclicBarrier@4a66949a"]
+ :ssh
+ {:dummy? false,
+  :username "root",
+  :password "root",
+  :strict-host-key-checking false,
+  :private-key-path "/root/.ssh/id_rsa"}
+ :checker
+ #object[jepsen.checker$compose$reify__10552
+         "0x57e83608"
+         "jepsen.checker$compose$reify__10552@57e83608"]
+ :argv
+ ("test"
+  "--nodes"
+  "n1,n2,n3,n4,n5"
+  "--ssh-private-key"
+  "/root/.ssh/id_rsa"
+  "--time-limit"
+  "60"
+  "--s3-endpoint"
+  "http://minio:9000"
+  "--camu-binary"
+  "/jepsen/camu/camu"
+  "--faults"
+  "kill")
+ :s3-endpoint "http://minio:9000"
+ :nemesis
+ (jepsen.nemesis.MapCompose
+  {:nemeses {{:kill :start} #unprintable "jepsen.nemesis$node_start_stopper$reify__12928@57d8d8e2",
+             {:kill :stop} #unprintable "jepsen.nemesis$node_start_stopper$reify__12928@2f726cf4"}})
+ :http-port 8080
+ :nodes ["n1" "n2" "n3" "n4" "n5"]
+ :test-count 1
+ :generator
+ #object[jepsen.util.Forgettable
+         "0x2b26d289"
+         ((jepsen.generator.Synchronize
+           {:gen (jepsen.generator.TimeLimit
+                  {:limit 60000000000,
+                   :cutoff nil,
+                   :gen (jepsen.generator.Any
+                         {:gens [(jepsen.generator.OnThreads
+                                  {:f #{:nemesis},
+                                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                           "0x56511eda"
+                                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@56511eda"],
+                                   :gen ((jepsen.generator.Synchronize
+                                          {:gen (jepsen.generator.TimeLimit
+                                                 {:limit 60000000000,
+                                                  :cutoff nil,
+                                                  :gen (jepsen.generator.Stagger
+                                                        {:dt 10000000000,
+                                                         :next-time nil,
+                                                         :gen (jepsen.generator.Mix
+                                                               {:i 0,
+                                                                :gens [(jepsen.generator.Cycle
+                                                                        {:remaining -1,
+                                                                         :original-gen [{:type :sleep,
+                                                                                         :value 5}
+                                                                                        {:type :info,
+                                                                                         :f :kill,
+                                                                                         :value :start}
+                                                                                        {:type :sleep,
+                                                                                         :value 10}
+                                                                                        {:type :info,
+                                                                                         :f :kill,
+                                                                                         :value :stop}],
+                                                                         :gen [{:type :sleep,
+                                                                                :value 5}
+                                                                               {:type :info,
+                                                                                :f :kill,
+                                                                                :value :start}
+                                                                               {:type :sleep,
+                                                                                :value 10}
+                                                                               {:type :info,
+                                                                                :f :kill,
+                                                                                :value :stop}]})]})})})})
+                                         (jepsen.generator.Synchronize
+                                          {:gen ((jepsen.generator.Synchronize
+                                                  {:gen (jepsen.generator.OnThreads
+                                                         {:f #{:nemesis},
+                                                          :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                                                  "0x303a484e"
+                                                                                  "jepsen.generator.context$make_thread_filter$lazy_filter__11515@303a484e"],
+                                                          :gen (jepsen.generator.Limit
+                                                                {:remaining 1,
+                                                                 :gen {:type :info,
+                                                                       :f :kill,
+                                                                       :value :stop}})})}))})
+                                         (jepsen.generator.Synchronize
+                                          {:gen {:type :sleep, :value 15}}))})
+                                 (jepsen.generator.OnThreads
+                                  {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                           "0x760f4310"
+                                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@760f4310"],
+                                   :gen (jepsen.generator.OnThreads
+                                         {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                                          :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                                  "0x3b9d85c2"
+                                                                  "jepsen.generator.context$make_thread_filter$lazy_filter__11515@3b9d85c2"],
+                                          :gen (jepsen.generator.Stagger
+                                                {:dt 200000000,
+                                                 :next-time nil,
+                                                 :gen #object[jepsen.camu$produce_op$fn__2866
+                                                              "0x65e4eba5"
+                                                              "jepsen.camu$produce_op$fn__2866@65e4eba5"]})})})]})})})
+          (jepsen.generator.Synchronize {:gen {:type :sleep, :value 15}})
+          (jepsen.generator.Synchronize
+           {:gen (jepsen.generator.OnThreads
+                  {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                           "0x77eb76f"
+                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@77eb76f"],
+                   :gen (jepsen.generator.EachThread
+                         {:fresh-gen (jepsen.generator.Limit
+                                      {:remaining 1,
+                                       :gen #object[jepsen.camu$camu_test$fn__2872
+                                                    "0x5c815478"
+                                                    "jepsen.camu$camu_test$fn__2872@5c815478"]}),
+                          :context-filters #object[clojure.core$promise$reify__8591
+                                                   "0xbe56353"
+                                                   {:status :pending, :val nil}],
+                          :gens {}})})}))]
+ :os
+ #object[jepsen.os$reify__13040 "0x1efa258e" "jepsen.os$reify__13040@1efa258e"]
+ :time-limit 60}
+
+2026-03-21 11:22:31,277{GMT}	INFO	[jepsen test runner] jepsen.db: Tearing down DB
+2026-03-21 11:22:31,278{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Tearing down camu on n1
+2026-03-21 11:22:31,278{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Tearing down camu on n2
+2026-03-21 11:22:31,278{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Tearing down camu on n3
+2026-03-21 11:22:31,279{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Tearing down camu on n4
+2026-03-21 11:22:31,279{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Tearing down camu on n5
+2026-03-21 11:22:31,370{GMT}	INFO	[jepsen test runner] jepsen.db: Setting up DB
+2026-03-21 11:22:31,370{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Setting up camu on n1
+2026-03-21 11:22:31,370{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Setting up camu on n3
+2026-03-21 11:22:31,370{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Setting up camu on n4
+2026-03-21 11:22:31,370{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Setting up camu on n2
+2026-03-21 11:22:31,371{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Setting up camu on n5
+2026-03-21 11:22:32,115{GMT}	INFO	[jepsen node n1] jepsen.control.util: Starting camu
+2026-03-21 11:22:32,115{GMT}	INFO	[jepsen node n5] jepsen.control.util: Starting camu
+2026-03-21 11:22:32,115{GMT}	INFO	[jepsen node n4] jepsen.control.util: Starting camu
+2026-03-21 11:22:32,115{GMT}	INFO	[jepsen node n2] jepsen.control.util: Starting camu
+2026-03-21 11:22:32,115{GMT}	INFO	[jepsen node n3] jepsen.control.util: Starting camu
+2026-03-21 11:22:32,216{GMT}	INFO	[jepsen test runner] jepsen.core: Relative time begins now
+2026-03-21 11:22:32,316{GMT}	WARN	[jepsen node n5] jepsen.camu.client: Could not connect to n5 to create topic
+2026-03-21 11:22:32,316{GMT}	WARN	[jepsen node n3] jepsen.camu.client: Could not connect to n3 to create topic
+2026-03-21 11:22:32,316{GMT}	WARN	[jepsen node n4] jepsen.camu.client: Could not connect to n4 to create topic
+2026-03-21 11:22:32,316{GMT}	WARN	[jepsen node n2] jepsen.camu.client: Could not connect to n2 to create topic
+2026-03-21 11:22:32,367{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-2", :value "v-2"}
+2026-03-21 11:22:32,380{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-2", :value "v-2"}	produce failed: 500
+2026-03-21 11:22:32,406{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-5", :value "v-5"}
+2026-03-21 11:22:32,417{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-5", :value "v-5"}	produce failed: 500
+2026-03-21 11:22:32,561{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-8", :value "v-8"}
+2026-03-21 11:22:32,583{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-8", :value "v-8"}	produce failed: 500
+2026-03-21 11:22:32,622{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-11", :value "v-11"}
+2026-03-21 11:22:32,644{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-11", :value "v-11"}	produce failed: 500
+2026-03-21 11:22:32,677{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-14", :value "v-14"}
+2026-03-21 11:22:32,689{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-14", :value "v-14", :partition 0, :offset 0}
+2026-03-21 11:22:32,875{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-17", :value "v-17"}
+2026-03-21 11:22:32,893{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-17", :value "v-17", :partition 1, :offset 0}
+2026-03-21 11:22:33,022{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-20", :value "v-20"}
+2026-03-21 11:22:33,037{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-20", :value "v-20"}	produce failed: 500
+2026-03-21 11:22:33,227{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-23", :value "v-23"}
+2026-03-21 11:22:33,243{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-23", :value "v-23"}	produce failed: 500
+2026-03-21 11:22:33,428{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-26", :value "v-26"}
+2026-03-21 11:22:33,440{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-28", :value "v-28"}
+2026-03-21 11:22:33,443{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-26", :value "v-26"}	produce failed: 500
+2026-03-21 11:22:33,452{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-28", :value "v-28"}	produce failed: 500
+2026-03-21 11:22:33,479{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-32", :value "v-32"}
+2026-03-21 11:22:33,488{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-32", :value "v-32", :partition 0, :offset 1}
+2026-03-21 11:22:33,579{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-35", :value "v-35"}
+2026-03-21 11:22:33,595{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-35", :value "v-35", :partition 1, :offset 1}
+2026-03-21 11:22:33,672{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-38", :value "v-38"}
+2026-03-21 11:22:33,685{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-38", :value "v-38"}	produce failed: 500
+2026-03-21 11:22:33,813{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-41", :value "v-41"}
+2026-03-21 11:22:33,830{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-41", :value "v-41"}	produce failed: 500
+2026-03-21 11:22:34,004{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-44", :value "v-44"}
+2026-03-21 11:22:34,018{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-44", :value "v-44"}	produce failed: 500
+2026-03-21 11:22:34,021{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-47", :value "v-47"}
+2026-03-21 11:22:34,030{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-47", :value "v-47"}	produce failed: 500
+2026-03-21 11:22:34,119{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-50", :value "v-50"}
+2026-03-21 11:22:34,131{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-50", :value "v-50", :partition 0, :offset 2}
+2026-03-21 11:22:34,237{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-53", :value "v-53"}
+2026-03-21 11:22:34,247{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-53", :value "v-53", :partition 1, :offset 2}
+2026-03-21 11:22:34,295{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-56", :value "v-56"}
+2026-03-21 11:22:34,298{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-56", :value "v-56"}	produce failed: 500
+2026-03-21 11:22:34,314{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-59", :value "v-59"}
+2026-03-21 11:22:34,317{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-59", :value "v-59"}	produce failed: 500
+2026-03-21 11:22:34,405{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-62", :value "v-62"}
+2026-03-21 11:22:34,413{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-62", :value "v-62"}	produce failed: 500
+2026-03-21 11:22:34,591{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-65", :value "v-65"}
+2026-03-21 11:22:34,602{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-65", :value "v-65"}	produce failed: 500
+2026-03-21 11:22:34,612{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-68", :value "v-68"}
+2026-03-21 11:22:34,620{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-68", :value "v-68", :partition 3, :offset 0}
+2026-03-21 11:22:34,641{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-71", :value "v-71"}
+2026-03-21 11:22:34,649{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-71", :value "v-71", :partition 1, :offset 3}
+2026-03-21 11:22:34,820{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-74", :value "v-74"}
+2026-03-21 11:22:34,836{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-74", :value "v-74"}	produce failed: 500
+2026-03-21 11:22:34,938{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-77", :value "v-77"}
+2026-03-21 11:22:34,952{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-77", :value "v-77"}	produce failed: 500
+2026-03-21 11:22:35,096{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-80", :value "v-80"}
+2026-03-21 11:22:35,111{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-80", :value "v-80"}	produce failed: 500
+2026-03-21 11:22:35,205{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-83", :value "v-83"}
+2026-03-21 11:22:35,220{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-83", :value "v-83"}	produce failed: 500
+2026-03-21 11:22:35,285{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-86", :value "v-86"}
+2026-03-21 11:22:35,301{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-86", :value "v-86", :partition 3, :offset 1}
+2026-03-21 11:22:35,470{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-89", :value "v-89"}
+2026-03-21 11:22:35,484{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-89", :value "v-89", :partition 2, :offset 0}
+2026-03-21 11:22:35,560{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-92", :value "v-92"}
+2026-03-21 11:22:35,576{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-92", :value "v-92"}	produce failed: 500
+2026-03-21 11:22:35,760{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-95", :value "v-95"}
+2026-03-21 11:22:35,773{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-95", :value "v-95"}	produce failed: 500
+2026-03-21 11:22:35,804{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-98", :value "v-98"}
+2026-03-21 11:22:35,820{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-98", :value "v-98"}	produce failed: 500
+2026-03-21 11:22:35,978{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-101", :value "v-101"}
+2026-03-21 11:22:35,991{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-101", :value "v-101"}	produce failed: 500
+2026-03-21 11:22:36,072{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-104", :value "v-104"}
+2026-03-21 11:22:36,105{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-106", :value "v-106"}
+2026-03-21 11:22:36,110{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-106", :value "v-106"}	produce failed: 500
+2026-03-21 11:22:36,111{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-104", :value "v-104", :partition 0, :offset 3}
+2026-03-21 11:22:36,189{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-110", :value "v-110"}
+2026-03-21 11:22:36,193{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-110", :value "v-110"}	produce failed: 500
+2026-03-21 11:22:36,255{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-113", :value "v-113"}
+2026-03-21 11:22:36,263{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-113", :value "v-113"}	produce failed: 500
+2026-03-21 11:22:36,311{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-116", :value "v-116"}
+2026-03-21 11:22:36,325{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-116", :value "v-116"}	produce failed: 500
+2026-03-21 11:22:36,455{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-119", :value "v-119"}
+2026-03-21 11:22:36,468{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-119", :value "v-119"}	produce failed: 500
+2026-03-21 11:22:36,571{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-122", :value "v-122"}
+2026-03-21 11:22:36,585{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-122", :value "v-122", :partition 0, :offset 4}
+2026-03-21 11:22:36,747{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-125", :value "v-125"}
+2026-03-21 11:22:36,763{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-125", :value "v-125", :partition 1, :offset 4}
+2026-03-21 11:22:36,937{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-128", :value "v-128"}
+2026-03-21 11:22:36,949{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-128", :value "v-128"}	produce failed: 500
+2026-03-21 11:22:37,038{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-131", :value "v-131"}
+2026-03-21 11:22:37,052{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-131", :value "v-131"}	produce failed: 500
+2026-03-21 11:22:37,138{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-134", :value "v-134"}
+2026-03-21 11:22:37,151{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-134", :value "v-134"}	produce failed: 500
+2026-03-21 11:22:37,206{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-137", :value "v-137"}
+2026-03-21 11:22:37,220{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-137", :value "v-137"}	produce failed: 500
+2026-03-21 11:22:37,254{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-140", :value "v-140"}
+2026-03-21 11:22:37,268{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-140", :value "v-140", :partition 0, :offset 5}
+2026-03-21 11:22:37,270{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-142", :value "v-142"}
+2026-03-21 11:22:37,280{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-142", :value "v-142", :partition 2, :offset 1}
+2026-03-21 11:22:37,375{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-146", :value "v-146"}
+2026-03-21 11:22:37,375{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-145", :value "v-145"}
+2026-03-21 11:22:37,388{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-146", :value "v-146"}	produce failed: 500
+2026-03-21 11:22:37,388{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-145", :value "v-145"}	produce failed: 500
+2026-03-21 11:22:37,425{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-149", :value "v-149"}
+2026-03-21 11:22:37,438{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-149", :value "v-149"}	produce failed: 500
+2026-03-21 11:22:37,448{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-152", :value "v-152"}
+2026-03-21 11:22:37,458{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-152", :value "v-152"}	produce failed: 500
+2026-03-21 11:22:37,637{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:start
+2026-03-21 11:22:37,638{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-156", :value "v-156"}
+2026-03-21 11:22:37,652{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-156", :value "v-156", :partition 3, :offset 2}
+2026-03-21 11:22:37,755{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	{"n3" [:restarted "n3"]}
+2026-03-21 11:22:37,837{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-160", :value "v-160"}
+2026-03-21 11:22:37,840{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-160", :value "v-160"}	produce failed: 500
+2026-03-21 11:22:37,943{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-163", :value "v-163"}
+2026-03-21 11:22:37,952{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-163", :value "v-163"}	produce failed: 500
+2026-03-21 11:22:38,061{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-166", :value "v-166"}
+2026-03-21 11:22:38,077{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-166", :value "v-166"}	produce failed: 500
+2026-03-21 11:22:38,188{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-169", :value "v-169"}
+2026-03-21 11:22:38,203{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-169", :value "v-169"}	produce failed: 500
+2026-03-21 11:22:38,210{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-172", :value "v-172"}
+2026-03-21 11:22:38,221{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-172", :value "v-172", :partition 1, :offset 5}
+2026-03-21 11:22:38,253{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-175", :value "v-175"}
+2026-03-21 11:22:38,265{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-175", :value "v-175", :partition 0, :offset 6}
+2026-03-21 11:22:38,455{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-178", :value "v-178"}
+2026-03-21 11:22:38,467{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-178", :value "v-178"}	produce failed: 500
+2026-03-21 11:22:38,513{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-181", :value "v-181"}
+2026-03-21 11:22:38,514{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-182", :value "v-182"}
+2026-03-21 11:22:38,522{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-181", :value "v-181"}	produce failed: 500
+2026-03-21 11:22:38,524{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-182", :value "v-182"}	produce failed: 500
+2026-03-21 11:22:38,698{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-186", :value "v-186"}
+2026-03-21 11:22:38,713{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-186", :value "v-186"}	produce failed: 500
+2026-03-21 11:22:38,878{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-189", :value "v-189"}
+2026-03-21 11:22:38,892{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-189", :value "v-189", :partition 3, :offset 3}
+2026-03-21 11:22:38,914{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-192", :value "v-192"}
+2026-03-21 11:22:38,927{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-192", :value "v-192", :partition 3, :offset 4}
+2026-03-21 11:22:38,957{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-195", :value "v-195"}
+2026-03-21 11:22:38,962{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-195", :value "v-195"}	produce failed: 500
+2026-03-21 11:22:39,117{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-198", :value "v-198"}
+2026-03-21 11:22:39,132{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-198", :value "v-198"}	produce failed: 500
+2026-03-21 11:22:39,298{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-201", :value "v-201"}
+2026-03-21 11:22:39,306{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-201", :value "v-201"}	produce failed: 500
+2026-03-21 11:22:39,464{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-204", :value "v-204"}
+2026-03-21 11:22:39,477{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-204", :value "v-204"}	produce failed: 500
+2026-03-21 11:22:39,619{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-207", :value "v-207"}
+2026-03-21 11:22:39,629{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-207", :value "v-207", :partition 0, :offset 7}
+2026-03-21 11:22:39,771{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-210", :value "v-210"}
+2026-03-21 11:22:39,783{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-210", :value "v-210", :partition 0, :offset 8}
+2026-03-21 11:22:39,889{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-213", :value "v-213"}
+2026-03-21 11:22:39,899{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-213", :value "v-213"}	produce failed: 500
+2026-03-21 11:22:39,909{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-216", :value "v-216"}
+2026-03-21 11:22:39,916{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-216", :value "v-216"}	produce failed: 500
+2026-03-21 11:22:40,083{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-219", :value "v-219"}
+2026-03-21 11:22:40,092{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-219", :value "v-219"}	produce failed: 500
+2026-03-21 11:22:40,149{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-222", :value "v-222"}
+2026-03-21 11:22:40,159{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-222", :value "v-222"}	produce failed: 500
+2026-03-21 11:22:40,273{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-225", :value "v-225"}
+2026-03-21 11:22:40,287{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-225", :value "v-225", :partition 0, :offset 9}
+2026-03-21 11:22:40,473{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-228", :value "v-228"}
+2026-03-21 11:22:40,488{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-228", :value "v-228", :partition 3, :offset 5}
+2026-03-21 11:22:40,539{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-231", :value "v-231"}
+2026-03-21 11:22:40,551{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-231", :value "v-231"}	produce failed: 500
+2026-03-21 11:22:40,566{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-234", :value "v-234"}
+2026-03-21 11:22:40,566{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-235", :value "v-235"}
+2026-03-21 11:22:40,574{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-234", :value "v-234"}	produce failed: 500
+2026-03-21 11:22:40,573{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-237", :value "v-237"}
+2026-03-21 11:22:40,574{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-235", :value "v-235"}	produce failed: 500
+2026-03-21 11:22:40,581{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-237", :value "v-237"}	produce failed: 500
+2026-03-21 11:22:40,688{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-241", :value "v-241"}
+2026-03-21 11:22:40,697{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-243", :value "v-243"}
+2026-03-21 11:22:40,698{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-241", :value "v-241", :partition 2, :offset 2}
+2026-03-21 11:22:40,703{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-243", :value "v-243"}	produce failed: 500
+2026-03-21 11:22:40,816{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-247", :value "v-247"}
+2026-03-21 11:22:40,825{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-247", :value "v-247"}	produce failed: 500
+2026-03-21 11:22:40,899{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-250", :value "v-250"}
+2026-03-21 11:22:40,908{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-250", :value "v-250"}	produce failed: 500
+2026-03-21 11:22:40,927{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-253", :value "v-253"}
+2026-03-21 11:22:40,932{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-253", :value "v-253"}	produce failed: 500
+2026-03-21 11:22:41,038{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-256", :value "v-256"}
+2026-03-21 11:22:41,049{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-256", :value "v-256"}	produce failed: 500
+2026-03-21 11:22:41,150{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-259", :value "v-259"}
+2026-03-21 11:22:41,163{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-259", :value "v-259", :partition 3, :offset 6}
+2026-03-21 11:22:41,201{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-262", :value "v-262"}
+2026-03-21 11:22:41,215{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-262", :value "v-262", :partition 1, :offset 6}
+2026-03-21 11:22:41,275{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-265", :value "v-265"}
+2026-03-21 11:22:41,288{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-265", :value "v-265"}	produce failed: 500
+2026-03-21 11:22:41,327{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-268", :value "v-268"}
+2026-03-21 11:22:41,340{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-268", :value "v-268"}	produce failed: 500
+2026-03-21 11:22:41,340{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-270", :value "v-270"}
+2026-03-21 11:22:41,347{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-272", :value "v-272"}
+2026-03-21 11:22:41,350{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-270", :value "v-270"}	produce failed: 500
+2026-03-21 11:22:41,355{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-272", :value "v-272"}	produce failed: 500
+2026-03-21 11:22:41,378{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-276", :value "v-276"}
+2026-03-21 11:22:41,389{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-276", :value "v-276", :partition 0, :offset 10}
+2026-03-21 11:22:41,506{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-279", :value "v-279"}
+2026-03-21 11:22:41,520{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-279", :value "v-279", :partition 1, :offset 7}
+2026-03-21 11:22:41,670{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-282", :value "v-282"}
+2026-03-21 11:22:41,685{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-282", :value "v-282"}	produce failed: 500
+2026-03-21 11:22:41,830{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-285", :value "v-285"}
+2026-03-21 11:22:41,834{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-285", :value "v-285"}	produce failed: 500
+2026-03-21 11:22:41,945{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-288", :value "v-288"}
+2026-03-21 11:22:41,955{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-288", :value "v-288"}	produce failed: 500
+2026-03-21 11:22:42,094{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-291", :value "v-291"}
+2026-03-21 11:22:42,106{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-291", :value "v-291"}	produce failed: 500
+2026-03-21 11:22:42,148{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-294", :value "v-294"}
+2026-03-21 11:22:42,160{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-294", :value "v-294", :partition 0, :offset 11}
+2026-03-21 11:22:42,165{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-297", :value "v-297"}
+2026-03-21 11:22:42,175{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-297", :value "v-297", :partition 1, :offset 8}
+2026-03-21 11:22:42,250{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-300", :value "v-300"}
+2026-03-21 11:22:42,263{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-300", :value "v-300"}	produce failed: 500
+2026-03-21 11:22:42,317{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-303", :value "v-303"}
+2026-03-21 11:22:42,330{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-303", :value "v-303"}	produce failed: 500
+2026-03-21 11:22:42,340{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-306", :value "v-306"}
+2026-03-21 11:22:42,349{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-306", :value "v-306"}	produce failed: 500
+2026-03-21 11:22:42,391{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-309", :value "v-309"}
+2026-03-21 11:22:42,397{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-309", :value "v-309"}	produce failed: 500
+2026-03-21 11:22:42,582{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-312", :value "v-312"}
+2026-03-21 11:22:42,594{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-312", :value "v-312", :partition 1, :offset 9}
+2026-03-21 11:22:42,659{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-315", :value "v-315"}
+2026-03-21 11:22:42,672{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-315", :value "v-315", :partition 0, :offset 12}
+2026-03-21 11:22:42,833{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-318", :value "v-318"}
+2026-03-21 11:22:42,844{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-318", :value "v-318"}	produce failed: 500
+2026-03-21 11:22:43,024{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-321", :value "v-321"}
+2026-03-21 11:22:43,038{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-321", :value "v-321"}	produce failed: 500
+2026-03-21 11:22:43,057{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-324", :value "v-324"}
+2026-03-21 11:22:43,068{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-324", :value "v-324"}	produce failed: 500
+2026-03-21 11:22:43,135{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-327", :value "v-327"}
+2026-03-21 11:22:43,148{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-327", :value "v-327"}	produce failed: 500
+2026-03-21 11:22:43,187{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-330", :value "v-330"}
+2026-03-21 11:22:43,197{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-330", :value "v-330", :partition 1, :offset 10}
+2026-03-21 11:22:43,236{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-333", :value "v-333"}
+2026-03-21 11:22:43,246{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-333", :value "v-333", :partition 0, :offset 13}
+2026-03-21 11:22:43,274{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-336", :value "v-336"}
+2026-03-21 11:22:43,285{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-336", :value "v-336"}	produce failed: 500
+2026-03-21 11:22:43,445{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-339", :value "v-339"}
+2026-03-21 11:22:43,458{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-339", :value "v-339"}	produce failed: 500
+2026-03-21 11:22:43,521{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-342", :value "v-342"}
+2026-03-21 11:22:43,532{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-342", :value "v-342"}	produce failed: 500
+2026-03-21 11:22:43,621{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-345", :value "v-345"}
+2026-03-21 11:22:43,634{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-345", :value "v-345"}	produce failed: 500
+2026-03-21 11:22:43,777{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-348", :value "v-348"}
+2026-03-21 11:22:43,792{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-348", :value "v-348", :partition 2, :offset 3}
+2026-03-21 11:22:43,836{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-351", :value "v-351"}
+2026-03-21 11:22:43,850{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-351", :value "v-351", :partition 0, :offset 14}
+2026-03-21 11:22:43,978{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-354", :value "v-354"}
+2026-03-21 11:22:43,984{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-354", :value "v-354"}	produce failed: 500
+2026-03-21 11:22:44,066{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-357", :value "v-357"}
+2026-03-21 11:22:44,072{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-357", :value "v-357"}	produce failed: 500
+2026-03-21 11:22:44,216{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-360", :value "v-360"}
+2026-03-21 11:22:44,223{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-360", :value "v-360"}	produce failed: 500
+2026-03-21 11:22:44,264{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-363", :value "v-363"}
+2026-03-21 11:22:44,272{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-363", :value "v-363"}	produce failed: 500
+2026-03-21 11:22:44,382{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-366", :value "v-366"}
+2026-03-21 11:22:44,392{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-366", :value "v-366", :partition 2, :offset 4}
+2026-03-21 11:22:44,522{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-369", :value "v-369"}
+2026-03-21 11:22:44,534{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-369", :value "v-369", :partition 3, :offset 7}
+2026-03-21 11:22:44,712{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-372", :value "v-372"}
+2026-03-21 11:22:44,723{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-372", :value "v-372"}	produce failed: 500
+2026-03-21 11:22:44,775{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-375", :value "v-375"}
+2026-03-21 11:22:44,784{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-375", :value "v-375"}	produce failed: 500
+2026-03-21 11:22:44,788{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-378", :value "v-378"}
+2026-03-21 11:22:44,795{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-378", :value "v-378"}	produce failed: 500
+2026-03-21 11:22:44,922{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-381", :value "v-381"}
+2026-03-21 11:22:44,934{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-381", :value "v-381"}	produce failed: 500
+2026-03-21 11:22:45,092{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-384", :value "v-384"}
+2026-03-21 11:22:45,105{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-384", :value "v-384", :partition 2, :offset 5}
+2026-03-21 11:22:45,156{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-387", :value "v-387"}
+2026-03-21 11:22:45,166{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-387", :value "v-387", :partition 3, :offset 8}
+2026-03-21 11:22:45,248{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-390", :value "v-390"}
+2026-03-21 11:22:45,256{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-390", :value "v-390"}	produce failed: 500
+2026-03-21 11:22:45,390{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-393", :value "v-393"}
+2026-03-21 11:22:45,404{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-393", :value "v-393"}	produce failed: 500
+2026-03-21 11:22:45,578{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-396", :value "v-396"}
+2026-03-21 11:22:45,591{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-396", :value "v-396"}	produce failed: 500
+2026-03-21 11:22:45,599{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-399", :value "v-399"}
+2026-03-21 11:22:45,605{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-399", :value "v-399"}	produce failed: 500
+2026-03-21 11:22:45,629{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-402", :value "v-402"}
+2026-03-21 11:22:45,633{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-402", :value "v-402", :partition 1, :offset 11}
+2026-03-21 11:22:45,719{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-405", :value "v-405"}
+2026-03-21 11:22:45,727{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-405", :value "v-405", :partition 0, :offset 15}
+2026-03-21 11:22:45,842{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-408", :value "v-408"}
+2026-03-21 11:22:45,850{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-408", :value "v-408"}	produce failed: 500
+2026-03-21 11:22:45,881{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-411", :value "v-411"}
+2026-03-21 11:22:45,889{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-411", :value "v-411"}	produce failed: 500
+2026-03-21 11:22:46,008{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-414", :value "v-414"}
+2026-03-21 11:22:46,020{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-414", :value "v-414"}	produce failed: 500
+2026-03-21 11:22:46,100{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-417", :value "v-417"}
+2026-03-21 11:22:46,111{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-417", :value "v-417"}	produce failed: 500
+2026-03-21 11:22:46,257{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-420", :value "v-420"}
+2026-03-21 11:22:46,268{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-420", :value "v-420", :partition 1, :offset 12}
+2026-03-21 11:22:46,404{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-423", :value "v-423"}
+2026-03-21 11:22:46,405{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-425", :value "v-425"}
+2026-03-21 11:22:46,414{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-425", :value "v-425"}	produce failed: 500
+2026-03-21 11:22:46,414{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-423", :value "v-423", :partition 0, :offset 16}
+2026-03-21 11:22:46,481{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-428", :value "v-428"}
+2026-03-21 11:22:46,490{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-428", :value "v-428"}	produce failed: 500
+2026-03-21 11:22:46,538{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-431", :value "v-431"}
+2026-03-21 11:22:46,545{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-431", :value "v-431"}	produce failed: 500
+2026-03-21 11:22:46,703{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-434", :value "v-434"}
+2026-03-21 11:22:46,717{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-434", :value "v-434"}	produce failed: 500
+2026-03-21 11:22:46,756{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-437", :value "v-437"}
+2026-03-21 11:22:46,765{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-437", :value "v-437", :partition 1, :offset 13}
+2026-03-21 11:22:46,877{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-440", :value "v-440"}
+2026-03-21 11:22:46,882{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-440", :value "v-440", :partition 3, :offset 9}
+2026-03-21 11:22:47,069{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-443", :value "v-443"}
+2026-03-21 11:22:47,082{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-443", :value "v-443"}	produce failed: 500
+2026-03-21 11:22:47,257{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-448", :value "v-448"}
+2026-03-21 11:22:47,270{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-448", :value "v-448"}	produce failed: 500
+2026-03-21 11:22:47,415{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-451", :value "v-451"}
+2026-03-21 11:22:47,427{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-451", :value "v-451"}	produce failed: 500
+2026-03-21 11:22:47,594{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-454", :value "v-454"}
+2026-03-21 11:22:47,606{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-454", :value "v-454", :partition 2, :offset 6}
+2026-03-21 11:22:47,662{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-457", :value "v-457"}
+2026-03-21 11:22:47,675{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-457", :value "v-457", :partition 3, :offset 10}
+2026-03-21 11:22:47,797{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-460", :value "v-460"}
+2026-03-21 11:22:47,809{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-460", :value "v-460"}	produce failed: 500
+2026-03-21 11:22:47,810{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-462", :value "v-462"}
+2026-03-21 11:22:47,817{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-462", :value "v-462"}	produce failed: 500
+2026-03-21 11:22:47,903{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-465", :value "v-465"}
+2026-03-21 11:22:47,912{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-465", :value "v-465"}	produce failed: 500
+2026-03-21 11:22:48,096{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-468", :value "v-468"}
+2026-03-21 11:22:48,110{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-468", :value "v-468"}	produce failed: 500
+2026-03-21 11:22:48,297{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-471", :value "v-471"}
+2026-03-21 11:22:48,312{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-471", :value "v-471", :partition 3, :offset 11}
+2026-03-21 11:22:48,397{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-474", :value "v-474"}
+2026-03-21 11:22:48,410{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-474", :value "v-474", :partition 0, :offset 17}
+2026-03-21 11:22:48,570{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-477", :value "v-477"}
+2026-03-21 11:22:48,580{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-477", :value "v-477"}	produce failed: 500
+2026-03-21 11:22:48,667{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-480", :value "v-480"}
+2026-03-21 11:22:48,680{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-482", :value "v-482"}
+2026-03-21 11:22:48,682{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-480", :value "v-480"}	produce failed: 500
+2026-03-21 11:22:48,689{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-482", :value "v-482"}	produce failed: 500
+2026-03-21 11:22:48,827{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-486", :value "v-486"}
+2026-03-21 11:22:48,836{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-486", :value "v-486"}	produce failed: 500
+2026-03-21 11:22:49,001{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-489", :value "v-489"}
+2026-03-21 11:22:49,015{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-489", :value "v-489", :partition 0, :offset 18}
+2026-03-21 11:22:49,045{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-492", :value "v-492"}
+2026-03-21 11:22:49,052{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-492", :value "v-492", :partition 0, :offset 19}
+2026-03-21 11:22:49,147{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-495", :value "v-495"}
+2026-03-21 11:22:49,181{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-495", :value "v-495"}	produce failed: 500
+2026-03-21 11:22:49,192{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-498", :value "v-498"}
+2026-03-21 11:22:49,196{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-498", :value "v-498"}	produce failed: 500
+2026-03-21 11:22:49,298{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-501", :value "v-501"}
+2026-03-21 11:22:49,307{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-501", :value "v-501"}	produce failed: 500
+2026-03-21 11:22:49,438{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-504", :value "v-504"}
+2026-03-21 11:22:49,453{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-504", :value "v-504"}	produce failed: 500
+2026-03-21 11:22:49,563{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-507", :value "v-507"}
+2026-03-21 11:22:49,577{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-507", :value "v-507", :partition 1, :offset 14}
+2026-03-21 11:22:49,708{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-510", :value "v-510"}
+2026-03-21 11:22:49,722{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-510", :value "v-510", :partition 1, :offset 15}
+2026-03-21 11:22:49,809{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-513", :value "v-513"}
+2026-03-21 11:22:49,824{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-513", :value "v-513"}	produce failed: 500
+2026-03-21 11:22:49,964{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-516", :value "v-516"}
+2026-03-21 11:22:49,975{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-516", :value "v-516"}	produce failed: 500
+2026-03-21 11:22:50,079{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-519", :value "v-519"}
+2026-03-21 11:22:50,116{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-519", :value "v-519"}	produce failed: 500
+2026-03-21 11:22:50,252{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-522", :value "v-522"}
+2026-03-21 11:22:50,253{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-524", :value "v-524"}
+2026-03-21 11:22:50,266{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-524", :value "v-524", :partition 2, :offset 7}
+2026-03-21 11:22:50,266{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-522", :value "v-522"}	produce failed: 500
+2026-03-21 11:22:50,340{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-527", :value "v-527"}
+2026-03-21 11:22:50,346{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-527", :value "v-527", :partition 3, :offset 12}
+2026-03-21 11:22:50,373{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-530", :value "v-530"}
+2026-03-21 11:22:50,379{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-530", :value "v-530"}	produce failed: 500
+2026-03-21 11:22:50,413{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-533", :value "v-533"}
+2026-03-21 11:22:50,436{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-533", :value "v-533"}	produce failed: 500
+2026-03-21 11:22:50,519{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-536", :value "v-536"}
+2026-03-21 11:22:50,524{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-536", :value "v-536"}	produce failed: 500
+2026-03-21 11:22:50,544{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-539", :value "v-539"}
+2026-03-21 11:22:50,548{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-539", :value "v-539"}	produce failed: 500
+2026-03-21 11:22:50,668{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-542", :value "v-542"}
+2026-03-21 11:22:50,681{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-542", :value "v-542", :partition 2, :offset 8}
+2026-03-21 11:22:50,853{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-545", :value "v-545"}
+2026-03-21 11:22:50,868{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-545", :value "v-545", :partition 3, :offset 13}
+2026-03-21 11:22:50,967{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-548", :value "v-548"}
+2026-03-21 11:22:50,977{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-548", :value "v-548"}	produce failed: 500
+2026-03-21 11:22:51,144{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-551", :value "v-551"}
+2026-03-21 11:22:51,157{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-551", :value "v-551"}	produce failed: 500
+2026-03-21 11:22:51,180{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-554", :value "v-554"}
+2026-03-21 11:22:51,186{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-554", :value "v-554"}	produce failed: 500
+2026-03-21 11:22:51,284{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-557", :value "v-557"}
+2026-03-21 11:22:51,300{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-557", :value "v-557"}	produce failed: 500
+2026-03-21 11:22:51,405{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-560", :value "v-560"}
+2026-03-21 11:22:51,420{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-560", :value "v-560", :partition 2, :offset 9}
+2026-03-21 11:22:51,595{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-563", :value "v-563"}
+2026-03-21 11:22:51,613{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-563", :value "v-563", :partition 3, :offset 14}
+2026-03-21 11:22:51,758{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-566", :value "v-566"}
+2026-03-21 11:22:51,768{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-566", :value "v-566"}	produce failed: 500
+2026-03-21 11:22:51,885{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-569", :value "v-569"}
+2026-03-21 11:22:51,898{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-569", :value "v-569"}	produce failed: 500
+2026-03-21 11:22:51,947{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-572", :value "v-572"}
+2026-03-21 11:22:51,950{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-572", :value "v-572"}	produce failed: 500
+2026-03-21 11:22:52,019{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-575", :value "v-575"}
+2026-03-21 11:22:52,024{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-575", :value "v-575"}	produce failed: 500
+2026-03-21 11:22:52,203{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-578", :value "v-578"}
+2026-03-21 11:22:52,212{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-580", :value "v-580"}
+2026-03-21 11:22:52,215{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-578", :value "v-578", :partition 3, :offset 15}
+2026-03-21 11:22:52,219{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-580", :value "v-580"}	produce failed: 500
+2026-03-21 11:22:52,372{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-584", :value "v-584"}
+2026-03-21 11:22:52,377{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-584", :value "v-584"}	produce failed: 500
+2026-03-21 11:22:52,464{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-587", :value "v-587"}
+2026-03-21 11:22:52,475{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-587", :value "v-587"}	produce failed: 500
+2026-03-21 11:22:52,664{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-590", :value "v-590"}
+2026-03-21 11:22:52,675{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-590", :value "v-590"}	produce failed: 500
+2026-03-21 11:22:52,866{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-593", :value "v-593"}
+2026-03-21 11:22:52,877{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-593", :value "v-593"}	produce failed: 500
+2026-03-21 11:22:52,996{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-596", :value "v-596"}
+2026-03-21 11:22:53,002{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-596", :value "v-596", :partition 3, :offset 16}
+2026-03-21 11:22:53,081{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-599", :value "v-599"}
+2026-03-21 11:22:53,088{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-599", :value "v-599", :partition 2, :offset 10}
+2026-03-21 11:22:53,184{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-602", :value "v-602"}
+2026-03-21 11:22:53,195{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-602", :value "v-602"}	produce failed: 500
+2026-03-21 11:22:53,249{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-605", :value "v-605"}
+2026-03-21 11:22:53,259{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-605", :value "v-605"}	produce failed: 500
+2026-03-21 11:22:53,260{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-608", :value "v-608"}
+2026-03-21 11:22:53,265{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-608", :value "v-608"}	produce failed: 500
+2026-03-21 11:22:53,315{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-611", :value "v-611"}
+2026-03-21 11:22:53,319{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-611", :value "v-611"}	produce failed: 500
+2026-03-21 11:22:53,393{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-614", :value "v-614"}
+2026-03-21 11:22:53,400{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-614", :value "v-614", :partition 0, :offset 20}
+2026-03-21 11:22:53,462{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-617", :value "v-617"}
+2026-03-21 11:22:53,468{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-617", :value "v-617", :partition 1, :offset 16}
+2026-03-21 11:22:53,496{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-620", :value "v-620"}
+2026-03-21 11:22:53,501{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-620", :value "v-620"}	produce failed: 500
+2026-03-21 11:22:53,644{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-623", :value "v-623"}
+2026-03-21 11:22:53,656{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-623", :value "v-623"}	produce failed: 500
+2026-03-21 11:22:53,734{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-626", :value "v-626"}
+2026-03-21 11:22:53,746{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-626", :value "v-626"}	produce failed: 500
+2026-03-21 11:22:53,775{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-629", :value "v-629"}
+2026-03-21 11:22:53,802{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-629", :value "v-629"}	produce failed: 500
+2026-03-21 11:22:53,852{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-632", :value "v-632"}
+2026-03-21 11:22:53,857{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-632", :value "v-632", :partition 0, :offset 21}
+2026-03-21 11:22:53,910{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-635", :value "v-635"}
+2026-03-21 11:22:53,914{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-635", :value "v-635", :partition 1, :offset 17}
+2026-03-21 11:22:54,092{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-638", :value "v-638"}
+2026-03-21 11:22:54,105{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-638", :value "v-638"}	produce failed: 500
+2026-03-21 11:22:54,166{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-641", :value "v-641"}
+2026-03-21 11:22:54,172{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-641", :value "v-641"}	produce failed: 500
+2026-03-21 11:22:54,323{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-644", :value "v-644"}
+2026-03-21 11:22:54,333{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-644", :value "v-644"}	produce failed: 500
+2026-03-21 11:22:54,404{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-647", :value "v-647"}
+2026-03-21 11:22:54,413{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-647", :value "v-647"}	produce failed: 500
+2026-03-21 11:22:54,476{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-650", :value "v-650"}
+2026-03-21 11:22:54,486{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-650", :value "v-650", :partition 0, :offset 22}
+2026-03-21 11:22:54,530{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-653", :value "v-653"}
+2026-03-21 11:22:54,539{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-653", :value "v-653", :partition 1, :offset 18}
+2026-03-21 11:22:54,600{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-656", :value "v-656"}
+2026-03-21 11:22:54,609{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-656", :value "v-656"}	produce failed: 500
+2026-03-21 11:22:54,658{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-659", :value "v-659"}
+2026-03-21 11:22:54,664{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-659", :value "v-659"}	produce failed: 500
+2026-03-21 11:22:54,706{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-662", :value "v-662"}
+2026-03-21 11:22:54,712{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-662", :value "v-662"}	produce failed: 500
+2026-03-21 11:22:54,889{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-665", :value "v-665"}
+2026-03-21 11:22:54,902{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-665", :value "v-665"}	produce failed: 500
+2026-03-21 11:22:55,058{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-668", :value "v-668"}
+2026-03-21 11:22:55,067{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-668", :value "v-668", :partition 3, :offset 17}
+2026-03-21 11:22:55,073{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-671", :value "v-671"}
+2026-03-21 11:22:55,077{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-671", :value "v-671", :partition 1, :offset 19}
+2026-03-21 11:22:55,135{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-674", :value "v-674"}
+2026-03-21 11:22:55,139{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-674", :value "v-674"}	produce failed: 500
+2026-03-21 11:22:55,291{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-677", :value "v-677"}
+2026-03-21 11:22:55,304{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-677", :value "v-677"}	produce failed: 500
+2026-03-21 11:22:55,492{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-680", :value "v-680"}
+2026-03-21 11:22:55,504{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-680", :value "v-680"}	produce failed: 500
+2026-03-21 11:22:55,536{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-683", :value "v-683"}
+2026-03-21 11:22:55,544{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-683", :value "v-683"}	produce failed: 500
+2026-03-21 11:22:55,719{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-686", :value "v-686"}
+2026-03-21 11:22:55,730{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-686", :value "v-686", :partition 3, :offset 18}
+2026-03-21 11:22:55,899{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-689", :value "v-689"}
+2026-03-21 11:22:55,910{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-689", :value "v-689", :partition 2, :offset 11}
+2026-03-21 11:22:56,091{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-692", :value "v-692"}
+2026-03-21 11:22:56,103{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-692", :value "v-692"}	produce failed: 500
+2026-03-21 11:22:56,132{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-695", :value "v-695"}
+2026-03-21 11:22:56,140{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-695", :value "v-695"}	produce failed: 500
+2026-03-21 11:22:56,201{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-698", :value "v-698"}
+2026-03-21 11:22:56,210{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-698", :value "v-698"}	produce failed: 500
+2026-03-21 11:22:56,298{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-701", :value "v-701"}
+2026-03-21 11:22:56,309{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-701", :value "v-701"}	produce failed: 500
+2026-03-21 11:22:56,433{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-704", :value "v-704"}
+2026-03-21 11:22:56,443{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-704", :value "v-704", :partition 2, :offset 12}
+2026-03-21 11:22:56,504{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-707", :value "v-707"}
+2026-03-21 11:22:56,509{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-707", :value "v-707", :partition 3, :offset 19}
+2026-03-21 11:22:56,635{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-710", :value "v-710"}
+2026-03-21 11:22:56,646{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-710", :value "v-710"}	produce failed: 500
+2026-03-21 11:22:56,706{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-713", :value "v-713"}
+2026-03-21 11:22:56,715{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-713", :value "v-713"}	produce failed: 500
+2026-03-21 11:22:56,771{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-716", :value "v-716"}
+2026-03-21 11:22:56,781{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-716", :value "v-716"}	produce failed: 500
+2026-03-21 11:22:56,969{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-719", :value "v-719"}
+2026-03-21 11:22:56,974{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-719", :value "v-719"}	produce failed: 500
+2026-03-21 11:22:57,098{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-722", :value "v-722"}
+2026-03-21 11:22:57,103{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-722", :value "v-722", :partition 2, :offset 13}
+2026-03-21 11:22:57,106{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:22:57,107{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n3\")"
+2026-03-21 11:22:57,206{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-728", :value "v-728"}
+2026-03-21 11:22:57,213{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-728", :value "v-728"}	produce failed: 500
+2026-03-21 11:22:57,312{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-731", :value "v-731"}
+2026-03-21 11:22:57,323{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-731", :value "v-731"}	produce failed: 500
+2026-03-21 11:22:57,449{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-734", :value "v-734"}
+2026-03-21 11:22:57,460{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-734", :value "v-734"}	produce failed: 500
+2026-03-21 11:22:57,556{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-737", :value "v-737"}
+2026-03-21 11:22:57,567{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-737", :value "v-737"}	produce failed: 500
+2026-03-21 11:22:57,658{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-740", :value "v-740"}
+2026-03-21 11:22:57,665{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-740", :value "v-740", :partition 2, :offset 14}
+2026-03-21 11:22:57,758{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-743", :value "v-743"}
+2026-03-21 11:22:57,766{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-743", :value "v-743", :partition 3, :offset 20}
+2026-03-21 11:22:57,795{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-746", :value "v-746"}
+2026-03-21 11:22:57,801{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-746", :value "v-746"}	produce failed: 500
+2026-03-21 11:22:57,928{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-749", :value "v-749"}
+2026-03-21 11:22:57,941{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-749", :value "v-749"}	produce failed: 500
+2026-03-21 11:22:58,069{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-752", :value "v-752"}
+2026-03-21 11:22:58,075{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-752", :value "v-752"}	produce failed: 500
+2026-03-21 11:22:58,169{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-755", :value "v-755"}
+2026-03-21 11:22:58,176{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-755", :value "v-755"}	produce failed: 500
+2026-03-21 11:22:58,257{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-758", :value "v-758"}
+2026-03-21 11:22:58,264{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-758", :value "v-758", :partition 3, :offset 21}
+2026-03-21 11:22:58,444{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-761", :value "v-761"}
+2026-03-21 11:22:58,451{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-761", :value "v-761", :partition 3, :offset 22}
+2026-03-21 11:22:58,628{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-764", :value "v-764"}
+2026-03-21 11:22:58,639{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-764", :value "v-764"}	produce failed: 500
+2026-03-21 11:22:58,715{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-767", :value "v-767"}
+2026-03-21 11:22:58,727{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-767", :value "v-767"}	produce failed: 500
+2026-03-21 11:22:58,845{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-770", :value "v-770"}
+2026-03-21 11:22:58,856{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-770", :value "v-770"}	produce failed: 500
+2026-03-21 11:22:58,901{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-773", :value "v-773"}
+2026-03-21 11:22:58,911{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-773", :value "v-773"}	produce failed: 500
+2026-03-21 11:22:59,039{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-776", :value "v-776"}
+2026-03-21 11:22:59,052{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-776", :value "v-776", :partition 3, :offset 23}
+2026-03-21 11:22:59,199{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-779", :value "v-779"}
+2026-03-21 11:22:59,212{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-779", :value "v-779", :partition 2, :offset 15}
+2026-03-21 11:22:59,365{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-782", :value "v-782"}
+2026-03-21 11:22:59,376{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-782", :value "v-782"}	produce failed: 500
+2026-03-21 11:22:59,554{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-785", :value "v-785"}
+2026-03-21 11:22:59,565{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-785", :value "v-785"}	produce failed: 500
+2026-03-21 11:22:59,721{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-788", :value "v-788"}
+2026-03-21 11:22:59,732{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-788", :value "v-788"}	produce failed: 500
+2026-03-21 11:22:59,765{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-791", :value "v-791"}
+2026-03-21 11:22:59,775{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-791", :value "v-791"}	produce failed: 500
+2026-03-21 11:22:59,952{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-794", :value "v-794"}
+2026-03-21 11:22:59,959{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-794", :value "v-794", :partition 3, :offset 24}
+2026-03-21 11:23:00,129{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-797", :value "v-797"}
+2026-03-21 11:23:00,134{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-797", :value "v-797", :partition 2, :offset 16}
+2026-03-21 11:23:00,294{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-800", :value "v-800"}
+2026-03-21 11:23:00,300{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-800", :value "v-800"}	produce failed: 500
+2026-03-21 11:23:00,470{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-803", :value "v-803"}
+2026-03-21 11:23:00,478{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-803", :value "v-803"}	produce failed: 500
+2026-03-21 11:23:00,601{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-806", :value "v-806"}
+2026-03-21 11:23:00,610{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-806", :value "v-806"}	produce failed: 500
+2026-03-21 11:23:00,731{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-809", :value "v-809"}
+2026-03-21 11:23:00,739{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-809", :value "v-809"}	produce failed: 500
+2026-03-21 11:23:00,876{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-812", :value "v-812"}
+2026-03-21 11:23:00,886{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-812", :value "v-812", :partition 0, :offset 23}
+2026-03-21 11:23:01,041{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-815", :value "v-815"}
+2026-03-21 11:23:01,053{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-815", :value "v-815", :partition 1, :offset 20}
+2026-03-21 11:23:01,075{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-818", :value "v-818"}
+2026-03-21 11:23:01,083{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-818", :value "v-818"}	produce failed: 500
+2026-03-21 11:23:01,128{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-821", :value "v-821"}
+2026-03-21 11:23:01,132{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-821", :value "v-821"}	produce failed: 500
+2026-03-21 11:23:01,162{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-824", :value "v-824"}
+2026-03-21 11:23:01,171{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-824", :value "v-824"}	produce failed: 500
+2026-03-21 11:23:01,173{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-827", :value "v-827"}
+2026-03-21 11:23:01,177{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-827", :value "v-827"}	produce failed: 500
+2026-03-21 11:23:01,238{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-830", :value "v-830"}
+2026-03-21 11:23:01,241{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-830", :value "v-830", :partition 0, :offset 24}
+2026-03-21 11:23:01,353{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-833", :value "v-833"}
+2026-03-21 11:23:01,360{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-833", :value "v-833", :partition 1, :offset 21}
+2026-03-21 11:23:01,448{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-836", :value "v-836"}
+2026-03-21 11:23:01,459{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-836", :value "v-836"}	produce failed: 500
+2026-03-21 11:23:01,517{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-839", :value "v-839"}
+2026-03-21 11:23:01,524{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-839", :value "v-839"}	produce failed: 500
+2026-03-21 11:23:01,661{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-842", :value "v-842"}
+2026-03-21 11:23:01,672{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-842", :value "v-842"}	produce failed: 500
+2026-03-21 11:23:01,771{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-845", :value "v-845"}
+2026-03-21 11:23:01,781{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-845", :value "v-845"}	produce failed: 500
+2026-03-21 11:23:01,893{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-848", :value "v-848"}
+2026-03-21 11:23:01,904{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-848", :value "v-848", :partition 3, :offset 25}
+2026-03-21 11:23:02,003{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-851", :value "v-851"}
+2026-03-21 11:23:02,005{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-853", :value "v-853"}
+2026-03-21 11:23:02,010{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-851", :value "v-851", :partition 1, :offset 22}
+2026-03-21 11:23:02,010{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-853", :value "v-853"}	produce failed: 500
+2026-03-21 11:23:02,090{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-856", :value "v-856"}
+2026-03-21 11:23:02,094{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-856", :value "v-856"}	produce failed: 500
+2026-03-21 11:23:02,150{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-859", :value "v-859"}
+2026-03-21 11:23:02,155{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-859", :value "v-859"}	produce failed: 500
+2026-03-21 11:23:02,252{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-862", :value "v-862"}
+2026-03-21 11:23:02,260{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-862", :value "v-862"}	produce failed: 500
+2026-03-21 11:23:02,437{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-865", :value "v-865"}
+2026-03-21 11:23:02,448{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-865", :value "v-865", :partition 2, :offset 17}
+2026-03-21 11:23:02,564{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-868", :value "v-868"}
+2026-03-21 11:23:02,576{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-868", :value "v-868", :partition 1, :offset 23}
+2026-03-21 11:23:02,695{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-871", :value "v-871"}
+2026-03-21 11:23:02,706{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-871", :value "v-871"}	produce failed: 500
+2026-03-21 11:23:02,803{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-874", :value "v-874"}
+2026-03-21 11:23:02,813{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-874", :value "v-874"}	produce failed: 500
+2026-03-21 11:23:02,846{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-877", :value "v-877"}
+2026-03-21 11:23:02,852{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-879", :value "v-879"}
+2026-03-21 11:23:02,852{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-877", :value "v-877"}	produce failed: 500
+2026-03-21 11:23:02,856{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-879", :value "v-879"}	produce failed: 500
+2026-03-21 11:23:02,856{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-882", :value "v-882"}
+2026-03-21 11:23:02,859{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-882", :value "v-882", :partition 1, :offset 24}
+2026-03-21 11:23:02,875{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-885", :value "v-885"}
+2026-03-21 11:23:02,878{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-885", :value "v-885", :partition 0, :offset 25}
+2026-03-21 11:23:03,046{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-888", :value "v-888"}
+2026-03-21 11:23:03,057{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-888", :value "v-888"}	produce failed: 500
+2026-03-21 11:23:03,081{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-891", :value "v-891"}
+2026-03-21 11:23:03,087{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-891", :value "v-891"}	produce failed: 500
+2026-03-21 11:23:03,203{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-894", :value "v-894"}
+2026-03-21 11:23:03,217{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-894", :value "v-894"}	produce failed: 500
+2026-03-21 11:23:03,279{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-897", :value "v-897"}
+2026-03-21 11:23:03,286{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-897", :value "v-897"}	produce failed: 500
+2026-03-21 11:23:03,349{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-902", :value "v-902"}
+2026-03-21 11:23:03,356{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-902", :value "v-902", :partition 2, :offset 18}
+2026-03-21 11:23:03,421{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-905", :value "v-905"}
+2026-03-21 11:23:03,432{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-905", :value "v-905"}	produce failed: 500
+2026-03-21 11:23:03,521{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-908", :value "v-908"}
+2026-03-21 11:23:03,531{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-908", :value "v-908"}	produce failed: 500
+2026-03-21 11:23:03,532{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-910", :value "v-910"}
+2026-03-21 11:23:03,540{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-910", :value "v-910"}	produce failed: 500
+2026-03-21 11:23:03,580{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-913", :value "v-913"}
+2026-03-21 11:23:03,586{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-913", :value "v-913"}	produce failed: 500
+2026-03-21 11:23:03,590{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-916", :value "v-916"}
+2026-03-21 11:23:03,595{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-916", :value "v-916", :partition 3, :offset 26}
+2026-03-21 11:23:03,681{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-919", :value "v-919"}
+2026-03-21 11:23:03,688{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-919", :value "v-919", :partition 2, :offset 19}
+2026-03-21 11:23:03,731{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-922", :value "v-922"}
+2026-03-21 11:23:03,737{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-922", :value "v-922"}	produce failed: 500
+2026-03-21 11:23:03,753{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-925", :value "v-925"}
+2026-03-21 11:23:03,758{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-925", :value "v-925"}	produce failed: 500
+2026-03-21 11:23:03,769{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-928", :value "v-928"}
+2026-03-21 11:23:03,774{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-928", :value "v-928"}	produce failed: 500
+2026-03-21 11:23:03,938{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-931", :value "v-931"}
+2026-03-21 11:23:03,949{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-931", :value "v-931"}	produce failed: 500
+2026-03-21 11:23:04,097{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-934", :value "v-934"}
+2026-03-21 11:23:04,108{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-934", :value "v-934", :partition 3, :offset 27}
+2026-03-21 11:23:04,242{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-937", :value "v-937"}
+2026-03-21 11:23:04,249{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-937", :value "v-937", :partition 2, :offset 20}
+2026-03-21 11:23:04,379{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-940", :value "v-940"}
+2026-03-21 11:23:04,389{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-940", :value "v-940"}	produce failed: 500
+2026-03-21 11:23:04,546{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-943", :value "v-943"}
+2026-03-21 11:23:04,556{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-943", :value "v-943"}	produce failed: 500
+2026-03-21 11:23:04,570{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-946", :value "v-946"}
+2026-03-21 11:23:04,577{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-946", :value "v-946"}	produce failed: 500
+2026-03-21 11:23:04,594{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-949", :value "v-949"}
+2026-03-21 11:23:04,599{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-949", :value "v-949"}	produce failed: 500
+2026-03-21 11:23:04,763{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-952", :value "v-952"}
+2026-03-21 11:23:04,775{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-952", :value "v-952", :partition 3, :offset 28}
+2026-03-21 11:23:04,895{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-955", :value "v-955"}
+2026-03-21 11:23:04,901{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-955", :value "v-955", :partition 2, :offset 21}
+2026-03-21 11:23:04,988{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-958", :value "v-958"}
+2026-03-21 11:23:05,000{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-958", :value "v-958"}	produce failed: 500
+2026-03-21 11:23:05,137{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-961", :value "v-961"}
+2026-03-21 11:23:05,147{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-961", :value "v-961"}	produce failed: 500
+2026-03-21 11:23:05,177{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-964", :value "v-964"}
+2026-03-21 11:23:05,182{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-964", :value "v-964"}	produce failed: 500
+2026-03-21 11:23:05,248{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-967", :value "v-967"}
+2026-03-21 11:23:05,248{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-968", :value "v-968"}
+2026-03-21 11:23:05,258{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-970", :value "v-970"}
+2026-03-21 11:23:05,259{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-968", :value "v-968", :partition 2, :offset 22}
+2026-03-21 11:23:05,260{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-967", :value "v-967"}	produce failed: 500
+2026-03-21 11:23:05,265{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-970", :value "v-970"}	produce failed: 500
+2026-03-21 11:23:05,460{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-975", :value "v-975"}
+2026-03-21 11:23:05,465{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-975", :value "v-975"}	produce failed: 500
+2026-03-21 11:23:05,500{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-978", :value "v-978"}
+2026-03-21 11:23:05,505{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-978", :value "v-978"}	produce failed: 500
+2026-03-21 11:23:05,672{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-981", :value "v-981"}
+2026-03-21 11:23:05,683{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-981", :value "v-981"}	produce failed: 500
+2026-03-21 11:23:05,866{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-984", :value "v-984"}
+2026-03-21 11:23:05,877{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-984", :value "v-984"}	produce failed: 500
+2026-03-21 11:23:05,999{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-987", :value "v-987"}
+2026-03-21 11:23:06,011{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-987", :value "v-987", :partition 1, :offset 25}
+2026-03-21 11:23:06,103{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-990", :value "v-990"}
+2026-03-21 11:23:06,117{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-990", :value "v-990", :partition 1, :offset 26}
+2026-03-21 11:23:06,124{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-993", :value "v-993"}
+2026-03-21 11:23:06,130{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-993", :value "v-993"}	produce failed: 500
+2026-03-21 11:23:06,244{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-996", :value "v-996"}
+2026-03-21 11:23:06,254{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-996", :value "v-996"}	produce failed: 500
+2026-03-21 11:23:06,425{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-999", :value "v-999"}
+2026-03-21 11:23:06,437{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-999", :value "v-999"}	produce failed: 500
+2026-03-21 11:23:06,444{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1002", :value "v-1002"}
+2026-03-21 11:23:06,453{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1002", :value "v-1002"}	produce failed: 500
+2026-03-21 11:23:06,469{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1005", :value "v-1005"}
+2026-03-21 11:23:06,475{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1005", :value "v-1005", :partition 3, :offset 29}
+2026-03-21 11:23:06,600{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1008", :value "v-1008"}
+2026-03-21 11:23:06,615{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1008", :value "v-1008", :partition 0, :offset 26}
+2026-03-21 11:23:06,770{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1011", :value "v-1011"}
+2026-03-21 11:23:06,781{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1011", :value "v-1011"}	produce failed: 500
+2026-03-21 11:23:06,887{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1014", :value "v-1014"}
+2026-03-21 11:23:06,899{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1014", :value "v-1014"}	produce failed: 500
+2026-03-21 11:23:07,084{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1017", :value "v-1017"}
+2026-03-21 11:23:07,087{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1017", :value "v-1017"}	produce failed: 500
+2026-03-21 11:23:07,106{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1020", :value "v-1020"}
+2026-03-21 11:23:07,109{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1020", :value "v-1020"}	produce failed: 500
+2026-03-21 11:23:07,182{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1023", :value "v-1023"}
+2026-03-21 11:23:07,186{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1023", :value "v-1023", :partition 3, :offset 30}
+2026-03-21 11:23:07,350{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1026", :value "v-1026"}
+2026-03-21 11:23:07,362{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1026", :value "v-1026", :partition 0, :offset 27}
+2026-03-21 11:23:07,491{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1029", :value "v-1029"}
+2026-03-21 11:23:07,502{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1029", :value "v-1029"}	produce failed: 500
+2026-03-21 11:23:07,556{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1032", :value "v-1032"}
+2026-03-21 11:23:07,565{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1032", :value "v-1032"}	produce failed: 500
+2026-03-21 11:23:07,566{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1035", :value "v-1035"}
+2026-03-21 11:23:07,571{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1035", :value "v-1035"}	produce failed: 500
+2026-03-21 11:23:07,764{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1038", :value "v-1038"}
+2026-03-21 11:23:07,774{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1038", :value "v-1038"}	produce failed: 500
+2026-03-21 11:23:07,964{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1041", :value "v-1041"}
+2026-03-21 11:23:07,976{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1041", :value "v-1041", :partition 3, :offset 31}
+2026-03-21 11:23:08,040{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1044", :value "v-1044"}
+2026-03-21 11:23:08,050{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1044", :value "v-1044", :partition 0, :offset 28}
+2026-03-21 11:23:08,128{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1047", :value "v-1047"}
+2026-03-21 11:23:08,136{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1047", :value "v-1047"}	produce failed: 500
+2026-03-21 11:23:08,274{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1050", :value "v-1050"}
+2026-03-21 11:23:08,281{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1050", :value "v-1050"}	produce failed: 500
+2026-03-21 11:23:08,295{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1053", :value "v-1053"}
+2026-03-21 11:23:08,301{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1053", :value "v-1053"}	produce failed: 500
+2026-03-21 11:23:08,491{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1057", :value "v-1057"}
+2026-03-21 11:23:08,497{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1057", :value "v-1057"}	produce failed: 500
+2026-03-21 11:23:08,667{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1060", :value "v-1060"}
+2026-03-21 11:23:08,677{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1060", :value "v-1060", :partition 2, :offset 23}
+2026-03-21 11:23:08,742{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1063", :value "v-1063"}
+2026-03-21 11:23:08,753{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1063", :value "v-1063", :partition 3, :offset 32}
+2026-03-21 11:23:08,794{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1066", :value "v-1066"}
+2026-03-21 11:23:08,804{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1066", :value "v-1066"}	produce failed: 500
+2026-03-21 11:23:08,830{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1069", :value "v-1069"}
+2026-03-21 11:23:08,836{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1069", :value "v-1069"}	produce failed: 500
+2026-03-21 11:23:08,925{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1072", :value "v-1072"}
+2026-03-21 11:23:08,933{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1072", :value "v-1072"}	produce failed: 500
+2026-03-21 11:23:09,026{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1075", :value "v-1075"}
+2026-03-21 11:23:09,037{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1075", :value "v-1075"}	produce failed: 500
+2026-03-21 11:23:09,141{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1078", :value "v-1078"}
+2026-03-21 11:23:09,153{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1078", :value "v-1078", :partition 3, :offset 33}
+2026-03-21 11:23:09,287{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1081", :value "v-1081"}
+2026-03-21 11:23:09,296{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1081", :value "v-1081", :partition 3, :offset 34}
+2026-03-21 11:23:09,305{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1084", :value "v-1084"}
+2026-03-21 11:23:09,312{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1084", :value "v-1084"}	produce failed: 500
+2026-03-21 11:23:09,410{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1087", :value "v-1087"}
+2026-03-21 11:23:09,421{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1087", :value "v-1087"}	produce failed: 500
+2026-03-21 11:23:09,516{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1090", :value "v-1090"}
+2026-03-21 11:23:09,529{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1090", :value "v-1090"}	produce failed: 500
+2026-03-21 11:23:09,679{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1093", :value "v-1093"}
+2026-03-21 11:23:09,690{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1093", :value "v-1093"}	produce failed: 500
+2026-03-21 11:23:09,876{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1096", :value "v-1096"}
+2026-03-21 11:23:09,886{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1096", :value "v-1096", :partition 3, :offset 35}
+2026-03-21 11:23:09,943{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1099", :value "v-1099"}
+2026-03-21 11:23:09,950{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1099", :value "v-1099", :partition 2, :offset 24}
+2026-03-21 11:23:10,031{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1102", :value "v-1102"}
+2026-03-21 11:23:10,042{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1102", :value "v-1102"}	produce failed: 500
+2026-03-21 11:23:10,098{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1105", :value "v-1105"}
+2026-03-21 11:23:10,101{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1105", :value "v-1105"}	produce failed: 500
+2026-03-21 11:23:10,190{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1108", :value "v-1108"}
+2026-03-21 11:23:10,195{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1108", :value "v-1108"}	produce failed: 500
+2026-03-21 11:23:10,269{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1111", :value "v-1111"}
+2026-03-21 11:23:10,275{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1111", :value "v-1111"}	produce failed: 500
+2026-03-21 11:23:10,297{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1114", :value "v-1114"}
+2026-03-21 11:23:10,302{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1114", :value "v-1114", :partition 2, :offset 25}
+2026-03-21 11:23:10,342{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1117", :value "v-1117"}
+2026-03-21 11:23:10,346{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1117", :value "v-1117", :partition 3, :offset 36}
+2026-03-21 11:23:10,448{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1120", :value "v-1120"}
+2026-03-21 11:23:10,455{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1120", :value "v-1120"}	produce failed: 500
+2026-03-21 11:23:10,565{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1123", :value "v-1123"}
+2026-03-21 11:23:10,573{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1123", :value "v-1123"}	produce failed: 500
+2026-03-21 11:23:10,586{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1126", :value "v-1126"}
+2026-03-21 11:23:10,593{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1126", :value "v-1126"}	produce failed: 500
+2026-03-21 11:23:10,673{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1129", :value "v-1129"}
+2026-03-21 11:23:10,681{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1129", :value "v-1129"}	produce failed: 500
+2026-03-21 11:23:10,714{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1132", :value "v-1132"}
+2026-03-21 11:23:10,719{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1132", :value "v-1132", :partition 2, :offset 26}
+2026-03-21 11:23:10,834{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1135", :value "v-1135"}
+2026-03-21 11:23:10,845{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1135", :value "v-1135", :partition 3, :offset 37}
+2026-03-21 11:23:10,893{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1138", :value "v-1138"}
+2026-03-21 11:23:10,902{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1138", :value "v-1138"}	produce failed: 500
+2026-03-21 11:23:10,947{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1141", :value "v-1141"}
+2026-03-21 11:23:10,955{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1141", :value "v-1141"}	produce failed: 500
+2026-03-21 11:23:10,971{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1144", :value "v-1144"}
+2026-03-21 11:23:10,977{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1144", :value "v-1144"}	produce failed: 500
+2026-03-21 11:23:11,019{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1147", :value "v-1147"}
+2026-03-21 11:23:11,024{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1147", :value "v-1147"}	produce failed: 500
+2026-03-21 11:23:11,128{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1150", :value "v-1150"}
+2026-03-21 11:23:11,141{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1150", :value "v-1150", :partition 2, :offset 27}
+2026-03-21 11:23:11,220{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1153", :value "v-1153"}
+2026-03-21 11:23:11,234{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1153", :value "v-1153", :partition 3, :offset 38}
+2026-03-21 11:23:11,270{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1156", :value "v-1156"}
+2026-03-21 11:23:11,277{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1156", :value "v-1156"}	produce failed: 500
+2026-03-21 11:23:11,281{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1159", :value "v-1159"}
+2026-03-21 11:23:11,287{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1159", :value "v-1159"}	produce failed: 500
+2026-03-21 11:23:11,430{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1162", :value "v-1162"}
+2026-03-21 11:23:11,441{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1162", :value "v-1162"}	produce failed: 500
+2026-03-21 11:23:11,536{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1165", :value "v-1165"}
+2026-03-21 11:23:11,547{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1165", :value "v-1165"}	produce failed: 500
+2026-03-21 11:23:11,671{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1168", :value "v-1168"}
+2026-03-21 11:23:11,682{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1168", :value "v-1168", :partition 1, :offset 27}
+2026-03-21 11:23:11,702{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1171", :value "v-1171"}
+2026-03-21 11:23:11,708{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1171", :value "v-1171", :partition 3, :offset 39}
+2026-03-21 11:23:11,875{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1174", :value "v-1174"}
+2026-03-21 11:23:11,888{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1174", :value "v-1174"}	produce failed: 500
+2026-03-21 11:23:11,937{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1177", :value "v-1177"}
+2026-03-21 11:23:11,947{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1177", :value "v-1177"}	produce failed: 500
+2026-03-21 11:23:12,124{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1180", :value "v-1180"}
+2026-03-21 11:23:12,128{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1180", :value "v-1180"}	produce failed: 500
+2026-03-21 11:23:12,209{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1183", :value "v-1183"}
+2026-03-21 11:23:12,213{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1183", :value "v-1183"}	produce failed: 500
+2026-03-21 11:23:12,289{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1186", :value "v-1186"}
+2026-03-21 11:23:12,289{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:start
+2026-03-21 11:23:12,291{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n3\")"
+2026-03-21 11:23:12,297{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1186", :value "v-1186", :partition 1, :offset 28}
+2026-03-21 11:23:12,343{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1191", :value "v-1191"}
+2026-03-21 11:23:12,349{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1191", :value "v-1191"}	produce failed: 500
+2026-03-21 11:23:12,431{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1194", :value "v-1194"}
+2026-03-21 11:23:12,434{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1194", :value "v-1194"}	produce failed: 500
+2026-03-21 11:23:12,512{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1197", :value "v-1197"}
+2026-03-21 11:23:12,519{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1197", :value "v-1197"}	produce failed: 500
+2026-03-21 11:23:12,694{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1200", :value "v-1200"}
+2026-03-21 11:23:12,704{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1200", :value "v-1200"}	produce failed: 500
+2026-03-21 11:23:12,823{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1203", :value "v-1203"}
+2026-03-21 11:23:12,836{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1203", :value "v-1203", :partition 3, :offset 40}
+2026-03-21 11:23:12,911{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1206", :value "v-1206"}
+2026-03-21 11:23:12,923{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1206", :value "v-1206", :partition 0, :offset 29}
+2026-03-21 11:23:13,105{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1209", :value "v-1209"}
+2026-03-21 11:23:13,116{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1209", :value "v-1209"}	produce failed: 500
+2026-03-21 11:23:13,137{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1212", :value "v-1212"}
+2026-03-21 11:23:13,143{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1212", :value "v-1212"}	produce failed: 500
+2026-03-21 11:23:13,284{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1215", :value "v-1215"}
+2026-03-21 11:23:13,297{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1215", :value "v-1215"}	produce failed: 500
+2026-03-21 11:23:13,306{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1218", :value "v-1218"}
+2026-03-21 11:23:13,312{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1218", :value "v-1218"}	produce failed: 500
+2026-03-21 11:23:13,386{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1221", :value "v-1221"}
+2026-03-21 11:23:13,394{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1221", :value "v-1221", :partition 3, :offset 41}
+2026-03-21 11:23:13,479{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1224", :value "v-1224"}
+2026-03-21 11:23:13,490{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1224", :value "v-1224", :partition 0, :offset 30}
+2026-03-21 11:23:13,610{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1229", :value "v-1229"}
+2026-03-21 11:23:13,621{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1229", :value "v-1229"}	produce failed: 500
+2026-03-21 11:23:13,664{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1232", :value "v-1232"}
+2026-03-21 11:23:13,666{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1234", :value "v-1234"}
+2026-03-21 11:23:13,671{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1232", :value "v-1232"}	produce failed: 500
+2026-03-21 11:23:13,672{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1234", :value "v-1234"}	produce failed: 500
+2026-03-21 11:23:13,797{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1238", :value "v-1238"}
+2026-03-21 11:23:13,809{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1238", :value "v-1238", :partition 1, :offset 29}
+2026-03-21 11:23:13,944{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1241", :value "v-1241"}
+2026-03-21 11:23:13,955{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1241", :value "v-1241", :partition 1, :offset 30}
+2026-03-21 11:23:14,034{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1244", :value "v-1244"}
+2026-03-21 11:23:14,044{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1244", :value "v-1244"}	produce failed: 500
+2026-03-21 11:23:14,218{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1247", :value "v-1247"}
+2026-03-21 11:23:14,223{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1249", :value "v-1249"}
+2026-03-21 11:23:14,226{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1247", :value "v-1247"}	produce failed: 500
+2026-03-21 11:23:14,230{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1249", :value "v-1249"}	produce failed: 500
+2026-03-21 11:23:14,422{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1253", :value "v-1253"}
+2026-03-21 11:23:14,434{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1253", :value "v-1253"}	produce failed: 500
+2026-03-21 11:23:14,575{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1256", :value "v-1256"}
+2026-03-21 11:23:14,587{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1256", :value "v-1256", :partition 1, :offset 31}
+2026-03-21 11:23:14,651{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1259", :value "v-1259"}
+2026-03-21 11:23:14,661{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1259", :value "v-1259", :partition 0, :offset 31}
+2026-03-21 11:23:14,805{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1262", :value "v-1262"}
+2026-03-21 11:23:14,822{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1262", :value "v-1262"}	produce failed: 500
+2026-03-21 11:23:14,823{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1264", :value "v-1264"}
+2026-03-21 11:23:14,828{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1264", :value "v-1264"}	produce failed: 500
+2026-03-21 11:23:14,880{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1267", :value "v-1267"}
+2026-03-21 11:23:14,886{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1267", :value "v-1267"}	produce failed: 500
+2026-03-21 11:23:15,005{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1270", :value "v-1270"}
+2026-03-21 11:23:15,006{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1272", :value "v-1272"}
+2026-03-21 11:23:15,018{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1270", :value "v-1270"}	produce failed: 500
+2026-03-21 11:23:15,018{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1272", :value "v-1272", :partition 3, :offset 42}
+2026-03-21 11:23:15,184{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1275", :value "v-1275"}
+2026-03-21 11:23:15,197{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1275", :value "v-1275", :partition 2, :offset 28}
+2026-03-21 11:23:15,374{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1278", :value "v-1278"}
+2026-03-21 11:23:15,386{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1278", :value "v-1278"}	produce failed: 500
+2026-03-21 11:23:15,399{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1281", :value "v-1281"}
+2026-03-21 11:23:15,405{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1281", :value "v-1281"}	produce failed: 500
+2026-03-21 11:23:15,492{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1284", :value "v-1284"}
+2026-03-21 11:23:15,501{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1284", :value "v-1284"}	produce failed: 500
+2026-03-21 11:23:15,602{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1287", :value "v-1287"}
+2026-03-21 11:23:15,615{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1287", :value "v-1287"}	produce failed: 500
+2026-03-21 11:23:15,805{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1290", :value "v-1290"}
+2026-03-21 11:23:15,816{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1290", :value "v-1290", :partition 3, :offset 43}
+2026-03-21 11:23:15,870{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1293", :value "v-1293"}
+2026-03-21 11:23:15,878{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1293", :value "v-1293", :partition 2, :offset 29}
+2026-03-21 11:23:15,941{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1296", :value "v-1296"}
+2026-03-21 11:23:15,948{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1296", :value "v-1296"}	produce failed: 500
+2026-03-21 11:23:16,067{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1299", :value "v-1299"}
+2026-03-21 11:23:16,078{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1299", :value "v-1299"}	produce failed: 500
+2026-03-21 11:23:16,106{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1302", :value "v-1302"}
+2026-03-21 11:23:16,113{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1302", :value "v-1302"}	produce failed: 500
+2026-03-21 11:23:16,309{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1305", :value "v-1305"}
+2026-03-21 11:23:16,321{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1305", :value "v-1305"}	produce failed: 500
+2026-03-21 11:23:16,482{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1308", :value "v-1308"}
+2026-03-21 11:23:16,493{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1308", :value "v-1308", :partition 1, :offset 32}
+2026-03-21 11:23:16,583{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1311", :value "v-1311"}
+2026-03-21 11:23:16,595{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1311", :value "v-1311", :partition 3, :offset 44}
+2026-03-21 11:23:16,633{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1314", :value "v-1314"}
+2026-03-21 11:23:16,642{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1314", :value "v-1314"}	produce failed: 500
+2026-03-21 11:23:16,722{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1317", :value "v-1317"}
+2026-03-21 11:23:16,729{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1317", :value "v-1317"}	produce failed: 500
+2026-03-21 11:23:16,753{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1320", :value "v-1320"}
+2026-03-21 11:23:16,758{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1320", :value "v-1320"}	produce failed: 500
+2026-03-21 11:23:16,906{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1323", :value "v-1323"}
+2026-03-21 11:23:16,917{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1323", :value "v-1323"}	produce failed: 500
+2026-03-21 11:23:17,100{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1326", :value "v-1326"}
+2026-03-21 11:23:17,113{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1326", :value "v-1326", :partition 1, :offset 33}
+2026-03-21 11:23:17,270{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1329", :value "v-1329"}
+2026-03-21 11:23:17,275{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1329", :value "v-1329", :partition 0, :offset 32}
+2026-03-21 11:23:17,318{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1332", :value "v-1332"}
+2026-03-21 11:23:17,324{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1332", :value "v-1332"}	produce failed: 500
+2026-03-21 11:23:17,389{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1335", :value "v-1335"}
+2026-03-21 11:23:17,397{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1335", :value "v-1335"}	produce failed: 500
+2026-03-21 11:23:17,583{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1338", :value "v-1338"}
+2026-03-21 11:23:17,587{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1338", :value "v-1338"}	produce failed: 500
+2026-03-21 11:23:17,738{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1341", :value "v-1341"}
+2026-03-21 11:23:17,741{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1343", :value "v-1343"}
+2026-03-21 11:23:17,750{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1343", :value "v-1343", :partition 0, :offset 33}
+2026-03-21 11:23:17,750{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1341", :value "v-1341"}	produce failed: 500
+2026-03-21 11:23:17,816{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1347", :value "v-1347"}
+2026-03-21 11:23:17,826{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1347", :value "v-1347", :partition 0, :offset 34}
+2026-03-21 11:23:17,827{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1349", :value "v-1349"}
+2026-03-21 11:23:17,833{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1349", :value "v-1349"}	produce failed: 500
+2026-03-21 11:23:17,863{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1352", :value "v-1352"}
+2026-03-21 11:23:17,868{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1352", :value "v-1352"}	produce failed: 500
+2026-03-21 11:23:17,919{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1355", :value "v-1355"}
+2026-03-21 11:23:17,924{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1355", :value "v-1355"}	produce failed: 500
+2026-03-21 11:23:18,116{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1358", :value "v-1358"}
+2026-03-21 11:23:18,127{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1358", :value "v-1358"}	produce failed: 500
+2026-03-21 11:23:18,216{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1361", :value "v-1361"}
+2026-03-21 11:23:18,227{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1361", :value "v-1361", :partition 0, :offset 35}
+2026-03-21 11:23:18,263{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1364", :value "v-1364"}
+2026-03-21 11:23:18,272{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1364", :value "v-1364", :partition 3, :offset 45}
+2026-03-21 11:23:18,449{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1367", :value "v-1367"}
+2026-03-21 11:23:18,456{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1367", :value "v-1367"}	produce failed: 500
+2026-03-21 11:23:18,480{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1370", :value "v-1370"}
+2026-03-21 11:23:18,485{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1370", :value "v-1370"}	produce failed: 500
+2026-03-21 11:23:18,529{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1373", :value "v-1373"}
+2026-03-21 11:23:18,535{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1373", :value "v-1373"}	produce failed: 500
+2026-03-21 11:23:18,690{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1376", :value "v-1376"}
+2026-03-21 11:23:18,701{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1376", :value "v-1376"}	produce failed: 500
+2026-03-21 11:23:18,736{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1379", :value "v-1379"}
+2026-03-21 11:23:18,743{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1379", :value "v-1379", :partition 1, :offset 34}
+2026-03-21 11:23:18,770{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1382", :value "v-1382"}
+2026-03-21 11:23:18,776{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1382", :value "v-1382", :partition 3, :offset 46}
+2026-03-21 11:23:18,957{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1385", :value "v-1385"}
+2026-03-21 11:23:18,970{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1385", :value "v-1385"}	produce failed: 500
+2026-03-21 11:23:19,000{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1388", :value "v-1388"}
+2026-03-21 11:23:19,007{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1388", :value "v-1388"}	produce failed: 500
+2026-03-21 11:23:19,093{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1391", :value "v-1391"}
+2026-03-21 11:23:19,105{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1391", :value "v-1391"}	produce failed: 500
+2026-03-21 11:23:19,253{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1394", :value "v-1394"}
+2026-03-21 11:23:19,266{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1394", :value "v-1394"}	produce failed: 500
+2026-03-21 11:23:19,283{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1397", :value "v-1397"}
+2026-03-21 11:23:19,287{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1397", :value "v-1397", :partition 1, :offset 35}
+2026-03-21 11:23:19,474{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1400", :value "v-1400"}
+2026-03-21 11:23:19,482{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1400", :value "v-1400", :partition 0, :offset 36}
+2026-03-21 11:23:19,639{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1403", :value "v-1403"}
+2026-03-21 11:23:19,650{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1403", :value "v-1403"}	produce failed: 500
+2026-03-21 11:23:19,715{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1406", :value "v-1406"}
+2026-03-21 11:23:19,725{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1406", :value "v-1406"}	produce failed: 500
+2026-03-21 11:23:19,905{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1409", :value "v-1409"}
+2026-03-21 11:23:19,915{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1409", :value "v-1409"}	produce failed: 500
+2026-03-21 11:23:20,014{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1412", :value "v-1412"}
+2026-03-21 11:23:20,025{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1412", :value "v-1412"}	produce failed: 500
+2026-03-21 11:23:20,200{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1415", :value "v-1415"}
+2026-03-21 11:23:20,211{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1415", :value "v-1415", :partition 2, :offset 30}
+2026-03-21 11:23:20,233{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1418", :value "v-1418"}
+2026-03-21 11:23:20,239{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1418", :value "v-1418", :partition 1, :offset 36}
+2026-03-21 11:23:20,330{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1421", :value "v-1421"}
+2026-03-21 11:23:20,342{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1421", :value "v-1421"}	produce failed: 500
+2026-03-21 11:23:20,458{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1424", :value "v-1424"}
+2026-03-21 11:23:20,468{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1424", :value "v-1424"}	produce failed: 500
+2026-03-21 11:23:20,640{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1427", :value "v-1427"}
+2026-03-21 11:23:20,650{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1427", :value "v-1427"}	produce failed: 500
+2026-03-21 11:23:20,708{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1430", :value "v-1430"}
+2026-03-21 11:23:20,718{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1430", :value "v-1430"}	produce failed: 500
+2026-03-21 11:23:20,886{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1433", :value "v-1433"}
+2026-03-21 11:23:20,913{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1435", :value "v-1435"}
+2026-03-21 11:23:20,918{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1433", :value "v-1433", :partition 2, :offset 31}
+2026-03-21 11:23:20,918{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1435", :value "v-1435"}	produce failed: 500
+2026-03-21 11:23:20,918{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1437", :value "v-1437"}
+2026-03-21 11:23:20,921{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1437", :value "v-1437"}	produce failed: 500
+2026-03-21 11:23:21,096{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1441", :value "v-1441"}
+2026-03-21 11:23:21,109{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1441", :value "v-1441"}	produce failed: 500
+2026-03-21 11:23:21,243{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1444", :value "v-1444"}
+2026-03-21 11:23:21,254{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1444", :value "v-1444"}	produce failed: 500
+2026-03-21 11:23:21,332{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1447", :value "v-1447"}
+2026-03-21 11:23:21,344{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1447", :value "v-1447"}	produce failed: 500
+2026-03-21 11:23:21,371{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1450", :value "v-1450"}
+2026-03-21 11:23:21,377{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1450", :value "v-1450", :partition 1, :offset 37}
+2026-03-21 11:23:21,417{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1453", :value "v-1453"}
+2026-03-21 11:23:21,422{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1453", :value "v-1453", :partition 0, :offset 37}
+2026-03-21 11:23:21,481{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1456", :value "v-1456"}
+2026-03-21 11:23:21,488{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1456", :value "v-1456"}	produce failed: 500
+2026-03-21 11:23:21,584{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1459", :value "v-1459"}
+2026-03-21 11:23:21,595{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1459", :value "v-1459"}	produce failed: 500
+2026-03-21 11:23:21,756{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1462", :value "v-1462"}
+2026-03-21 11:23:21,768{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1462", :value "v-1462"}	produce failed: 500
+2026-03-21 11:23:21,795{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1465", :value "v-1465"}
+2026-03-21 11:23:21,803{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1465", :value "v-1465"}	produce failed: 500
+2026-03-21 11:23:21,833{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1468", :value "v-1468"}
+2026-03-21 11:23:21,836{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1468", :value "v-1468", :partition 2, :offset 32}
+2026-03-21 11:23:21,969{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1471", :value "v-1471"}
+2026-03-21 11:23:21,980{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1471", :value "v-1471", :partition 0, :offset 38}
+2026-03-21 11:23:22,156{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1474", :value "v-1474"}
+2026-03-21 11:23:22,174{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1476", :value "v-1476"}
+2026-03-21 11:23:22,177{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1474", :value "v-1474"}	produce failed: 500
+2026-03-21 11:23:22,180{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1476", :value "v-1476"}	produce failed: 500
+2026-03-21 11:23:22,268{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1480", :value "v-1480"}
+2026-03-21 11:23:22,272{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1480", :value "v-1480"}	produce failed: 500
+2026-03-21 11:23:22,409{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1483", :value "v-1483"}
+2026-03-21 11:23:22,417{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1483", :value "v-1483"}	produce failed: 500
+2026-03-21 11:23:22,422{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1486", :value "v-1486"}
+2026-03-21 11:23:22,427{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1486", :value "v-1486", :partition 2, :offset 33}
+2026-03-21 11:23:22,625{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1489", :value "v-1489"}
+2026-03-21 11:23:22,636{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1489", :value "v-1489", :partition 3, :offset 47}
+2026-03-21 11:23:22,803{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1492", :value "v-1492"}
+2026-03-21 11:23:22,813{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1492", :value "v-1492"}	produce failed: 500
+2026-03-21 11:23:22,861{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1495", :value "v-1495"}
+2026-03-21 11:23:22,869{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1495", :value "v-1495"}	produce failed: 500
+2026-03-21 11:23:23,041{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1498", :value "v-1498"}
+2026-03-21 11:23:23,052{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1498", :value "v-1498"}	produce failed: 500
+2026-03-21 11:23:23,182{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1501", :value "v-1501"}
+2026-03-21 11:23:23,193{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1501", :value "v-1501"}	produce failed: 500
+2026-03-21 11:23:23,233{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1504", :value "v-1504"}
+2026-03-21 11:23:23,242{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1504", :value "v-1504", :partition 3, :offset 48}
+2026-03-21 11:23:23,342{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1507", :value "v-1507"}
+2026-03-21 11:23:23,355{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1507", :value "v-1507", :partition 2, :offset 34}
+2026-03-21 11:23:23,379{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1510", :value "v-1510"}
+2026-03-21 11:23:23,386{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1510", :value "v-1510"}	produce failed: 500
+2026-03-21 11:23:23,392{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1513", :value "v-1513"}
+2026-03-21 11:23:23,396{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1513", :value "v-1513"}	produce failed: 500
+2026-03-21 11:23:23,434{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1516", :value "v-1516"}
+2026-03-21 11:23:23,439{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1516", :value "v-1516"}	produce failed: 500
+2026-03-21 11:23:23,439{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1518", :value "v-1518"}
+2026-03-21 11:23:23,442{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1518", :value "v-1518"}	produce failed: 500
+2026-03-21 11:23:23,505{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:23:23,505{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n3\")"
+2026-03-21 11:23:23,524{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1523", :value "v-1523"}
+2026-03-21 11:23:23,529{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1523", :value "v-1523", :partition 0, :offset 39}
+2026-03-21 11:23:23,715{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1526", :value "v-1526"}
+2026-03-21 11:23:23,728{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1526", :value "v-1526"}	produce failed: 500
+2026-03-21 11:23:23,789{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1529", :value "v-1529"}
+2026-03-21 11:23:23,802{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1529", :value "v-1529"}	produce failed: 500
+2026-03-21 11:23:23,890{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1532", :value "v-1532"}
+2026-03-21 11:23:23,902{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1532", :value "v-1532"}	produce failed: 500
+2026-03-21 11:23:23,965{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1535", :value "v-1535"}
+2026-03-21 11:23:23,976{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1535", :value "v-1535"}	produce failed: 500
+2026-03-21 11:23:24,136{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1538", :value "v-1538"}
+2026-03-21 11:23:24,144{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1538", :value "v-1538", :partition 0, :offset 40}
+2026-03-21 11:23:24,291{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1541", :value "v-1541"}
+2026-03-21 11:23:24,302{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1541", :value "v-1541", :partition 0, :offset 41}
+2026-03-21 11:23:24,458{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1544", :value "v-1544"}
+2026-03-21 11:23:24,471{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1544", :value "v-1544"}	produce failed: 500
+2026-03-21 11:23:24,524{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1547", :value "v-1547"}
+2026-03-21 11:23:24,530{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1547", :value "v-1547"}	produce failed: 500
+2026-03-21 11:23:24,532{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1550", :value "v-1550"}
+2026-03-21 11:23:24,536{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1550", :value "v-1550"}	produce failed: 500
+2026-03-21 11:23:24,697{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1553", :value "v-1553"}
+2026-03-21 11:23:24,708{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1553", :value "v-1553"}	produce failed: 500
+2026-03-21 11:23:24,873{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1556", :value "v-1556"}
+2026-03-21 11:23:24,883{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1556", :value "v-1556", :partition 0, :offset 42}
+2026-03-21 11:23:25,000{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1559", :value "v-1559"}
+2026-03-21 11:23:25,010{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1559", :value "v-1559", :partition 1, :offset 38}
+2026-03-21 11:23:25,065{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1562", :value "v-1562"}
+2026-03-21 11:23:25,074{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1562", :value "v-1562"}	produce failed: 500
+2026-03-21 11:23:25,208{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1565", :value "v-1565"}
+2026-03-21 11:23:25,215{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1565", :value "v-1565"}	produce failed: 500
+2026-03-21 11:23:25,283{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1568", :value "v-1568"}
+2026-03-21 11:23:25,288{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1568", :value "v-1568"}	produce failed: 500
+2026-03-21 11:23:25,297{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1571", :value "v-1571"}
+2026-03-21 11:23:25,302{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1571", :value "v-1571"}	produce failed: 500
+2026-03-21 11:23:25,328{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1574", :value "v-1574"}
+2026-03-21 11:23:25,333{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1574", :value "v-1574", :partition 0, :offset 43}
+2026-03-21 11:23:25,359{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1577", :value "v-1577"}
+2026-03-21 11:23:25,363{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1577", :value "v-1577", :partition 1, :offset 39}
+2026-03-21 11:23:25,541{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1580", :value "v-1580"}
+2026-03-21 11:23:25,552{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1580", :value "v-1580"}	produce failed: 500
+2026-03-21 11:23:25,717{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1583", :value "v-1583"}
+2026-03-21 11:23:25,728{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1583", :value "v-1583"}	produce failed: 500
+2026-03-21 11:23:25,909{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1586", :value "v-1586"}
+2026-03-21 11:23:25,919{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1586", :value "v-1586"}	produce failed: 500
+2026-03-21 11:23:25,974{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1589", :value "v-1589"}
+2026-03-21 11:23:25,987{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1589", :value "v-1589"}	produce failed: 500
+2026-03-21 11:23:26,142{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1592", :value "v-1592"}
+2026-03-21 11:23:26,152{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1592", :value "v-1592", :partition 0, :offset 44}
+2026-03-21 11:23:26,241{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1595", :value "v-1595"}
+2026-03-21 11:23:26,250{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1595", :value "v-1595", :partition 1, :offset 40}
+2026-03-21 11:23:26,251{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1598", :value "v-1598"}
+2026-03-21 11:23:26,259{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1598", :value "v-1598"}	produce failed: 500
+2026-03-21 11:23:26,449{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1601", :value "v-1601"}
+2026-03-21 11:23:26,460{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1601", :value "v-1601"}	produce failed: 500
+2026-03-21 11:23:26,500{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1604", :value "v-1604"}
+2026-03-21 11:23:26,503{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1604", :value "v-1604"}	produce failed: 500
+2026-03-21 11:23:26,576{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1607", :value "v-1607"}
+2026-03-21 11:23:26,583{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1607", :value "v-1607"}	produce failed: 500
+2026-03-21 11:23:26,708{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1610", :value "v-1610"}
+2026-03-21 11:23:26,719{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1610", :value "v-1610", :partition 3, :offset 49}
+2026-03-21 11:23:26,762{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1613", :value "v-1613"}
+2026-03-21 11:23:26,770{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1613", :value "v-1613", :partition 2, :offset 35}
+2026-03-21 11:23:26,923{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1616", :value "v-1616"}
+2026-03-21 11:23:26,933{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1616", :value "v-1616"}	produce failed: 500
+2026-03-21 11:23:27,049{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1619", :value "v-1619"}
+2026-03-21 11:23:27,060{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1619", :value "v-1619"}	produce failed: 500
+2026-03-21 11:23:27,205{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1622", :value "v-1622"}
+2026-03-21 11:23:27,218{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1622", :value "v-1622"}	produce failed: 500
+2026-03-21 11:23:27,339{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1625", :value "v-1625"}
+2026-03-21 11:23:27,343{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1625", :value "v-1625"}	produce failed: 500
+2026-03-21 11:23:27,347{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1628", :value "v-1628"}
+2026-03-21 11:23:27,351{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1628", :value "v-1628", :partition 0, :offset 45}
+2026-03-21 11:23:27,418{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1631", :value "v-1631"}
+2026-03-21 11:23:27,424{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1631", :value "v-1631", :partition 2, :offset 36}
+2026-03-21 11:23:27,614{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1634", :value "v-1634"}
+2026-03-21 11:23:27,626{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1634", :value "v-1634"}	produce failed: 500
+2026-03-21 11:23:27,761{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1637", :value "v-1637"}
+2026-03-21 11:23:27,772{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1637", :value "v-1637"}	produce failed: 500
+2026-03-21 11:23:27,867{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1640", :value "v-1640"}
+2026-03-21 11:23:27,877{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1640", :value "v-1640"}	produce failed: 500
+2026-03-21 11:23:28,000{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1643", :value "v-1643"}
+2026-03-21 11:23:28,010{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1643", :value "v-1643"}	produce failed: 500
+2026-03-21 11:23:28,193{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1646", :value "v-1646"}
+2026-03-21 11:23:28,202{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1646", :value "v-1646", :partition 0, :offset 46}
+2026-03-21 11:23:28,348{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1649", :value "v-1649"}
+2026-03-21 11:23:28,359{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1649", :value "v-1649", :partition 1, :offset 41}
+2026-03-21 11:23:28,513{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1652", :value "v-1652"}
+2026-03-21 11:23:28,521{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1652", :value "v-1652"}	produce failed: 500
+2026-03-21 11:23:28,599{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1655", :value "v-1655"}
+2026-03-21 11:23:28,605{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1655", :value "v-1655"}	produce failed: 500
+2026-03-21 11:23:28,772{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1658", :value "v-1658"}
+2026-03-21 11:23:28,783{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1658", :value "v-1658"}	produce failed: 500
+2026-03-21 11:23:28,924{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1661", :value "v-1661"}
+2026-03-21 11:23:28,934{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1661", :value "v-1661"}	produce failed: 500
+2026-03-21 11:23:28,943{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1664", :value "v-1664"}
+2026-03-21 11:23:28,950{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1664", :value "v-1664", :partition 0, :offset 47}
+2026-03-21 11:23:29,013{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1667", :value "v-1667"}
+2026-03-21 11:23:29,022{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1667", :value "v-1667", :partition 1, :offset 42}
+2026-03-21 11:23:29,208{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1670", :value "v-1670"}
+2026-03-21 11:23:29,219{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1670", :value "v-1670"}	produce failed: 500
+2026-03-21 11:23:29,400{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1673", :value "v-1673"}
+2026-03-21 11:23:29,411{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1673", :value "v-1673"}	produce failed: 500
+2026-03-21 11:23:29,575{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1676", :value "v-1676"}
+2026-03-21 11:23:29,585{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1676", :value "v-1676"}	produce failed: 500
+2026-03-21 11:23:29,641{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1679", :value "v-1679"}
+2026-03-21 11:23:29,651{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1679", :value "v-1679"}	produce failed: 500
+2026-03-21 11:23:29,800{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1682", :value "v-1682"}
+2026-03-21 11:23:29,810{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1682", :value "v-1682", :partition 0, :offset 48}
+2026-03-21 11:23:29,858{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1685", :value "v-1685"}
+2026-03-21 11:23:29,866{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1685", :value "v-1685", :partition 1, :offset 43}
+2026-03-21 11:23:29,996{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1688", :value "v-1688"}
+2026-03-21 11:23:30,006{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1688", :value "v-1688"}	produce failed: 500
+2026-03-21 11:23:30,049{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1691", :value "v-1691"}
+2026-03-21 11:23:30,058{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1691", :value "v-1691"}	produce failed: 500
+2026-03-21 11:23:30,131{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1694", :value "v-1694"}
+2026-03-21 11:23:30,131{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1695", :value "v-1695"}
+2026-03-21 11:23:30,142{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1694", :value "v-1694"}	produce failed: 500
+2026-03-21 11:23:30,144{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1695", :value "v-1695"}	produce failed: 500
+2026-03-21 11:23:30,194{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1699", :value "v-1699"}
+2026-03-21 11:23:30,203{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1699", :value "v-1699", :partition 0, :offset 49}
+2026-03-21 11:23:30,275{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1702", :value "v-1702"}
+2026-03-21 11:23:30,284{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1702", :value "v-1702", :partition 3, :offset 50}
+2026-03-21 11:23:30,320{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1707", :value "v-1707"}
+2026-03-21 11:23:30,327{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1707", :value "v-1707"}	produce failed: 500
+2026-03-21 11:23:30,421{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1710", :value "v-1710"}
+2026-03-21 11:23:30,431{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1710", :value "v-1710"}	produce failed: 500
+2026-03-21 11:23:30,487{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1713", :value "v-1713"}
+2026-03-21 11:23:30,496{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1713", :value "v-1713"}	produce failed: 500
+2026-03-21 11:23:30,656{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1716", :value "v-1716"}
+2026-03-21 11:23:30,667{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1716", :value "v-1716", :partition 2, :offset 37}
+2026-03-21 11:23:30,741{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1719", :value "v-1719"}
+2026-03-21 11:23:30,750{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1719", :value "v-1719", :partition 3, :offset 51}
+2026-03-21 11:23:30,821{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1722", :value "v-1722"}
+2026-03-21 11:23:30,831{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1722", :value "v-1722"}	produce failed: 500
+2026-03-21 11:23:30,893{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1725", :value "v-1725"}
+2026-03-21 11:23:30,900{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1725", :value "v-1725"}	produce failed: 500
+2026-03-21 11:23:31,070{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1728", :value "v-1728"}
+2026-03-21 11:23:31,081{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1728", :value "v-1728"}	produce failed: 500
+2026-03-21 11:23:31,179{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1731", :value "v-1731"}
+2026-03-21 11:23:31,191{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1731", :value "v-1731"}	produce failed: 500
+2026-03-21 11:23:31,197{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1734", :value "v-1734"}
+2026-03-21 11:23:31,203{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1734", :value "v-1734", :partition 2, :offset 38}
+2026-03-21 11:23:31,251{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1737", :value "v-1737"}
+2026-03-21 11:23:31,256{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1737", :value "v-1737", :partition 3, :offset 52}
+2026-03-21 11:23:31,305{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1740", :value "v-1740"}
+2026-03-21 11:23:31,311{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1740", :value "v-1740"}	produce failed: 500
+2026-03-21 11:23:31,378{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1743", :value "v-1743"}
+2026-03-21 11:23:31,388{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1743", :value "v-1743"}	produce failed: 500
+2026-03-21 11:23:31,458{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1746", :value "v-1746"}
+2026-03-21 11:23:31,467{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1746", :value "v-1746"}	produce failed: 500
+2026-03-21 11:23:31,471{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1749", :value "v-1749"}
+2026-03-21 11:23:31,476{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1749", :value "v-1749"}	produce failed: 500
+2026-03-21 11:23:31,667{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1752", :value "v-1752"}
+2026-03-21 11:23:31,678{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1752", :value "v-1752", :partition 2, :offset 39}
+2026-03-21 11:23:31,794{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:invoke	:produce	{:key "k-1755", :value "v-1755"}
+2026-03-21 11:23:31,808{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:ok	:produce	{:key "k-1755", :value "v-1755", :partition 3, :offset 53}
+2026-03-21 11:23:31,937{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-1758", :value "v-1758"}
+2026-03-21 11:23:31,949{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-1758", :value "v-1758"}	produce failed: 500
+2026-03-21 11:23:31,977{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-1761", :value "v-1761"}
+2026-03-21 11:23:31,985{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-1761", :value "v-1761"}	produce failed: 500
+2026-03-21 11:23:32,129{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-1764", :value "v-1764"}
+2026-03-21 11:23:32,138{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-1764", :value "v-1764"}	produce failed: 500
+2026-03-21 11:23:32,311{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-1767", :value "v-1767"}
+2026-03-21 11:23:32,314{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:fail	:produce	{:key "k-1767", :value "v-1767"}	produce failed: 500
+2026-03-21 11:23:50,367{GMT}	INFO	[jepsen test runner] jepsen.core: Snarfing log files
+2026-03-21 11:23:50,374{GMT}	INFO	[jepsen node n5] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:23:50,374{GMT}	INFO	[jepsen node n3] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:23:50,375{GMT}	INFO	[jepsen node n1] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:23:50,375{GMT}	INFO	[jepsen node n4] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:23:50,375{GMT}	INFO	[jepsen node n2] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:23:50,550{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Tearing down camu on n1
+2026-03-21 11:23:50,550{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Tearing down camu on n3
+2026-03-21 11:23:50,550{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Tearing down camu on n2
+2026-03-21 11:23:50,550{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Tearing down camu on n5
+2026-03-21 11:23:50,550{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Tearing down camu on n4
+2026-03-21 11:23:50,553{GMT}	INFO	[jepsen node n4] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:23:50,553{GMT}	INFO	[jepsen node n2] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:23:50,553{GMT}	INFO	[jepsen node n3] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:23:50,554{GMT}	INFO	[jepsen node n1] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:23:50,554{GMT}	INFO	[jepsen node n5] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:23:50,736{GMT}	WARN	[jepsen test runner] jepsen.core: Test crashed!
+clojure.lang.ExceptionInfo: Generator threw java.lang.NullPointerException - Cannot invoke "Object.getClass()" because "x" is null when asked for an operation. Generator:
+(nil
+ jepsen.generator.Synchronize{
+   :gen jepsen.generator.OnThreads{
+     :f {:element :nemesis},
+     :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515 0x77eb76f "jepsen.generator.context$make_thread_filter$lazy_filter__11515@77eb76f"],
+     :gen jepsen.generator.EachThread{
+       :fresh-gen jepsen.generator.Limit{
+         :remaining 1,
+         :gen #object[jepsen.camu$camu_test$fn__2872 0x5c815478 "jepsen.camu$camu_test$fn__2872@5c815478"]},
+       :context-filters #<Promise@be56353: 
+                          {0
+                           #object[jepsen.generator.context$make_thread_filter$by_bitset__11517 0x2fe12ec3 "jepsen.generator.context$make_thread_filter$by_bitset__11517@2fe12ec3"],
+                           1
+                           #object[jepsen.generator.context$make_thread_filter$by_bitset__11517 0x2199e1a4 "jepsen.generator.context$make_thread_filter$by_bitset__11517@2199e1a4"],
+                           2
+                           #object[jepsen.generator.context$make_thread_filter$by_bitset__11517 0x747b8f5c "jepsen.generator.context$make_thread_filter$by_bitset__11517@747b8f5c"],
+                           3
+                           #object[jepsen.generator.context$make_thread_filter$by_bitset__11517 0x3638a852 "jepsen.generator.context$make_thread_filter$by_bitset__11517@3638a852"],
+                           4
+                           #object[jepsen.generator.context$make_thread_filter$by_bitset__11517 0x49976824 "jepsen.generator.context$make_thread_filter$by_bitset__11517@49976824"]}>,
+       :gens {}}}})
+
+Context:
+
+{:time 78099838709,
+ :next-thread-index 0,
+ :translation-table
+ {:int-thread-count 5,
+  :named-threads [:nemesis],
+  :named-thread->index {:nemesis 0}},
+ :all-threads #{0 1 2 3 4 5},
+ :free-threads #{0 1 2 3 4 5},
+ :thread-index->process [0 1 2 3 4 :nemesis],
+ :process->thread {0 0, 1 1, 2 2, 3 3, 4 4, :nemesis :nemesis},
+ :ext-map {}}
+
+	at slingshot.support$stack_trace.invoke(support.clj:201)
+	at jepsen.generator.FriendlyExceptions.op(generator.clj:708)
+	at jepsen.generator.Validate.op(generator.clj:647)
+	at jepsen.generator.interpreter$run_BANG_.invokeStatic(interpreter.clj:262)
+	at jepsen.generator.interpreter$run_BANG_.invoke(interpreter.clj:184)
+	at jepsen.core$run_case_BANG_.invokeStatic(core.clj:213)
+	at jepsen.core$run_case_BANG_.invoke(core.clj:208)
+	at jepsen.core$run_BANG_$fn__13309$fn__13312$fn__13317.invoke(core.clj:402)
+	at jepsen.core$run_BANG_$fn__13309$fn__13312.invoke(core.clj:400)
+	at jepsen.core$run_BANG_$fn__13309.invoke(core.clj:398)
+	at jepsen.core$run_BANG_.invokeStatic(core.clj:396)
+	at jepsen.core$run_BANG_.invoke(core.clj:322)
+	at jepsen.cli$single_test_cmd$fn__14199.invoke(cli.clj:396)
+	at jepsen.cli$run_BANG_.invokeStatic(cli.clj:329)
+	at jepsen.cli$run_BANG_.invoke(cli.clj:258)
+	at jepsen.camu$_main.invokeStatic(camu.clj:92)
+	at jepsen.camu$_main.doInvoke(camu.clj:89)
+	at clojure.lang.RestFn.invoke(RestFn.java:1289)
+	at clojure.lang.Var.invoke(Var.java:506)
+	at user$eval140.invokeStatic(form-init5090369908200680795.clj:1)
+	at user$eval140.invoke(form-init5090369908200680795.clj:1)
+	at clojure.lang.Compiler.eval(Compiler.java:7194)
+	at clojure.lang.Compiler.eval(Compiler.java:7184)
+	at clojure.lang.Compiler.load(Compiler.java:7653)
+	at clojure.lang.Compiler.loadFile(Compiler.java:7591)
+	at clojure.main$load_script.invokeStatic(main.clj:475)
+	at clojure.main$init_opt.invokeStatic(main.clj:477)
+	at clojure.main$init_opt.invoke(main.clj:477)
+	at clojure.main$initialize.invokeStatic(main.clj:508)
+	at clojure.main$null_opt.invokeStatic(main.clj:542)
+	at clojure.main$null_opt.invoke(main.clj:539)
+	at clojure.main$main.invokeStatic(main.clj:664)
+	at clojure.main$main.doInvoke(main.clj:616)
+	at clojure.lang.RestFn.applyTo(RestFn.java:137)
+	at clojure.lang.Var.applyTo(Var.java:705)
+	at clojure.main.main(main.java:40)
+Caused by: java.lang.NullPointerException: Cannot invoke "Object.getClass()" because "x" is null
+	at clojure.lang.Numbers.ops(Numbers.java:1095)
+	at clojure.lang.Numbers.remainder(Numbers.java:205)
+	at clojure.core$mod.invokeStatic(core.clj:3572)
+	at clojure.core$mod.invoke(core.clj:3567)
+	at jepsen.camu$camu_test$fn__2872.invoke(camu.clj:71)
+	at jepsen.generator.Fn.op(generator.clj:551)
+	at jepsen.generator$fn__11615.invokeStatic(generator.clj:577)
+	at jepsen.generator$fn__11615.invoke(generator.clj:561)
+	at jepsen.generator$fn__11546$G__11524__11555.invoke(generator.clj:408)
+	at jepsen.generator.Limit.op(generator.clj:1193)
+	at jepsen.generator.EachThread$fn__11982.invoke(generator.clj:994)
+	at clojure.core$keep$fn__8649.invoke(core.clj:7409)
+	at clojure.lang.LazySeq.sval(LazySeq.java:42)
+	at clojure.lang.LazySeq.seq(LazySeq.java:51)
+	at clojure.lang.RT.seq(RT.java:535)
+	at clojure.core$seq__5467.invokeStatic(core.clj:139)
+	at clojure.core.protocols$seq_reduce.invokeStatic(protocols.clj:24)
+	at clojure.core.protocols$fn__8236.invokeStatic(protocols.clj:75)
+	at clojure.core.protocols$fn__8236.invoke(protocols.clj:75)
+	at clojure.core.protocols$fn__8178$G__8173__8191.invoke(protocols.clj:13)
+	at clojure.core$reduce.invokeStatic(core.clj:6886)
+	at clojure.core$reduce.invoke(core.clj:6868)
+	at jepsen.generator.EachThread.op(generator.clj:998)
+	at jepsen.generator.OnThreads.op(generator.clj:876)
+	at jepsen.generator.Synchronize.op(generator.clj:1440)
+	at jepsen.generator$fn__11623.invokeStatic(generator.clj:595)
+	at jepsen.generator$fn__11623.invoke(generator.clj:561)
+	at jepsen.generator$fn__11546$G__11524__11555.invoke(generator.clj:408)
+	at jepsen.generator.FriendlyExceptions.op(generator.clj:705)
+	... 34 common frames omitted

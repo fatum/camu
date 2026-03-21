@@ -1,0 +1,351 @@
+2026-03-21 11:12:24,075{GMT}	INFO	[jepsen test runner] jepsen.core: Command line:
+lein run test --nodes n1,n2,n3,n4,n5 --ssh-private-key /root/.ssh/id_rsa --time-limit 60 --s3-endpoint http://minio:9000 --camu-binary /jepsen/camu/camu --faults kill
+2026-03-21 11:12:24,117{GMT}	INFO	[jepsen test runner] jepsen.core: Running test:
+{:remote
+ #jepsen.control.retry.Remote{:remote #jepsen.control.scp.Remote{:cmd-remote #jepsen.control.sshj.SSHJRemote{:concurrency-limit 6,
+                                                                                                             :conn-spec nil,
+                                                                                                             :client nil,
+                                                                                                             :semaphore nil},
+                                                                 :conn-spec nil},
+                              :conn nil}
+ :faults #{:kill}
+ :ssh-private-key "/root/.ssh/id_rsa"
+ :concurrency 5
+ :camu-binary "/jepsen/camu/camu"
+ :db
+ #object[jepsen.camu.db$db$reify__2857
+         "0x6aa7d7a0"
+         "jepsen.camu.db$db$reify__2857@6aa7d7a0"]
+ :leave-db-running? false
+ :name "camu"
+ :logging-json? false
+ :start-time
+ #object[org.joda.time.DateTime "0x4c3125ff" "2026-03-21T11:12:24.057Z"]
+ :net
+ #object[jepsen.net$reify__12635 "0xd2ca3a9" "jepsen.net$reify__12635@d2ca3a9"]
+ :client #jepsen.camu.client.CamuClient{:node nil, :topic "jepsen-test"}
+ :barrier
+ #object[java.util.concurrent.CyclicBarrier
+         "0x2b26d289"
+         "java.util.concurrent.CyclicBarrier@2b26d289"]
+ :ssh
+ {:dummy? false,
+  :username "root",
+  :password "root",
+  :strict-host-key-checking false,
+  :private-key-path "/root/.ssh/id_rsa"}
+ :checker
+ #object[jepsen.checker$compose$reify__10552
+         "0x7f680a9a"
+         "jepsen.checker$compose$reify__10552@7f680a9a"]
+ :argv
+ ("test"
+  "--nodes"
+  "n1,n2,n3,n4,n5"
+  "--ssh-private-key"
+  "/root/.ssh/id_rsa"
+  "--time-limit"
+  "60"
+  "--s3-endpoint"
+  "http://minio:9000"
+  "--camu-binary"
+  "/jepsen/camu/camu"
+  "--faults"
+  "kill")
+ :s3-endpoint "http://minio:9000"
+ :nemesis
+ (jepsen.nemesis.MapCompose
+  {:nemeses {{:kill :start} #unprintable "jepsen.nemesis$node_start_stopper$reify__12928@3a33d655",
+             {:kill :stop} #unprintable "jepsen.nemesis$node_start_stopper$reify__12928@526a1b51"}})
+ :http-port 8080
+ :nodes ["n1" "n2" "n3" "n4" "n5"]
+ :test-count 1
+ :generator
+ #object[jepsen.util.Forgettable
+         "0x3b9d85c2"
+         ((jepsen.generator.Synchronize
+           {:gen (jepsen.generator.TimeLimit
+                  {:limit 60000000000,
+                   :cutoff nil,
+                   :gen (jepsen.generator.Any
+                         {:gens [(jepsen.generator.OnThreads
+                                  {:f #{:nemesis},
+                                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                           "0x4c9235c0"
+                                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@4c9235c0"],
+                                   :gen ((jepsen.generator.Synchronize
+                                          {:gen (jepsen.generator.TimeLimit
+                                                 {:limit 60000000000,
+                                                  :cutoff nil,
+                                                  :gen (jepsen.generator.Stagger
+                                                        {:dt 10000000000,
+                                                         :next-time nil,
+                                                         :gen (jepsen.generator.Mix
+                                                               {:i 0,
+                                                                :gens [(jepsen.generator.Cycle
+                                                                        {:remaining -1,
+                                                                         :original-gen [{:type :sleep,
+                                                                                         :value 5}
+                                                                                        {:type :info,
+                                                                                         :f :kill,
+                                                                                         :value :start}
+                                                                                        {:type :sleep,
+                                                                                         :value 10}
+                                                                                        {:type :info,
+                                                                                         :f :kill,
+                                                                                         :value :stop}],
+                                                                         :gen [{:type :sleep,
+                                                                                :value 5}
+                                                                               {:type :info,
+                                                                                :f :kill,
+                                                                                :value :start}
+                                                                               {:type :sleep,
+                                                                                :value 10}
+                                                                               {:type :info,
+                                                                                :f :kill,
+                                                                                :value :stop}]})]})})})})
+                                         (jepsen.generator.Synchronize
+                                          {:gen ((jepsen.generator.Synchronize
+                                                  {:gen (jepsen.generator.OnThreads
+                                                         {:f #{:nemesis},
+                                                          :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                                                  "0x1ae69abe"
+                                                                                  "jepsen.generator.context$make_thread_filter$lazy_filter__11515@1ae69abe"],
+                                                          :gen (jepsen.generator.Limit
+                                                                {:remaining 1,
+                                                                 :gen {:type :info,
+                                                                       :f :kill,
+                                                                       :value :stop}})})}))})
+                                         (jepsen.generator.Synchronize
+                                          {:gen {:type :sleep, :value 15}}))})
+                                 (jepsen.generator.OnThreads
+                                  {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                                           "0x557f0a39"
+                                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@557f0a39"],
+                                   :gen (jepsen.generator.Stagger
+                                         {:dt 200000000,
+                                          :next-time nil,
+                                          :gen #unprintable "jepsen.camu$produce_generator$reify__2866@50508ed3"})})]})})})
+          (jepsen.generator.Synchronize {:gen {:type :sleep, :value 15}})
+          (jepsen.generator.Synchronize
+           {:gen (jepsen.generator.OnThreads
+                  {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                           "0xd319d2c"
+                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@d319d2c"],
+                   :gen (jepsen.generator.EachThread
+                         {:fresh-gen ({:type :invoke,
+                                       :f :consume,
+                                       :value {:partition 0, :offset 0}}
+                                      {:type :invoke,
+                                       :f :consume,
+                                       :value {:partition 1, :offset 0}}
+                                      {:type :invoke,
+                                       :f :consume,
+                                       :value {:partition 2, :offset 0}}
+                                      {:type :invoke,
+                                       :f :consume,
+                                       :value {:partition 3, :offset 0}}),
+                          :context-filters #object[clojure.core$promise$reify__8591
+                                                   "0x23acd55e"
+                                                   {:status :pending, :val nil}],
+                          :gens {}})})}))]
+ :os
+ #object[jepsen.os$reify__13040 "0xeaf3dd0" "jepsen.os$reify__13040@eaf3dd0"]
+ :time-limit 60}
+
+2026-03-21 11:12:25,125{GMT}	INFO	[jepsen test runner] jepsen.db: Tearing down DB
+2026-03-21 11:12:25,125{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Tearing down camu on n1
+2026-03-21 11:12:25,125{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Tearing down camu on n2
+2026-03-21 11:12:25,126{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Tearing down camu on n5
+2026-03-21 11:12:25,126{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Tearing down camu on n3
+2026-03-21 11:12:25,126{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Tearing down camu on n4
+2026-03-21 11:12:25,224{GMT}	INFO	[jepsen test runner] jepsen.db: Setting up DB
+2026-03-21 11:12:25,224{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Setting up camu on n1
+2026-03-21 11:12:25,224{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Setting up camu on n2
+2026-03-21 11:12:25,225{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Setting up camu on n5
+2026-03-21 11:12:25,225{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Setting up camu on n4
+2026-03-21 11:12:25,225{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Setting up camu on n3
+2026-03-21 11:12:25,967{GMT}	INFO	[jepsen node n1] jepsen.control.util: Starting camu
+2026-03-21 11:12:25,968{GMT}	INFO	[jepsen node n5] jepsen.control.util: Starting camu
+2026-03-21 11:12:25,970{GMT}	INFO	[jepsen node n3] jepsen.control.util: Starting camu
+2026-03-21 11:12:25,973{GMT}	INFO	[jepsen node n4] jepsen.control.util: Starting camu
+2026-03-21 11:12:25,982{GMT}	INFO	[jepsen node n2] jepsen.control.util: Starting camu
+2026-03-21 11:12:26,071{GMT}	INFO	[jepsen test runner] jepsen.core: Relative time begins now
+2026-03-21 11:12:26,305{GMT}	INFO	[jepsen test runner] jepsen.core: Snarfing log files
+2026-03-21 11:12:26,311{GMT}	INFO	[jepsen node n2] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:12:26,311{GMT}	INFO	[jepsen node n5] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:12:26,311{GMT}	INFO	[jepsen node n1] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:12:26,311{GMT}	INFO	[jepsen node n3] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:12:26,311{GMT}	INFO	[jepsen node n4] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:12:26,482{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Tearing down camu on n1
+2026-03-21 11:12:26,482{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Tearing down camu on n3
+2026-03-21 11:12:26,482{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Tearing down camu on n2
+2026-03-21 11:12:26,482{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Tearing down camu on n4
+2026-03-21 11:12:26,482{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Tearing down camu on n5
+2026-03-21 11:12:26,485{GMT}	INFO	[jepsen node n2] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:12:26,485{GMT}	INFO	[jepsen node n3] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:12:26,485{GMT}	INFO	[jepsen node n5] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:12:26,485{GMT}	INFO	[jepsen node n1] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:12:26,485{GMT}	INFO	[jepsen node n4] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:12:26,681{GMT}	WARN	[jepsen test runner] jepsen.core: Test crashed!
+clojure.lang.ExceptionInfo: Generator threw java.lang.UnsupportedOperationException - nth not supported on this type: PersistentArrayMap when asked for an operation. Generator:
+(jepsen.generator.Synchronize{
+   :gen jepsen.generator.TimeLimit{
+     :limit 60000000000,
+     :cutoff nil,
+     :gen jepsen.generator.Any{
+       :gens [jepsen.generator.OnThreads{
+                :f #{:nemesis},
+                :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515 0x4c9235c0 "jepsen.generator.context$make_thread_filter$lazy_filter__11515@4c9235c0"],
+                :gen (jepsen.generator.Synchronize{
+                        :gen jepsen.generator.TimeLimit{
+                          :limit 60000000000,
+                          :cutoff nil,
+                          :gen jepsen.generator.Stagger{
+                            :dt 10000000000,
+                            :next-time nil,
+                            :gen jepsen.generator.Mix{
+                              :i 0,
+                              :gens [jepsen.generator.Cycle{
+                                       :remaining -1,
+                                       :original-gen
+                                       [{:type :sleep, :value 5}
+                                        {:type :info,
+                                         :f :kill,
+                                         :value :start}
+                                        {:type :sleep, :value 10}
+                                        {:type :info,
+                                         :f :kill,
+                                         :value :stop}],
+                                       :gen
+                                       [{:type :sleep, :value 5}
+                                        {:type :info,
+                                         :f :kill,
+                                         :value :start}
+                                        {:type :sleep, :value 10}
+                                        {:type :info,
+                                         :f :kill,
+                                         :value :stop}]}]}}}}
+                      jepsen.generator.Synchronize{
+                        :gen (jepsen.generator.Synchronize{
+                                :gen
+                                jepsen.generator.OnThreads{
+                                  :f #{:nemesis},
+                                  :context-filter
+                                  #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515 0x1ae69abe "jepsen.generator.context$make_thread_filter$lazy_filter__11515@1ae69abe"],
+                                  :gen
+                                  jepsen.generator.Limit{
+                                    :remaining 1,
+                                    :gen
+                                    {:type :info,
+                                     :f :kill,
+                                     :value :stop}}}})}
+                      jepsen.generator.Synchronize{
+                        :gen {:type :sleep, :value 15}})}
+              jepsen.generator.OnThreads{
+                :f {:element :nemesis},
+                :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515 0x557f0a39 "jepsen.generator.context$make_thread_filter$lazy_filter__11515@557f0a39"],
+                :gen jepsen.generator.Stagger{
+                  :dt 200000000,
+                  :next-time nil,
+                  :gen #object[jepsen.camu$produce_generator$reify__2866 0x50508ed3 "jepsen.camu$produce_generator$reify__2866@50508ed3"]
+}}]}}}
+ jepsen.generator.Synchronize{
+   :gen {:type :sleep, :value 15}}
+ jepsen.generator.Synchronize{
+   :gen jepsen.generator.OnThreads{
+     :f {:element :nemesis},
+     :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515 0xd319d2c "jepsen.generator.context$make_thread_filter$lazy_filter__11515@d319d2c"],
+     :gen jepsen.generator.EachThread{
+       :fresh-gen ({:type :invoke,
+                    :f :consume,
+                    :value {:partition 0, :offset 0}}
+                   {:type :invoke,
+                    :f :consume,
+                    :value {:partition 1, :offset 0}}
+                   {:type :invoke,
+                    :f :consume,
+                    :value {:partition 2, :offset 0}}
+                   {:type :invoke,
+                    :f :consume,
+                    :value {:partition 3, :offset 0}}),
+       :context-filters #<Promise@23acd55e: :not-delivered>,
+       :gens {}}}})
+
+Context:
+
+{:time 199601835,
+ :next-thread-index 0,
+ :translation-table
+ {:int-thread-count 5,
+  :named-threads [:nemesis],
+  :named-thread->index {:nemesis 0}},
+ :all-threads #{0 1 2 3 4 5},
+ :free-threads #{0 1 2 3 4 5},
+ :thread-index->process [0 1 2 3 4 :nemesis],
+ :process->thread {0 0, 1 1, 2 2, 3 3, 4 4, :nemesis :nemesis},
+ :ext-map {}}
+
+	at slingshot.support$stack_trace.invoke(support.clj:201)
+	at jepsen.generator.FriendlyExceptions.op(generator.clj:708)
+	at jepsen.generator.Validate.op(generator.clj:647)
+	at jepsen.generator.interpreter$run_BANG_.invokeStatic(interpreter.clj:262)
+	at jepsen.generator.interpreter$run_BANG_.invoke(interpreter.clj:184)
+	at jepsen.core$run_case_BANG_.invokeStatic(core.clj:213)
+	at jepsen.core$run_case_BANG_.invoke(core.clj:208)
+	at jepsen.core$run_BANG_$fn__13309$fn__13312$fn__13317.invoke(core.clj:402)
+	at jepsen.core$run_BANG_$fn__13309$fn__13312.invoke(core.clj:400)
+	at jepsen.core$run_BANG_$fn__13309.invoke(core.clj:398)
+	at jepsen.core$run_BANG_.invokeStatic(core.clj:396)
+	at jepsen.core$run_BANG_.invoke(core.clj:322)
+	at jepsen.cli$single_test_cmd$fn__14199.invoke(cli.clj:396)
+	at jepsen.cli$run_BANG_.invokeStatic(cli.clj:329)
+	at jepsen.cli$run_BANG_.invoke(cli.clj:258)
+	at jepsen.camu$_main.invokeStatic(camu.clj:89)
+	at jepsen.camu$_main.doInvoke(camu.clj:86)
+	at clojure.lang.RestFn.invoke(RestFn.java:1289)
+	at clojure.lang.Var.invoke(Var.java:506)
+	at user$eval140.invokeStatic(form-init16123620088661870118.clj:1)
+	at user$eval140.invoke(form-init16123620088661870118.clj:1)
+	at clojure.lang.Compiler.eval(Compiler.java:7194)
+	at clojure.lang.Compiler.eval(Compiler.java:7184)
+	at clojure.lang.Compiler.load(Compiler.java:7653)
+	at clojure.lang.Compiler.loadFile(Compiler.java:7591)
+	at clojure.main$load_script.invokeStatic(main.clj:475)
+	at clojure.main$init_opt.invokeStatic(main.clj:477)
+	at clojure.main$init_opt.invoke(main.clj:477)
+	at clojure.main$initialize.invokeStatic(main.clj:508)
+	at clojure.main$null_opt.invokeStatic(main.clj:542)
+	at clojure.main$null_opt.invoke(main.clj:539)
+	at clojure.main$main.invokeStatic(main.clj:664)
+	at clojure.main$main.doInvoke(main.clj:616)
+	at clojure.lang.RestFn.applyTo(RestFn.java:137)
+	at clojure.lang.Var.applyTo(Var.java:705)
+	at clojure.main.main(main.java:40)
+Caused by: java.lang.UnsupportedOperationException: nth not supported on this type: PersistentArrayMap
+	at clojure.lang.RT.nthFrom(RT.java:992)
+	at clojure.lang.RT.nth(RT.java:940)
+	at jepsen.generator.Stagger.op(generator.clj:1327)
+	at jepsen.generator.OnThreads.op(generator.clj:876)
+	at jepsen.generator.Any$fn__11940.invoke(generator.clj:947)
+	at clojure.core$map_indexed$mapi__8638$fn__8639.invoke(core.clj:7376)
+	at clojure.lang.LazySeq.sval(LazySeq.java:42)
+	at clojure.lang.LazySeq.seq(LazySeq.java:51)
+	at clojure.lang.RT.seq(RT.java:535)
+	at clojure.core$seq__5467.invokeStatic(core.clj:139)
+	at clojure.core.protocols$seq_reduce.invokeStatic(protocols.clj:24)
+	at clojure.core.protocols$fn__8236.invokeStatic(protocols.clj:75)
+	at clojure.core.protocols$fn__8236.invoke(protocols.clj:75)
+	at clojure.core.protocols$fn__8178$G__8173__8191.invoke(protocols.clj:13)
+	at clojure.core$reduce.invokeStatic(core.clj:6886)
+	at clojure.core$reduce.invoke(core.clj:6868)
+	at jepsen.generator.Any.op(generator.clj:951)
+	at jepsen.generator.TimeLimit.op(generator.clj:1301)
+	at jepsen.generator.Synchronize.op(generator.clj:1440)
+	at jepsen.generator$fn__11623.invokeStatic(generator.clj:595)
+	at jepsen.generator$fn__11623.invoke(generator.clj:561)
+	at jepsen.generator$fn__11546$G__11524__11555.invoke(generator.clj:408)
+	at jepsen.generator.FriendlyExceptions.op(generator.clj:705)
+	... 34 common frames omitted

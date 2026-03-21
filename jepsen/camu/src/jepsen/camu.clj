@@ -48,16 +48,13 @@
             (consume-gen)]))
 
 (defn drain-gen
-  "Returns a generator that drains all partitions (0..3).
-   Each thread drains partition = (mod process partitions)."
+  "Returns a generator that drains all 4 partitions."
   []
-  (gen/each-thread
-   (gen/once
-    (fn [test ctx]
-      {:type  :invoke
-       :f     :drain
-       :value {:partition (mod (:process ctx) partitions)
-               :offset   0}}))))
+  (map (fn [p]
+         {:type  :invoke
+          :f     :drain
+          :value {:partition p :offset 0}})
+       (range partitions)))
 
 (defn camu-test
   "Constructs a Jepsen test map for camu."
@@ -81,32 +78,27 @@
                          :recovery-time       (camu-checker/recovery-time-checker)
                          :stats               (checker/stats)})
             :generator
-            (let [;; Mixed workload: 70% produce, 30% consume
-                  workload (mixed-workload-gen counter)
-                  ;; Nemesis: cycle of start/sleep/stop/sleep per fault
-                  nem-gen  (->> (gen/mix
-                                 (mapv (fn [fault]
-                                         (gen/cycle
-                                          [{:type :info :f fault :value :start}
-                                           (gen/sleep 10)
-                                           {:type :info :f fault :value :stop}
-                                           (gen/sleep 5)]))
-                                       faults)))]
-              (gen/phases
-               ;; Phase 1: clients produce+consume, nemesis injects faults
-               (->> (gen/any workload nem-gen)
-                    (gen/time-limit (:time-limit opts 300)))
-               ;; Phase 2: stop all nemeses, let cluster recover
-               (gen/log "Stopping all nemeses...")
-               (apply gen/phases
-                      (for [fault faults]
-                        (gen/nemesis
-                         (gen/once {:type :info :f fault :value :stop}))))
-               (gen/log "Recovering — waiting 15s for cluster stabilization...")
-               (gen/sleep 15)
-               ;; Phase 3: drain ALL partitions from ALL nodes
-               (gen/log "Draining all partitions for verification...")
-               (gen/clients (drain-gen))))})))
+            (gen/phases
+             ;; Phase 1: clients produce+consume while nemesis injects faults
+             (gen/time-limit
+              (:time-limit opts 300)
+              (gen/nemesis
+               (gen/cycle [(gen/sleep 5)
+                           (gen/once {:type :info :f :kill :value :start})
+                           (gen/sleep 15)
+                           (gen/once {:type :info :f :kill :value :stop})
+                           (gen/sleep 5)])
+               (gen/clients
+                (->> (mixed-workload-gen counter)
+                     (gen/stagger 1/10)))))
+             ;; Phase 2: stop nemesis, let cluster recover
+             (gen/log "Stopping nemesis...")
+             (gen/nemesis (gen/once {:type :info :f :kill :value :stop}))
+             (gen/log "Recovering — waiting 20s...")
+             (gen/sleep 20)
+             ;; Phase 3: drain ALL partitions
+             (gen/log "Draining all partitions for verification...")
+             (gen/clients (drain-gen)))})))
 
 (def cli-opts
   "Additional CLI options for camu tests."

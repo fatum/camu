@@ -1,0 +1,298 @@
+{:index 0, :time 234557157, :type :info, :process 0, :f :kill, :value :start}
+{:index 1, :time 235855800, :type :invoke, :process 1, :f :produce, :value {:key "k-2", :value "v-2"}}
+{:index 2, :time 236100762, :type :invoke, :process 2, :f :produce, :value {:key "k-3", :value "v-3"}}
+{:index 3, :time 236166263, :type :invoke, :process 3, :f :produce, :value {:key "k-4", :value "v-4"}}
+{:index 4, :time 236239723, :type :invoke, :process 4, :f :produce, :value {:key "k-5", :value "v-5"}}
+{:index 5, :time 237113818, :type :info, :process 0, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 6, :time 237233487, :type :invoke, :process 5, :f :produce, :value {:key "k-8", :value "v-8"}}
+{:index 7, :time 245619814, :type :fail, :process 1, :f :produce, :value {:key "k-2", :value "v-2"}, :error :misdirected}
+{:index 8, :time 245664856, :type :info, :process 1, :f :kill, :value :stop}
+{:index 9, :time 246496826, :type :info, :process 1, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 10, :time 247486382, :type :fail, :process 3, :f :produce, :value {:key "k-4", :value "v-4"}, :error :misdirected}
+{:index 11, :time 247511049, :type :info, :process 3, :f :kill, :value :start}
+{:index 12, :time 247832512, :type :ok, :process 4, :f :produce, :value {:key "k-5", :value "v-5", :partition 0, :offset 0}}
+{:index 13, :time 247940180, :type :info, :process 3, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 14, :time 247960722, :type :info, :process 8, :f :kill, :value :stop}
+{:index 15, :time 248126891, :type :info, :process 8, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 16, :time 248465229, :type :fail, :process 5, :f :produce, :value {:key "k-8", :value "v-8"}, :error :misdirected}
+{:index 17, :time 248501521, :type :invoke, :process 5, :f :produce, :value {:key "k-28", :value "v-28"}}
+{:index 18, :time 251664774, :type :fail, :process 2, :f :produce, :value {:key "k-3", :value "v-3"}, :error :misdirected}
+{:index 19, :time 251725192, :type :info, :process 2, :f :kill, :value :start}
+{:index 20, :time 252252366, :type :info, :process 2, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 21, :time 254578149, :type :fail, :process 5, :f :produce, :value {:key "k-28", :value "v-28"}, :error :misdirected}
+{:index 22, :time 254668067, :type :invoke, :process 5, :f :produce, :value {:key "k-37", :value "v-37"}}
+{:index 23, :time 259386092, :type :fail, :process 5, :f :produce, :value {:key "k-37", :value "v-37"}, :error :misdirected}
+{:index 24, :time 259470427, :type :info, :process 5, :f :kill, :value :stop}
+{:index 25, :time 259862432, :type :info, :process 5, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 26, :time 5249092207, :type :invoke, :process 6, :f :produce, :value {:key "k-3074", :value "v-3074"}}
+{:index 27, :time 5251912080, :type :invoke, :process 13, :f :produce, :value {:key "k-3075", :value "v-3075"}}
+{:index 28, :time 5260909124, :type :invoke, :process 10, :f :produce, :value {:key "k-3083", :value "v-3083"}}
+{:index 29, :time 5276952268, :type :fail, :process 13, :f :produce, :value {:key "k-3075", :value "v-3075"}, :error :misdirected}
+{:index 30, :time 5277113395, :type :fail, :process 6, :f :produce, :value {:key "k-3074", :value "v-3074"}, :error :misdirected}
+{:index 31, :time 5277143271, :type :invoke, :process 6, :f :produce, :value {:key "k-3095", :value "v-3095"}}
+{:index 32, :time 5277383357, :type :info, :process 13, :f :kill, :value :start}
+{:index 33, :time 5279159841, :type :info, :process 13, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 34, :time 5279351135, :type :invoke, :process 18, :f :produce, :value {:key "k-3099", :value "v-3099"}}
+{:index 35, :time 5291236345, :type :fail, :process 6, :f :produce, :value {:key "k-3095", :value "v-3095"}, :error :misdirected}
+{:index 36, :time 5291321305, :type :fail, :process 18, :f :produce, :value {:key "k-3099", :value "v-3099"}, :error :misdirected}
+{:index 37, :time 5291470515, :type :info, :process 18, :f :kill, :value :stop}
+{:index 38, :time 5292172609, :type :info, :process 18, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 39, :time 5292271152, :type :invoke, :process 23, :f :produce, :value {:key "k-3112", :value "v-3112"}}
+{:index 40, :time 5306307476, :type :fail, :process 10, :f :produce, :value {:key "k-3083", :value "v-3083"}, :error :misdirected}
+{:index 41, :time 5306360101, :type :invoke, :process 10, :f :produce, :value {:key "k-3124", :value "v-3124"}}
+{:index 42, :time 5313567120, :type :fail, :process 10, :f :produce, :value {:key "k-3124", :value "v-3124"}, :error :misdirected}
+{:index 43, :time 5318918821, :type :fail, :process 23, :f :produce, :value {:key "k-3112", :value "v-3112"}, :error :misdirected}
+{:index 44, :time 5318950196, :type :invoke, :process 23, :f :produce, :value {:key "k-3136", :value "v-3136"}}
+{:index 45, :time 5324710361, :type :fail, :process 23, :f :produce, :value {:key "k-3136", :value "v-3136"}, :error :misdirected}
+{:index 46, :time 5324740320, :type :invoke, :process 23, :f :produce, :value {:key "k-3142", :value "v-3142"}}
+{:index 47, :time 5329210717, :type :fail, :process 23, :f :produce, :value {:key "k-3142", :value "v-3142"}, :error :misdirected}
+{:index 48, :time 5329235384, :type :invoke, :process 23, :f :produce, :value {:key "k-3147", :value "v-3147"}}
+{:index 49, :time 5333573029, :type :fail, :process 23, :f :produce, :value {:key "k-3147", :value "v-3147"}, :error :misdirected}
+{:index 50, :time 5333606696, :type :info, :process 23, :f :kill, :value :start}
+{:index 51, :time 5333781240, :type :info, :process 23, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 52, :time 5333811532, :type :invoke, :process 28, :f :produce, :value {:key "k-3154", :value "v-3154"}}
+{:index 53, :time 5337369707, :type :fail, :process 28, :f :produce, :value {:key "k-3154", :value "v-3154"}, :error :misdirected}
+{:index 54, :time 5337395499, :type :invoke, :process 28, :f :produce, :value {:key "k-3159", :value "v-3159"}}
+{:index 55, :time 5341018092, :type :fail, :process 28, :f :produce, :value {:key "k-3159", :value "v-3159"}, :error :misdirected}
+{:index 56, :time 10241707487, :type :info, :process :nemesis, :f :kill, :value :stop}
+{:index 57, :time 10255775770, :type :invoke, :process 4, :f :produce, :value {:key "k-6137", :value "v-6137"}}
+{:index 58, :time 10258280722, :type :invoke, :process 7, :f :produce, :value {:key "k-6140", :value "v-6140"}}
+{:index 59, :time 10268739412, :type :ok, :process 4, :f :produce, :value {:key "k-6137", :value "v-6137", :partition 2, :offset 0}}
+{:index 60, :time 10269010707, :type :invoke, :process 4, :f :produce, :value {:key "k-6149", :value "v-6149"}}
+{:index 61, :time 10277198365, :type :ok, :process 4, :f :produce, :value {:key "k-6149", :value "v-6149", :partition 3, :offset 0}}
+{:index 62, :time 10277313700, :type :invoke, :process 4, :f :produce, :value {:key "k-6157", :value "v-6157"}}
+{:index 63, :time 10277739623, :type :fail, :process 7, :f :produce, :value {:key "k-6140", :value "v-6140"}, :error :misdirected}
+{:index 64, :time 10281842722, :type :ok, :process 4, :f :produce, :value {:key "k-6157", :value "v-6157", :partition 0, :offset 1}}
+{:index 65, :time 10281907848, :type :info, :process 4, :f :kill, :value :start}
+{:index 66, :time 10282277562, :type :info, :process 4, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 67, :time 10282350438, :type :invoke, :process 9, :f :produce, :value {:key "k-6165", :value "v-6165"}}
+{:index 68, :time 10286013615, :type :ok, :process 9, :f :produce, :value {:key "k-6165", :value "v-6165", :partition 1, :offset 0}}
+{:index 69, :time 10286048074, :type :invoke, :process 9, :f :produce, :value {:key "k-6169", :value "v-6169"}}
+{:index 70, :time 10289187576, :type :ok, :process 9, :f :produce, :value {:key "k-6169", :value "v-6169", :partition 1, :offset 1}}
+{:index 71, :time 10323920985, :type :info, :process 10, :f :kill, :value :stop}
+{:index 72, :time 10324163114, :type :info, :process 10, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 73, :time 10359092859, :type :info, :process :nemesis, :f :kill, :value {"n1" [:restarted "n1"]}}
+{:index 74, :time 10359143443, :type :invoke, :process :nemesis, :f :produce, :value {:key "k-6221", :value "v-6221"}}
+{:index 75, :time 10361365141, :type :info, :process :nemesis, :f :produce, :value {:key "k-6221", :value "v-6221"}, :exception {:via [{:type java.lang.IllegalArgumentException, :message "no nemesis can handle :produce", :at [jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365]}], :trace [[jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365] [jepsen.nemesis.Validate invoke_BANG_ "nemesis.clj" 63] [jepsen.generator.interpreter.NemesisWorker invoke_BANG_ "interpreter.clj" 77] [jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147 invoke "interpreter.clj" 140] [jepsen.generator.interpreter$spawn_worker$fn__13146 invoke "interpreter.clj" 123] [clojure.core$binding_conveyor_fn$fn__5823 invoke "core.clj" 2047] [clojure.lang.AFn call "AFn.java" 18] [java.util.concurrent.FutureTask run "FutureTask.java" 317] [java.util.concurrent.ThreadPoolExecutor runWorker "ThreadPoolExecutor.java" 1144] [java.util.concurrent.ThreadPoolExecutor$Worker run "ThreadPoolExecutor.java" 642] [java.lang.Thread run "Thread.java" 1583]], :cause "no nemesis can handle :produce"}, :error "indeterminate: no nemesis can handle :produce"}
+{:index 76, :time 10361405058, :type :info, :process :nemesis, :f :kill, :value :start}
+{:index 77, :time 10362207528, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 78, :time 15287646398, :type :invoke, :process 7, :f :produce, :value {:key "k-9217", :value "v-9217"}}
+{:index 79, :time 15291910875, :type :invoke, :process 6, :f :produce, :value {:key "k-9221", :value "v-9221"}}
+{:index 80, :time 15315113621, :type :fail, :process 6, :f :produce, :value {:key "k-9221", :value "v-9221"}, :error :misdirected}
+{:index 81, :time 15315211289, :type :invoke, :process 6, :f :produce, :value {:key "k-9235", :value "v-9235"}}
+{:index 82, :time 15324707007, :type :info, :process 15, :f :kill, :value :stop}
+{:index 83, :time 15325518060, :type :info, :process 15, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 84, :time 15325566060, :type :invoke, :process 20, :f :produce, :value {:key "k-9245", :value "v-9245"}}
+{:index 85, :time 15337178058, :type :fail, :process 20, :f :produce, :value {:key "k-9245", :value "v-9245"}, :error :misdirected}
+{:index 86, :time 15337249518, :type :fail, :process 7, :f :produce, :value {:key "k-9217", :value "v-9217"}, :error :misdirected}
+{:index 87, :time 15337333727, :type :invoke, :process 7, :f :produce, :value {:key "k-9254", :value "v-9254"}}
+{:index 88, :time 15342031252, :type :invoke, :process 28, :f :produce, :value {:key "k-9257", :value "v-9257"}}
+{:index 89, :time 15349502816, :type :fail, :process 28, :f :produce, :value {:key "k-9257", :value "v-9257"}, :error :misdirected}
+{:index 90, :time 15349545067, :type :info, :process 28, :f :kill, :value :start}
+{:index 91, :time 15349903447, :type :info, :process 28, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 92, :time 15351775223, :type :fail, :process 7, :f :produce, :value {:key "k-9254", :value "v-9254"}, :error :misdirected}
+{:index 93, :time 15351803724, :type :info, :process 7, :f :kill, :value :stop}
+{:index 94, :time 15352494567, :type :fail, :process 6, :f :produce, :value {:key "k-9235", :value "v-9235"}, :error :misdirected}
+{:index 95, :time 15352697320, :type :info, :process 7, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 96, :time 15352747029, :type :invoke, :process 12, :f :produce, :value {:key "k-9273", :value "v-9273"}}
+{:index 97, :time 15358220856, :type :fail, :process 12, :f :produce, :value {:key "k-9273", :value "v-9273"}, :error :misdirected}
+{:index 98, :time 15358324441, :type :invoke, :process 12, :f :produce, :value {:key "k-9277", :value "v-9277"}}
+{:index 99, :time 15363189260, :type :fail, :process 12, :f :produce, :value {:key "k-9277", :value "v-9277"}, :error :misdirected}
+{:index 100, :time 15363221511, :type :invoke, :process 12, :f :produce, :value {:key "k-9282", :value "v-9282"}}
+{:index 101, :time 15367106316, :type :fail, :process 12, :f :produce, :value {:key "k-9282", :value "v-9282"}, :error :misdirected}
+{:index 102, :time 15367208692, :type :invoke, :process 12, :f :produce, :value {:key "k-9286", :value "v-9286"}}
+{:index 103, :time 15371313667, :type :fail, :process 12, :f :produce, :value {:key "k-9286", :value "v-9286"}, :error :misdirected}
+{:index 104, :time 15371342126, :type :invoke, :process 12, :f :produce, :value {:key "k-9290", :value "v-9290"}}
+{:index 105, :time 15375091095, :type :fail, :process 12, :f :produce, :value {:key "k-9290", :value "v-9290"}, :error :misdirected}
+{:index 106, :time 15375116304, :type :invoke, :process 12, :f :produce, :value {:key "k-9294", :value "v-9294"}}
+{:index 107, :time 15378656313, :type :fail, :process 12, :f :produce, :value {:key "k-9294", :value "v-9294"}, :error :misdirected}
+{:index 108, :time 15378681646, :type :info, :process 12, :f :kill, :value :start}
+{:index 109, :time 15379286780, :type :info, :process 12, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 110, :time 20294727634, :type :invoke, :process 9, :f :produce, :value {:key "k-12284", :value "v-12284"}}
+{:index 111, :time 20305674914, :type :ok, :process 9, :f :produce, :value {:key "k-12284", :value "v-12284", :partition 0, :offset 2}}
+{:index 112, :time 20305746123, :type :info, :process 9, :f :kill, :value :stop}
+{:index 113, :time 20306543926, :type :info, :process 9, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 114, :time 20306633594, :type :invoke, :process 14, :f :produce, :value {:key "k-12295", :value "v-12295"}}
+{:index 115, :time 20313921614, :type :ok, :process 14, :f :produce, :value {:key "k-12295", :value "v-12295", :partition 2, :offset 1}}
+{:index 116, :time 20314099950, :type :invoke, :process 14, :f :produce, :value {:key "k-12301", :value "v-12301"}}
+{:index 117, :time 20322391567, :type :ok, :process 14, :f :produce, :value {:key "k-12301", :value "v-12301", :partition 0, :offset 3}}
+{:index 118, :time 20322521277, :type :invoke, :process 14, :f :produce, :value {:key "k-12309", :value "v-12309"}}
+{:index 119, :time 20329305999, :type :ok, :process 14, :f :produce, :value {:key "k-12309", :value "v-12309", :partition 0, :offset 4}}
+{:index 120, :time 20344538964, :type :invoke, :process 20, :f :produce, :value {:key "k-12326", :value "v-12326"}}
+{:index 121, :time 20356447675, :type :invoke, :process 6, :f :produce, :value {:key "k-12333", :value "v-12333"}}
+{:index 122, :time 20356564926, :type :fail, :process 20, :f :produce, :value {:key "k-12326", :value "v-12326"}, :error :misdirected}
+{:index 123, :time 20356576010, :type :info, :process 20, :f :kill, :value :start}
+{:index 124, :time 20357094517, :type :info, :process 20, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 125, :time 20362880933, :type :invoke, :process :nemesis, :f :produce, :value {:key "k-12343", :value "v-12343"}}
+{:index 126, :time 20363764612, :type :info, :process :nemesis, :f :produce, :value {:key "k-12343", :value "v-12343"}, :exception {:via [{:type java.lang.IllegalArgumentException, :message "no nemesis can handle :produce", :at [jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365]}], :trace [[jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365] [jepsen.nemesis.Validate invoke_BANG_ "nemesis.clj" 63] [jepsen.generator.interpreter.NemesisWorker invoke_BANG_ "interpreter.clj" 77] [jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147 invoke "interpreter.clj" 140] [jepsen.generator.interpreter$spawn_worker$fn__13146 invoke "interpreter.clj" 123] [clojure.core$binding_conveyor_fn$fn__5823 invoke "core.clj" 2047] [clojure.lang.AFn call "AFn.java" 18] [java.util.concurrent.FutureTask run "FutureTask.java" 317] [java.util.concurrent.ThreadPoolExecutor runWorker "ThreadPoolExecutor.java" 1144] [java.util.concurrent.ThreadPoolExecutor$Worker run "ThreadPoolExecutor.java" 642] [java.lang.Thread run "Thread.java" 1583]], :cause "no nemesis can handle :produce"}, :error "indeterminate: no nemesis can handle :produce"}
+{:index 127, :time 20363790279, :type :info, :process :nemesis, :f :kill, :value :stop}
+{:index 128, :time 20364140992, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 129, :time 20365668014, :type :fail, :process 6, :f :produce, :value {:key "k-12333", :value "v-12333"}, :error :misdirected}
+{:index 130, :time 20365697014, :type :info, :process 6, :f :kill, :value :start}
+{:index 131, :time 20366241522, :type :info, :process 6, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 132, :time 20366289856, :type :invoke, :process 11, :f :produce, :value {:key "k-12351", :value "v-12351"}}
+{:index 133, :time 20373320122, :type :fail, :process 11, :f :produce, :value {:key "k-12351", :value "v-12351"}, :error :misdirected}
+{:index 134, :time 20373360081, :type :invoke, :process 11, :f :produce, :value {:key "k-12358", :value "v-12358"}}
+{:index 135, :time 20378961827, :type :fail, :process 11, :f :produce, :value {:key "k-12358", :value "v-12358"}, :error :misdirected}
+{:index 136, :time 25330806826, :type :info, :process 14, :f :kill, :value :stop}
+{:index 137, :time 25333091692, :type :info, :process 14, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 138, :time 25350736609, :type :invoke, :process 33, :f :produce, :value {:key "k-15425", :value "v-15425"}}
+{:index 139, :time 25367837519, :type :info, :process :nemesis, :f :kill, :value :start}
+{:index 140, :time 25369225038, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 141, :time 25375641046, :type :fail, :process 33, :f :produce, :value {:key "k-15425", :value "v-15425"}, :error :misdirected}
+{:index 142, :time 25375730589, :type :invoke, :process 33, :f :produce, :value {:key "k-15445", :value "v-15445"}}
+{:index 143, :time 25384951595, :type :info, :process 17, :f :kill, :value :stop}
+{:index 144, :time 25385916442, :type :info, :process 17, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 145, :time 25386041861, :type :invoke, :process 22, :f :produce, :value {:key "k-15455", :value "v-15455"}}
+{:index 146, :time 25389866748, :type :fail, :process 33, :f :produce, :value {:key "k-15445", :value "v-15445"}, :error :misdirected}
+{:index 147, :time 25390028667, :type :invoke, :process 33, :f :produce, :value {:key "k-15459", :value "v-15459"}}
+{:index 148, :time 25397917738, :type :fail, :process 22, :f :produce, :value {:key "k-15455", :value "v-15455"}, :error :misdirected}
+{:index 149, :time 25398055698, :type :invoke, :process 22, :f :produce, :value {:key "k-15466", :value "v-15466"}}
+{:index 150, :time 25398757875, :type :fail, :process 33, :f :produce, :value {:key "k-15459", :value "v-15459"}, :error :misdirected}
+{:index 151, :time 25398810375, :type :invoke, :process 33, :f :produce, :value {:key "k-15468", :value "v-15468"}}
+{:index 152, :time 25404759460, :type :fail, :process 22, :f :produce, :value {:key "k-15466", :value "v-15466"}, :error :misdirected}
+{:index 153, :time 25404863211, :type :invoke, :process 22, :f :produce, :value {:key "k-15473", :value "v-15473"}}
+{:index 154, :time 25406660279, :type :fail, :process 33, :f :produce, :value {:key "k-15468", :value "v-15468"}, :error :misdirected}
+{:index 155, :time 25410900839, :type :fail, :process 22, :f :produce, :value {:key "k-15473", :value "v-15473"}, :error :misdirected}
+{:index 156, :time 25410966590, :type :info, :process 22, :f :kill, :value :start}
+{:index 157, :time 25411370345, :type :info, :process 22, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 158, :time 30337064370, :type :info, :process 19, :f :kill, :value :stop}
+{:index 159, :time 30340301832, :type :info, :process 19, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 160, :time 30358029834, :type :info, :process 25, :f :kill, :value :start}
+{:index 161, :time 30359536981, :type :info, :process 25, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 162, :time 30383026773, :type :invoke, :process 11, :f :produce, :value {:key "k-18491", :value "v-18491"}}
+{:index 163, :time 30406985196, :type :fail, :process 11, :f :produce, :value {:key "k-18491", :value "v-18491"}, :error :misdirected}
+{:index 164, :time 30407084114, :type :info, :process 11, :f :kill, :value :stop}
+{:index 165, :time 30408011836, :type :info, :process 11, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 166, :time 30408396508, :type :info, :process 16, :f :kill, :value :start}
+{:index 167, :time 30409372855, :type :info, :process 16, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 168, :time 30409559608, :type :invoke, :process 21, :f :produce, :value {:key "k-18515", :value "v-18515"}}
+{:index 169, :time 30421554570, :type :fail, :process 21, :f :produce, :value {:key "k-18515", :value "v-18515"}, :error :misdirected}
+{:index 170, :time 30421616613, :type :invoke, :process 21, :f :produce, :value {:key "k-18524", :value "v-18524"}}
+{:index 171, :time 30428757339, :type :fail, :process 21, :f :produce, :value {:key "k-18524", :value "v-18524"}, :error :misdirected}
+{:index 172, :time 30428809881, :type :invoke, :process 21, :f :produce, :value {:key "k-18531", :value "v-18531"}}
+{:index 173, :time 30435152347, :type :fail, :process 21, :f :produce, :value {:key "k-18531", :value "v-18531"}, :error :misdirected}
+{:index 174, :time 30435217014, :type :invoke, :process 21, :f :produce, :value {:key "k-18538", :value "v-18538"}}
+{:index 175, :time 30440780135, :type :fail, :process 21, :f :produce, :value {:key "k-18538", :value "v-18538"}, :error :misdirected}
+{:index 176, :time 30440810885, :type :invoke, :process 21, :f :produce, :value {:key "k-18544", :value "v-18544"}}
+{:index 177, :time 30446157711, :type :fail, :process 21, :f :produce, :value {:key "k-18544", :value "v-18544"}, :error :misdirected}
+{:index 178, :time 35347470097, :type :invoke, :process 24, :f :produce, :value {:key "k-21436", :value "v-21436"}}
+{:index 179, :time 35366151779, :type :ok, :process 24, :f :produce, :value {:key "k-21436", :value "v-21436", :partition 1, :offset 2}}
+{:index 180, :time 35366240697, :type :invoke, :process 24, :f :produce, :value {:key "k-21451", :value "v-21451"}}
+{:index 181, :time 35374816902, :type :ok, :process 24, :f :produce, :value {:key "k-21451", :value "v-21451", :partition 2, :offset 2}}
+{:index 182, :time 35374894654, :type :invoke, :process 24, :f :produce, :value {:key "k-21459", :value "v-21459"}}
+{:index 183, :time 35375303284, :type :info, :process :nemesis, :f :kill, :value :stop}
+{:index 184, :time 35375976002, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 185, :time 35380305189, :type :ok, :process 24, :f :produce, :value {:key "k-21459", :value "v-21459", :partition 2, :offset 3}}
+{:index 186, :time 35380400940, :type :info, :process 24, :f :kill, :value :start}
+{:index 187, :time 35380804154, :type :info, :process 24, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 188, :time 35380976615, :type :invoke, :process 29, :f :produce, :value {:key "k-21469", :value "v-21469"}}
+{:index 189, :time 35385230884, :type :ok, :process 29, :f :produce, :value {:key "k-21469", :value "v-21469", :partition 1, :offset 3}}
+{:index 190, :time 35417868806, :type :invoke, :process 33, :f :produce, :value {:key "k-21495", :value "v-21495"}}
+{:index 191, :time 35421638901, :type :info, :process 27, :f :kill, :value :stop}
+{:index 192, :time 35423392926, :type :info, :process 27, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 193, :time 35423512553, :type :invoke, :process 32, :f :produce, :value {:key "k-21501", :value "v-21501"}}
+{:index 194, :time 35434104411, :type :fail, :process 33, :f :produce, :value {:key "k-21495", :value "v-21495"}, :error :misdirected}
+{:index 195, :time 35434939340, :type :fail, :process 32, :f :produce, :value {:key "k-21501", :value "v-21501"}, :error :misdirected}
+{:index 196, :time 35434969382, :type :info, :process 32, :f :kill, :value :start}
+{:index 197, :time 35435499890, :type :info, :process 32, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 198, :time 35435571224, :type :invoke, :process 37, :f :produce, :value {:key "k-21513", :value "v-21513"}}
+{:index 199, :time 35442956912, :type :fail, :process 37, :f :produce, :value {:key "k-21513", :value "v-21513"}, :error :misdirected}
+{:index 200, :time 35443058414, :type :invoke, :process 37, :f :produce, :value {:key "k-21520", :value "v-21520"}}
+{:index 201, :time 35449147250, :type :fail, :process 37, :f :produce, :value {:key "k-21520", :value "v-21520"}, :error :misdirected}
+{:index 202, :time 35449244127, :type :invoke, :process 37, :f :produce, :value {:key "k-21526", :value "v-21526"}}
+{:index 203, :time 35454161238, :type :fail, :process 37, :f :produce, :value {:key "k-21526", :value "v-21526"}, :error :misdirected}
+{:index 204, :time 40370575839, :type :info, :process 30, :f :kill, :value :stop}
+{:index 205, :time 40373922303, :type :info, :process 30, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 206, :time 40377325435, :type :info, :process :nemesis, :f :kill, :value :start}
+{:index 207, :time 40378877623, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 208, :time 40378976833, :type :invoke, :process :nemesis, :f :produce, :value {:key "k-24522", :value "v-24522"}}
+{:index 209, :time 40381983376, :type :info, :process :nemesis, :f :produce, :value {:key "k-24522", :value "v-24522"}, :exception {:via [{:type java.lang.IllegalArgumentException, :message "no nemesis can handle :produce", :at [jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365]}], :trace [[jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365] [jepsen.nemesis.Validate invoke_BANG_ "nemesis.clj" 63] [jepsen.generator.interpreter.NemesisWorker invoke_BANG_ "interpreter.clj" 77] [jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147 invoke "interpreter.clj" 140] [jepsen.generator.interpreter$spawn_worker$fn__13146 invoke "interpreter.clj" 123] [clojure.core$binding_conveyor_fn$fn__5823 invoke "core.clj" 2047] [clojure.lang.AFn call "AFn.java" 18] [java.util.concurrent.FutureTask run "FutureTask.java" 317] [java.util.concurrent.ThreadPoolExecutor runWorker "ThreadPoolExecutor.java" 1144] [java.util.concurrent.ThreadPoolExecutor$Worker run "ThreadPoolExecutor.java" 642] [java.lang.Thread run "Thread.java" 1583]], :cause "no nemesis can handle :produce"}, :error "indeterminate: no nemesis can handle :produce"}
+{:index 210, :time 40443267830, :type :info, :process 33, :f :kill, :value :stop}
+{:index 211, :time 40444361012, :type :info, :process 33, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 212, :time 40444809935, :type :invoke, :process 38, :f :produce, :value {:key "k-24567", :value "v-24567"}}
+{:index 213, :time 40446938965, :type :invoke, :process 21, :f :produce, :value {:key "k-24570", :value "v-24570"}}
+{:index 214, :time 40470254880, :type :fail, :process 21, :f :produce, :value {:key "k-24570", :value "v-24570"}, :error :misdirected}
+{:index 215, :time 40470380382, :type :fail, :process 38, :f :produce, :value {:key "k-24567", :value "v-24567"}, :error :misdirected}
+{:index 216, :time 40470397299, :type :invoke, :process 21, :f :produce, :value {:key "k-24585", :value "v-24585"}}
+{:index 217, :time 40470547551, :type :invoke, :process 38, :f :produce, :value {:key "k-24586", :value "v-24586"}}
+{:index 218, :time 40483029811, :type :fail, :process 21, :f :produce, :value {:key "k-24585", :value "v-24585"}, :error :misdirected}
+{:index 219, :time 40484272287, :type :fail, :process 38, :f :produce, :value {:key "k-24586", :value "v-24586"}, :error :misdirected}
+{:index 220, :time 40484320913, :type :invoke, :process 38, :f :produce, :value {:key "k-24598", :value "v-24598"}}
+{:index 221, :time 40491817895, :type :fail, :process 38, :f :produce, :value {:key "k-24598", :value "v-24598"}, :error :misdirected}
+{:index 222, :time 40491855103, :type :info, :process 38, :f :kill, :value :start}
+{:index 223, :time 40492182733, :type :info, :process 38, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 224, :time 45385398337, :type :invoke, :process 35, :f :produce, :value {:key "k-27578", :value "v-27578"}}
+{:index 225, :time 45386002638, :type :invoke, :process 29, :f :produce, :value {:key "k-27580", :value "v-27580"}}
+{:index 226, :time 45409699391, :type :ok, :process 29, :f :produce, :value {:key "k-27580", :value "v-27580", :partition 1, :offset 4}}
+{:index 227, :time 45409790517, :type :info, :process 29, :f :kill, :value :stop}
+{:index 228, :time 45411003035, :type :info, :process 29, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 229, :time 45411087994, :type :invoke, :process 34, :f :produce, :value {:key "k-27598", :value "v-27598"}}
+{:index 230, :time 45418666977, :type :fail, :process 35, :f :produce, :value {:key "k-27578", :value "v-27578"}, :error :misdirected}
+{:index 231, :time 45418756270, :type :ok, :process 34, :f :produce, :value {:key "k-27598", :value "v-27598", :partition 0, :offset 5}}
+{:index 232, :time 45418766562, :type :invoke, :process 34, :f :produce, :value {:key "k-27605", :value "v-27605"}}
+{:index 233, :time 45418854729, :type :invoke, :process 35, :f :produce, :value {:key "k-27606", :value "v-27606"}}
+{:index 234, :time 45424157513, :type :ok, :process 34, :f :produce, :value {:key "k-27605", :value "v-27605", :partition 3, :offset 1}}
+{:index 235, :time 45424205180, :type :invoke, :process 34, :f :produce, :value {:key "k-27611", :value "v-27611"}}
+{:index 236, :time 45428145403, :type :ok, :process 34, :f :produce, :value {:key "k-27611", :value "v-27611", :partition 2, :offset 4}}
+{:index 237, :time 45428194029, :type :invoke, :process 34, :f :produce, :value {:key "k-27615", :value "v-27615"}}
+{:index 238, :time 45428843080, :type :fail, :process 35, :f :produce, :value {:key "k-27606", :value "v-27606"}, :error :misdirected}
+{:index 239, :time 45431144029, :type :ok, :process 34, :f :produce, :value {:key "k-27615", :value "v-27615", :partition 2, :offset 5}}
+{:index 240, :time 45431196238, :type :invoke, :process 34, :f :produce, :value {:key "k-27620", :value "v-27620"}}
+{:index 241, :time 45433647606, :type :ok, :process 34, :f :produce, :value {:key "k-27620", :value "v-27620", :partition 2, :offset 6}}
+{:index 242, :time 45433710732, :type :info, :process 34, :f :kill, :value :start}
+{:index 243, :time 45433945861, :type :info, :process 34, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 244, :time 45433999320, :type :invoke, :process 39, :f :produce, :value {:key "k-27626", :value "v-27626"}}
+{:index 245, :time 45436715733, :type :ok, :process 39, :f :produce, :value {:key "k-27626", :value "v-27626", :partition 0, :offset 6}}
+{:index 246, :time 45464434169, :type :info, :process 37, :f :kill, :value :stop}
+{:index 247, :time 45464752882, :type :info, :process 37, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 248, :time 45493736127, :type :info, :process 21, :f :kill, :value :start}
+{:index 249, :time 45494284718, :type :info, :process 21, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 250, :time 45494329802, :type :invoke, :process 26, :f :produce, :value {:key "k-27673", :value "v-27673"}}
+{:index 251, :time 45508738382, :type :fail, :process 26, :f :produce, :value {:key "k-27673", :value "v-27673"}, :error :misdirected}
+{:index 252, :time 45508779590, :type :invoke, :process 26, :f :produce, :value {:key "k-27683", :value "v-27683"}}
+{:index 253, :time 45515435060, :type :fail, :process 26, :f :produce, :value {:key "k-27683", :value "v-27683"}, :error :misdirected}
+{:index 254, :time 50383934147, :type :info, :process :nemesis, :f :kill, :value :stop}
+{:index 255, :time 50385541419, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 256, :time 50438713008, :type :info, :process 35, :f :kill, :value :start}
+{:index 257, :time 50439944484, :type :info, :process 35, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 258, :time 50467805796, :type :invoke, :process 42, :f :produce, :value {:key "k-30706", :value "v-30706"}}
+{:index 259, :time 50494800263, :type :fail, :process 42, :f :produce, :value {:key "k-30706", :value "v-30706"}, :error :misdirected}
+{:index 260, :time 50494862723, :type :info, :process 42, :f :kill, :value :stop}
+{:index 261, :time 50494948057, :type :invoke, :process 43, :f :produce, :value {:key "k-30727", :value "v-30727"}}
+{:index 262, :time 50495738652, :type :info, :process 42, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 263, :time 50495824403, :type :invoke, :process 47, :f :produce, :value {:key "k-30729", :value "v-30729"}}
+{:index 264, :time 50507191606, :type :fail, :process 47, :f :produce, :value {:key "k-30729", :value "v-30729"}, :error :misdirected}
+{:index 265, :time 50512525973, :type :fail, :process 43, :f :produce, :value {:key "k-30727", :value "v-30727"}, :error :misdirected}
+{:index 266, :time 50512553724, :type :invoke, :process 43, :f :produce, :value {:key "k-30744", :value "v-30744"}}
+{:index 267, :time 50518967023, :type :fail, :process 43, :f :produce, :value {:key "k-30744", :value "v-30744"}, :error :misdirected}
+{:index 268, :time 50518991940, :type :info, :process 43, :f :kill, :value :start}
+{:index 269, :time 50519136151, :type :info, :process 43, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 270, :time 55390950159, :type :invoke, :process :nemesis, :f :produce, :value {:key "k-33717", :value "v-33717"}}
+{:index 271, :time 55395898730, :type :info, :process :nemesis, :f :produce, :value {:key "k-33717", :value "v-33717"}, :exception {:via [{:type java.lang.IllegalArgumentException, :message "no nemesis can handle :produce", :at [jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365]}], :trace [[jepsen.nemesis.MapCompose invoke_BANG_ "nemesis.clj" 365] [jepsen.nemesis.Validate invoke_BANG_ "nemesis.clj" 63] [jepsen.generator.interpreter.NemesisWorker invoke_BANG_ "interpreter.clj" 77] [jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147 invoke "interpreter.clj" 140] [jepsen.generator.interpreter$spawn_worker$fn__13146 invoke "interpreter.clj" 123] [clojure.core$binding_conveyor_fn$fn__5823 invoke "core.clj" 2047] [clojure.lang.AFn call "AFn.java" 18] [java.util.concurrent.FutureTask run "FutureTask.java" 317] [java.util.concurrent.ThreadPoolExecutor runWorker "ThreadPoolExecutor.java" 1144] [java.util.concurrent.ThreadPoolExecutor$Worker run "ThreadPoolExecutor.java" 642] [java.lang.Thread run "Thread.java" 1583]], :cause "no nemesis can handle :produce"}, :error "indeterminate: no nemesis can handle :produce"}
+{:index 272, :time 55396027648, :type :info, :process :nemesis, :f :kill, :value :stop}
+{:index 273, :time 55397327250, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 274, :time 55446693743, :type :invoke, :process 39, :f :produce, :value {:key "k-33754", :value "v-33754"}}
+{:index 275, :time 55462818264, :type :ok, :process 39, :f :produce, :value {:key "k-33754", :value "v-33754", :partition 1, :offset 5}}
+{:index 276, :time 55462884015, :type :invoke, :process 39, :f :produce, :value {:key "k-33765", :value "v-33765"}}
+{:index 277, :time 55470407622, :type :ok, :process 39, :f :produce, :value {:key "k-33765", :value "v-33765", :partition 1, :offset 6}}
+{:index 278, :time 55470476414, :type :info, :process 39, :f :kill, :value :start}
+{:index 279, :time 55471061381, :type :info, :process 39, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 280, :time 55511635749, :type :info, :process 47, :f :kill, :value :stop}
+{:index 281, :time 55512937434, :type :info, :process 47, :f :kill, :value :stop, :error "No matching clause: :kill"}
+{:index 282, :time 55516762405, :type :info, :process 26, :f :kill, :value :start}
+{:index 283, :time 55517505874, :type :info, :process 26, :f :kill, :value :start, :error "No matching clause: :kill"}
+{:index 284, :time 55517579167, :type :invoke, :process 31, :f :produce, :value {:key "k-33808", :value "v-33808"}}
+{:index 285, :time 55537151112, :type :fail, :process 31, :f :produce, :value {:key "k-33808", :value "v-33808"}, :error :misdirected}
+{:index 286, :time 65545992855, :type :info, :process :nemesis, :f :kill, :value :stop}
+{:index 287, :time 65549505322, :type :info, :process :nemesis, :f :kill, :value "nemesis already disrupting (\"n1\")"}
+{:index 288, :time 80559699998, :type :invoke, :process 40, :f :consume, :value {:partition 2, :offset 0}}
+{:index 289, :time 80562011072, :type :invoke, :process 44, :f :consume, :value {:partition 1, :offset 0}}
+{:index 290, :time 80562215742, :type :invoke, :process 48, :f :consume, :value {:partition 2, :offset 0}}
+{:index 291, :time 80562375119, :type :invoke, :process 52, :f :consume, :value {:partition 3, :offset 0}}
+{:index 292, :time 80562530955, :type :invoke, :process 31, :f :consume, :value {:partition 2, :offset 0}}
+{:index 293, :time 80571512207, :type :ok, :process 48, :f :consume, :value []}
+{:index 294, :time 80571616750, :type :ok, :process 44, :f :consume, :value [{:offset 0, :partition 1, :key "k-6165", :value "v-6165"} {:offset 1, :partition 1, :key "k-6169", :value "v-6169"}]}
+{:index 295, :time 80571631001, :type :ok, :process 40, :f :consume, :value []}
+{:index 296, :time 80571643126, :type :ok, :process 31, :f :consume, :value []}
+{:index 297, :time 80571691585, :type :ok, :process 52, :f :consume, :value []}

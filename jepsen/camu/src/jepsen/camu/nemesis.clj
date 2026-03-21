@@ -14,7 +14,7 @@
   "Restarts the camu process on the current node."
   []
   (c/exec :bash :-c
-          "nohup /opt/camu/camu --config /etc/camu/camu.yaml >> /var/log/camu.log 2>&1 &"))
+          "nohup /opt/camu/camu serve --config /etc/camu/camu.yaml >> /var/log/camu.log 2>&1 &"))
 
 (defn pause-camu!
   "Sends SIGSTOP to camu on the current node."
@@ -41,26 +41,32 @@
 (defn kill-nemesis
   "A nemesis that kills and restarts camu processes."
   []
-  (nemesis/node-start-stopper
-   rand-nth
-   (fn start [test node]
-     (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
-     [:killed node])
-   (fn stop [test node]
-     (c/on-nodes test [node] (fn [_ _] (start-camu!)))
-     [:restarted node])))
+  (reify nemesis/Nemesis
+    (setup! [this test] this)
+    (invoke! [this test op]
+      (let [node (rand-nth (:nodes test))]
+        (case (:value op)
+          :start (do (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
+                     (assoc op :value [:killed node]))
+          :stop  (do (c/on-nodes test (:nodes test) (fn [_ _] (start-camu!)))
+                     (assoc op :value :restarted)))))
+    (teardown! [this test]
+      (c/on-nodes test (:nodes test) (fn [_ _] (start-camu!))))))
 
 (defn pause-nemesis
   "A nemesis that pauses and resumes camu processes."
   []
-  (nemesis/node-start-stopper
-   rand-nth
-   (fn start [test node]
-     (c/on-nodes test [node] (fn [_ _] (pause-camu!)))
-     [:paused node])
-   (fn stop [test node]
-     (c/on-nodes test [node] (fn [_ _] (resume-camu!)))
-     [:resumed node])))
+  (reify nemesis/Nemesis
+    (setup! [this test] this)
+    (invoke! [this test op]
+      (let [node (rand-nth (:nodes test))]
+        (case (:value op)
+          :start (do (c/on-nodes test [node] (fn [_ _] (pause-camu!)))
+                     (assoc op :value [:paused node]))
+          :stop  (do (c/on-nodes test (:nodes test) (fn [_ _] (resume-camu!)))
+                     (assoc op :value :resumed)))))
+    (teardown! [this test]
+      (c/on-nodes test (:nodes test) (fn [_ _] (resume-camu!))))))
 
 (defn partition-nemesis
   "A nemesis that partitions the network into random halves."
@@ -68,37 +74,37 @@
   (nemesis/partition-random-halves))
 
 (defn rejoin-nemesis
-  "A nemesis that kills a node, waits for lease expiry, then restarts it.
-   This specifically tests the epoch fencing mechanism: the restarted instance
-   must acquire a new epoch before writing."
+  "A nemesis that kills a node, waits for lease expiry, then restarts it."
   []
   (reify nemesis/Nemesis
     (setup! [this test] this)
     (invoke! [this test op]
-      (case (:f op)
-        :rejoin-start
+      (case (:value op)
+        :start
         (let [node (rand-nth (:nodes test))]
           (info "Rejoin nemesis: killing" node "for lease expiry test")
           (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
-          ;; Wait longer than the lease TTL so the lease is reclaimed
           (Thread/sleep 20000)
           (c/on-nodes test [node] (fn [_ _] (start-camu!)))
-          (assoc op :type :info :value [:rejoined node]))
-        :rejoin-stop
-        (assoc op :type :info :value :no-op)))
+          (assoc op :value [:rejoined node]))
+        :stop
+        (assoc op :value :no-op)))
     (teardown! [this test])))
 
 (defn s3-partition-nemesis
   "A nemesis that blocks/unblocks a random node's access to MinIO port 9000."
   [s3-host]
-  (nemesis/node-start-stopper
-   rand-nth
-   (fn start [test node]
-     (c/on-nodes test [node] (fn [_ _] (unblock-s3! s3-host)))
-     [:s3-unblocked node])
-   (fn stop [test node]
-     (c/on-nodes test [node] (fn [_ _] (block-s3! s3-host)))
-     [:s3-blocked node])))
+  (reify nemesis/Nemesis
+    (setup! [this test] this)
+    (invoke! [this test op]
+      (let [node (rand-nth (:nodes test))]
+        (case (:value op)
+          :start (do (c/on-nodes test [node] (fn [_ _] (block-s3! s3-host)))
+                     (assoc op :value [:s3-blocked node]))
+          :stop  (do (c/on-nodes test (:nodes test) (fn [_ _] (unblock-s3! s3-host)))
+                     (assoc op :value :s3-unblocked)))))
+    (teardown! [this test]
+      (c/on-nodes test (:nodes test) (fn [_ _] (unblock-s3! s3-host))))))
 
 (defn clock-skew-nemesis
   "A nemesis that introduces clock drift on nodes."

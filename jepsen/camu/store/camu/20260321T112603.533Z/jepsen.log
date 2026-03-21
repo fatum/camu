@@ -1,0 +1,622 @@
+2026-03-21 11:26:03,551{GMT}	INFO	[jepsen test runner] jepsen.core: Command line:
+lein run test --nodes n1,n2,n3,n4,n5 --ssh-private-key /root/.ssh/id_rsa --time-limit 60 --s3-endpoint http://minio:9000 --camu-binary /jepsen/camu/camu --faults kill
+2026-03-21 11:26:03,575{GMT}	INFO	[jepsen test runner] jepsen.core: Running test:
+{:remote
+ #jepsen.control.retry.Remote{:remote #jepsen.control.scp.Remote{:cmd-remote #jepsen.control.sshj.SSHJRemote{:concurrency-limit 6,
+                                                                                                             :conn-spec nil,
+                                                                                                             :client nil,
+                                                                                                             :semaphore nil},
+                                                                 :conn-spec nil},
+                              :conn nil}
+ :faults #{:kill}
+ :ssh-private-key "/root/.ssh/id_rsa"
+ :concurrency 5
+ :camu-binary "/jepsen/camu/camu"
+ :db
+ #object[jepsen.camu.db$db$reify__2857
+         "0x1df8ea34"
+         "jepsen.camu.db$db$reify__2857@1df8ea34"]
+ :leave-db-running? false
+ :name "camu"
+ :logging-json? false
+ :start-time
+ #object[org.joda.time.DateTime "0x6b0636d9" "2026-03-21T11:26:03.533Z"]
+ :net
+ #object[jepsen.net$reify__12635
+         "0x63893cf6"
+         "jepsen.net$reify__12635@63893cf6"]
+ :client #jepsen.camu.client.CamuClient{:node nil, :topic "jepsen-test"}
+ :barrier
+ #object[java.util.concurrent.CyclicBarrier
+         "0x7a14d8a4"
+         "java.util.concurrent.CyclicBarrier@7a14d8a4"]
+ :ssh
+ {:dummy? false,
+  :username "root",
+  :password "root",
+  :strict-host-key-checking false,
+  :private-key-path "/root/.ssh/id_rsa"}
+ :checker
+ #object[jepsen.checker$compose$reify__10552
+         "0x20673498"
+         "jepsen.checker$compose$reify__10552@20673498"]
+ :argv
+ ("test"
+  "--nodes"
+  "n1,n2,n3,n4,n5"
+  "--ssh-private-key"
+  "/root/.ssh/id_rsa"
+  "--time-limit"
+  "60"
+  "--s3-endpoint"
+  "http://minio:9000"
+  "--camu-binary"
+  "/jepsen/camu/camu"
+  "--faults"
+  "kill")
+ :s3-endpoint "http://minio:9000"
+ :nemesis
+ (jepsen.nemesis.MapCompose
+  {:nemeses {{:kill :start} #unprintable "jepsen.nemesis$node_start_stopper$reify__12928@7a8d6eb3",
+             {:kill :stop} #unprintable "jepsen.nemesis$node_start_stopper$reify__12928@50c99398"}})
+ :http-port 8080
+ :nodes ["n1" "n2" "n3" "n4" "n5"]
+ :test-count 1
+ :generator
+ #object[jepsen.util.Forgettable
+         "0x68823b6b"
+         ((jepsen.generator.Synchronize
+           {:gen (jepsen.generator.TimeLimit
+                  {:limit 60000000000,
+                   :cutoff nil,
+                   :gen (jepsen.generator.Any
+                         {:gens [#object[jepsen.camu$camu_test$produce__2866
+                                         "0x57d8d8e2"
+                                         "jepsen.camu$camu_test$produce__2866@57d8d8e2"]
+                                 (jepsen.generator.Mix
+                                  {:i 0,
+                                   :gens [(jepsen.generator.Cycle
+                                           {:remaining -1,
+                                            :original-gen [{:type :info,
+                                                            :f :kill,
+                                                            :value :start}
+                                                           {:type :sleep,
+                                                            :value 10}
+                                                           {:type :info,
+                                                            :f :kill,
+                                                            :value :stop}
+                                                           {:type :sleep,
+                                                            :value 5}],
+                                            :gen [{:type :info,
+                                                   :f :kill,
+                                                   :value :start}
+                                                  {:type :sleep, :value 10}
+                                                  {:type :info,
+                                                   :f :kill,
+                                                   :value :stop}
+                                                  {:type :sleep, :value 5}]})]})]})})})
+          (jepsen.generator.Synchronize
+           {:gen {:type :log, :value "Recovering..."}})
+          (jepsen.generator.Synchronize
+           {:gen (jepsen.generator.OnThreads
+                  {:f #{:nemesis},
+                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                           "0x2f726cf4"
+                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@2f726cf4"],
+                   :gen {:type :info, :f :kill, :value :stop}})})
+          (jepsen.generator.Synchronize {:gen {:type :sleep, :value 15}})
+          (jepsen.generator.Synchronize
+           {:gen {:type :log, :value "Draining partitions..."}})
+          (jepsen.generator.Synchronize
+           {:gen (jepsen.generator.OnThreads
+                  {:f #jepsen.generator.context.AllBut{:element :nemesis},
+                   :context-filter #object[jepsen.generator.context$make_thread_filter$lazy_filter__11515
+                                           "0x514eefc4"
+                                           "jepsen.generator.context$make_thread_filter$lazy_filter__11515@514eefc4"],
+                   :gen (jepsen.generator.EachThread
+                         {:fresh-gen (jepsen.generator.Limit
+                                      {:remaining 1,
+                                       :gen #object[jepsen.camu$camu_test$fn__2870
+                                                    "0x560e1459"
+                                                    "jepsen.camu$camu_test$fn__2870@560e1459"]}),
+                          :context-filters #object[clojure.core$promise$reify__8591
+                                                   "0x4700db93"
+                                                   {:status :pending, :val nil}],
+                          :gens {}})})}))]
+ :os
+ #object[jepsen.os$reify__13040 "0x6aa7d7a0" "jepsen.os$reify__13040@6aa7d7a0"]
+ :time-limit 60}
+
+2026-03-21 11:26:04,522{GMT}	INFO	[jepsen test runner] jepsen.db: Tearing down DB
+2026-03-21 11:26:04,529{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Tearing down camu on n1
+2026-03-21 11:26:04,529{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Tearing down camu on n2
+2026-03-21 11:26:04,529{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Tearing down camu on n3
+2026-03-21 11:26:04,529{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Tearing down camu on n5
+2026-03-21 11:26:04,529{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Tearing down camu on n4
+2026-03-21 11:26:04,626{GMT}	INFO	[jepsen test runner] jepsen.db: Setting up DB
+2026-03-21 11:26:04,627{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Setting up camu on n1
+2026-03-21 11:26:04,627{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Setting up camu on n2
+2026-03-21 11:26:04,627{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Setting up camu on n3
+2026-03-21 11:26:04,627{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Setting up camu on n5
+2026-03-21 11:26:04,627{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Setting up camu on n4
+2026-03-21 11:26:05,388{GMT}	INFO	[jepsen node n1] jepsen.control.util: Starting camu
+2026-03-21 11:26:05,388{GMT}	INFO	[jepsen node n3] jepsen.control.util: Starting camu
+2026-03-21 11:26:05,388{GMT}	INFO	[jepsen node n2] jepsen.control.util: Starting camu
+2026-03-21 11:26:05,388{GMT}	INFO	[jepsen node n5] jepsen.control.util: Starting camu
+2026-03-21 11:26:05,389{GMT}	INFO	[jepsen node n4] jepsen.control.util: Starting camu
+2026-03-21 11:26:05,485{GMT}	INFO	[jepsen test runner] jepsen.core: Relative time begins now
+2026-03-21 11:26:05,721{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:info	:kill	:start
+2026-03-21 11:26:05,721{GMT}	INFO	[jepsen worker 0] jepsen.util: 0	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:05,722{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:invoke	:produce	{:key "k-4", :value "v-4"}
+2026-03-21 11:26:05,722{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:invoke	:produce	{:key "k-2", :value "v-2"}
+2026-03-21 11:26:05,723{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:invoke	:produce	{:key "k-8", :value "v-8"}
+2026-03-21 11:26:05,723{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-5", :value "v-5"}
+2026-03-21 11:26:05,723{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:invoke	:produce	{:key "k-3", :value "v-3"}
+2026-03-21 11:26:05,730{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:fail	:produce	{:key "k-2", :value "v-2"}	:misdirected
+2026-03-21 11:26:05,730{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:info	:kill	:stop
+2026-03-21 11:26:05,730{GMT}	INFO	[jepsen worker 1] jepsen.util: 1	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:05,732{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:fail	:produce	{:key "k-4", :value "v-4"}	:misdirected
+2026-03-21 11:26:05,732{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:info	:kill	:start
+2026-03-21 11:26:05,732{GMT}	INFO	[jepsen worker 3] jepsen.util: 3	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:05,732{GMT}	INFO	[jepsen worker 3] jepsen.util: 8	:info	:kill	:stop
+2026-03-21 11:26:05,732{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:ok	:produce	{:key "k-5", :value "v-5", :partition 0, :offset 0}
+2026-03-21 11:26:05,732{GMT}	INFO	[jepsen worker 3] jepsen.util: 8	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:05,733{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:fail	:produce	{:key "k-8", :value "v-8"}	:misdirected
+2026-03-21 11:26:05,733{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:invoke	:produce	{:key "k-28", :value "v-28"}
+2026-03-21 11:26:05,736{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:fail	:produce	{:key "k-3", :value "v-3"}	:misdirected
+2026-03-21 11:26:05,736{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:info	:kill	:start
+2026-03-21 11:26:05,736{GMT}	INFO	[jepsen worker 2] jepsen.util: 2	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:05,739{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:fail	:produce	{:key "k-28", :value "v-28"}	:misdirected
+2026-03-21 11:26:05,739{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:invoke	:produce	{:key "k-37", :value "v-37"}
+2026-03-21 11:26:05,744{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:fail	:produce	{:key "k-37", :value "v-37"}	:misdirected
+2026-03-21 11:26:05,744{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:info	:kill	:stop
+2026-03-21 11:26:05,744{GMT}	INFO	[jepsen worker 0] jepsen.util: 5	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:10,737{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:invoke	:produce	{:key "k-3074", :value "v-3074"}
+2026-03-21 11:26:10,737{GMT}	INFO	[jepsen worker 3] jepsen.util: 13	:invoke	:produce	{:key "k-3075", :value "v-3075"}
+2026-03-21 11:26:10,746{GMT}	INFO	[jepsen worker 0] jepsen.util: 10	:invoke	:produce	{:key "k-3083", :value "v-3083"}
+2026-03-21 11:26:10,761{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:fail	:produce	{:key "k-3074", :value "v-3074"}	:misdirected
+2026-03-21 11:26:10,761{GMT}	INFO	[jepsen worker 3] jepsen.util: 13	:fail	:produce	{:key "k-3075", :value "v-3075"}	:misdirected
+2026-03-21 11:26:10,762{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:invoke	:produce	{:key "k-3095", :value "v-3095"}
+2026-03-21 11:26:10,763{GMT}	INFO	[jepsen worker 3] jepsen.util: 13	:info	:kill	:start
+2026-03-21 11:26:10,763{GMT}	INFO	[jepsen worker 3] jepsen.util: 13	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:10,764{GMT}	INFO	[jepsen worker 3] jepsen.util: 18	:invoke	:produce	{:key "k-3099", :value "v-3099"}
+2026-03-21 11:26:10,775{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:fail	:produce	{:key "k-3095", :value "v-3095"}	:misdirected
+2026-03-21 11:26:10,776{GMT}	INFO	[jepsen worker 3] jepsen.util: 18	:fail	:produce	{:key "k-3099", :value "v-3099"}	:misdirected
+2026-03-21 11:26:10,776{GMT}	INFO	[jepsen worker 3] jepsen.util: 18	:info	:kill	:stop
+2026-03-21 11:26:10,776{GMT}	INFO	[jepsen worker 3] jepsen.util: 18	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:10,777{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:invoke	:produce	{:key "k-3112", :value "v-3112"}
+2026-03-21 11:26:10,791{GMT}	INFO	[jepsen worker 0] jepsen.util: 10	:fail	:produce	{:key "k-3083", :value "v-3083"}	:misdirected
+2026-03-21 11:26:10,791{GMT}	INFO	[jepsen worker 0] jepsen.util: 10	:invoke	:produce	{:key "k-3124", :value "v-3124"}
+2026-03-21 11:26:10,798{GMT}	INFO	[jepsen worker 0] jepsen.util: 10	:fail	:produce	{:key "k-3124", :value "v-3124"}	:misdirected
+2026-03-21 11:26:10,803{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:fail	:produce	{:key "k-3112", :value "v-3112"}	:misdirected
+2026-03-21 11:26:10,803{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:invoke	:produce	{:key "k-3136", :value "v-3136"}
+2026-03-21 11:26:10,809{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:fail	:produce	{:key "k-3136", :value "v-3136"}	:misdirected
+2026-03-21 11:26:10,809{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:invoke	:produce	{:key "k-3142", :value "v-3142"}
+2026-03-21 11:26:10,813{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:fail	:produce	{:key "k-3142", :value "v-3142"}	:misdirected
+2026-03-21 11:26:10,814{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:invoke	:produce	{:key "k-3147", :value "v-3147"}
+2026-03-21 11:26:10,818{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:fail	:produce	{:key "k-3147", :value "v-3147"}	:misdirected
+2026-03-21 11:26:10,818{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:info	:kill	:start
+2026-03-21 11:26:10,818{GMT}	INFO	[jepsen worker 3] jepsen.util: 23	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:10,818{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:invoke	:produce	{:key "k-3154", :value "v-3154"}
+2026-03-21 11:26:10,822{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:fail	:produce	{:key "k-3154", :value "v-3154"}	:misdirected
+2026-03-21 11:26:10,822{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:invoke	:produce	{:key "k-3159", :value "v-3159"}
+2026-03-21 11:26:10,825{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:fail	:produce	{:key "k-3159", :value "v-3159"}	:misdirected
+2026-03-21 11:26:15,728{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:26:15,740{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-6137", :value "v-6137"}
+2026-03-21 11:26:15,744{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:invoke	:produce	{:key "k-6140", :value "v-6140"}
+2026-03-21 11:26:15,754{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:ok	:produce	{:key "k-6137", :value "v-6137", :partition 2, :offset 0}
+2026-03-21 11:26:15,754{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-6149", :value "v-6149"}
+2026-03-21 11:26:15,761{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:ok	:produce	{:key "k-6149", :value "v-6149", :partition 3, :offset 0}
+2026-03-21 11:26:15,762{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:invoke	:produce	{:key "k-6157", :value "v-6157"}
+2026-03-21 11:26:15,762{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:fail	:produce	{:key "k-6140", :value "v-6140"}	:misdirected
+2026-03-21 11:26:15,766{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:ok	:produce	{:key "k-6157", :value "v-6157", :partition 0, :offset 1}
+2026-03-21 11:26:15,766{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:info	:kill	:start
+2026-03-21 11:26:15,766{GMT}	INFO	[jepsen worker 4] jepsen.util: 4	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:15,767{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:invoke	:produce	{:key "k-6165", :value "v-6165"}
+2026-03-21 11:26:15,770{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:ok	:produce	{:key "k-6165", :value "v-6165", :partition 1, :offset 0}
+2026-03-21 11:26:15,771{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:invoke	:produce	{:key "k-6169", :value "v-6169"}
+2026-03-21 11:26:15,774{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:ok	:produce	{:key "k-6169", :value "v-6169", :partition 1, :offset 1}
+2026-03-21 11:26:15,808{GMT}	INFO	[jepsen worker 0] jepsen.util: 10	:info	:kill	:stop
+2026-03-21 11:26:15,808{GMT}	INFO	[jepsen worker 0] jepsen.util: 10	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:15,843{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	{"n1" [:restarted "n1"]}
+2026-03-21 11:26:15,844{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:invoke	:produce	{:key "k-6221", :value "v-6221"}
+2026-03-21 11:26:15,844{GMT}	WARN	[jepsen worker nemesis] jepsen.generator.interpreter: Process :nemesis crashed
+java.lang.IllegalArgumentException: no nemesis can handle :produce
+	at jepsen.nemesis.MapCompose.invoke_BANG_(nemesis.clj:365)
+	at jepsen.nemesis.Validate.invoke_BANG_(nemesis.clj:63)
+	at jepsen.generator.interpreter.NemesisWorker.invoke_BANG_(interpreter.clj:77)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147.invoke(interpreter.clj:140)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146.invoke(interpreter.clj:123)
+	at clojure.core$binding_conveyor_fn$fn__5823.invoke(core.clj:2047)
+	at clojure.lang.AFn.call(AFn.java:18)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+2026-03-21 11:26:15,846{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:start
+2026-03-21 11:26:15,847{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:26:20,773{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:invoke	:produce	{:key "k-9217", :value "v-9217"}
+2026-03-21 11:26:20,777{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:invoke	:produce	{:key "k-9221", :value "v-9221"}
+2026-03-21 11:26:20,800{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:fail	:produce	{:key "k-9221", :value "v-9221"}	:misdirected
+2026-03-21 11:26:20,800{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:invoke	:produce	{:key "k-9235", :value "v-9235"}
+2026-03-21 11:26:20,809{GMT}	INFO	[jepsen worker 0] jepsen.util: 15	:info	:kill	:stop
+2026-03-21 11:26:20,810{GMT}	INFO	[jepsen worker 0] jepsen.util: 15	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:20,810{GMT}	INFO	[jepsen worker 0] jepsen.util: 20	:invoke	:produce	{:key "k-9245", :value "v-9245"}
+2026-03-21 11:26:20,821{GMT}	INFO	[jepsen worker 0] jepsen.util: 20	:fail	:produce	{:key "k-9245", :value "v-9245"}	:misdirected
+2026-03-21 11:26:20,821{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:fail	:produce	{:key "k-9217", :value "v-9217"}	:misdirected
+2026-03-21 11:26:20,823{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:invoke	:produce	{:key "k-9254", :value "v-9254"}
+2026-03-21 11:26:20,826{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:invoke	:produce	{:key "k-9257", :value "v-9257"}
+2026-03-21 11:26:20,834{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:fail	:produce	{:key "k-9257", :value "v-9257"}	:misdirected
+2026-03-21 11:26:20,834{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:info	:kill	:start
+2026-03-21 11:26:20,834{GMT}	INFO	[jepsen worker 3] jepsen.util: 28	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:20,837{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:fail	:produce	{:key "k-9254", :value "v-9254"}	:misdirected
+2026-03-21 11:26:20,837{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:fail	:produce	{:key "k-9235", :value "v-9235"}	:misdirected
+2026-03-21 11:26:20,837{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:info	:kill	:stop
+2026-03-21 11:26:20,837{GMT}	INFO	[jepsen worker 2] jepsen.util: 7	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:20,837{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:invoke	:produce	{:key "k-9273", :value "v-9273"}
+2026-03-21 11:26:20,842{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:fail	:produce	{:key "k-9273", :value "v-9273"}	:misdirected
+2026-03-21 11:26:20,843{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:invoke	:produce	{:key "k-9277", :value "v-9277"}
+2026-03-21 11:26:20,847{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:fail	:produce	{:key "k-9277", :value "v-9277"}	:misdirected
+2026-03-21 11:26:20,848{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:invoke	:produce	{:key "k-9282", :value "v-9282"}
+2026-03-21 11:26:20,851{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:fail	:produce	{:key "k-9282", :value "v-9282"}	:misdirected
+2026-03-21 11:26:20,851{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:invoke	:produce	{:key "k-9286", :value "v-9286"}
+2026-03-21 11:26:20,856{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:fail	:produce	{:key "k-9286", :value "v-9286"}	:misdirected
+2026-03-21 11:26:20,856{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:invoke	:produce	{:key "k-9290", :value "v-9290"}
+2026-03-21 11:26:20,859{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:fail	:produce	{:key "k-9290", :value "v-9290"}	:misdirected
+2026-03-21 11:26:20,859{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:invoke	:produce	{:key "k-9294", :value "v-9294"}
+2026-03-21 11:26:20,863{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:fail	:produce	{:key "k-9294", :value "v-9294"}	:misdirected
+2026-03-21 11:26:20,863{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:info	:kill	:start
+2026-03-21 11:26:20,863{GMT}	INFO	[jepsen worker 2] jepsen.util: 12	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:25,779{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:invoke	:produce	{:key "k-12284", :value "v-12284"}
+2026-03-21 11:26:25,790{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:ok	:produce	{:key "k-12284", :value "v-12284", :partition 0, :offset 2}
+2026-03-21 11:26:25,790{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:info	:kill	:stop
+2026-03-21 11:26:25,791{GMT}	INFO	[jepsen worker 4] jepsen.util: 9	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:25,791{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:invoke	:produce	{:key "k-12295", :value "v-12295"}
+2026-03-21 11:26:25,798{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:ok	:produce	{:key "k-12295", :value "v-12295", :partition 2, :offset 1}
+2026-03-21 11:26:25,799{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:invoke	:produce	{:key "k-12301", :value "v-12301"}
+2026-03-21 11:26:25,807{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:ok	:produce	{:key "k-12301", :value "v-12301", :partition 0, :offset 3}
+2026-03-21 11:26:25,807{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:invoke	:produce	{:key "k-12309", :value "v-12309"}
+2026-03-21 11:26:25,814{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:ok	:produce	{:key "k-12309", :value "v-12309", :partition 0, :offset 4}
+2026-03-21 11:26:25,829{GMT}	INFO	[jepsen worker 0] jepsen.util: 20	:invoke	:produce	{:key "k-12326", :value "v-12326"}
+2026-03-21 11:26:25,841{GMT}	INFO	[jepsen worker 0] jepsen.util: 20	:fail	:produce	{:key "k-12326", :value "v-12326"}	:misdirected
+2026-03-21 11:26:25,841{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:invoke	:produce	{:key "k-12333", :value "v-12333"}
+2026-03-21 11:26:25,841{GMT}	INFO	[jepsen worker 0] jepsen.util: 20	:info	:kill	:start
+2026-03-21 11:26:25,841{GMT}	INFO	[jepsen worker 0] jepsen.util: 20	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:25,847{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:invoke	:produce	{:key "k-12343", :value "v-12343"}
+2026-03-21 11:26:25,848{GMT}	WARN	[jepsen worker nemesis] jepsen.generator.interpreter: Process :nemesis crashed
+java.lang.IllegalArgumentException: no nemesis can handle :produce
+	at jepsen.nemesis.MapCompose.invoke_BANG_(nemesis.clj:365)
+	at jepsen.nemesis.Validate.invoke_BANG_(nemesis.clj:63)
+	at jepsen.generator.interpreter.NemesisWorker.invoke_BANG_(interpreter.clj:77)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147.invoke(interpreter.clj:140)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146.invoke(interpreter.clj:123)
+	at clojure.core$binding_conveyor_fn$fn__5823.invoke(core.clj:2047)
+	at clojure.lang.AFn.call(AFn.java:18)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+2026-03-21 11:26:25,848{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:26:25,848{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:26:25,850{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:fail	:produce	{:key "k-12333", :value "v-12333"}	:misdirected
+2026-03-21 11:26:25,850{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:info	:kill	:start
+2026-03-21 11:26:25,850{GMT}	INFO	[jepsen worker 1] jepsen.util: 6	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:25,851{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:invoke	:produce	{:key "k-12351", :value "v-12351"}
+2026-03-21 11:26:25,858{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:fail	:produce	{:key "k-12351", :value "v-12351"}	:misdirected
+2026-03-21 11:26:25,858{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:invoke	:produce	{:key "k-12358", :value "v-12358"}
+2026-03-21 11:26:25,863{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:fail	:produce	{:key "k-12358", :value "v-12358"}	:misdirected
+2026-03-21 11:26:30,816{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:info	:kill	:stop
+2026-03-21 11:26:30,817{GMT}	INFO	[jepsen worker 4] jepsen.util: 14	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:30,835{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:invoke	:produce	{:key "k-15425", :value "v-15425"}
+2026-03-21 11:26:30,852{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:start
+2026-03-21 11:26:30,853{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:26:30,860{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:fail	:produce	{:key "k-15425", :value "v-15425"}	:misdirected
+2026-03-21 11:26:30,860{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:invoke	:produce	{:key "k-15445", :value "v-15445"}
+2026-03-21 11:26:30,869{GMT}	INFO	[jepsen worker 2] jepsen.util: 17	:info	:kill	:stop
+2026-03-21 11:26:30,870{GMT}	INFO	[jepsen worker 2] jepsen.util: 17	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:30,870{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:invoke	:produce	{:key "k-15455", :value "v-15455"}
+2026-03-21 11:26:30,874{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:fail	:produce	{:key "k-15445", :value "v-15445"}	:misdirected
+2026-03-21 11:26:30,874{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:invoke	:produce	{:key "k-15459", :value "v-15459"}
+2026-03-21 11:26:30,882{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:fail	:produce	{:key "k-15455", :value "v-15455"}	:misdirected
+2026-03-21 11:26:30,882{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:invoke	:produce	{:key "k-15466", :value "v-15466"}
+2026-03-21 11:26:30,883{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:fail	:produce	{:key "k-15459", :value "v-15459"}	:misdirected
+2026-03-21 11:26:30,883{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:invoke	:produce	{:key "k-15468", :value "v-15468"}
+2026-03-21 11:26:30,889{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:fail	:produce	{:key "k-15466", :value "v-15466"}	:misdirected
+2026-03-21 11:26:30,890{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:invoke	:produce	{:key "k-15473", :value "v-15473"}
+2026-03-21 11:26:30,891{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:fail	:produce	{:key "k-15468", :value "v-15468"}	:misdirected
+2026-03-21 11:26:30,895{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:fail	:produce	{:key "k-15473", :value "v-15473"}	:misdirected
+2026-03-21 11:26:30,895{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:info	:kill	:start
+2026-03-21 11:26:30,895{GMT}	INFO	[jepsen worker 2] jepsen.util: 22	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:35,822{GMT}	INFO	[jepsen worker 4] jepsen.util: 19	:info	:kill	:stop
+2026-03-21 11:26:35,825{GMT}	INFO	[jepsen worker 4] jepsen.util: 19	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:35,843{GMT}	INFO	[jepsen worker 0] jepsen.util: 25	:info	:kill	:start
+2026-03-21 11:26:35,844{GMT}	INFO	[jepsen worker 0] jepsen.util: 25	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:35,868{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:invoke	:produce	{:key "k-18491", :value "v-18491"}
+2026-03-21 11:26:35,891{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:fail	:produce	{:key "k-18491", :value "v-18491"}	:misdirected
+2026-03-21 11:26:35,892{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:info	:kill	:stop
+2026-03-21 11:26:35,892{GMT}	INFO	[jepsen worker 1] jepsen.util: 11	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:35,893{GMT}	INFO	[jepsen worker 1] jepsen.util: 16	:info	:kill	:start
+2026-03-21 11:26:35,894{GMT}	INFO	[jepsen worker 1] jepsen.util: 16	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:35,894{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-18515", :value "v-18515"}
+2026-03-21 11:26:35,906{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-18515", :value "v-18515"}	:misdirected
+2026-03-21 11:26:35,906{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-18524", :value "v-18524"}
+2026-03-21 11:26:35,913{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-18524", :value "v-18524"}	:misdirected
+2026-03-21 11:26:35,913{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-18531", :value "v-18531"}
+2026-03-21 11:26:35,919{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-18531", :value "v-18531"}	:misdirected
+2026-03-21 11:26:35,920{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-18538", :value "v-18538"}
+2026-03-21 11:26:35,925{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-18538", :value "v-18538"}	:misdirected
+2026-03-21 11:26:35,925{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-18544", :value "v-18544"}
+2026-03-21 11:26:35,930{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-18544", :value "v-18544"}	:misdirected
+2026-03-21 11:26:40,833{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:invoke	:produce	{:key "k-21436", :value "v-21436"}
+2026-03-21 11:26:40,850{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:ok	:produce	{:key "k-21436", :value "v-21436", :partition 1, :offset 2}
+2026-03-21 11:26:40,851{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:invoke	:produce	{:key "k-21451", :value "v-21451"}
+2026-03-21 11:26:40,859{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:ok	:produce	{:key "k-21451", :value "v-21451", :partition 2, :offset 2}
+2026-03-21 11:26:40,859{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:invoke	:produce	{:key "k-21459", :value "v-21459"}
+2026-03-21 11:26:40,860{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:26:40,860{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:26:40,865{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:ok	:produce	{:key "k-21459", :value "v-21459", :partition 2, :offset 3}
+2026-03-21 11:26:40,865{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:info	:kill	:start
+2026-03-21 11:26:40,865{GMT}	INFO	[jepsen worker 4] jepsen.util: 24	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:40,865{GMT}	INFO	[jepsen worker 4] jepsen.util: 29	:invoke	:produce	{:key "k-21469", :value "v-21469"}
+2026-03-21 11:26:40,869{GMT}	INFO	[jepsen worker 4] jepsen.util: 29	:ok	:produce	{:key "k-21469", :value "v-21469", :partition 1, :offset 3}
+2026-03-21 11:26:40,902{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:invoke	:produce	{:key "k-21495", :value "v-21495"}
+2026-03-21 11:26:40,907{GMT}	INFO	[jepsen worker 2] jepsen.util: 27	:info	:kill	:stop
+2026-03-21 11:26:40,907{GMT}	INFO	[jepsen worker 2] jepsen.util: 27	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:40,908{GMT}	INFO	[jepsen worker 2] jepsen.util: 32	:invoke	:produce	{:key "k-21501", :value "v-21501"}
+2026-03-21 11:26:40,918{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:fail	:produce	{:key "k-21495", :value "v-21495"}	:misdirected
+2026-03-21 11:26:40,919{GMT}	INFO	[jepsen worker 2] jepsen.util: 32	:fail	:produce	{:key "k-21501", :value "v-21501"}	:misdirected
+2026-03-21 11:26:40,919{GMT}	INFO	[jepsen worker 2] jepsen.util: 32	:info	:kill	:start
+2026-03-21 11:26:40,920{GMT}	INFO	[jepsen worker 2] jepsen.util: 32	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:40,920{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:invoke	:produce	{:key "k-21513", :value "v-21513"}
+2026-03-21 11:26:40,927{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:fail	:produce	{:key "k-21513", :value "v-21513"}	:misdirected
+2026-03-21 11:26:40,927{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:invoke	:produce	{:key "k-21520", :value "v-21520"}
+2026-03-21 11:26:40,933{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:fail	:produce	{:key "k-21520", :value "v-21520"}	:misdirected
+2026-03-21 11:26:40,934{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:invoke	:produce	{:key "k-21526", :value "v-21526"}
+2026-03-21 11:26:40,938{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:fail	:produce	{:key "k-21526", :value "v-21526"}	:misdirected
+2026-03-21 11:26:45,855{GMT}	INFO	[jepsen worker 0] jepsen.util: 30	:info	:kill	:stop
+2026-03-21 11:26:45,858{GMT}	INFO	[jepsen worker 0] jepsen.util: 30	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:45,862{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:start
+2026-03-21 11:26:45,863{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:26:45,864{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:invoke	:produce	{:key "k-24522", :value "v-24522"}
+2026-03-21 11:26:45,864{GMT}	WARN	[jepsen worker nemesis] jepsen.generator.interpreter: Process :nemesis crashed
+java.lang.IllegalArgumentException: no nemesis can handle :produce
+	at jepsen.nemesis.MapCompose.invoke_BANG_(nemesis.clj:365)
+	at jepsen.nemesis.Validate.invoke_BANG_(nemesis.clj:63)
+	at jepsen.generator.interpreter.NemesisWorker.invoke_BANG_(interpreter.clj:77)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147.invoke(interpreter.clj:140)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146.invoke(interpreter.clj:123)
+	at clojure.core$binding_conveyor_fn$fn__5823.invoke(core.clj:2047)
+	at clojure.lang.AFn.call(AFn.java:18)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+2026-03-21 11:26:45,928{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:info	:kill	:stop
+2026-03-21 11:26:45,929{GMT}	INFO	[jepsen worker 3] jepsen.util: 33	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:45,930{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:invoke	:produce	{:key "k-24567", :value "v-24567"}
+2026-03-21 11:26:45,932{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-24570", :value "v-24570"}
+2026-03-21 11:26:45,955{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:fail	:produce	{:key "k-24567", :value "v-24567"}	:misdirected
+2026-03-21 11:26:45,955{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-24570", :value "v-24570"}	:misdirected
+2026-03-21 11:26:45,955{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:invoke	:produce	{:key "k-24586", :value "v-24586"}
+2026-03-21 11:26:45,955{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:invoke	:produce	{:key "k-24585", :value "v-24585"}
+2026-03-21 11:26:45,967{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:fail	:produce	{:key "k-24585", :value "v-24585"}	:misdirected
+2026-03-21 11:26:45,969{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:fail	:produce	{:key "k-24586", :value "v-24586"}	:misdirected
+2026-03-21 11:26:45,969{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:invoke	:produce	{:key "k-24598", :value "v-24598"}
+2026-03-21 11:26:45,976{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:fail	:produce	{:key "k-24598", :value "v-24598"}	:misdirected
+2026-03-21 11:26:45,976{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:info	:kill	:start
+2026-03-21 11:26:45,976{GMT}	INFO	[jepsen worker 3] jepsen.util: 38	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:50,871{GMT}	INFO	[jepsen worker 4] jepsen.util: 29	:invoke	:produce	{:key "k-27580", :value "v-27580"}
+2026-03-21 11:26:50,871{GMT}	INFO	[jepsen worker 0] jepsen.util: 35	:invoke	:produce	{:key "k-27578", :value "v-27578"}
+2026-03-21 11:26:50,894{GMT}	INFO	[jepsen worker 4] jepsen.util: 29	:ok	:produce	{:key "k-27580", :value "v-27580", :partition 1, :offset 4}
+2026-03-21 11:26:50,895{GMT}	INFO	[jepsen worker 4] jepsen.util: 29	:info	:kill	:stop
+2026-03-21 11:26:50,895{GMT}	INFO	[jepsen worker 4] jepsen.util: 29	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:50,896{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:invoke	:produce	{:key "k-27598", :value "v-27598"}
+2026-03-21 11:26:50,903{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:ok	:produce	{:key "k-27598", :value "v-27598", :partition 0, :offset 5}
+2026-03-21 11:26:50,903{GMT}	INFO	[jepsen worker 0] jepsen.util: 35	:fail	:produce	{:key "k-27578", :value "v-27578"}	:misdirected
+2026-03-21 11:26:50,903{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:invoke	:produce	{:key "k-27605", :value "v-27605"}
+2026-03-21 11:26:50,904{GMT}	INFO	[jepsen worker 0] jepsen.util: 35	:invoke	:produce	{:key "k-27606", :value "v-27606"}
+2026-03-21 11:26:50,908{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:ok	:produce	{:key "k-27605", :value "v-27605", :partition 3, :offset 1}
+2026-03-21 11:26:50,909{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:invoke	:produce	{:key "k-27611", :value "v-27611"}
+2026-03-21 11:26:50,912{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:ok	:produce	{:key "k-27611", :value "v-27611", :partition 2, :offset 4}
+2026-03-21 11:26:50,913{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:invoke	:produce	{:key "k-27615", :value "v-27615"}
+2026-03-21 11:26:50,913{GMT}	INFO	[jepsen worker 0] jepsen.util: 35	:fail	:produce	{:key "k-27606", :value "v-27606"}	:misdirected
+2026-03-21 11:26:50,915{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:ok	:produce	{:key "k-27615", :value "v-27615", :partition 2, :offset 5}
+2026-03-21 11:26:50,916{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:invoke	:produce	{:key "k-27620", :value "v-27620"}
+2026-03-21 11:26:50,918{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:ok	:produce	{:key "k-27620", :value "v-27620", :partition 2, :offset 6}
+2026-03-21 11:26:50,918{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:info	:kill	:start
+2026-03-21 11:26:50,918{GMT}	INFO	[jepsen worker 4] jepsen.util: 34	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:50,918{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:invoke	:produce	{:key "k-27626", :value "v-27626"}
+2026-03-21 11:26:50,921{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:ok	:produce	{:key "k-27626", :value "v-27626", :partition 0, :offset 6}
+2026-03-21 11:26:50,949{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:info	:kill	:stop
+2026-03-21 11:26:50,949{GMT}	INFO	[jepsen worker 2] jepsen.util: 37	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:50,978{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:info	:kill	:start
+2026-03-21 11:26:50,978{GMT}	INFO	[jepsen worker 1] jepsen.util: 21	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:50,979{GMT}	INFO	[jepsen worker 1] jepsen.util: 26	:invoke	:produce	{:key "k-27673", :value "v-27673"}
+2026-03-21 11:26:50,993{GMT}	INFO	[jepsen worker 1] jepsen.util: 26	:fail	:produce	{:key "k-27673", :value "v-27673"}	:misdirected
+2026-03-21 11:26:50,993{GMT}	INFO	[jepsen worker 1] jepsen.util: 26	:invoke	:produce	{:key "k-27683", :value "v-27683"}
+2026-03-21 11:26:51,000{GMT}	INFO	[jepsen worker 1] jepsen.util: 26	:fail	:produce	{:key "k-27683", :value "v-27683"}	:misdirected
+2026-03-21 11:26:55,869{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:26:55,870{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:26:55,923{GMT}	INFO	[jepsen worker 0] jepsen.util: 35	:info	:kill	:start
+2026-03-21 11:26:55,924{GMT}	INFO	[jepsen worker 0] jepsen.util: 35	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:26:55,953{GMT}	INFO	[jepsen worker 2] jepsen.util: 42	:invoke	:produce	{:key "k-30706", :value "v-30706"}
+2026-03-21 11:26:55,979{GMT}	INFO	[jepsen worker 2] jepsen.util: 42	:fail	:produce	{:key "k-30706", :value "v-30706"}	:misdirected
+2026-03-21 11:26:55,979{GMT}	INFO	[jepsen worker 3] jepsen.util: 43	:invoke	:produce	{:key "k-30727", :value "v-30727"}
+2026-03-21 11:26:55,980{GMT}	INFO	[jepsen worker 2] jepsen.util: 42	:info	:kill	:stop
+2026-03-21 11:26:55,980{GMT}	INFO	[jepsen worker 2] jepsen.util: 42	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:26:55,980{GMT}	INFO	[jepsen worker 2] jepsen.util: 47	:invoke	:produce	{:key "k-30729", :value "v-30729"}
+2026-03-21 11:26:55,991{GMT}	INFO	[jepsen worker 2] jepsen.util: 47	:fail	:produce	{:key "k-30729", :value "v-30729"}	:misdirected
+2026-03-21 11:26:55,997{GMT}	INFO	[jepsen worker 3] jepsen.util: 43	:fail	:produce	{:key "k-30727", :value "v-30727"}	:misdirected
+2026-03-21 11:26:55,997{GMT}	INFO	[jepsen worker 3] jepsen.util: 43	:invoke	:produce	{:key "k-30744", :value "v-30744"}
+2026-03-21 11:26:56,003{GMT}	INFO	[jepsen worker 3] jepsen.util: 43	:fail	:produce	{:key "k-30744", :value "v-30744"}	:misdirected
+2026-03-21 11:26:56,003{GMT}	INFO	[jepsen worker 3] jepsen.util: 43	:info	:kill	:start
+2026-03-21 11:26:56,003{GMT}	INFO	[jepsen worker 3] jepsen.util: 43	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:27:00,876{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:invoke	:produce	{:key "k-33717", :value "v-33717"}
+2026-03-21 11:27:00,878{GMT}	WARN	[jepsen worker nemesis] jepsen.generator.interpreter: Process :nemesis crashed
+java.lang.IllegalArgumentException: no nemesis can handle :produce
+	at jepsen.nemesis.MapCompose.invoke_BANG_(nemesis.clj:365)
+	at jepsen.nemesis.Validate.invoke_BANG_(nemesis.clj:63)
+	at jepsen.generator.interpreter.NemesisWorker.invoke_BANG_(interpreter.clj:77)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146$fn__13147.invoke(interpreter.clj:140)
+	at jepsen.generator.interpreter$spawn_worker$fn__13146.invoke(interpreter.clj:123)
+	at clojure.core$binding_conveyor_fn$fn__5823.invoke(core.clj:2047)
+	at clojure.lang.AFn.call(AFn.java:18)
+	at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:317)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1144)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:642)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+2026-03-21 11:27:00,881{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:27:00,882{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:27:00,931{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:invoke	:produce	{:key "k-33754", :value "v-33754"}
+2026-03-21 11:27:00,947{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:ok	:produce	{:key "k-33754", :value "v-33754", :partition 1, :offset 5}
+2026-03-21 11:27:00,948{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:invoke	:produce	{:key "k-33765", :value "v-33765"}
+2026-03-21 11:27:00,955{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:ok	:produce	{:key "k-33765", :value "v-33765", :partition 1, :offset 6}
+2026-03-21 11:27:00,955{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:info	:kill	:start
+2026-03-21 11:27:00,955{GMT}	INFO	[jepsen worker 4] jepsen.util: 39	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:27:00,996{GMT}	INFO	[jepsen worker 2] jepsen.util: 47	:info	:kill	:stop
+2026-03-21 11:27:00,997{GMT}	INFO	[jepsen worker 2] jepsen.util: 47	:info	:kill	:stop	No matching clause: :kill
+2026-03-21 11:27:01,001{GMT}	INFO	[jepsen worker 1] jepsen.util: 26	:info	:kill	:start
+2026-03-21 11:27:01,002{GMT}	INFO	[jepsen worker 1] jepsen.util: 26	:info	:kill	:start	No matching clause: :kill
+2026-03-21 11:27:01,002{GMT}	INFO	[jepsen worker 1] jepsen.util: 31	:invoke	:produce	{:key "k-33808", :value "v-33808"}
+2026-03-21 11:27:01,022{GMT}	INFO	[jepsen worker 1] jepsen.util: 31	:fail	:produce	{:key "k-33808", :value "v-33808"}	:misdirected
+2026-03-21 11:27:11,029{GMT}	INFO	[jepsen worker 0] jepsen.generator.interpreter: Recovering...
+2026-03-21 11:27:11,032{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	:stop
+2026-03-21 11:27:11,034{GMT}	INFO	[jepsen worker nemesis] jepsen.util: :nemesis	:info	:kill	"nemesis already disrupting (\"n1\")"
+2026-03-21 11:27:26,043{GMT}	INFO	[jepsen worker 3] jepsen.generator.interpreter: Draining partitions...
+2026-03-21 11:27:26,046{GMT}	INFO	[jepsen worker 0] jepsen.util: 40	:invoke	:consume	{:partition 2, :offset 0}
+2026-03-21 11:27:26,046{GMT}	INFO	[jepsen worker 4] jepsen.util: 44	:invoke	:consume	{:partition 1, :offset 0}
+2026-03-21 11:27:26,047{GMT}	INFO	[jepsen worker 2] jepsen.util: 52	:invoke	:consume	{:partition 3, :offset 0}
+2026-03-21 11:27:26,047{GMT}	INFO	[jepsen worker 3] jepsen.util: 48	:invoke	:consume	{:partition 2, :offset 0}
+2026-03-21 11:27:26,047{GMT}	INFO	[jepsen worker 1] jepsen.util: 31	:invoke	:consume	{:partition 2, :offset 0}
+2026-03-21 11:27:26,056{GMT}	INFO	[jepsen worker 1] jepsen.util: 31	:ok	:consume	[]
+2026-03-21 11:27:26,056{GMT}	INFO	[jepsen worker 0] jepsen.util: 40	:ok	:consume	[]
+2026-03-21 11:27:26,056{GMT}	INFO	[jepsen worker 4] jepsen.util: 44	:ok	:consume	[{:offset 0, :partition 1, :key "k-6165", :value "v-6165"} {:offset 1, :partition 1, :key "k-6169", :value "v-6169"}]
+2026-03-21 11:27:26,056{GMT}	INFO	[jepsen worker 2] jepsen.util: 52	:ok	:consume	[]
+2026-03-21 11:27:26,056{GMT}	INFO	[jepsen worker 3] jepsen.util: 48	:ok	:consume	[]
+2026-03-21 11:27:26,141{GMT}	INFO	[jepsen test runner] jepsen.core: Run complete, writing
+2026-03-21 11:27:26,168{GMT}	INFO	[jepsen test runner] jepsen.core: Snarfing log files
+2026-03-21 11:27:26,176{GMT}	INFO	[jepsen node n1] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,177{GMT}	INFO	[jepsen node n2] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,177{GMT}	INFO	[jepsen node n4] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,177{GMT}	INFO	[jepsen node n3] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,177{GMT}	INFO	[jepsen node n5] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,364{GMT}	INFO	[jepsen test runner] jepsen.core: Snarfing log files
+2026-03-21 11:27:26,369{GMT}	INFO	[jepsen node n3] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,369{GMT}	INFO	[jepsen node n5] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,369{GMT}	INFO	[jepsen node n1] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,369{GMT}	INFO	[jepsen node n4] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,369{GMT}	INFO	[jepsen node n2] jepsen.core: downloading /var/log/camu.log to camu.log
+2026-03-21 11:27:26,543{GMT}	INFO	[jepsen node n2] jepsen.camu.db: Tearing down camu on n2
+2026-03-21 11:27:26,543{GMT}	INFO	[jepsen node n1] jepsen.camu.db: Tearing down camu on n1
+2026-03-21 11:27:26,543{GMT}	INFO	[jepsen node n3] jepsen.camu.db: Tearing down camu on n3
+2026-03-21 11:27:26,543{GMT}	INFO	[jepsen node n5] jepsen.camu.db: Tearing down camu on n5
+2026-03-21 11:27:26,543{GMT}	INFO	[jepsen node n4] jepsen.camu.db: Tearing down camu on n4
+2026-03-21 11:27:26,547{GMT}	INFO	[jepsen node n3] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:27:26,547{GMT}	INFO	[jepsen node n5] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:27:26,547{GMT}	INFO	[jepsen node n1] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:27:26,548{GMT}	INFO	[jepsen node n4] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:27:26,548{GMT}	INFO	[jepsen node n2] jepsen.control.util: Stopping /var/run/camu.pid
+2026-03-21 11:27:26,743{GMT}	INFO	[jepsen test runner] jepsen.core: Analyzing...
+2026-03-21 11:27:26,754{GMT}	INFO	[jepsen test runner] jepsen.core: Analysis complete
+2026-03-21 11:27:26,765{GMT}	INFO	[jepsen results] jepsen.store: Wrote /jepsen/camu/store/camu/20260321T112603.533Z/results.edn
+2026-03-21 11:27:26,778{GMT}	INFO	[jepsen test runner] jepsen.core: {:no-data-loss {:valid? false,
+                :produced 23,
+                :consumed 2,
+                :missing 15,
+                :missing-data ({:key "k-12284",
+                                :value "v-12284",
+                                :partition 0,
+                                :offset 2}
+                               {:key "k-12301",
+                                :value "v-12301",
+                                :partition 0,
+                                :offset 3}
+                               {:key "k-12309",
+                                :value "v-12309",
+                                :partition 0,
+                                :offset 4}
+                               {:key "k-21436",
+                                :value "v-21436",
+                                :partition 1,
+                                :offset 2}
+                               {:key "k-21451",
+                                :value "v-21451",
+                                :partition 2,
+                                :offset 2}
+                               {:key "k-21459",
+                                :value "v-21459",
+                                :partition 2,
+                                :offset 3}
+                               {:key "k-21469",
+                                :value "v-21469",
+                                :partition 1,
+                                :offset 3}
+                               {:key "k-27580",
+                                :value "v-27580",
+                                :partition 1,
+                                :offset 4}
+                               {:key "k-27598",
+                                :value "v-27598",
+                                :partition 0,
+                                :offset 5}
+                               {:key "k-27611",
+                                :value "v-27611",
+                                :partition 2,
+                                :offset 4}
+                               {:key "k-27615",
+                                :value "v-27615",
+                                :partition 2,
+                                :offset 5}
+                               {:key "k-27620",
+                                :value "v-27620",
+                                :partition 2,
+                                :offset 6}
+                               {:key "k-27626",
+                                :value "v-27626",
+                                :partition 0,
+                                :offset 6}
+                               {:key "k-33754",
+                                :value "v-33754",
+                                :partition 1,
+                                :offset 5}
+                               {:key "k-33765",
+                                :value "v-33765",
+                                :partition 1,
+                                :offset 6})},
+ :offset-monotonicity {:valid? true, :problems nil},
+ :no-split-brain {:valid? true, :conflicts nil},
+ :availability {:valid? true,
+                :ok-count 28,
+                :fail-count 67,
+                :info-count 104,
+                :availability 0.2828282828282828},
+ :lease-fencing {:valid? true, :rejoin-count 0, :conflicts ()},
+ :recovery-time {:valid? true,
+                 :min-recovery-ns 4329187,
+                 :max-recovery-ns 15025519352,
+                 :mean-recovery-ns 7286854211,
+                 :count 22},
+ :stats {:valid? false,
+         :count 177,
+         :ok-count 28,
+         :fail-count 67,
+         :info-count 82,
+         :by-f {:consume {:valid? true,
+                          :count 5,
+                          :ok-count 5,
+                          :fail-count 0,
+                          :info-count 0},
+                :kill {:valid? false,
+                       :count 82,
+                       :ok-count 0,
+                       :fail-count 0,
+                       :info-count 82},
+                :produce {:valid? true,
+                          :count 90,
+                          :ok-count 23,
+                          :fail-count 67,
+                          :info-count 0}}},
+ :valid? false}
+
+
+Analysis invalid! (ﾉಥ益ಥ）ﾉ ┻━┻
