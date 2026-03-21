@@ -9,3 +9,5 @@
 .idea/
 .vscode/
 *.swp
+jepsen/camu/store/
+jepsen/camu/camu
