@@ -268,7 +268,7 @@ func (s *Server) AcquireLeasesForTopic(topic string, numPartitions int) {
 		Partitions: flattenAssignments(assignments),
 		Version:    1,
 	}
-	if err := s.assignmentStore.Write(ctx, topic, ta); err != nil {
+	if err := s.assignmentStore.Write(ctx, topic, ta, ""); err != nil {
 		slog.Error("AcquireLeasesForTopic: write assignments", "topic", topic, "error", err)
 	}
 
@@ -298,13 +298,15 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 		ta := coordination.TopicAssignments{
 			Partitions: newPartitions,
 		}
+		var etag string
 		if err == nil {
 			ta.Version = existing.Version + 1
+			etag = existing.ETag
 		} else {
 			ta.Version = 1
 		}
 
-		if err := s.assignmentStore.Write(ctx, tc.Name, ta); err != nil {
+		if err := s.assignmentStore.Write(ctx, tc.Name, ta, etag); err != nil {
 			slog.Error("publishAssignments: write", "topic", tc.Name, "error", err)
 		}
 	}
