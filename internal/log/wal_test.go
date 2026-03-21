@@ -123,35 +123,6 @@ func TestWAL_EmptyReplay(t *testing.T) {
 	}
 }
 
-func TestWAL_UnflushedMessages(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.wal")
-
-	w, err := OpenWAL(path, false)
-	if err != nil {
-		t.Fatalf("OpenWAL: %v", err)
-	}
-	defer w.Close()
-
-	for i := 0; i < 3; i++ {
-		m := Message{Offset: uint64(i), Timestamp: int64(i * 100), Value: []byte("val")}
-		if err := w.Append(m); err != nil {
-			t.Fatalf("Append %d: %v", i, err)
-		}
-	}
-
-	unflushed := w.UnflushedFrom(1)
-	if len(unflushed) != 2 {
-		t.Fatalf("expected 2 unflushed messages from offset 1, got %d", len(unflushed))
-	}
-	if unflushed[0].Offset != 1 {
-		t.Errorf("expected offset 1, got %d", unflushed[0].Offset)
-	}
-	if unflushed[1].Offset != 2 {
-		t.Errorf("expected offset 2, got %d", unflushed[1].Offset)
-	}
-}
-
 func TestWAL_CorruptEntrySkipped(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "corrupt.wal")
@@ -212,12 +183,6 @@ func TestWAL_AppendBatch(t *testing.T) {
 
 	if err := w.AppendBatch(msgs); err != nil {
 		t.Fatalf("AppendBatch() error: %v", err)
-	}
-
-	// Verify in-memory buffer
-	unflushed := w.UnflushedFrom(0)
-	if len(unflushed) != 3 {
-		t.Fatalf("UnflushedFrom(0) = %d messages, want 3", len(unflushed))
 	}
 
 	w.Close()

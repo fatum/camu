@@ -307,21 +307,6 @@ func (pm *PartitionManager) IsOwned(topic string, partitionID int) bool {
 	return true
 }
 
-// GetBuffer returns unflushed messages from WAL for the given partition.
-func (pm *PartitionManager) GetBuffer(topic string, partitionID int) []log.Message {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	tp, ok := pm.partitions[topic]
-	if !ok {
-		return nil
-	}
-	ps, ok := tp[partitionID]
-	if !ok {
-		return nil
-	}
-	return ps.wal.UnflushedFrom(0)
-}
-
 // GetRouter returns the router for the given topic.
 func (pm *PartitionManager) GetRouter(topic string) *producer.Router {
 	pm.mu.RLock()

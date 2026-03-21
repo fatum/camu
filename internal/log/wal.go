@@ -21,10 +21,9 @@ import (
 //	[message frame bytes  (same format as segment.go writeMessageFrame)]
 //	[4-byte CRC32         (uint32 big-endian, over the message frame bytes)]
 type WAL struct {
-	mu     sync.Mutex
-	file   *os.File
-	buf    []Message // in-memory buffer of all appended messages
-	fsync  bool
+	mu    sync.Mutex
+	file  *os.File
+	fsync bool
 }
 
 // OpenWAL opens (or creates) the WAL file at path. It does NOT auto-replay;
@@ -77,8 +76,6 @@ func (w *WAL) Append(msg Message) error {
 			return fmt.Errorf("WAL fsync: %w", err)
 		}
 	}
-
-	w.buf = append(w.buf, msg)
 	return nil
 }
 
@@ -133,57 +130,48 @@ func (w *WAL) AppendBatch(msgs []Message) error {
 		}
 	}
 
-	w.buf = append(w.buf, msgs...)
 	return nil
 }
 
 // Replay reads all valid entries from the beginning of the WAL file.
-// Entries with a bad CRC or that are truncated (from a crash mid-write) are
-// silently skipped — only entries that trail the last valid entry can be
-// corrupt; earlier corruption would be a data integrity problem we surface.
 func (w *WAL) Replay() ([]Message, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.replayLocked()
+}
 
+// replayLocked reads all valid entries from the file. Caller must hold w.mu.
+func (w *WAL) replayLocked() ([]Message, error) {
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("WAL seek start: %w", err)
 	}
 
 	var msgs []Message
 	for {
-		// Read 4-byte entry length
 		var entryLen uint32
 		if err := binary.Read(w.file, binary.BigEndian, &entryLen); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break // clean or truncated end
+				break
 			}
 			return nil, fmt.Errorf("WAL read entry length: %w", err)
 		}
 
-		// Read the frame bytes
 		frameBytes := make([]byte, entryLen)
 		if _, err := io.ReadFull(w.file, frameBytes); err != nil {
-			// Truncated entry — skip and stop
 			break
 		}
 
-		// Read 4-byte CRC32
 		var storedCRC uint32
 		if err := binary.Read(w.file, binary.BigEndian, &storedCRC); err != nil {
-			// Truncated before CRC — skip and stop
 			break
 		}
 
-		// Validate checksum
 		if crc32.ChecksumIEEE(frameBytes) != storedCRC {
-			// Corrupt entry — skip and stop (trailing corruption from crash)
 			break
 		}
 
-		// Decode the message frame
 		msg, err := readMessageFrame(bytes.NewReader(frameBytes))
 		if err != nil {
-			// Should not happen for a valid CRC'd frame, but skip defensively
 			break
 		}
 
@@ -200,14 +188,19 @@ func (w *WAL) TruncateBefore(offset uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Collect entries to keep from the in-memory buffer.
-	// (The buffer is the authoritative ordered list after Append calls.)
-	var keep []Message
-	for _, m := range w.buf {
+	// Replay WAL from disk to find entries to keep.
+	keep, err := w.replayLocked()
+	if err != nil {
+		return fmt.Errorf("WAL truncate replay: %w", err)
+	}
+	// Filter to keep only messages >= offset.
+	filtered := keep[:0]
+	for _, m := range keep {
 		if m.Offset >= offset {
-			keep = append(keep, m)
+			filtered = append(filtered, m)
 		}
 	}
+	keep = filtered
 
 	// Build the new WAL file content in memory, then write atomically.
 	tmpPath := w.file.Name() + ".tmp"
@@ -265,23 +258,7 @@ func (w *WAL) TruncateBefore(offset uint64) error {
 		return fmt.Errorf("WAL truncate reopen: %w", err)
 	}
 	w.file = f
-	w.buf = keep
 	return nil
-}
-
-// UnflushedFrom returns all in-memory messages whose Offset >= offset.
-// It performs no file I/O; the buffer is populated by Append.
-func (w *WAL) UnflushedFrom(offset uint64) []Message {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	var result []Message
-	for _, m := range w.buf {
-		if m.Offset >= offset {
-			result = append(result, m)
-		}
-	}
-	return result
 }
 
 // Close closes the underlying file.
