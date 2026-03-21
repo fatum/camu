@@ -137,16 +137,7 @@ Every message is appended to a local WAL file and fsynced before the client rece
 1. Producer sends `POST /v1/topics/{topic}/messages` with message(s) containing key, value, headers
 2. Server hashes each message's key to determine the target partition (round-robin if no key)
 3. If this instance owns the target partition: append to local WAL, fsync, assign offset, respond to client
-4. If another instance owns it: return `307 Redirect` with the owner's address in the `Location` header and a JSON body containing the owner's instance ID and address:
-   ```json
-   {
-     "redirect": {
-       "instance_id": "abc-123",
-       "address": "http://10.0.1.5:8080",
-       "partition": 3
-     }
-   }
-   ```
+4. If this instance does not own the target partition: return `421 Misdirected Request` with the current routing map so the client can update its routing table and retry to the correct instance
 5. Background flusher batches WAL entries into segments, uploads to S3, updates index, truncates WAL
 
 ### Batching
@@ -269,6 +260,23 @@ POST   /v1/topics/{topic}/offsets/{consumer_id}            — commit offsets
 GET    /v1/topics/{topic}/offsets/{consumer_id}             — get offsets
 ```
 
+### Routing
+
+```
+GET    /v1/topics/{topic}/routing                          — partition → instance mapping
+```
+
+Response:
+```json
+{
+  "partitions": {
+    "0": {"instance_id": "abc-123", "address": "http://10.0.1.5:8080"},
+    "1": {"instance_id": "abc-123", "address": "http://10.0.1.5:8080"},
+    "2": {"instance_id": "def-456", "address": "http://10.0.1.6:8080"}
+  }
+}
+```
+
 ### Cluster
 
 ```
@@ -294,9 +302,9 @@ Each camu instance owns a subset of partitions via S3-based leases. Only the own
 
 ### Write Routing
 
-When a produce request arrives:
-- If this instance owns the target partition: write locally
-- If another instance owns it: return `307 Redirect` to the owner
+Clients fetch the partition-to-instance routing map via `GET /v1/topics/{topic}/routing` and cache it locally. They send writes directly to the owning instance.
+
+If a write hits the wrong instance (stale routing), the server returns `421 Misdirected Request` with the current routing map. The client updates its cache and retries.
 
 ## Configuration
 
@@ -342,7 +350,7 @@ groups:
 - Single binary: `camu serve --config camu.yaml`
 - Multiple instances point to the same S3 bucket — they discover each other via coordination leases
 - No external dependencies beyond S3-compatible storage and local disk for WAL
-- All instances must be directly network-reachable to clients (not behind an opaque load balancer) because write routing uses `307 Redirect` to the partition owner
+- All instances must be directly network-reachable to clients since clients route writes to specific instances based on the routing map
 - Health check at `GET /v1/cluster/status`
 
 ### Graceful Shutdown
