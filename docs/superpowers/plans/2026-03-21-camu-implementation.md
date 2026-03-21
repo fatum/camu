@@ -61,6 +61,19 @@
 | `test/integration/chaos_test.go` | Chaos tests (random kills, latency injection) |
 | `test/bench/throughput_test.go` | Produce/consume throughput benchmarks |
 
+### Jepsen
+
+| File | Responsibility |
+|------|---------------|
+| `jepsen/camu/project.clj` | Clojure project definition, Jepsen dependency |
+| `jepsen/camu/src/jepsen/camu.clj` | Main test runner, generator, checker composition |
+| `jepsen/camu/src/jepsen/camu/client.clj` | HTTP client for produce/consume operations |
+| `jepsen/camu/src/jepsen/camu/nemesis.clj` | Fault injection: kill, partition, pause |
+| `jepsen/camu/src/jepsen/camu/checker.clj` | Invariant checkers: no data loss, offset monotonicity, no split-brain |
+| `jepsen/camu/src/jepsen/camu/db.clj` | Cluster lifecycle: install, start, stop camu on nodes |
+| `jepsen/camu/docker-compose.yml` | 5-node Jepsen environment + MinIO |
+| `jepsen/camu/run.sh` | Build + run script |
+
 ---
 
 ### Task 1: Project Scaffolding
@@ -3290,4 +3303,510 @@ Expected: PASS
 ```bash
 git add internal/log/gc.go internal/log/gc_test.go
 git commit -m "feat: orphan segment garbage collector"
+```
+
+---
+
+### Task 26: Jepsen Verification
+
+**Files:**
+- Create: `jepsen/camu/project.clj`
+- Create: `jepsen/camu/src/jepsen/camu.clj`
+- Create: `jepsen/camu/src/jepsen/camu/client.clj`
+- Create: `jepsen/camu/src/jepsen/camu/nemesis.clj`
+- Create: `jepsen/camu/src/jepsen/camu/checker.clj`
+- Create: `jepsen/camu/src/jepsen/camu/db.clj`
+- Create: `jepsen/camu/README.md`
+- Create: `jepsen/camu/docker-compose.yml`
+
+This task sets up a full Jepsen test suite for camu. Jepsen runs concurrent operations against a camu cluster while injecting faults, records a complete operation history, and verifies consistency invariants.
+
+**Prerequisites:** JVM, Leiningen, Docker (for test nodes)
+
+- [ ] **Step 1: Set up Jepsen project**
+
+Create `jepsen/camu/project.clj`:
+
+```clojure
+(defproject jepsen.camu "0.1.0"
+  :description "Jepsen tests for Camu commit log"
+  :dependencies [[org.clojure/clojure "1.11.1"]
+                 [jepsen "0.3.5"]
+                 [clj-http "3.12.3"]
+                 [cheshire "5.12.0"]]
+  :main jepsen.camu
+  :jvm-opts ["-Xmx4g"])
+```
+
+- [ ] **Step 2: Implement db (cluster lifecycle)**
+
+Create `jepsen/camu/src/jepsen/camu/db.clj`:
+
+```clojure
+(ns jepsen.camu.db
+  (:require [clojure.tools.logging :refer [info]]
+            [jepsen [control :as c]
+                    [db :as db]
+                    [util :as util]]
+            [jepsen.control.util :as cu]))
+
+(defn db
+  "Manages camu lifecycle on a Jepsen node."
+  [opts]
+  (reify db/DB
+    (setup! [_ test node]
+      (info "Installing camu on" node)
+      ;; Upload camu binary (pre-built)
+      (c/upload (:camu-binary opts) "/usr/local/bin/camu")
+      (c/exec :chmod "+x" "/usr/local/bin/camu")
+      ;; Create directories
+      (c/exec :mkdir :-p "/var/lib/camu/wal")
+      (c/exec :mkdir :-p "/var/lib/camu/cache")
+      ;; Write config
+      (let [config (str "server:\n"
+                        "  address: \"0.0.0.0:8080\"\n"
+                        "  instance_id: \"" node "\"\n"
+                        "storage:\n"
+                        "  bucket: \"" (:bucket opts) "\"\n"
+                        "  region: \"us-east-1\"\n"
+                        "  endpoint: \"" (:s3-endpoint opts) "\"\n"
+                        "  credentials:\n"
+                        "    access_key: \"minioadmin\"\n"
+                        "    secret_key: \"minioadmin\"\n"
+                        "wal:\n"
+                        "  directory: \"/var/lib/camu/wal\"\n"
+                        "  fsync: true\n"
+                        "segments:\n"
+                        "  max_size: 1048576\n"
+                        "  max_age: \"2s\"\n"
+                        "  compression: \"none\"\n"
+                        "cache:\n"
+                        "  directory: \"/var/lib/camu/cache\"\n"
+                        "  max_size: 1073741824\n"
+                        "coordination:\n"
+                        "  lease_ttl: \"10s\"\n"
+                        "  heartbeat_interval: \"3s\"\n"
+                        "  rebalance_delay: \"5s\"\n")]
+        (cu/write-file! config "/etc/camu.yaml"))
+      ;; Start camu
+      (cu/start-daemon!
+        {:logfile "/var/log/camu.log"
+         :pidfile "/var/run/camu.pid"
+         :chdir   "/"}
+        "/usr/local/bin/camu"
+        :serve :--config "/etc/camu.yaml"))
+
+    (teardown! [_ test node]
+      (info "Tearing down camu on" node)
+      (cu/stop-daemon! "/var/run/camu.pid")
+      (c/exec :rm :-rf "/var/lib/camu"))
+
+    db/LogFiles
+    (log-files [_ test node]
+      ["/var/log/camu.log"])))
+```
+
+- [ ] **Step 3: Implement client (camu HTTP operations)**
+
+Create `jepsen/camu/src/jepsen/camu/client.clj`:
+
+```clojure
+(ns jepsen.camu.client
+  (:require [clj-http.client :as http]
+            [cheshire.core :as json]
+            [clojure.tools.logging :refer [info warn]]
+            [jepsen [client :as client]])
+  (:import (java.net ConnectException SocketTimeoutException)))
+
+(defn base-url [node]
+  (str "http://" node ":8080"))
+
+(defn produce!
+  "Produce a message with the given key and value. Returns the assigned offset."
+  [node topic key value]
+  (let [resp (http/post (str (base-url node) "/v1/topics/" topic "/messages")
+                        {:content-type :json
+                         :body (json/generate-string
+                                 [{:key key :value value}])
+                         :socket-timeout 5000
+                         :connection-timeout 5000
+                         :throw-exceptions false})]
+    (when (= 200 (:status resp))
+      (-> resp :body (json/parse-string true) :offsets first))))
+
+(defn consume!
+  "Consume messages from a partition starting at offset."
+  [node topic partition offset limit]
+  (let [resp (http/get (str (base-url node) "/v1/topics/" topic
+                            "/partitions/" partition
+                            "/messages")
+                       {:query-params {:offset offset :limit limit}
+                        :socket-timeout 5000
+                        :connection-timeout 5000
+                        :throw-exceptions false})]
+    (when (= 200 (:status resp))
+      (-> resp :body (json/parse-string true)))))
+
+(defrecord CamuClient [node topic]
+  client/Client
+  (open! [this test node]
+    (assoc this :node node))
+
+  (setup! [this test]
+    ;; Create topic once
+    (try
+      (http/post (str (base-url node) "/v1/topics")
+                 {:content-type :json
+                  :body (json/generate-string
+                          {:name topic :partitions 4 :retention "24h"})
+                  :throw-exceptions false})
+      (catch Exception _)))
+
+  (invoke! [this test op]
+    (try
+      (case (:f op)
+        :produce
+        (let [result (produce! node topic
+                               (str (:key (:value op)))
+                               (str (:val (:value op))))]
+          (if result
+            (assoc op :type :ok :value (assoc (:value op)
+                                              :offset (:offset result)
+                                              :partition (:partition result)))
+            (assoc op :type :fail :error :produce-failed)))
+
+        :consume
+        (let [partition (:partition (:value op))
+              offset    (or (:offset (:value op)) 0)
+              result    (consume! node topic partition offset 1000)]
+          (if result
+            (assoc op :type :ok :value (:messages result))
+            (assoc op :type :fail :error :consume-failed))))
+
+      (catch ConnectException _
+        (assoc op :type :fail :error :connection-refused))
+      (catch SocketTimeoutException _
+        (assoc op :type :info :error :timeout))))
+
+  (teardown! [this test])
+  (close! [this test]))
+
+(defn client
+  "Creates a new CamuClient."
+  [topic]
+  (map->CamuClient {:topic topic}))
+```
+
+- [ ] **Step 4: Implement nemeses (fault injection)**
+
+Create `jepsen/camu/src/jepsen/camu/nemesis.clj`:
+
+```clojure
+(ns jepsen.camu.nemesis
+  (:require [jepsen [nemesis :as nemesis]
+                    [generator :as gen]
+                    [net :as net]]))
+
+(defn nemesis-package
+  "Returns a nemesis and generator for camu testing.
+   Supports:
+   - :kill    — SIGKILL random camu processes
+   - :partition — network partitions between nodes
+   - :pause   — SIGSTOP/SIGCONT camu processes"
+  [opts]
+  (let [faults (:faults opts #{:kill :partition})]
+    {:nemesis
+     (nemesis/compose
+       (merge
+         (when (:kill faults)
+           {#{:kill} (nemesis/node-start-stopper
+                       rand-nth
+                       (fn start [test node]
+                         (jepsen.control/exec :pkill :-9 :camu)
+                         [:killed node])
+                       (fn stop [test node]
+                         (jepsen.control/exec
+                           :bash :-c
+                           "nohup /usr/local/bin/camu serve --config /etc/camu.yaml > /var/log/camu.log 2>&1 &")
+                         [:restarted node]))})
+         (when (:partition faults)
+           {#{:partition} (nemesis/partition-random-halves)})
+         (when (:pause faults)
+           {#{:pause} (nemesis/hammer-time "camu")})))
+
+     :generator
+     (gen/phases
+       ;; Let the cluster stabilize
+       (gen/sleep 10)
+       ;; Run faults interleaved with client operations
+       (->> (gen/mix
+              (concat
+                (when (:kill faults)
+                  [{:type :info :f :kill}])
+                (when (:partition faults)
+                  [{:type :info :f :partition}])
+                (when (:pause faults)
+                  [{:type :info :f :pause}])))
+            (gen/stagger 5)
+            (gen/time-limit (:time-limit opts 60)))
+       ;; Recover
+       (gen/nemesis (gen/once {:type :info :f :recover}))
+       (gen/sleep 15))}))
+```
+
+- [ ] **Step 5: Implement checker (invariant verification)**
+
+Create `jepsen/camu/src/jepsen/camu/checker.clj`:
+
+```clojure
+(ns jepsen.camu.checker
+  (:require [jepsen [checker :as checker]]
+            [clojure.set :as set]
+            [clojure.tools.logging :refer [info warn]]))
+
+(defn no-data-loss-checker
+  "Verifies that every acknowledged produce is eventually consumable.
+   After all operations complete, consumes all partitions and checks
+   that every :ok produce offset appears in the consumed data."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [;; All acknowledged produces
+            acked-produces (->> history
+                                (filter #(and (= :ok (:type %))
+                                              (= :produce (:f %))))
+                                (map :value))
+            ;; Group by partition
+            by-partition (group-by :partition acked-produces)
+            ;; All successful consumes (the final drain read)
+            consumed (->> history
+                          (filter #(and (= :ok (:type %))
+                                        (= :consume (:f %))))
+                          (mapcat :value))
+            consumed-offsets (set (map (fn [m] [(:partition m) (:offset m)]) consumed))
+            ;; Check each acked produce exists in consumed
+            missing (->> acked-produces
+                         (filter #(not (consumed-offsets [(:partition %) (:offset %)]))))]
+        {:valid? (empty? missing)
+         :acked-count (count acked-produces)
+         :consumed-count (count consumed)
+         :missing-count (count missing)
+         :missing (take 10 missing)}))))
+
+(defn offset-monotonicity-checker
+  "Verifies that offsets within each partition are strictly increasing
+   with no gaps and no duplicates."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [consumed (->> history
+                          (filter #(and (= :ok (:type %))
+                                        (= :consume (:f %))))
+                          (mapcat :value))
+            by-partition (group-by :partition consumed)
+            violations (for [[partition msgs] by-partition
+                             :let [offsets (sort (map :offset msgs))
+                                   dups (- (count offsets) (count (distinct offsets)))
+                                   gaps (for [[a b] (partition 2 1 (distinct offsets))
+                                              :when (> (- b a) 1)]
+                                          {:from a :to b :gap (- b a 1)})]
+                             :when (or (pos? dups) (seq gaps))]
+                         {:partition partition
+                          :duplicate-count dups
+                          :gaps gaps})]
+        {:valid? (empty? violations)
+         :violations violations}))))
+
+(defn no-split-brain-checker
+  "Verifies that no two messages in the same partition have the same offset
+   but different values (indicating two instances wrote to the same partition)."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [consumed (->> history
+                          (filter #(and (= :ok (:type %))
+                                        (= :consume (:f %))))
+                          (mapcat :value))
+            by-partition (group-by :partition consumed)
+            conflicts (for [[partition msgs] by-partition
+                            :let [by-offset (group-by :offset msgs)]
+                            [offset offset-msgs] by-offset
+                            :when (> (count (distinct (map :value offset-msgs))) 1)]
+                        {:partition partition
+                         :offset offset
+                         :values (map :value offset-msgs)})]
+        {:valid? (empty? conflicts)
+         :conflict-count (count conflicts)
+         :conflicts (take 10 conflicts)}))))
+```
+
+- [ ] **Step 6: Implement main test runner**
+
+Create `jepsen/camu/src/jepsen/camu.clj`:
+
+```clojure
+(ns jepsen.camu
+  (:gen-class)
+  (:require [clojure.tools.logging :refer [info]]
+            [jepsen [cli :as cli]
+                    [checker :as checker]
+                    [generator :as gen]
+                    [tests :as tests]]
+            [jepsen.os.debian :as debian]
+            [jepsen.camu [client :as client]
+                         [db :as db]
+                         [nemesis :as nemesis]
+                         [checker :as camu-checker]]))
+
+(defn camu-test
+  "Constructs a Jepsen test map for camu."
+  [opts]
+  (let [topic "jepsen-test"
+        nem   (nemesis/nemesis-package
+                {:faults (:faults opts #{:kill :partition})
+                 :time-limit (:time-limit opts 60)})
+        n     (atom 0)]
+    (merge tests/noop-test
+           opts
+           {:name      "camu"
+            :os        debian/os
+            :db        (db/db {:camu-binary (:camu-binary opts "./camu")
+                               :bucket      "jepsen-bucket"
+                               :s3-endpoint (:s3-endpoint opts "http://minio:9000")})
+            :client    (client/client topic)
+            :nemesis   (:nemesis nem)
+            :checker   (checker/compose
+                         {:no-data-loss       (camu-checker/no-data-loss-checker)
+                          :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+                          :no-split-brain     (camu-checker/no-split-brain-checker)
+                          :timeline           (checker/timeline)
+                          :stats              (checker/stats)
+                          :perf               (checker/perf)})
+            :generator (gen/phases
+                         ;; Client operations + nemesis interleaved
+                         (->> (gen/mix
+                                [{:type :invoke :f :produce
+                                  :value {:key (str "k-" (swap! n inc))
+                                          :val (str "v-" @n)}}])
+                              (gen/stagger 1/10)
+                              (gen/nemesis (:generator nem))
+                              (gen/time-limit (:time-limit opts 60)))
+                         ;; Recovery
+                         (gen/nemesis (gen/once {:type :info :f :recover}))
+                         (gen/sleep 15)
+                         ;; Final drain — consume all partitions
+                         (gen/clients
+                           (gen/each-thread
+                             (gen/once
+                               (fn [_ _]
+                                 (for [p (range 4)]
+                                   {:type :invoke :f :consume
+                                    :value {:partition p :offset 0}}))))))})))
+
+(defn -main
+  "CLI entry point."
+  [& args]
+  (cli/run!
+    (merge (cli/single-test-cmd {:test-fn camu-test})
+           (cli/serve-cmd))
+    args))
+```
+
+- [ ] **Step 7: Create Docker Compose for Jepsen nodes**
+
+Create `jepsen/camu/docker-compose.yml`:
+
+```yaml
+version: "3.8"
+services:
+  control:
+    image: jepsen-control
+    build: .
+    volumes:
+      - ./:/jepsen/camu
+      - ../../:/camu-src
+    depends_on:
+      - minio
+      - n1
+      - n2
+      - n3
+      - n4
+      - n5
+
+  minio:
+    image: minio/minio
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+
+  n1:
+    image: jepsen-node
+    hostname: n1
+    privileged: true
+
+  n2:
+    image: jepsen-node
+    hostname: n2
+    privileged: true
+
+  n3:
+    image: jepsen-node
+    hostname: n3
+    privileged: true
+
+  n4:
+    image: jepsen-node
+    hostname: n4
+    privileged: true
+
+  n5:
+    image: jepsen-node
+    hostname: n5
+    privileged: true
+```
+
+- [ ] **Step 8: Add Jepsen run script**
+
+Create `jepsen/camu/run.sh`:
+
+```bash
+#!/bin/bash
+set -e
+
+# Build camu binary for Linux
+echo "Building camu..."
+cd ../../
+GOOS=linux GOARCH=amd64 go build -o jepsen/camu/camu ./cmd/camu/
+cd jepsen/camu
+
+# Start Docker environment
+echo "Starting Jepsen environment..."
+docker-compose up -d
+
+# Run Jepsen tests
+echo "Running Jepsen tests..."
+docker-compose exec control \
+  lein run test \
+    --nodes n1,n2,n3,n4,n5 \
+    --time-limit 120 \
+    --s3-endpoint http://minio:9000 \
+    --camu-binary /jepsen/camu/camu
+
+echo "Results in jepsen/camu/store/latest/"
+```
+
+- [ ] **Step 9: Verify Jepsen project compiles**
+
+```bash
+cd /Users/maksim/Projects/camu/jepsen/camu && lein deps && lein compile
+```
+
+Expected: Compiles without errors
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add jepsen/
+git commit -m "feat: Jepsen test suite for consistency verification"
 ```
