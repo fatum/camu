@@ -202,13 +202,33 @@ cd jepsen/camu && docker compose up --abort-on-container-exit control
 
 ### Jepsen Results
 
-Verified on a 5-node cluster with process kill faults:
+Verified on a 5-node cluster with process kill faults over 300 seconds. Mixed workload: 70% produce, 30% consume with kill/restart cycles every ~25s.
 
-| Checker | Result |
-|---------|--------|
-| Offset monotonicity | VALID |
-| No split-brain | VALID |
-| Lease fencing | VALID |
+**Consistency checkers:**
+
+| Checker | Result | Description |
+|---------|--------|-------------|
+| No split-brain | VALID | No two writers at same (partition, offset) |
+| Total order | VALID | Offsets contiguous 0,1,2,...N per partition |
+| Offset monotonicity | VALID | No gaps or duplicates |
+| Lease fencing | VALID | Epoch fencing prevents stale writes after rejoin |
+
+**Operational metrics:**
+
+| Metric | Value |
+|--------|-------|
+| Total operations | 2,916 |
+| Produce attempts / succeeded | 2,034 / 729 (36% availability under faults) |
+| Consume attempts / succeeded | 878 / 789 |
+| Drain (post-recovery verification) | 4/4 partitions drained |
+| Recovery events measured | 50 |
+| Min recovery time | 3.5 ms |
+| Max recovery time | 20 s |
+| Mean recovery time | 979 ms |
+
+**Expected behavior:** Acked writes on killed instances may be lost if the WAL wasn't flushed to S3 before the kill. This is the documented `acks=1` trade-off — equivalent to Kafka with a single replica.
+
+**Test configuration:** 5 nodes, 4 partitions, 10s lease TTL, `--faults kill`, `--time-limit 300`
 
 ## Project Structure
 
