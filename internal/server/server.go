@@ -178,12 +178,27 @@ func (s *Server) initExistingTopics() error {
 		return fmt.Errorf("list topics: %w", err)
 	}
 	for _, tc := range topics {
-		if err := s.partitionManager.InitTopic(ctx, tc); err != nil {
+		epochs := s.getOwnedEpochs(tc.Name)
+		if err := s.partitionManager.InitTopic(ctx, tc, epochs); err != nil {
 			slog.Error("failed to init topic", "topic", tc.Name, "error", err)
 			return fmt.Errorf("init topic %q: %w", tc.Name, err)
 		}
 	}
 	return nil
+}
+
+// getOwnedEpochs returns a map of partitionID -> epoch for owned leases of a topic.
+func (s *Server) getOwnedEpochs(topic string) map[int]uint64 {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+
+	epochs := make(map[int]uint64)
+	if partitions, ok := s.ownedLeases[topic]; ok {
+		for pid, lease := range partitions {
+			epochs[pid] = lease.Epoch
+		}
+	}
+	return epochs
 }
 
 const leaseTTL = 30 * time.Second

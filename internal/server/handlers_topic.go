@@ -86,13 +86,14 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.partitionManager.InitTopic(r.Context(), tc); err != nil {
+	// Acquire leases first so we have epochs for partition init.
+	s.AcquireLeasesForTopic(tc.Name, tc.Partitions)
+
+	epochs := s.getOwnedEpochs(tc.Name)
+	if err := s.partitionManager.InitTopic(r.Context(), tc, epochs); err != nil {
 		writeError(w, http.StatusInternalServerError, "topic created but partition init failed: "+err.Error())
 		return
 	}
-
-	// Acquire leases for the new topic's partitions.
-	s.AcquireLeasesForTopic(tc.Name, tc.Partitions)
 
 	writeJSON(w, http.StatusCreated, topicToResponse(tc))
 }

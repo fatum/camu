@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -125,7 +126,9 @@ func (pm *PartitionManager) resolveGlobalID(globalID int) (string, int, bool) {
 }
 
 // InitTopic initializes all partitions for the given topic.
-func (pm *PartitionManager) InitTopic(ctx context.Context, tc meta.TopicConfig) error {
+// The epochs map provides the lease epoch for each partition (from acquired leases).
+// Partitions not in the map use epoch 0 (single-instance / no coordination).
+func (pm *PartitionManager) InitTopic(ctx context.Context, tc meta.TopicConfig, epochs map[int]uint64) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -136,7 +139,8 @@ func (pm *PartitionManager) InitTopic(ctx context.Context, tc meta.TopicConfig) 
 	topicPartitions := make(map[int]*partitionState)
 
 	for pid := 0; pid < tc.Partitions; pid++ {
-		ps, err := pm.initPartition(ctx, tc.Name, pid)
+		epoch := epochs[pid] // 0 if not in map
+		ps, err := pm.initPartition(ctx, tc.Name, pid, epoch)
 		if err != nil {
 			// Clean up already-initialized partitions on failure.
 			for _, p := range topicPartitions {
@@ -155,7 +159,9 @@ func (pm *PartitionManager) InitTopic(ctx context.Context, tc meta.TopicConfig) 
 }
 
 // initPartition initializes a single partition: loads index, opens WAL, replays.
-func (pm *PartitionManager) initPartition(ctx context.Context, topic string, partitionID int) (*partitionState, error) {
+// The epoch comes from the acquired lease — if the WAL contains data from a
+// previous epoch, it is discarded (another instance already took over those offsets).
+func (pm *PartitionManager) initPartition(ctx context.Context, topic string, partitionID int, epoch uint64) (*partitionState, error) {
 	// 1. Load or create index.
 	indexKey := fmt.Sprintf("%s/%d/index.json", topic, partitionID)
 	idx := log.NewIndex()
@@ -184,14 +190,38 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 		return nil, fmt.Errorf("open WAL: %w", err)
 	}
 
-	// 3. Replay WAL to recover unflushed messages.
+	// 3. Check epoch fencing — if a previous epoch's WAL exists, discard it.
+	epochFile := walPath + ".epoch"
+	var prevEpoch uint64
+	if epochData, err := os.ReadFile(epochFile); err == nil {
+		fmt.Sscanf(string(epochData), "%d", &prevEpoch)
+	}
+
+	if epoch > prevEpoch && prevEpoch > 0 {
+		// Epoch has advanced — another instance took over this partition.
+		// Discard the stale WAL (those offsets were reassigned).
+		slog.Warn("epoch fencing: discarding stale WAL",
+			"topic", topic, "partition", partitionID,
+			"wal_epoch", prevEpoch, "lease_epoch", epoch)
+		wal.Close()
+		os.Remove(walPath)
+		wal, err = log.OpenWAL(walPath, false)
+		if err != nil {
+			return nil, fmt.Errorf("reopen WAL after epoch discard: %w", err)
+		}
+	}
+
+	// Write current epoch to sidecar file.
+	os.WriteFile(epochFile, []byte(fmt.Sprintf("%d", epoch)), 0o644)
+
+	// 4. Replay WAL to recover unflushed messages.
 	msgs, err := wal.Replay()
 	if err != nil {
 		wal.Close()
 		return nil, fmt.Errorf("replay WAL: %w", err)
 	}
 
-	// 4. Set nextOffset from max(index.NextOffset(), last WAL message offset + 1).
+	// 5. Set nextOffset from max(index.NextOffset(), last WAL message offset + 1).
 	nextOffset := idx.NextOffset()
 	if len(msgs) > 0 {
 		lastWALOffset := msgs[len(msgs)-1].Offset + 1
@@ -205,7 +235,7 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 		index:      idx,
 		indexETag:  indexETag,
 		nextOffset: nextOffset,
-		epoch:      0,
+		epoch:      epoch,
 	}, nil
 }
 
