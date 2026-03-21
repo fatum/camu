@@ -89,9 +89,9 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		leaseStop:        make(chan struct{}),
 	}
 
-	// Wire lease check into partition manager so flushes are rejected
-	// when this instance no longer owns the partition.
-	pm.SetLeaseChecker(s.isOwnedPartition)
+	// Wire lease check into partition manager — verifies from S3 at flush time.
+	// If ownership lost, revokes the partition so future writes are rejected locally.
+	pm.SetLeaseChecker(s.verifyLeaseFromS3)
 
 	s.httpServer = &http.Server{
 		Handler: s.routes(),
@@ -369,32 +369,50 @@ func (s *Server) releaseAllLeases(ctx context.Context) {
 // isOwnedPartition checks if this instance owns the given partition via leases.
 func (s *Server) isOwnedPartition(topic string, partitionID int) bool {
 	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+
 	topicLeases, ok := s.ownedLeases[topic]
 	if !ok {
-		s.leaseMu.RUnlock()
 		return false
 	}
 	lease, ok := topicLeases[partitionID]
 	if !ok {
-		s.leaseMu.RUnlock()
 		return false
 	}
-	s.leaseMu.RUnlock()
+	// Pure local check — no S3 I/O on write path.
+	return time.Now().Before(lease.ExpiresAt)
+}
 
-	// Fast path: lease clearly valid.
-	if time.Now().Add(2 * time.Second).Before(lease.ExpiresAt) {
-		return true
-	}
-
-	// Lease near expiry or expired — re-verify from S3 to be certain.
+// verifyLeaseFromS3 re-checks lease ownership from S3 (used at flush time).
+// If the lease has been taken by another instance, removes it from ownedLeases
+// so all future writes are rejected immediately.
+func (s *Server) verifyLeaseFromS3(topic string, partitionID int) bool {
 	s3Lease, err := s.leaseStore.Get(context.Background(), topic, partitionID)
 	if err != nil {
-		slog.Warn("isOwnedPartition: S3 verify failed, assuming not owned",
+		slog.Warn("verifyLeaseFromS3: failed, revoking ownership",
 			"topic", topic, "partition", partitionID, "error", err)
+		s.revokePartition(topic, partitionID)
 		return false
 	}
 
-	return s3Lease.InstanceID == s.instanceID && time.Now().Before(s3Lease.ExpiresAt)
+	if s3Lease.InstanceID != s.instanceID || !time.Now().Before(s3Lease.ExpiresAt) {
+		slog.Warn("verifyLeaseFromS3: lost ownership",
+			"topic", topic, "partition", partitionID,
+			"owner", s3Lease.InstanceID, "self", s.instanceID)
+		s.revokePartition(topic, partitionID)
+		return false
+	}
+	return true
+}
+
+// revokePartition removes a partition from ownedLeases so all future writes
+// to it are rejected via isOwnedPartition.
+func (s *Server) revokePartition(topic string, partitionID int) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if topicLeases, ok := s.ownedLeases[topic]; ok {
+		delete(topicLeases, partitionID)
+	}
 }
 
 // getRoutingMap builds the routing response for a topic by checking leases in S3.
