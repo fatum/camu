@@ -137,7 +137,16 @@ Every message is appended to a local WAL file and fsynced before the client rece
 1. Producer sends `POST /v1/topics/{topic}/messages` with message(s) containing key, value, headers
 2. Server hashes each message's key to determine the target partition (round-robin if no key)
 3. If this instance owns the target partition: append to local WAL, fsync, assign offset, respond to client
-4. If another instance owns it: return `307 Redirect` to the owner
+4. If another instance owns it: return `307 Redirect` with the owner's address in the `Location` header and a JSON body containing the owner's instance ID and address:
+   ```json
+   {
+     "redirect": {
+       "instance_id": "abc-123",
+       "address": "http://10.0.1.5:8080",
+       "partition": 3
+     }
+   }
+   ```
 5. Background flusher batches WAL entries into segments, uploads to S3, updates index, truncates WAL
 
 ### Batching
@@ -267,6 +276,8 @@ GET    /v1/cluster/status                                  — instance list, as
 ```
 
 All responses are JSON. Errors use standard HTTP status codes with `{"error": "message"}` body.
+
+Every response includes the `X-Camu-Instance-ID` header identifying which instance served the request.
 
 ## Multi-Instance Coordination
 
