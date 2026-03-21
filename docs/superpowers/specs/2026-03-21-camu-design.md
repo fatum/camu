@@ -162,11 +162,13 @@ If the in-memory buffer exceeds a high-water mark, the server returns `503 Servi
 GET /v1/topics/{topic}/partitions/{id}/messages?offset=N&limit=100
 ```
 
-Server resolves the requested offset through a tiered read path:
+Server resolves the requested offset through a tiered read path (same on all instances, including the partition owner):
 
 1. **In-memory buffer** — if this instance owns the partition and the offset is in the active (unflushed) buffer, serve directly from memory
 2. **Disk segment cache** — check local disk for a cached copy of the segment
 3. **S3 fetch** — fetch the segment from S3, write to disk cache, then serve
+
+The owning instance writes flushed segments to the disk cache at flush time, so it never needs to fetch its own segments back from S3.
 
 Response includes `next_offset`.
 
