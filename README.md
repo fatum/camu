@@ -215,15 +215,28 @@ resp, _ := http.Get("http://localhost:8080/v1/topics/events/partitions/0/message
 ```
 Producer HTTP Request
        |
+  [Ownership Check]     local lease expiry check (zero I/O)
+       |                  expired -> 421 Misdirected
+       |
   [Partition Router]     hash(key) % N  or  round-robin
        |
   [WAL Append + fsync]   durable on local disk before ack
        |
-  [Batcher]              tracks size, triggers flush on threshold
-       |                 (no in-memory message copies — WAL is source of truth)
-  [Flush: WAL -> S3]     reads WAL, serializes segment, uploads
+  [HTTP Response]        write is durable
        |
-  [Disk Cache Write]     segment cached locally at flush time
+  [Batcher]              tracks size counters (no message copies)
+       |                  threshold: 8MB or 5s
+       |
+  [Flush]
+       |
+  [Verify Lease from S3]  re-check ownership before uploading
+       |                    lost -> revoke partition, skip flush
+       |
+  [WAL Replay]           read unflushed messages from disk
+       |
+  [S3 Segment Upload]    immutable segment with epoch in filename
+       |
+  [Disk Cache Write]     cached locally at flush time
        |
   [Index Update]         conditional put to S3 index.json
        |
@@ -231,18 +244,19 @@ Producer HTTP Request
 ```
 
 **Write flow per message:**
-1. HTTP request arrives, routed to partition owner
-2. Message appended to WAL file + fsynced (~30us)
-3. HTTP response sent -- write is durable on local disk
+1. HTTP request arrives — local lease check (no I/O), reject with 421 if not owned
+2. Message routed to partition, appended to WAL + fsynced (~30us)
+3. HTTP response sent — write is durable on local disk
 4. Batcher tracks accumulated size; when threshold hit (8MB or 5s):
-   - Reads unflushed messages from WAL
+   - **Re-verifies lease from S3** — if ownership lost, revokes partition and skips flush
+   - Reads unflushed messages from WAL (WAL is the single source of truth)
    - Serializes into immutable segment (binary format, optional snappy/zstd)
-   - Uploads segment to S3
+   - Uploads segment to S3 with epoch in filename (`{offset}-{epoch}.segment`)
    - Writes segment to local disk cache
    - Updates partition index in S3 (conditional put)
    - Truncates WAL
 
-**No in-memory message buffering.** The WAL on disk is the single source of truth. The batcher only tracks size counters -- at flush time it reads directly from the WAL.
+**No in-memory message buffering.** The batcher only tracks size counters — at flush time it reads directly from the WAL. Ownership is validated at two points: locally on every write (zero I/O) and from S3 on every flush.
 
 ### Read Path
 
@@ -302,7 +316,21 @@ Multiple camu instances share the same S3 bucket. Partitions are distributed eve
 2. Surviving instances detect expired leases on renewal
 3. Rebalancer redistributes orphaned partitions
 
-**Epoch fencing:** Each lease acquisition increments an epoch. If a killed instance recovers after another has taken over, the stale instance sees the advanced epoch and discards its unflushed WAL.
+**Epoch fencing:** Each lease acquisition increments an epoch stored in S3. The epoch is embedded in segment filenames (`{offset}-{epoch}.segment`) and validated at multiple points:
+
+| Check | When | Action on failure |
+|-------|------|-------------------|
+| Local lease expiry | Every produce request (zero I/O) | Reject with 421 |
+| S3 lease verification | Every batcher flush (~5s) | Revoke partition, skip flush, reject future writes |
+| WAL epoch sidecar | Partition init after restart | Discard stale WAL if epoch advanced |
+
+**Ownership revocation flow:**
+1. Batcher flush triggers S3 lease check
+2. Another instance owns the partition -> `revokePartition()` deletes from local map
+3. All subsequent produce requests fail instantly via local check (no I/O)
+4. Stale WAL entries are never uploaded to S3
+
+Clients discover partition owners via `GET /v1/topics/{topic}/routing` (returns instance addresses from lease data). Writes to a non-owning instance return `421 Misdirected Request` with the current routing map.
 
 ## Configuration
 
