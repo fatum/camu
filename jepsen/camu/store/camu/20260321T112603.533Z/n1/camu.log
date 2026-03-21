@@ -1,3 +1,0 @@
-2026-03-21 11:26:05 Jepsen starting  /opt/camu/camu serve --config /etc/camu/camu.yaml
-camu listening on [::]:8080
-Unknown command: --config
