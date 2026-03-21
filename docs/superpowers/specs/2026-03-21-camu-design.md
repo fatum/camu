@@ -305,6 +305,7 @@ groups:
 - Single binary: `camu serve --config camu.yaml`
 - Multiple instances point to the same S3 bucket — they discover each other via coordination leases
 - No external dependencies beyond S3-compatible storage and local disk for WAL
+- All instances must be directly network-reachable to clients (not behind an opaque load balancer) because write routing uses `307 Redirect` to the partition owner
 - Health check at `GET /v1/cluster/status`
 
 ### Graceful Shutdown
