@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 
@@ -14,12 +15,13 @@ import (
 
 // Server is the HTTP server for camu.
 type Server struct {
-	cfg        *config.Config
-	httpServer *http.Server
-	s3Client   *storage.S3Client
-	topicStore *meta.TopicStore
-	instanceID string
-	listener   net.Listener
+	cfg              *config.Config
+	httpServer       *http.Server
+	s3Client         *storage.S3Client
+	topicStore       *meta.TopicStore
+	partitionManager *PartitionManager
+	instanceID       string
+	listener         net.Listener
 }
 
 // New creates a new Server, initializing the S3 client from config.
@@ -49,11 +51,17 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		instanceID = uuid.NewString()
 	}
 
+	pm, err := NewPartitionManager(cfg, s3Client)
+	if err != nil {
+		return nil, fmt.Errorf("creating partition manager: %w", err)
+	}
+
 	s := &Server{
-		cfg:        cfg,
-		s3Client:   s3Client,
-		topicStore: meta.NewTopicStore(s3Client),
-		instanceID: instanceID,
+		cfg:              cfg,
+		s3Client:         s3Client,
+		topicStore:       meta.NewTopicStore(s3Client),
+		partitionManager: pm,
+		instanceID:       instanceID,
 	}
 
 	s.httpServer = &http.Server{
@@ -65,6 +73,9 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 // Start starts the HTTP server on the configured address.
 func (s *Server) Start() error {
+	if err := s.initExistingTopics(); err != nil {
+		return fmt.Errorf("init existing topics: %w", err)
+	}
 	ln, err := net.Listen("tcp", s.cfg.Server.Address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.Server.Address, err)
@@ -76,6 +87,9 @@ func (s *Server) Start() error {
 
 // StartOnPort starts the HTTP server on a specific port.
 func (s *Server) StartOnPort(port int) error {
+	if err := s.initExistingTopics(); err != nil {
+		return fmt.Errorf("init existing topics: %w", err)
+	}
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -86,9 +100,14 @@ func (s *Server) StartOnPort(port int) error {
 	return nil
 }
 
-// Shutdown gracefully shuts down the HTTP server.
+// Shutdown gracefully shuts down the HTTP server and partition manager.
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.httpServer.Shutdown(ctx)
+	httpErr := s.httpServer.Shutdown(ctx)
+	pmErr := s.partitionManager.Shutdown(ctx)
+	if httpErr != nil {
+		return httpErr
+	}
+	return pmErr
 }
 
 // Address returns the actual listening address (host:port).
@@ -102,4 +121,21 @@ func (s *Server) Address() string {
 // InstanceID returns the server's unique instance ID.
 func (s *Server) InstanceID() string {
 	return s.instanceID
+}
+
+// initExistingTopics loads all topics from the topic store and initializes
+// partition state for each one.
+func (s *Server) initExistingTopics() error {
+	ctx := context.Background()
+	topics, err := s.topicStore.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list topics: %w", err)
+	}
+	for _, tc := range topics {
+		if err := s.partitionManager.InitTopic(ctx, tc); err != nil {
+			slog.Error("failed to init topic", "topic", tc.Name, "error", err)
+			return fmt.Errorf("init topic %q: %w", tc.Name, err)
+		}
+	}
+	return nil
 }

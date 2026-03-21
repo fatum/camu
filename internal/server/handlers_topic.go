@@ -86,6 +86,11 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.partitionManager.InitTopic(r.Context(), tc); err != nil {
+		writeError(w, http.StatusInternalServerError, "topic created but partition init failed: "+err.Error())
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, topicToResponse(tc))
 }
 

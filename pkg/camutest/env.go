@@ -47,6 +47,8 @@ func New(t testing.TB, opts ...Option) *Env {
 	}
 
 	for i := 0; i < o.Instances; i++ {
+		walDir := t.TempDir()
+		cacheDir := t.TempDir()
 		cfg := &config.Config{
 			Server: config.ServerConfig{
 				Address: ":0",
@@ -54,6 +56,19 @@ func New(t testing.TB, opts ...Option) *Env {
 			Storage: config.StorageConfig{
 				Bucket:   "test-bucket",
 				Endpoint: "memory://",
+			},
+			WAL: config.WALConfig{
+				Directory: walDir,
+				Fsync:     false,
+			},
+			Segments: config.SegmentsConfig{
+				MaxSize:     8388608,
+				MaxAge:      "5s",
+				Compression: "none",
+			},
+			Cache: config.CacheConfig{
+				Directory: cacheDir,
+				MaxSize:   104857600, // 100 MB for tests
 			},
 		}
 

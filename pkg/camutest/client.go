@@ -133,6 +133,49 @@ func (c *Client) DeleteTopic(name string) error {
 	return nil
 }
 
+// ProduceMessage is a message to produce.
+type ProduceMessage struct {
+	Key     string            `json:"key,omitempty"`
+	Value   string            `json:"value"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// ProduceResponse holds the response from a produce request.
+type ProduceResponse struct {
+	Offsets []OffsetInfo `json:"offsets"`
+}
+
+// OffsetInfo holds partition and offset for a produced message.
+type OffsetInfo struct {
+	Partition int    `json:"partition"`
+	Offset    uint64 `json:"offset"`
+}
+
+// Produce sends messages to a topic.
+func (c *Client) Produce(topic string, msgs []ProduceMessage) (*ProduceResponse, error) {
+	body, err := json.Marshal(msgs)
+	if err != nil {
+		return nil, fmt.Errorf("Produce marshal: %w", err)
+	}
+	resp, err := c.httpClient.Post(c.baseURL+"/v1/topics/"+topic+"/messages", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("Produce request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var ae apiError
+		json.NewDecoder(resp.Body).Decode(&ae)
+		return nil, fmt.Errorf("Produce: status %d: %s", resp.StatusCode, ae.Error)
+	}
+
+	var pr ProduceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("Produce decode: %w", err)
+	}
+	return &pr, nil
+}
+
 // ClusterStatus returns the cluster status.
 func (c *Client) ClusterStatus() (*ClusterStatusResponse, error) {
 	resp, err := c.httpClient.Get(c.baseURL + "/v1/cluster/status")

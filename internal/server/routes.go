@@ -9,6 +9,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/topics/{topic}", s.handleGetTopic)
 	mux.HandleFunc("DELETE /v1/topics/{topic}", s.handleDeleteTopic)
 	mux.HandleFunc("GET /v1/cluster/status", s.handleClusterStatus)
+	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
+	mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
 	return s.withMiddleware(mux)
 }
 
