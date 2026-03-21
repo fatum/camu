@@ -256,19 +256,20 @@ func (s *Server) initialCoordination() {
 func (s *Server) AcquireLeasesForTopic(topic string, numPartitions int) {
 	ctx := context.Background()
 
-	if s.amLeader() {
-		// Leader: publish assignments for the new topic.
-		active, err := s.registry.ActiveInstances(ctx)
-		if err != nil {
-			active = []string{s.instanceID}
-		}
-		active = ensureInList(active, s.instanceID)
-		assignments := coordination.Assign(active, numPartitions)
-		ta := coordination.TopicAssignments{
-			Partitions: flattenAssignments(assignments),
-			Version:    1,
-		}
-		s.assignmentStore.Write(ctx, topic, ta)
+	// Always write initial assignments on topic creation — the creating
+	// instance bootstraps the assignment. Leader will overwrite on next cycle.
+	active, err := s.registry.ActiveInstances(ctx)
+	if err != nil || len(active) == 0 {
+		active = []string{s.instanceID}
+	}
+	active = ensureInList(active, s.instanceID)
+	assignments := coordination.Assign(active, numPartitions)
+	ta := coordination.TopicAssignments{
+		Partitions: flattenAssignments(assignments),
+		Version:    1,
+	}
+	if err := s.assignmentStore.Write(ctx, topic, ta); err != nil {
+		slog.Error("AcquireLeasesForTopic: write assignments", "topic", topic, "error", err)
 	}
 
 	s.applyAssignmentsForTopic(ctx, topic, numPartitions)
@@ -434,9 +435,8 @@ func (s *Server) isOwnedPartition(topic string, partitionID int) bool {
 func (s *Server) verifyOwnershipFromS3(topic string, partitionID int) bool {
 	assigned, err := s.assignmentStore.Read(context.Background(), topic)
 	if err != nil {
-		slog.Warn("verifyOwnership: failed", "topic", topic, "partition", partitionID, "error", err)
-		s.revokePartition(topic, partitionID)
-		return false
+		// No assignments in S3 — trust local state (bootstrap/single-instance).
+		return s.isOwnedPartition(topic, partitionID)
 	}
 	if assigned.Partitions[partitionID] != s.instanceID {
 		slog.Warn("verifyOwnership: lost", "topic", topic, "partition", partitionID,
