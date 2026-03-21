@@ -1,33 +1,83 @@
 # Camu
 
-A stateless, S3-backed commit log server. Kafka-style partitioned topics with a simple HTTP/REST API.
+[![CI](https://github.com/fatum/camu/actions/workflows/ci.yml/badge.svg)](https://github.com/fatum/camu/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/fatum/camu.svg)](https://pkg.go.dev/github.com/fatum/camu)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Why Camu
+**A Kafka-like commit log that stores everything in S3.** No brokers to manage, no disks to provision, no replication to configure. One binary, one S3 bucket, `curl` is your client.
 
-- **Stateless** — all durable state lives in S3. No ZooKeeper, no Raft, no cluster state to manage.
-- **Simple API** — HTTP/REST with JSON. `curl` is your client.
-- **S3-compatible** — works with AWS S3, MinIO, Cloudflare R2, Backblaze B2.
-- **Crash-safe** — local WAL with fsync guarantees durability before acknowledging writes.
-- **Multi-instance** — S3-based lease coordination with epoch fencing for partition ownership.
+```bash
+# Produce
+curl -X POST http://localhost:8080/v1/topics/events/messages \
+  -d '{"key": "user-123", "value": "clicked button"}'
+
+# Consume
+curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0"
+```
+
+## When to Use Camu
+
+**Use camu when:**
+- You want Kafka-style ordered partitioned logs without operating Kafka
+- Your storage costs matter more than sub-millisecond latency
+- You need a message bus that scales to zero when idle (S3 costs only)
+- You want any language to produce/consume via HTTP — no client libraries needed
+- You're already on AWS/MinIO/R2 and want to keep infrastructure simple
+
+**Use Kafka/Redpanda when:**
+- You need sub-millisecond end-to-end latency (camu has ~5s flush delay)
+- You need exactly-once semantics
+- You need millions of messages/sec from a single partition
+- You need the Kafka protocol for existing ecosystem compatibility
+
+## How It Compares
+
+| | Kafka | Redpanda | **Camu** |
+|---|---|---|---|
+| Storage | Local disk + replication | Local disk + Raft | **S3** ($0.023/GB/mo) |
+| Ops dependencies | ZooKeeper or KRaft | None | **None** (just S3) |
+| Protocol | Custom binary | Kafka-compatible | **HTTP/REST** |
+| Min deployment | 3 nodes | 1 node | **1 binary + S3 bucket** |
+| Cost at rest | Disk on every broker | Disk on every broker | **S3 only** (~free) |
+| Latency (p99) | <10ms | <10ms | **~5s** (flush interval) |
+| Throughput | 1M+ msgs/sec | 1M+ msgs/sec | **89K msgs/sec** (batched) |
+| Scaling | Add brokers | Add brokers | **Add instances** (stateless) |
+| Client libraries | Required | Required | **Any HTTP client** |
+| Consistency | ISR replication | Raft | **S3 + epoch fencing** |
 
 ## Quick Start
 
-```bash
-# Build
-go build -o camu ./cmd/camu
+### Docker (fastest)
 
-# Start MinIO (or use any S3-compatible storage)
-docker run -d -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
+```bash
+# Start MinIO + camu in one command
+docker run -d --name minio -p 9000:9000 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  minio/minio server /data
 
 # Create bucket
-docker exec <container> mc alias set local http://localhost:9000 minioadmin minioadmin
-docker exec <container> mc mb local/camu-data
+docker exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
+docker exec minio mc mb local/camu-data
 
-# Configure
-cp camu.yaml.example camu.yaml
-# Edit camu.yaml with your S3 endpoint and credentials
+# Run camu
+docker run -d --name camu --net=host \
+  -v /tmp/camu:/var/lib/camu \
+  -e CAMU_STORAGE_BUCKET=camu-data \
+  -e CAMU_STORAGE_ENDPOINT=http://localhost:9000 \
+  -e CAMU_STORAGE_CREDENTIALS_ACCESS_KEY=minioadmin \
+  -e CAMU_STORAGE_CREDENTIALS_SECRET_KEY=minioadmin \
+  ghcr.io/fatum/camu serve
+```
 
-# Run
+### From Source
+
+```bash
+go install github.com/fatum/camu/cmd/camu@latest
+
+# Or build locally
+git clone https://github.com/fatum/camu && cd camu
+go build -o camu ./cmd/camu
+cp camu.yaml.example camu.yaml  # edit with your S3 credentials
 ./camu serve --config camu.yaml
 ```
 
@@ -67,11 +117,6 @@ curl -X POST http://localhost:8080/v1/topics/orders/messages \
   -d '[{"key": "u1", "value": "msg1"}, {"key": "u2", "value": "msg2"}]'
 
 # Response: {"offsets": [{"partition": 3, "offset": 0}]}
-
-# Produce to a specific partition
-curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
-  -H "Content-Type: application/json" \
-  -d '{"key": "k", "value": "direct"}'
 ```
 
 Messages with the same key always go to the same partition (FNV-32a hash). No key = round-robin.
@@ -86,15 +131,13 @@ curl "http://localhost:8080/v1/topics/orders/partitions/0/messages?offset=0&limi
 # Stream via Server-Sent Events
 curl -N http://localhost:8080/v1/topics/orders/partitions/0/stream?offset=0 \
   -H "Accept: text/event-stream"
-# id: 0
-# data: {"offset":0,"timestamp":1234,"key":"k","value":"hello"}
 ```
 
-SSE supports `Last-Event-ID` header for reconnection.
+SSE supports `Last-Event-ID` header for automatic reconnection.
 
 ### Offset Checkpoints
 
-Consumers track their own position via named offset checkpoints stored durably in S3.
+Consumers track their own position via named checkpoints stored durably in S3.
 
 ```bash
 # Commit offsets for a named group
@@ -104,13 +147,6 @@ curl -X POST http://localhost:8080/v1/groups/my-group/commit \
 
 # Get group offsets
 curl http://localhost:8080/v1/groups/my-group/offsets
-
-# Per-consumer offsets
-curl -X POST http://localhost:8080/v1/topics/orders/offsets/consumer-1 \
-  -H "Content-Type: application/json" \
-  -d '{"offsets": {"0": 42}}'
-
-curl http://localhost:8080/v1/topics/orders/offsets/consumer-1
 ```
 
 ### Routing
@@ -118,10 +154,58 @@ curl http://localhost:8080/v1/topics/orders/offsets/consumer-1
 ```bash
 # Get partition-to-instance mapping (for multi-instance deployments)
 curl http://localhost:8080/v1/topics/orders/routing
-# Response: {"partitions": {"0": {"instance_id": "abc", "address": "..."}, ...}}
 
 # Cluster status
 curl http://localhost:8080/v1/cluster/status
+```
+
+## Client Examples
+
+Camu uses plain HTTP — no client library needed. Use whatever language you want.
+
+### Python
+
+```python
+import requests
+
+# Produce
+requests.post("http://localhost:8080/v1/topics/events/messages",
+    json={"key": "user-1", "value": "signup"})
+
+# Consume
+resp = requests.get("http://localhost:8080/v1/topics/events/partitions/0/messages",
+    params={"offset": 0, "limit": 50})
+for msg in resp.json()["messages"]:
+    print(f"offset={msg['offset']} key={msg['key']} value={msg['value']}")
+```
+
+### Node.js
+
+```javascript
+// Produce
+await fetch("http://localhost:8080/v1/topics/events/messages", {
+  method: "POST",
+  headers: {"Content-Type": "application/json"},
+  body: JSON.stringify({key: "user-1", value: "signup"})
+});
+
+// Consume via SSE
+const es = new EventSource(
+  "http://localhost:8080/v1/topics/events/partitions/0/stream?offset=0"
+);
+es.onmessage = (e) => console.log(JSON.parse(e.data));
+```
+
+### Go
+
+```go
+// Produce
+body := `{"key": "user-1", "value": "signup"}`
+http.Post("http://localhost:8080/v1/topics/events/messages",
+    "application/json", strings.NewReader(body))
+
+// Consume
+resp, _ := http.Get("http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limit=50")
 ```
 
 ## Architecture
@@ -137,7 +221,7 @@ Producer HTTP Request
        |
   [Batcher]              tracks size, triggers flush on threshold
        |                 (no in-memory message copies — WAL is source of truth)
-  [Flush: WAL → S3]      reads WAL, serializes segment, uploads
+  [Flush: WAL -> S3]     reads WAL, serializes segment, uploads
        |
   [Disk Cache Write]     segment cached locally at flush time
        |
@@ -148,8 +232,8 @@ Producer HTTP Request
 
 **Write flow per message:**
 1. HTTP request arrives, routed to partition owner
-2. Message appended to WAL file + fsynced (~30μs)
-3. HTTP response sent — write is durable on local disk
+2. Message appended to WAL file + fsynced (~30us)
+3. HTTP response sent -- write is durable on local disk
 4. Batcher tracks accumulated size; when threshold hit (8MB or 5s):
    - Reads unflushed messages from WAL
    - Serializes into immutable segment (binary format, optional snappy/zstd)
@@ -158,18 +242,18 @@ Producer HTTP Request
    - Updates partition index in S3 (conditional put)
    - Truncates WAL
 
-**No in-memory message buffering.** The WAL on disk is the single source of truth. The batcher only tracks size counters — at flush time it reads directly from the WAL.
+**No in-memory message buffering.** The WAL on disk is the single source of truth. The batcher only tracks size counters -- at flush time it reads directly from the WAL.
 
 ### Read Path
 
 ```
 Consumer HTTP Request
        |
-  [Partition Index]     lookup offset → segment key
+  [Partition Index]     lookup offset -> segment key
        |
   [Disk Cache]          local segment file?
-       |                  yes → read from disk
-       |                  no  → fetch from S3, cache to disk
+       |                  yes -> read from disk
+       |                  no  -> fetch from S3, cache to disk
        |
   [Segment Parse]       deserialize from offset, return messages
 ```
@@ -177,26 +261,26 @@ Consumer HTTP Request
 **Read flow:**
 1. Look up which segment contains the requested offset (from index)
 2. Check local disk cache for the segment
-3. Cache miss → fetch from S3, write to disk cache
+3. Cache miss -> fetch from S3, write to disk cache
 4. Parse segment binary, return messages from requested offset
 
-All instances use the same read path — no special owner logic. Consumers see data after it's flushed to S3 (default 5s delay).
+All instances use the same read path. Consumers see data after it's flushed to S3 (default 5s).
 
-### Throughput
+### Performance
 
 Benchmarked on Apple M3 Pro, single instance, in-memory S3:
 
 | Operation | Throughput | Latency |
 |-----------|-----------|---------|
-| Produce (single message) | ~14,000 msgs/sec | 71 μs/msg |
-| Produce (batch of 100) | ~89,000 msgs/sec | 11 μs/msg |
-| Consume (100 msgs/poll) | ~320,000 msgs/sec | 3 μs/msg |
+| Produce (single message) | ~14,000 msgs/sec | 71 us/msg |
+| Produce (batch of 100) | ~89,000 msgs/sec | 11 us/msg |
+| Consume (100 msgs/poll) | ~320,000 msgs/sec | 3 us/msg |
 
-**Bottlenecks:** Single produce is bound by HTTP round-trip + WAL fsync. Batching amortizes both — 6x improvement. Consume is fast because segments are served from disk cache.
+**Bottlenecks:** Single produce is bound by HTTP round-trip + WAL fsync. Batching amortizes both -- 6x improvement. Consume is fast because segments are served from disk cache.
 
-**With real S3:** Produce throughput is unchanged (WAL is local). Consume cold-reads add S3 GET latency (~50-100ms per segment), then cached.
+**With real S3:** Produce throughput is unchanged (WAL is local). Consume cold-reads add ~50-100ms per segment, then cached.
 
-**Scaling:** Throughput scales linearly with partitions × instances. 3 instances with 12 partitions → ~270K single msgs/sec or ~1M batched msgs/sec theoretical max.
+**Scaling:** Throughput scales linearly with partitions x instances. 3 instances with 12 partitions -> ~270K single msgs/sec or ~1M batched msgs/sec.
 
 ## Multi-Instance
 
@@ -220,11 +304,9 @@ Multiple camu instances share the same S3 bucket. Partitions are distributed eve
 
 **Epoch fencing:** Each lease acquisition increments an epoch. If a killed instance recovers after another has taken over, the stale instance sees the advanced epoch and discards its unflushed WAL.
 
-Clients discover partition owners via `GET /v1/topics/{topic}/routing`. Writes to a non-owning instance return `421 Misdirected Request` with the current routing map.
-
 ## Configuration
 
-See [`camu.yaml.example`](camu.yaml.example) for all options. Key settings:
+See [`camu.yaml.example`](camu.yaml.example) for all options.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -264,7 +346,7 @@ cd jepsen/camu && docker compose up --abort-on-container-exit control
 
 Verified on a 5-node cluster with process kill faults over 300 seconds. Mixed workload: 70% produce, 30% consume with kill/restart cycles every ~25s.
 
-**Consistency checkers:**
+**Consistency:**
 
 | Checker | Result | Description |
 |---------|--------|-------------|
@@ -273,22 +355,7 @@ Verified on a 5-node cluster with process kill faults over 300 seconds. Mixed wo
 | Offset monotonicity | VALID | No gaps or duplicates |
 | Lease fencing | VALID | Epoch fencing prevents stale writes after rejoin |
 
-**Operational metrics:**
-
-| Metric | Value |
-|--------|-------|
-| Total operations | 2,916 |
-| Produce attempts / succeeded | 2,034 / 729 (36% availability under faults) |
-| Consume attempts / succeeded | 878 / 789 |
-| Drain (post-recovery verification) | 4/4 partitions drained |
-| Recovery events measured | 50 |
-| Min recovery time | 3.5 ms |
-| Max recovery time | 20 s |
-| Mean recovery time | 979 ms |
-
-**Expected behavior:** Acked writes on killed instances may be lost if the WAL wasn't flushed to S3 before the kill. This is the documented `acks=1` trade-off — equivalent to Kafka with a single replica.
-
-**Test configuration:** 5 nodes, 4 partitions, 10s lease TTL, `--faults kill`, `--time-limit 300`
+**Operations:** 2,976 total | 975 produce ok (47% availability under faults) | 779 consume ok | Mean recovery: 944ms
 
 ## Project Structure
 
@@ -314,10 +381,37 @@ camu/
 
 ## Trade-offs
 
-- **Unflushed data loss on failover** — if an instance dies before flushing to S3, unflushed WAL entries are lost when another instance takes over (equivalent to Kafka `acks=1`). The WAL is recoverable if the same instance restarts.
-- **5s visibility delay** — consumers see data after S3 flush (configurable via `segments.max_age`). There is no in-memory read path — all reads go through disk cache or S3.
-- **S3 latency for offset commits** — offset checkpoints go to S3 (acceptable since commits are infrequent).
-- **Rebalance convergence** — 6-10s for partitions to redistribute after a node join/leave (2 renewal cycles).
+| Decision | Benefit | Cost |
+|----------|---------|------|
+| S3 as sole storage | Unlimited, cheap, no replication to manage | ~5s visibility delay (flush interval) |
+| WAL on local disk | Fast acks (~30us), crash-safe | Unflushed data lost on failover (`acks=1`) |
+| HTTP/REST API | Any language, no client library, curl-debuggable | Higher per-message overhead than binary protocols |
+| Stateless instances | Scale to zero, no cluster state, easy deploys | Rebalance takes 6-10s on topology change |
+| No in-memory buffer | Simple, WAL is single source of truth | All reads go through disk/S3, no real-time reads |
+
+## Contributing
+
+Contributions welcome! Here's how to get started:
+
+```bash
+git clone https://github.com/fatum/camu && cd camu
+
+# Run all tests
+go test ./internal/...
+go test -tags integration ./test/integration/ -timeout 120s
+
+# Run benchmarks
+go test -tags integration ./test/bench/ -bench=. -benchtime=10s
+```
+
+**Areas we'd love help with:**
+- Client libraries (Python, Node, Java)
+- Terraform/Helm deployment templates
+- Grafana dashboard for monitoring
+- S3-compatible storage provider testing (R2, B2, GCS via S3 compat)
+- Performance optimization (segment format, compression tuning)
+
+Please open an issue before starting large changes.
 
 ## License
 
