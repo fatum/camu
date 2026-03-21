@@ -158,6 +158,7 @@ func (pm *PartitionManager) InitTopic(ctx context.Context, tc meta.TopicConfig, 
 
 	pm.partitions[tc.Name] = topicPartitions
 	pm.routers[tc.Name] = producer.NewRouter(tc.Partitions)
+	slog.Info("topic_initialized", "topic", tc.Name, "partitions", tc.Partitions)
 	return nil
 }
 
@@ -514,10 +515,19 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		break
 	}
 
+	slog.Info("segment_flushed",
+		"topic", topic,
+		"partition", partitionID,
+		"base_offset", baseOffset,
+		"end_offset", endOffset,
+		"size_bytes", len(segData),
+	)
+
 	// 5. Truncate WAL before the flushed offset.
 	if err := ps.wal.TruncateBefore(endOffset + 1); err != nil {
 		return fmt.Errorf("truncate WAL: %w", err)
 	}
+	slog.Debug("wal_truncated", "topic", topic, "partition", partitionID, "before_offset", endOffset+1)
 
 	return nil
 }

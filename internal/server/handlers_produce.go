@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -125,6 +126,7 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				writeError(w, http.StatusServiceUnavailable, "backpressure: buffer full")
 				return
 			}
+			slog.Error("produce_failed", "topic", topicName, "partition", partitionID, "error", err)
 			writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 			return
 		}
@@ -220,6 +222,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "backpressure: buffer full")
 			return
 		}
+		slog.Error("produce_failed", "topic", topicName, "partition", partitionID, "error", err)
 		writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 		return
 	}

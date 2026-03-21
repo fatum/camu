@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -15,6 +16,11 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: camu <serve|test>\n")
 		os.Exit(1)
@@ -50,15 +56,15 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("camu listening on %s\n", srv.Address())
+		slog.Info("server started", "address", srv.Address())
 
 		// Block until signal
 		<-sigCh
-		fmt.Println("\nShutting down...")
+		slog.Info("shutting down")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Shutdown error: %v\n", err)
+			slog.Error("shutdown error", "error", err)
 		}
 
 	case "test":

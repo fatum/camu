@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/base64"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -63,6 +64,7 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	// Call fetcher (disk cache -> S3).
 	msgs, nextOffset, err := s.fetcher.Fetch(r.Context(), index, topicName, partitionID, startOffset, limit)
 	if err != nil {
+		slog.Error("consume_failed", "topic", topicName, "partition", partitionID, "offset", startOffset, "error", err)
 		writeError(w, http.StatusInternalServerError, "fetch failed: "+err.Error())
 		return
 	}

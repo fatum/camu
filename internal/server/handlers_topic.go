@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -82,6 +83,7 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
+		slog.Error("topic_create_failed", "topic", tc.Name, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -91,10 +93,12 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 
 	epochs := s.getOwnedEpochs(tc.Name)
 	if err := s.partitionManager.InitTopic(r.Context(), tc, epochs); err != nil {
+		slog.Error("topic_init_failed", "topic", tc.Name, "partitions", tc.Partitions, "error", err)
 		writeError(w, http.StatusInternalServerError, "topic created but partition init failed: "+err.Error())
 		return
 	}
 
+	slog.Info("topic_created", "topic", tc.Name, "partitions", tc.Partitions)
 	writeJSON(w, http.StatusCreated, topicToResponse(tc))
 }
 
@@ -141,8 +145,10 @@ func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.topicStore.Delete(r.Context(), name); err != nil {
+		slog.Error("topic_delete_failed", "topic", name, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	slog.Info("topic_deleted", "topic", name)
 	w.WriteHeader(http.StatusNoContent)
 }
