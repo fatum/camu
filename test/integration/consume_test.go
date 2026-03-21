@@ -25,7 +25,9 @@ func TestProduceAndConsume(t *testing.T) {
 		t.Fatalf("Produce() error: %v", err)
 	}
 
-	// Consume immediately — should read from in-memory buffer (no flush needed).
+	// Wait for flush to S3 (no in-memory buffer reads).
+	time.Sleep(6 * time.Second)
+
 	resp, err := client.Consume("pc-test", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Consume() error: %v", err)
@@ -99,7 +101,10 @@ func TestConsumeFromOffset(t *testing.T) {
 		t.Fatalf("Produce() error: %v", err)
 	}
 
-	// Consume from offset 3 — should get 2 messages from buffer.
+	// Wait for flush to S3.
+	time.Sleep(6 * time.Second)
+
+	// Consume from offset 3 — should get 2 messages.
 	resp, err := client.Consume("cfo-test", 0, 3, 10)
 	if err != nil {
 		t.Fatalf("Consume() error: %v", err)
@@ -127,8 +132,10 @@ func TestSSEStreaming(t *testing.T) {
 		{Key: "k1", Value: "msg2"},
 	})
 
-	// SSE should read from buffer immediately (no flush wait needed)
-	events, err := client.StreamSSE("sse-test", 0, 0, 2, 5*time.Second)
+	// Wait for flush to S3.
+	time.Sleep(6 * time.Second)
+
+	events, err := client.StreamSSE("sse-test", 0, 0, 2, 10*time.Second)
 	if err != nil {
 		t.Fatalf("StreamSSE() error: %v", err)
 	}

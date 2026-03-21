@@ -72,7 +72,7 @@ func TestFetcher_ReadFromCache(t *testing.T) {
 	fetcher := NewFetcher(s3Client, diskCache)
 
 	// Fetch from offset 0 — should read from cache.
-	result, nextOffset, err := fetcher.Fetch(context.Background(), idx, nil, "test-topic", 0, 0, 10)
+	result, nextOffset, err := fetcher.Fetch(context.Background(), idx, "test-topic", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 	fetcher := NewFetcher(s3Client, diskCache)
 
 	// First fetch — should come from S3 and be cached.
-	result, nextOffset, err := fetcher.Fetch(context.Background(), idx, nil, "test-topic", 0, 0, 10)
+	result, nextOffset, err := fetcher.Fetch(context.Background(), idx, "test-topic", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Fetch (first): %v", err)
 	}
@@ -148,57 +148,12 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 		t.Fatalf("s3Client.Delete: %v", err)
 	}
 
-	result2, nextOffset2, err := fetcher.Fetch(context.Background(), idx, nil, "test-topic", 0, 0, 10)
+	result2, nextOffset2, err := fetcher.Fetch(context.Background(), idx, "test-topic", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Fetch (second, from cache): %v", err)
 	}
 	if len(result2) != 3 {
 		t.Fatalf("expected 3 messages from cache, got %d", len(result2))
-	}
-	if nextOffset2 != 3 {
-		t.Errorf("nextOffset = %d, want 3", nextOffset2)
-	}
-}
-
-func TestFetcher_ReadFromBuffer(t *testing.T) {
-	s3Client, err := storage.NewS3Client(storage.S3Config{
-		Bucket:   "test",
-		Endpoint: "memory://",
-	})
-	if err != nil {
-		t.Fatalf("NewS3Client: %v", err)
-	}
-
-	cacheDir := t.TempDir()
-	diskCache, err := log.NewDiskCache(cacheDir, 100*1024*1024)
-	if err != nil {
-		t.Fatalf("NewDiskCache: %v", err)
-	}
-
-	fetcher := NewFetcher(s3Client, diskCache)
-
-	// Create buffer messages (unflushed).
-	buffer := makeTestMessages(3)
-
-	// Fetch from offset 0 with buffer — should read from buffer.
-	result, nextOffset, err := fetcher.Fetch(context.Background(), log.NewIndex(), buffer, "test-topic", 0, 0, 10)
-	if err != nil {
-		t.Fatalf("Fetch: %v", err)
-	}
-	if len(result) != 3 {
-		t.Fatalf("expected 3 messages from buffer, got %d", len(result))
-	}
-	if nextOffset != 3 {
-		t.Errorf("nextOffset = %d, want 3", nextOffset)
-	}
-
-	// Fetch from offset 1 — should get 2 messages.
-	result2, nextOffset2, err := fetcher.Fetch(context.Background(), log.NewIndex(), buffer, "test-topic", 0, 1, 10)
-	if err != nil {
-		t.Fatalf("Fetch from offset 1: %v", err)
-	}
-	if len(result2) != 2 {
-		t.Fatalf("expected 2 messages from buffer, got %d", len(result2))
 	}
 	if nextOffset2 != 3 {
 		t.Errorf("nextOffset = %d, want 3", nextOffset2)
@@ -222,8 +177,8 @@ func TestFetcher_EmptyTopic(t *testing.T) {
 
 	fetcher := NewFetcher(s3Client, diskCache)
 
-	// Fetch from empty topic — no index, no buffer.
-	result, nextOffset, err := fetcher.Fetch(context.Background(), log.NewIndex(), nil, "test-topic", 0, 0, 10)
+	// Fetch from empty topic — no indexed segments.
+	result, nextOffset, err := fetcher.Fetch(context.Background(), log.NewIndex(), "test-topic", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}

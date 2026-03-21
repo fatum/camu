@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/log"
-	"github.com/maksim/camu/internal/storage"
 )
 
 // sseMessage is the JSON payload for a single SSE data line.
@@ -43,8 +42,7 @@ func WriteSSEEvent(w io.Writer, msg log.Message) error {
 // It loops until ctx is cancelled. If no new messages are available, it sleeps
 // briefly (100ms) before retrying.
 func StreamSSE(ctx context.Context, w http.ResponseWriter, fetcher *Fetcher,
-	s3Client *storage.S3Client, diskCache *log.DiskCache,
-	index *log.Index, buffer func() []log.Message,
+	index *log.Index,
 	topic string, partitionID int, startOffset uint64) error {
 
 	flusher, ok := w.(http.Flusher)
@@ -61,7 +59,7 @@ func StreamSSE(ctx context.Context, w http.ResponseWriter, fetcher *Fetcher,
 		default:
 		}
 
-		msgs, nextOffset, err := fetcher.Fetch(ctx, index, buffer(), topic, partitionID, currentOffset, 100)
+		msgs, nextOffset, err := fetcher.Fetch(ctx, index, topic, partitionID, currentOffset, 100)
 		if err != nil {
 			return fmt.Errorf("fetch: %w", err)
 		}

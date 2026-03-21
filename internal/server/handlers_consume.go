@@ -6,7 +6,6 @@ import (
 	"strconv"
 
 	"github.com/maksim/camu/internal/consumer"
-	"github.com/maksim/camu/internal/log"
 )
 
 type consumeResponse struct {
@@ -61,11 +60,8 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get the unflushed buffer.
-	buffer := s.partitionManager.GetBuffer(topicName, partitionID)
-
-	// Call fetcher.
-	msgs, nextOffset, err := s.fetcher.Fetch(r.Context(), index, buffer, topicName, partitionID, startOffset, limit)
+	// Call fetcher (disk cache -> S3).
+	msgs, nextOffset, err := s.fetcher.Fetch(r.Context(), index, topicName, partitionID, startOffset, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "fetch failed: "+err.Error())
 		return
@@ -133,13 +129,7 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// buffer is a func so StreamSSE always gets the latest unflushed messages.
-	bufferFn := func() []log.Message {
-		return s.partitionManager.GetBuffer(topicName, partitionID)
-	}
-
-	consumer.StreamSSE(r.Context(), w, s.fetcher, s.s3Client, s.partitionManager.GetDiskCache(),
-		index, bufferFn, topicName, partitionID, startOffset)
+	consumer.StreamSSE(r.Context(), w, s.fetcher, index, topicName, partitionID, startOffset)
 }
 
 // tryString returns the string representation of b if it is valid UTF-8,
