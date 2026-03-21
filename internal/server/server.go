@@ -25,11 +25,18 @@ type Server struct {
 	s3Client         *storage.S3Client
 	topicStore       *meta.TopicStore
 	partitionManager *PartitionManager
-	fetcher     *consumer.Fetcher
-	leaseStore  *coordination.LeaseStore
-	offsetStore *storage.OffsetStore
+	fetcher          *consumer.Fetcher
+	leaseStore       *coordination.LeaseStore
+	registry         *coordination.Registry
+	offsetStore      *storage.OffsetStore
 	instanceID       string
 	listener         net.Listener
+
+	// Leader-based coordination.
+	leaderElection  *coordination.LeaderElection
+	assignmentStore *coordination.AssignmentStore
+	isLeader        bool
+	leaderLease     coordination.LeaderLease
 
 	// leaseMu protects ownedLeases.
 	leaseMu     sync.RWMutex
@@ -83,7 +90,9 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		partitionManager: pm,
 		fetcher:          consumer.NewFetcher(s3Client, pm.GetDiskCache()),
 		leaseStore:       coordination.NewLeaseStore(s3Client),
-		offsetStore: storage.NewOffsetStore(s3Client),
+		offsetStore:      storage.NewOffsetStore(s3Client),
+		leaderElection:   coordination.NewLeaderElection(s3Client, instanceID, leaseTTL),
+		assignmentStore:  coordination.NewAssignmentStore(s3Client),
 		instanceID:       instanceID,
 		ownedLeases:      make(map[string]map[int]coordination.Lease),
 		leaseStop:        make(chan struct{}),
@@ -102,33 +111,37 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 // Start starts the HTTP server on the configured address.
 func (s *Server) Start() error {
-	if err := s.initExistingTopics(); err != nil {
-		return fmt.Errorf("init existing topics: %w", err)
-	}
-	s.acquireAllLeases()
-	s.startLeaseRenewal()
 	ln, err := net.Listen("tcp", s.cfg.Server.Address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.Server.Address, err)
 	}
 	s.listener = ln
+	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), leaseTTL*3)
+	s.registry.Register(context.Background())
+	if err := s.initExistingTopics(); err != nil {
+		return fmt.Errorf("init existing topics: %w", err)
+	}
+	s.initialCoordination()
+	s.startLeaseRenewal()
 	go s.httpServer.Serve(ln)
 	return nil
 }
 
 // StartOnPort starts the HTTP server on a specific port.
 func (s *Server) StartOnPort(port int) error {
-	if err := s.initExistingTopics(); err != nil {
-		return fmt.Errorf("init existing topics: %w", err)
-	}
-	s.acquireAllLeases()
-	s.startLeaseRenewal()
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 	s.listener = ln
+	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), leaseTTL*3)
+	s.registry.Register(context.Background())
+	if err := s.initExistingTopics(); err != nil {
+		return fmt.Errorf("init existing topics: %w", err)
+	}
+	s.initialCoordination()
+	s.startLeaseRenewal()
 	go s.httpServer.Serve(ln)
 	return nil
 }
@@ -153,6 +166,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	close(s.leaseStop)
 	s.leaseWg.Wait()
 	s.releaseAllLeases(ctx)
+
+	// 5. Deregister from cluster.
+	s.registry.Deregister(ctx)
 
 	if httpErr != nil {
 		return httpErr
@@ -208,51 +224,145 @@ func (s *Server) getOwnedEpochs(topic string) map[int]uint64 {
 const leaseTTL = 30 * time.Second
 const leaseRenewalInterval = 10 * time.Second
 
-// acquireAllLeases acquires leases for this instance's assigned partitions
-// across all topics, using the rebalancer to distribute evenly.
-func (s *Server) acquireAllLeases() {
+// initialCoordination runs leader election and assignment on startup.
+func (s *Server) initialCoordination() {
 	ctx := context.Background()
+
+	// Try to become leader.
+	lease, acquired, err := s.leaderElection.TryAcquire(ctx)
+	if err != nil {
+		slog.Warn("initialCoordination: leader election failed", "error", err)
+	} else if acquired {
+		s.isLeader = true
+		s.leaderLease = lease
+		slog.Info("initialCoordination: became leader", "instance", s.instanceID)
+	}
+
+	// Leader publishes assignments for all topics.
+	if s.isLeader {
+		s.publishAssignments(ctx)
+	}
+
+	// All instances apply assignments (acquire leases for assigned partitions).
+	s.applyAssignments(ctx)
+}
+
+// AcquireLeasesForTopic is called from handleCreateTopic when a new topic is
+// created. If this instance is the leader, it publishes assignments for the
+// new topic. Then it applies assignments to acquire its own leases.
+func (s *Server) AcquireLeasesForTopic(topic string, numPartitions int) {
+	ctx := context.Background()
+
+	// If we're the leader, publish assignments for this topic immediately.
+	if s.isLeader {
+		active, err := s.registry.ActiveInstances(ctx)
+		if err != nil {
+			slog.Warn("AcquireLeasesForTopic: discover instances", "error", err)
+			active = []string{s.instanceID}
+		}
+		active = ensureInList(active, s.instanceID)
+		assignments := coordination.Assign(active, numPartitions)
+		ta := coordination.TopicAssignments{
+			Partitions: flattenAssignments(assignments, numPartitions),
+			Version:    1,
+		}
+		if err := s.assignmentStore.Write(ctx, topic, ta); err != nil {
+			slog.Error("AcquireLeasesForTopic: write assignments", "error", err)
+		}
+	} else {
+		// Not leader: publish assignments as a fallback for the new topic.
+		// This ensures the creating instance can still acquire partitions
+		// even if the leader hasn't seen the topic yet.
+		active := []string{s.instanceID}
+		// Try to get more instances, but don't fail if we can't.
+		if instances, err := s.registry.ActiveInstances(ctx); err == nil && len(instances) > 0 {
+			active = instances
+			active = ensureInList(active, s.instanceID)
+		}
+		assignments := coordination.Assign(active, numPartitions)
+		ta := coordination.TopicAssignments{
+			Partitions: flattenAssignments(assignments, numPartitions),
+			Version:    1,
+		}
+		if err := s.assignmentStore.Write(ctx, topic, ta); err != nil {
+			slog.Error("AcquireLeasesForTopic: write assignments (non-leader)", "error", err)
+		}
+	}
+
+	// Apply assignments for this specific topic.
+	s.applyAssignmentsForTopic(ctx, topic, numPartitions)
+}
+
+// publishAssignments computes and writes partition assignments for all topics.
+// Only called by the leader.
+func (s *Server) publishAssignments(ctx context.Context) {
+	active, err := s.registry.ActiveInstances(ctx)
+	if err != nil {
+		slog.Warn("publishAssignments: discover instances", "error", err)
+		active = []string{s.instanceID}
+	}
+	active = ensureInList(active, s.instanceID)
+
 	topics, err := s.topicStore.List(ctx)
 	if err != nil {
-		slog.Error("acquireAllLeases: list topics", "error", err)
+		slog.Warn("publishAssignments: list topics", "error", err)
 		return
 	}
 
 	for _, tc := range topics {
-		s.acquireLeasesForTopic(ctx, tc.Name, tc.Partitions)
-	}
-}
+		assignments := coordination.Assign(active, tc.Partitions)
+		ta := coordination.TopicAssignments{
+			Partitions: flattenAssignments(assignments, tc.Partitions),
+		}
 
-// AcquireLeasesForTopic acquires leases for this instance's assigned partitions
-// of a specific topic, using the rebalancer for even distribution.
-func (s *Server) AcquireLeasesForTopic(topic string, numPartitions int) {
-	s.acquireLeasesForTopic(context.Background(), topic, numPartitions)
-}
+		// Read existing version to increment.
+		if existing, err := s.assignmentStore.Read(ctx, tc.Name); err == nil {
+			ta.Version = existing.Version + 1
+		} else {
+			ta.Version = 1
+		}
 
-func (s *Server) acquireLeasesForTopic(ctx context.Context, topic string, numPartitions int) {
-	// Discover active instances (from existing leases) + always include self.
-	registry := coordination.NewRegistry(s.s3Client, s.instanceID, s.Address())
-	active, err := registry.ActiveInstances(ctx, topic)
-	if err != nil {
-		slog.Warn("acquireLeasesForTopic: discover instances", "error", err)
-		active = nil
-	}
-
-	// Ensure this instance is in the active set.
-	found := false
-	for _, id := range active {
-		if id == s.instanceID {
-			found = true
-			break
+		if err := s.assignmentStore.Write(ctx, tc.Name, ta); err != nil {
+			slog.Error("publishAssignments: write", "topic", tc.Name, "error", err)
 		}
 	}
-	if !found {
-		active = append(active, s.instanceID)
+
+	slog.Info("publishAssignments: completed",
+		"instance", s.instanceID,
+		"topics", len(topics),
+		"active_instances", len(active))
+}
+
+// applyAssignments reads assignments from S3 and acquires/releases leases
+// for all topics based on what is assigned to this instance.
+func (s *Server) applyAssignments(ctx context.Context) {
+	topics, err := s.topicStore.List(ctx)
+	if err != nil {
+		slog.Warn("applyAssignments: list topics", "error", err)
+		return
 	}
 
-	// Use rebalancer to determine which partitions this instance should own.
-	assignments := coordination.Assign(active, numPartitions)
-	myPartitions := assignments[s.instanceID]
+	for _, tc := range topics {
+		s.applyAssignmentsForTopic(ctx, tc.Name, tc.Partitions)
+	}
+}
+
+// applyAssignmentsForTopic reads assignments for a single topic and acquires
+// or releases partition leases accordingly.
+func (s *Server) applyAssignmentsForTopic(ctx context.Context, topic string, numPartitions int) {
+	assigned, err := s.assignmentStore.Read(ctx, topic)
+	if err != nil {
+		slog.Debug("applyAssignmentsForTopic: no assignments found", "topic", topic, "error", err)
+		return
+	}
+
+	// Determine which partitions are assigned to us.
+	var myPartitions []int
+	for pid, instanceID := range assigned.Partitions {
+		if instanceID == s.instanceID {
+			myPartitions = append(myPartitions, pid)
+		}
+	}
 
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
@@ -268,7 +378,7 @@ func (s *Server) acquireLeasesForTopic(ctx context.Context, topic string, numPar
 		}
 		lease, err := s.leaseStore.Acquire(ctx, topic, pid, s.instanceID, s.Address(), leaseTTL)
 		if err != nil {
-			slog.Debug("acquireLeasesForTopic: skipping", "topic", topic, "partition", pid, "error", err)
+			slog.Debug("applyAssignmentsForTopic: skipping", "topic", topic, "partition", pid, "error", err)
 			continue
 		}
 		s.ownedLeases[topic][pid] = lease
@@ -282,7 +392,7 @@ func (s *Server) acquireLeasesForTopic(ctx context.Context, topic string, numPar
 	for pid, lease := range s.ownedLeases[topic] {
 		if !assignedSet[pid] {
 			if err := s.leaseStore.Release(ctx, lease); err != nil {
-				slog.Debug("acquireLeasesForTopic: release", "topic", topic, "partition", pid, "error", err)
+				slog.Debug("applyAssignmentsForTopic: release", "topic", topic, "partition", pid, "error", err)
 			}
 			delete(s.ownedLeases[topic], pid)
 		}
@@ -292,7 +402,7 @@ func (s *Server) acquireLeasesForTopic(ctx context.Context, topic string, numPar
 		"topic", topic,
 		"instance", s.instanceID,
 		"assigned", myPartitions,
-		"active_instances", len(active))
+		"is_leader", s.isLeader)
 }
 
 // startLeaseRenewal starts a background goroutine that renews owned leases.
@@ -313,23 +423,55 @@ func (s *Server) startLeaseRenewal() {
 	}()
 }
 
-// renewLeases re-runs the rebalancer on each cycle to pick up new instances.
-// Renews leases for assigned partitions, releases leases for unassigned ones.
+// renewLeases runs the leader-based coordination cycle:
+// 1. Heartbeat registry
+// 2. Try to become/stay leader
+// 3. Leader: compute and publish assignments
+// 4. All: read assignments and acquire/release leases
+// 5. Renew owned leases
 func (s *Server) renewLeases() {
 	ctx := context.Background()
-	topics, err := s.topicStore.List(ctx)
-	if err != nil {
-		slog.Warn("renewLeases: list topics", "error", err)
-		// Fall back to just renewing what we have.
-		s.renewOwnedLeases(ctx)
-		return
+
+	// Heartbeat registry so other instances see us as active.
+	if err := s.registry.Register(ctx); err != nil {
+		slog.Warn("renewLeases: registry heartbeat failed", "error", err)
 	}
 
-	for _, tc := range topics {
-		s.acquireLeasesForTopic(ctx, tc.Name, tc.Partitions)
+	// Try to become/stay leader.
+	if s.isLeader {
+		renewed, err := s.leaderElection.Renew(ctx, s.leaderLease)
+		if err != nil {
+			slog.Warn("renewLeases: lost leadership", "error", err)
+			s.isLeader = false
+			// Try to re-acquire immediately.
+			lease, acquired, err := s.leaderElection.TryAcquire(ctx)
+			if err == nil && acquired {
+				s.isLeader = true
+				s.leaderLease = lease
+			}
+		} else {
+			s.leaderLease = renewed
+		}
+	} else {
+		lease, acquired, err := s.leaderElection.TryAcquire(ctx)
+		if err != nil {
+			slog.Debug("renewLeases: leader election failed", "error", err)
+		} else if acquired {
+			s.isLeader = true
+			s.leaderLease = lease
+			slog.Info("renewLeases: became leader", "instance", s.instanceID)
+		}
 	}
 
-	// Renew leases we still own after rebalance.
+	// Leader: compute and publish assignments.
+	if s.isLeader {
+		s.publishAssignments(ctx)
+	}
+
+	// All: read assignments and acquire/release leases.
+	s.applyAssignments(ctx)
+
+	// Renew leases we still own.
 	s.renewOwnedLeases(ctx)
 }
 
@@ -440,4 +582,26 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 	}
 
 	return resp
+}
+
+// flattenAssignments converts the rebalancer output (instanceID -> []partitionID)
+// into a flat map (partitionID -> instanceID).
+func flattenAssignments(assignments map[string][]int, numPartitions int) map[int]string {
+	result := make(map[int]string, numPartitions)
+	for instanceID, partitions := range assignments {
+		for _, pid := range partitions {
+			result[pid] = instanceID
+		}
+	}
+	return result
+}
+
+// ensureInList returns the list with instanceID included (appends if missing).
+func ensureInList(list []string, instanceID string) []string {
+	for _, id := range list {
+		if id == instanceID {
+			return list
+		}
+	}
+	return append(list, instanceID)
 }
