@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,6 +39,10 @@ type Server struct {
 	// leaseStop signals the background lease renewal goroutine to stop.
 	leaseStop chan struct{}
 	leaseWg   sync.WaitGroup
+
+	// shuttingDown is set to 1 during shutdown; produce handlers check this
+	// and reject new writes with 503 before batcher/WAL are torn down.
+	shuttingDown atomic.Bool
 }
 
 // New creates a new Server, initializing the S3 client from config.
@@ -127,16 +132,26 @@ func (s *Server) StartOnPort(port int) error {
 }
 
 // Shutdown gracefully shuts down the HTTP server and partition manager.
+// Ordering:
+//  1. Set shuttingDown so produce handlers reject new writes immediately.
+//  2. Stop the HTTP server (drains in-flight requests).
+//  3. Stop the batcher — flushes remaining WAL entries to S3.
+//  4. Stop lease renewal and release all owned leases.
 func (s *Server) Shutdown(ctx context.Context) error {
-	// Stop lease renewal goroutine.
+	// 1. Stop accepting new writes.
+	s.shuttingDown.Store(true)
+
+	// 2. Shut down HTTP server (waits for in-flight requests to finish).
+	httpErr := s.httpServer.Shutdown(ctx)
+
+	// 3. Flush batcher / close WALs.
+	pmErr := s.partitionManager.Shutdown(ctx)
+
+	// 4. Stop lease renewal goroutine and release leases.
 	close(s.leaseStop)
 	s.leaseWg.Wait()
-
-	// Release all owned leases.
 	s.releaseAllLeases(ctx)
 
-	httpErr := s.httpServer.Shutdown(ctx)
-	pmErr := s.partitionManager.Shutdown(ctx)
 	if httpErr != nil {
 		return httpErr
 	}

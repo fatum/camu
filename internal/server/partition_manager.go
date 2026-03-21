@@ -245,7 +245,9 @@ func (pm *PartitionManager) Append(ctx context.Context, topic string, partitionI
 
 	// Add to batcher.
 	globalID := pm.getGlobalID(topic, partitionID)
-	pm.batcher.Append(globalID, msg)
+	if err := pm.batcher.Append(globalID, msg); err != nil {
+		return 0, fmt.Errorf("batcher append: %w", err)
+	}
 
 	return offset, nil
 }
@@ -292,7 +294,9 @@ func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, parti
 	// Add all to batcher.
 	globalID := pm.getGlobalID(topic, partitionID)
 	for _, msg := range msgs {
-		pm.batcher.Append(globalID, msg)
+		if err := pm.batcher.Append(globalID, msg); err != nil {
+			return nil, fmt.Errorf("batcher append: %w", err)
+		}
 	}
 
 	return offsets, nil

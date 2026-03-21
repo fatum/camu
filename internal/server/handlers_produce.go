@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/producer"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -26,6 +27,12 @@ type offsetInfo struct {
 }
 
 func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) {
+	if s.shuttingDown.Load() {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+
 	topicName := r.PathValue("topic")
 
 	// Validate topic exists.
@@ -113,6 +120,11 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 
 		assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
 		if err != nil {
+			if errors.Is(err, producer.ErrBackpressure) {
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusServiceUnavailable, "backpressure: buffer full")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 			return
 		}
@@ -129,6 +141,12 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
+	if s.shuttingDown.Load() {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, "server is shutting down")
+		return
+	}
+
 	topicName := r.PathValue("topic")
 	partitionStr := r.PathValue("id")
 
@@ -197,6 +215,11 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
 	if err != nil {
+		if errors.Is(err, producer.ErrBackpressure) {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusServiceUnavailable, "backpressure: buffer full")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 		return
 	}
