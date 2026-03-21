@@ -12,6 +12,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
 	mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
 	mux.HandleFunc("GET /v1/topics/{topic}/partitions/{id}/messages", s.handleConsumeLowLevel)
+	mux.HandleFunc("GET /v1/topics/{topic}/partitions/{id}/stream", s.handleStreamLowLevel)
 	mux.HandleFunc("GET /v1/topics/{topic}/consume", s.handleConsumeHighLevel)
 	return s.withMiddleware(mux)
 }

@@ -1,10 +1,12 @@
 package camutest
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -212,6 +214,90 @@ func (c *Client) Consume(topic string, partition int, offset uint64, limit int) 
 		return nil, fmt.Errorf("Consume decode: %w", err)
 	}
 	return &cr, nil
+}
+
+// StreamSSE opens an SSE connection and reads up to maxEvents events or until timeout.
+func (c *Client) StreamSSE(topic string, partition int, offset uint64, maxEvents int, timeout time.Duration) ([]ConsumedMessage, error) {
+	url := fmt.Sprintf("%s/v1/topics/%s/partitions/%d/stream?offset=%d",
+		c.baseURL, topic, partition, offset)
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("StreamSSE request: %w", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	// Use a client without a global timeout so we can read the stream.
+	streamClient := &http.Client{}
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("StreamSSE do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var ae apiError
+		json.NewDecoder(resp.Body).Decode(&ae)
+		return nil, fmt.Errorf("StreamSSE: status %d: %s", resp.StatusCode, ae.Error)
+	}
+
+	var events []ConsumedMessage
+	scanner := bufio.NewScanner(resp.Body)
+
+	// Deadline for the whole read loop.
+	deadline := time.Now().Add(timeout)
+
+	var currentID string
+	var currentData string
+
+	for time.Now().Before(deadline) && len(events) < maxEvents {
+		// Use a channel to drive the scanner with a timeout.
+		type scanResult struct {
+			text string
+			ok   bool
+		}
+		ch := make(chan scanResult, 1)
+		go func() {
+			ok := scanner.Scan()
+			ch <- scanResult{text: scanner.Text(), ok: ok}
+		}()
+
+		var line string
+		select {
+		case res := <-ch:
+			if !res.ok {
+				return events, nil
+			}
+			line = res.text
+		case <-time.After(time.Until(deadline)):
+			return events, nil
+		}
+
+		switch {
+		case strings.HasPrefix(line, "id: "):
+			currentID = strings.TrimPrefix(line, "id: ")
+		case strings.HasPrefix(line, "data: "):
+			currentData = strings.TrimPrefix(line, "data: ")
+		case line == "":
+			// Blank line = end of event.
+			if currentData != "" {
+				var msg ConsumedMessage
+				if err := json.Unmarshal([]byte(currentData), &msg); err == nil {
+					// Override offset from id field if present.
+					if currentID != "" {
+						var id uint64
+						fmt.Sscan(currentID, &id)
+						msg.Offset = id
+					}
+					events = append(events, msg)
+				}
+			}
+			currentID = ""
+			currentData = ""
+		}
+	}
+
+	return events, nil
 }
 
 // ClusterStatus returns the cluster status.
