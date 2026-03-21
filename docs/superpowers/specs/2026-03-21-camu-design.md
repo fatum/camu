@@ -75,7 +75,7 @@ S3-compatible client using the AWS SDK v2. Works with AWS S3, MinIO, Cloudflare 
   {topic}/
     {partition_id}/
       index.json
-      {base_offset}.segment
+      {base_offset}-{epoch}.segment
   _coordination/
     leases/
       {topic}/{partition_id}.lease
@@ -100,12 +100,12 @@ Binary format:
 
 1. Active segment lives in memory, accumulating writes from the WAL
 2. Flushed to S3 when it hits a size threshold (default 8MB) or time threshold (default 5s)
-3. After flush, the partition index is updated via conditional put
+3. After flush, the partition index is updated via conditional put. If the index update fails, the flush is retried — the segment is re-uploaded with the same key (idempotent) and the index update is reattempted. Orphaned segments (uploaded but not indexed) are cleaned up by a background garbage collector that compares S3 segment listings against the index.
 4. Flushed segments are immutable
 
 ### Retention Cleanup
 
-A background goroutine periodically scans partition indexes, identifies segments older than the retention duration, deletes them from S3, and updates the index.
+A background goroutine on the partition owner periodically scans the partition index, identifies segments older than the retention duration, removes them from the index first (conditional put), then deletes the S3 objects. Deleting from the index first ensures that active readers won't be directed to a segment that's about to be deleted. Readers that already fetched and cached a segment locally are unaffected. Readers that get a 404 from S3 (race between index update and delete) retry from the updated index.
 
 ## Write-Ahead Log (WAL)
 
@@ -171,7 +171,9 @@ A disk-based cache of segments fetched from S3. Segments are written to local di
 
 ### Read Distribution
 
-Any instance can serve consumer reads, not just the partition owner. The read path on a non-owner instance is: disk cache → S3 fetch (and cache). This allows consumer reads to be load-balanced across all instances, decoupling read throughput from write ownership. Only the owning instance can serve reads from the in-memory buffer (unflushed data).
+Any instance can serve consumer reads, not just the partition owner. The read path on a non-owner instance is: disk cache → S3 fetch (and cache). This allows consumer reads to be load-balanced across all instances, decoupling read throughput from write ownership.
+
+**Note:** Only the owning instance can serve unflushed data (from the in-memory buffer). Consumers reading from a non-owner will only see data up to the last flushed segment. There is a visibility delay equal to the segment flush interval (default 5s) when reading from non-owners. For real-time consumption, consumers should read from the partition owner or use SSE on the owner.
 
 ### Consumer Groups
 
@@ -181,7 +183,7 @@ Any instance can serve consumer reads, not just the partition owner. The read pa
 - `GET /v1/groups/{group_id}/offsets` — get committed offsets
 - `POST /v1/groups/{group_id}/leave` — leave group, trigger rebalance
 
-Partition assignment uses range or round-robin strategy. Missed heartbeats trigger rebalance.
+Partition assignment uses round-robin strategy. Each instance that receives a `join` or `heartbeat` request for a group acts as the coordinator for that group. The coordinating instance tracks group membership — if a consumer misses its heartbeat deadline (configurable, default 10s), the coordinator removes it and triggers a rebalance, reassigning its partitions to remaining members. If the coordinating instance itself dies, consumers' heartbeats will fail and they re-join via another instance, which becomes the new coordinator.
 
 ### Consumer-Specific Offsets
 
@@ -196,7 +198,7 @@ This allows consumers to track their position without joining a group — useful
 
 ### Offset Storage
 
-Committed offsets (both group and consumer-specific) are stored in S3 at `_coordination/groups/{group_id}/offsets.json` for groups and `_coordination/consumers/{consumer_id}/offsets.json` for standalone consumers.
+Committed offsets (both group and consumer-specific) are stored in S3 at `_coordination/groups/{group_id}/offsets.json` for groups and `_coordination/consumers/{consumer_id}/offsets.json` for standalone consumers. S3-only is an intentional simplification — offset commits are infrequent relative to message writes, so S3 latency is acceptable. Alternative offset stores (Redis, DynamoDB) can be added in the future if needed without API changes.
 
 ## HTTP API
 
@@ -311,7 +313,9 @@ The epoch is embedded in segment filenames (`{base_offset}-{epoch}.segment`) and
 
 Clients fetch the partition-to-instance routing map via `GET /v1/topics/{topic}/routing` and cache it locally. They send writes directly to the owning instance.
 
-If a write hits the wrong instance (stale routing), the server returns `421 Misdirected Request` with the current routing map. The client updates its cache and retries.
+**Routing cache behavior:** Clients should refresh the routing map on any `421` response or connection error to an instance. Proactive refresh on a fixed interval (e.g., every 30s) is recommended to reduce 421s during rebalances. The routing response includes a `Cache-Control: max-age=10` header as a hint.
+
+If a write hits the wrong instance (stale routing), the server returns `421 Misdirected Request` with the current routing map in the response body. The client updates its cache and retries.
 
 ## Configuration
 
