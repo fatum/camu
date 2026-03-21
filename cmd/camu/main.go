@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,22 +43,22 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Handle signals for graceful shutdown
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-		go func() {
-			<-sigCh
-			fmt.Println("\nShutting down...")
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			srv.Shutdown(ctx)
-		}()
-
-		fmt.Printf("camu listening on %s\n", cfg.Server.Address)
-		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 			os.Exit(1)
+		}
+		fmt.Printf("camu listening on %s\n", srv.Address())
+
+		// Block until signal
+		<-sigCh
+		fmt.Println("\nShutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Shutdown error: %v\n", err)
 		}
 
 	case "test":
