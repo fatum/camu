@@ -59,7 +59,7 @@ services:
         echo 'SSH keys distributed. Waiting for nodes to pick up keys...' &&
         sleep 3 &&
         echo 'Running Jepsen test...' &&
-        exec lein run test --nodes n1,n2,n3,n4,n5 --ssh-private-key /root/.ssh/id_rsa --time-limit 60 --s3-endpoint http://minio:9000 --camu-binary /jepsen/camu/camu --faults kill
+        exec lein run test --nodes n1,n2,n3,n4,n5 --ssh-private-key /root/.ssh/id_rsa --time-limit 300 --s3-endpoint http://minio:9000 --camu-binary /jepsen/camu/camu --faults kill
       "
 
   n1: &node

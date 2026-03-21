@@ -7,6 +7,7 @@
 
 (def default-topic "jepsen-test")
 (def http-timeout-ms 5000)
+(def drain-timeout-ms 15000)
 
 (defn base-url
   "Returns the base URL for a given node."
@@ -26,7 +27,7 @@
                            :connect-timeout   http-timeout-ms
                            :throw-exceptions  false})]
       (when (not (#{200 201 409} (:status resp)))
-        (warn "Create topic returned" (:status resp))))
+        (warn "Create topic returned" (:status resp) "on" node)))
     (catch ConnectException _
       (warn "Could not connect to" node "to create topic"))
     (catch SocketTimeoutException _
@@ -55,13 +56,35 @@
 (defn consume!
   "Consumes messages from the given topic and partition. Returns a vec of
    plain serializable message maps."
+  ([node topic partition offset]
+   (consume! node topic partition offset 1000))
+  ([node topic partition offset limit]
+   (let [resp (http/get (str (base-url node) "/v1/topics/" topic
+                             "/partitions/" partition "/messages")
+                        {:query-params     {:offset offset
+                                            :limit  limit}
+                         :socket-timeout   http-timeout-ms
+                         :connect-timeout  http-timeout-ms
+                         :throw-exceptions false})]
+     (if (= 200 (:status resp))
+       (let [body (json/parse-string (:body resp) true)]
+         (vec (map (fn [m] {:offset    (:offset m)
+                            :partition partition
+                            :key       (:key m)
+                            :value     (:value m)})
+                   (:messages body))))
+       []))))
+
+(defn drain!
+  "Drains all messages from a partition, using a larger limit and timeout.
+   Used for the final verification phase."
   [node topic partition offset]
   (let [resp (http/get (str (base-url node) "/v1/topics/" topic
                             "/partitions/" partition "/messages")
                        {:query-params     {:offset offset
-                                           :limit  1000}
-                        :socket-timeout   http-timeout-ms
-                        :connect-timeout  http-timeout-ms
+                                           :limit  10000}
+                        :socket-timeout   drain-timeout-ms
+                        :connect-timeout  drain-timeout-ms
                         :throw-exceptions false})]
     (if (= 200 (:status resp))
       (let [body (json/parse-string (:body resp) true)]
@@ -73,9 +96,7 @@
       [])))
 
 (defn commit-offsets!
-  "Commits the consumer offset for the given topic and consumer-id.
-   POST /v1/topics/{topic}/offsets/{consumer_id}
-   Used to verify offset durability across faults."
+  "Commits the consumer offset for the given topic and consumer-id."
   [node topic consumer-id partition offset]
   (http/post (str (base-url node) "/v1/topics/" topic
                   "/offsets/" consumer-id)
@@ -87,9 +108,7 @@
   :ok)
 
 (defn get-offsets!
-  "Fetches the committed consumer offset for the given topic and consumer-id.
-   GET /v1/topics/{topic}/offsets/{consumer_id}
-   Used to verify committed offsets survive instance restarts."
+  "Fetches the committed consumer offset for the given topic and consumer-id."
   [node topic consumer-id]
   (let [resp (http/get (str (base-url node) "/v1/topics/" topic
                             "/offsets/" consumer-id)
@@ -105,24 +124,49 @@
     (assoc this :node node'))
 
   (setup! [this test]
-    (create-topic! node default-topic)
+    ;; Create topic on ALL nodes so each instance knows about the topic
+    (doseq [n (:nodes test)]
+      (create-topic! n default-topic))
     this)
 
   (invoke! [this test op]
     (try
      (case (:f op)
        :produce
-       (let [{:keys [key value]} (:value op)
-             result (produce! node default-topic key value)]
-         (assoc op :type :ok :value {:key       key
-                                     :value     value
-                                     :partition (:partition result)
-                                     :offset    (:offset result)}))
+       (let [{:keys [key value]} (:value op)]
+         ;; Try all nodes until one accepts (handles 421 misdirected)
+         (loop [nodes (shuffle (:nodes test))]
+           (if (empty? nodes)
+             (assoc op :type :fail :error :all-misdirected)
+             (let [result (try (produce! (first nodes) default-topic key value)
+                               (catch clojure.lang.ExceptionInfo e
+                                 (if (= :misdirected (:type (ex-data e)))
+                                   ::retry
+                                   (throw e))))]
+               (if (= ::retry result)
+                 (recur (rest nodes))
+                 (assoc op :type :ok :value {:key       key
+                                             :value     value
+                                             :partition (:partition result)
+                                             :offset    (:offset result)}))))))
 
        :consume
        (let [{:keys [partition offset]} (:value op)
              messages (consume! node default-topic partition (or offset 0))]
-         (assoc op :type :ok :value messages))
+         (assoc op :type :ok :value {:partition partition :messages messages}))
+
+       :drain
+       (let [{:keys [partition offset]} (:value op)
+             ;; Try all nodes for drain to maximize chance of success
+             messages (loop [nodes (shuffle (:nodes test))]
+                        (if (empty? nodes)
+                          []
+                          (let [msgs (drain! (first nodes) default-topic
+                                             partition (or offset 0))]
+                            (if (seq msgs)
+                              msgs
+                              (recur (rest nodes))))))]
+         (assoc op :type :ok :value {:partition partition :messages messages}))
 
        :commit-offsets
        (let [{:keys [consumer-id partition offset]} (:value op)

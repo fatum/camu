@@ -44,11 +44,11 @@
   (nemesis/node-start-stopper
    rand-nth
    (fn start [test node]
-     (c/on-nodes test [node] (fn [_ _] (start-camu!)))
-     [:restarted node])
-   (fn stop [test node]
      (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
-     [:killed node])))
+     [:killed node])
+   (fn stop [test node]
+     (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+     [:restarted node])))
 
 (defn pause-nemesis
   "A nemesis that pauses and resumes camu processes."
@@ -56,11 +56,16 @@
   (nemesis/node-start-stopper
    rand-nth
    (fn start [test node]
-     (c/on-nodes test [node] (fn [_ _] (resume-camu!)))
-     [:resumed node])
-   (fn stop [test node]
      (c/on-nodes test [node] (fn [_ _] (pause-camu!)))
-     [:paused node])))
+     [:paused node])
+   (fn stop [test node]
+     (c/on-nodes test [node] (fn [_ _] (resume-camu!)))
+     [:resumed node])))
+
+(defn partition-nemesis
+  "A nemesis that partitions the network into random halves."
+  []
+  (nemesis/partition-random-halves))
 
 (defn rejoin-nemesis
   "A nemesis that kills a node, waits for lease expiry, then restarts it.
@@ -84,9 +89,7 @@
     (teardown! [this test])))
 
 (defn s3-partition-nemesis
-  "A nemesis that blocks/unblocks a random node's access to MinIO port 9000.
-   Tests what happens when a camu instance can't reach S3 but still receives
-   client requests."
+  "A nemesis that blocks/unblocks a random node's access to MinIO port 9000."
   [s3-host]
   (nemesis/node-start-stopper
    rand-nth
@@ -98,41 +101,38 @@
      [:s3-blocked node])))
 
 (defn clock-skew-nemesis
-  "A nemesis that introduces clock drift on nodes.
-   Tests lease expiry under clock drift and epoch fencing correctness."
+  "A nemesis that introduces clock drift on nodes."
   []
   (nemesis/clock-scrambler 10))
 
 (defn composed-nemesis
   "Returns a nemesis that composes fault types specified in the faults set.
-   Supported fault keys: :kill :partition :pause :rejoin :s3-partition :clock-skew"
+   Supported fault keys: :kill :partition :pause :rejoin :s3-partition :clock-skew
+
+   For :kill — start = kill process, stop = restart process
+   For :partition — start = partition network, stop = heal network
+   For :pause — start = SIGSTOP, stop = SIGCONT"
   ([] (composed-nemesis #{:kill :partition :pause}))
   ([faults]
    (nemesis/compose
     (cond-> {}
       (:kill faults)
-      (assoc {:kill :start} (kill-nemesis)
-             {:kill :stop}  (kill-nemesis))
+      (assoc #{:kill} (kill-nemesis))
 
       (:partition faults)
-      (assoc {:partition :start} (nemesis/partitioner nemesis/bridge)
-             {:partition :stop}  (nemesis/partitioner nemesis/bridge))
+      (assoc #{:partition} (partition-nemesis))
 
       (:pause faults)
-      (assoc {:pause :start} (pause-nemesis)
-             {:pause :stop}  (pause-nemesis))
+      (assoc #{:pause} (pause-nemesis))
 
       (:rejoin faults)
-      (assoc {:rejoin :start} (rejoin-nemesis)
-             {:rejoin :stop}  (rejoin-nemesis))
+      (assoc #{:rejoin} (rejoin-nemesis))
 
       (:s3-partition faults)
-      (assoc {:s3-partition :start} (s3-partition-nemesis "minio")
-             {:s3-partition :stop}  (s3-partition-nemesis "minio"))
+      (assoc #{:s3-partition} (s3-partition-nemesis "minio"))
 
       (:clock-skew faults)
-      (assoc {:clock-skew :start} (clock-skew-nemesis)
-             {:clock-skew :stop}  (clock-skew-nemesis))))))
+      (assoc #{:clock-skew} (clock-skew-nemesis))))))
 
 (defn fault-cycles
   "Returns a sequence of gen/cycle generators for the given fault keys."
