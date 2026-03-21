@@ -307,7 +307,17 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 		}
 
 		if err := s.assignmentStore.Write(ctx, tc.Name, ta, etag); err != nil {
-			slog.Error("publishAssignments: write", "topic", tc.Name, "error", err)
+			// CAS conflict — another writer updated assignments. Retry once
+			// with a fresh read to pick up the latest version.
+			existing2, readErr := s.assignmentStore.Read(ctx, tc.Name)
+			if readErr == nil {
+				ta.Version = existing2.Version + 1
+				if retryErr := s.assignmentStore.Write(ctx, tc.Name, ta, existing2.ETag); retryErr != nil {
+					slog.Warn("publishAssignments: retry failed", "topic", tc.Name, "error", retryErr)
+				}
+			} else {
+				slog.Error("publishAssignments: write failed", "topic", tc.Name, "error", err)
+			}
 		}
 	}
 
