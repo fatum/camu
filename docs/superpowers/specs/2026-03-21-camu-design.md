@@ -12,7 +12,7 @@ The system supports Kafka-style partitioned topics, consumer groups with server-
 - Stateless by default — all durable state lives in S3
 - Open-source library quality — clean API, good docs, broad compatibility
 - High throughput via batching and local WAL
-- Pluggable storage backends with S3-compatible as default
+- S3-compatible storage (AWS S3, MinIO, R2, B2)
 
 ## Core Data Model
 
@@ -64,25 +64,9 @@ Contains the owning instance ID, lease epoch, lease expiry timestamp, and an ETa
 
 ## Storage Layer
 
-### Storage Interface
+### S3 Client
 
-All persistence goes through a pluggable `Storage` interface:
-
-```go
-type Storage interface {
-    Put(ctx context.Context, key string, data []byte, opts PutOpts) error
-    Get(ctx context.Context, key string) ([]byte, error)
-    Delete(ctx context.Context, key string) error
-    List(ctx context.Context, prefix string) ([]string, error)
-    ConditionalPut(ctx context.Context, key string, data []byte, etag string) (newEtag string, err error)
-}
-```
-
-`ConditionalPut` is critical for lease coordination — it maps to S3's `If-Match` conditional writes.
-
-### Default Implementation
-
-S3-compatible client using the AWS SDK v2. Works with AWS S3, MinIO, Cloudflare R2, Backblaze B2 — anything that speaks the S3 API. Users provide bucket name, region, endpoint URL, and credentials.
+S3-compatible client using the AWS SDK v2. Works with AWS S3, MinIO, Cloudflare R2, Backblaze B2 — anything that speaks the S3 API. Users provide bucket name, region, endpoint URL, and credentials. Uses S3 conditional writes (`If-Match`) for lease coordination.
 
 ### S3 Object Layout
 
@@ -212,7 +196,7 @@ This allows consumers to track their position without joining a group — useful
 
 ### Offset Storage
 
-Committed offsets (both group and consumer-specific) go through a pluggable storage interface. Default: S3 at `_coordination/groups/{group_id}/offsets.json` for groups and `_coordination/consumers/{consumer_id}/offsets.json` for standalone consumers. Users can plug in Redis or DynamoDB for faster commits.
+Committed offsets (both group and consumer-specific) are stored in S3 at `_coordination/groups/{group_id}/offsets.json` for groups and `_coordination/consumers/{consumer_id}/offsets.json` for standalone consumers.
 
 ## HTTP API
 
@@ -339,7 +323,6 @@ server:
   instance_id: ""
 
 storage:
-  backend: "s3"
   bucket: "camu-data"
   region: "us-east-1"
   endpoint: ""
@@ -365,8 +348,6 @@ coordination:
   heartbeat_interval: "3s"
   rebalance_delay: "5s"
 
-groups:
-  offset_store: "s3"
 ```
 
 ## Deployment
@@ -476,9 +457,8 @@ camu/
 │   │   ├── registry.go
 │   │   └── rebalancer.go
 │   ├── storage/
-│   │   ├── storage.go
 │   │   ├── s3.go
-│   │   └── offset_store.go
+│   │   └── offsets.go
 │   ├── config/
 │   │   └── config.go
 │   └── meta/
