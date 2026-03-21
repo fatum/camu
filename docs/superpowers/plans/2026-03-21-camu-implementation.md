@@ -1193,7 +1193,9 @@ git commit -m "feat: topic metadata CRUD backed by S3"
 - Create: `pkg/camutest/options.go`
 - Create: `pkg/camutest/env_test.go`
 
-This task builds the test harness. It needs a minimal HTTP server to boot, so it depends on the server skeleton (Task 9). We build the camutest framework here with a health-check-only server, then flesh out the server in Task 9.
+This task builds the test harness. It co-depends with Task 9 (server skeleton). Build the camutest framework and the minimal server skeleton together — the server must exist for camutest to boot instances.
+
+**Important:** Implement the server skeleton (server.go, routes.go, handlers_cluster.go with health check endpoint) as Step 2 of this task, BEFORE writing the camutest env. This resolves the bootstrap dependency — camutest can boot real server instances that respond to health checks.
 
 - [ ] **Step 1: Write camutest test**
 
@@ -1657,18 +1659,44 @@ git commit -m "feat: per-partition batcher with size and time flush triggers"
 
 This wires up the full produce path: HTTP handler → router → WAL append → respond. The batcher runs in the background flushing to S3.
 
-- [ ] **Step 1: Implement produce handlers**
+**Single-instance mode:** In Tasks 10-14, the server runs as a single instance that implicitly owns ALL partitions (no lease coordination needed). Multi-instance lease-based ownership is added in Task 15. This allows the produce/consume path to be tested end-to-end before adding coordination complexity.
+
+- [ ] **Step 1: Implement partition manager**
+
+Create `internal/server/partition_manager.go`:
+- `PartitionManager` struct: manages per-partition state (WAL, offset counter, in-memory buffer)
+- `NewPartitionManager(cfg, s3Client, diskCache) *PartitionManager`
+- `Init(ctx, topic TopicConfig) error` — for each partition in the topic:
+  - Load partition index from S3 (or create empty index if not found)
+  - Open WAL file at `{wal_dir}/{topic}/{partition_id}.wal`
+  - Replay WAL to recover unflushed messages
+  - Initialize next offset from max(index.NextOffset(), last WAL offset + 1)
+  - Create router with topic's partition count
+  - Start batcher with OnFlush callback that:
+    1. Serializes messages into segment binary format
+    2. Uploads segment to S3 at `{topic}/{partition_id}/{base_offset}-{epoch}.segment`
+    3. Writes segment to disk cache
+    4. Updates partition index via conditional put
+    5. Truncates WAL up to flushed offset
+- `Append(topic, partitionID, msg) (offset uint64, error)` — appends to WAL, fsyncs, assigns offset
+- `IsOwned(topic, partitionID) bool` — returns true (single-instance owns all; overridden in Task 15)
+- `GetBuffer(topic, partitionID) []Message` — returns unflushed messages for consumer reads
+- `Shutdown(ctx) error` — flushes all batchers, closes WALs
+
+- [ ] **Step 2: Implement produce handlers**
 
 Create `internal/server/handlers_produce.go`:
 - `handleProduceHighLevel` — `POST /v1/topics/{topic}/messages`
   - Parses request body: single message `{"key": "base64", "value": "base64", "headers": {}}` or array of messages
+  - Validates topic exists via topicStore
   - Routes each message to partition via router
-  - Checks partition ownership — if not owned, returns 421 with routing map
-  - Appends to WAL, assigns offset, responds with `{"offsets": [{"partition": N, "offset": M}]}`
+  - Checks `partitionManager.IsOwned()` — if not owned, returns 421 with routing map
+  - Calls `partitionManager.Append()` for each message
+  - Responds with `{"offsets": [{"partition": N, "offset": M}]}`
 - `handleProduceLowLevel` — `POST /v1/topics/{topic}/partitions/{id}/messages`
   - Same but partition is explicit from URL
 
-- [ ] **Step 2: Register routes**
+- [ ] **Step 3: Register routes**
 
 Add to `internal/server/routes.go`:
 ```go
@@ -1676,14 +1704,15 @@ mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
 mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
 ```
 
-- [ ] **Step 3: Wire up partition management in server**
+- [ ] **Step 4: Wire up partition manager in server startup**
 
-Update `internal/server/server.go` to initialize per-partition WALs, batcher, and router when topics are loaded on startup. The server needs:
-- A partition manager that tracks owned partitions and their WALs
-- The batcher with an OnFlush callback that serializes messages into segments and uploads to S3
-- The router for key-based partition assignment
+Update `internal/server/server.go`:
+- Create `PartitionManager` during `New()`
+- On startup, load all topics from `topicStore.List()`, call `partitionManager.Init()` for each
+- When a new topic is created via API, call `partitionManager.Init()` for it
+- On shutdown, call `partitionManager.Shutdown()`
 
-- [ ] **Step 4: Write integration tests**
+- [ ] **Step 5: Write integration tests**
 
 Create `test/integration/produce_test.go`:
 
@@ -1772,7 +1801,7 @@ func TestProduceKeyRouting(t *testing.T) {
 }
 ```
 
-- [ ] **Step 5: Run integration tests**
+- [ ] **Step 6: Run integration tests**
 
 ```bash
 cd /Users/maksim/Projects/camu && go test -tags integration ./test/integration/ -v -run TestProduce
@@ -1780,11 +1809,11 @@ cd /Users/maksim/Projects/camu && go test -tags integration ./test/integration/ 
 
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add internal/server/handlers_produce.go internal/server/routes.go internal/server/server.go test/integration/produce_test.go
-git commit -m "feat: produce HTTP handlers with WAL write and partition routing"
+git add internal/server/partition_manager.go internal/server/handlers_produce.go internal/server/routes.go internal/server/server.go test/integration/produce_test.go
+git commit -m "feat: produce HTTP handlers with partition manager, WAL write, and S3 flush"
 ```
 
 ---
@@ -2120,12 +2149,15 @@ git commit -m "feat: SSE streaming for consumers"
 
 ### Task 15: Coordination — Leases and Partition Ownership
 
+This task replaces the single-instance "own everything" model from Task 12 with S3-based lease coordination. After this task, `PartitionManager.IsOwned()` checks actual lease state, and the server acquires/renews/releases leases.
+
 **Files:**
 - Create: `internal/coordination/lease.go`
 - Create: `internal/coordination/lease_test.go`
 - Create: `internal/coordination/registry.go`
 - Create: `internal/coordination/rebalancer.go`
 - Create: `internal/coordination/rebalancer_test.go`
+- Modify: `internal/server/partition_manager.go` — integrate lease checks into `IsOwned()`, add lease acquisition on startup, WAL discard on epoch mismatch
 
 - [ ] **Step 1: Write lease tests**
 
@@ -3308,6 +3340,10 @@ git commit -m "feat: orphan segment garbage collector"
 ---
 
 ### Task 26: Jepsen Verification
+
+**Post-MVP:** This task requires Tasks 1-20 to be complete (a fully functional multi-instance camu cluster). Run Jepsen after the core system is working end-to-end. Jepsen validates correctness under faults — it is not needed for initial development but is critical before any production use.
+
+**Prerequisites:** JVM 11+, Leiningen, Docker
 
 **Files:**
 - Create: `jepsen/camu/project.clj`
