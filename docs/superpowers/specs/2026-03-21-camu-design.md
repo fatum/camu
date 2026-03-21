@@ -165,8 +165,8 @@ GET /v1/topics/{topic}/partitions/{id}/messages?offset=N&limit=100
 Server resolves the requested offset through a tiered read path:
 
 1. **In-memory buffer** — if this instance owns the partition and the offset is in the active (unflushed) buffer, serve directly from memory
-2. **Local segment cache** — check the LRU cache for the segment containing the offset
-3. **S3 fetch** — fetch the segment from S3, cache it locally, then serve
+2. **Disk segment cache** — check local disk for a cached copy of the segment
+3. **S3 fetch** — fetch the segment from S3, write to disk cache, then serve
 
 Response includes `next_offset`.
 
@@ -181,7 +181,11 @@ Server holds the connection open and pushes messages as SSE events. For historic
 
 ### Segment Cache
 
-A local LRU cache holds recently-read segments in memory. Segments fetched from S3 for consumer reads are automatically cached so subsequent reads of the same offset range are served locally. Since segments are immutable once flushed, no invalidation is needed. Cache size is configurable (default 512MB).
+A disk-based cache of segments fetched from S3. Segments are written to local disk on first fetch and subsequent reads stream directly from the cached file by offset — no in-memory buffering needed. Since segments are immutable once flushed, no invalidation is required. Cache directory and max size are configurable; oldest segments are evicted when the size limit is reached.
+
+### Read Distribution
+
+Any instance can serve consumer reads, not just the partition owner. The read path on a non-owner instance is: disk cache → S3 fetch (and cache). This allows consumer reads to be load-balanced across all instances, decoupling read throughput from write ownership. Only the owning instance can serve reads from the in-memory buffer (unflushed data).
 
 ### Consumer Groups
 
@@ -351,7 +355,8 @@ segments:
   compression: "snappy"
 
 cache:
-  segment_cache_size: 536870912
+  directory: "/var/lib/camu/cache"
+  max_size: 10737418240          # 10GB disk cache
 
 coordination:
   lease_ttl: "10s"
