@@ -57,6 +57,33 @@
                         :as              :json})]
     (get-in resp [:body :messages] [])))
 
+(defn commit-offsets!
+  "Commits the consumer offset for the given topic and consumer-id.
+   POST /v1/topics/{topic}/offsets/{consumer_id}
+   Used to verify offset durability across faults."
+  [node topic consumer-id partition offset]
+  (let [resp (http/post (str (base-url node) "/v1/topics/" topic
+                             "/offsets/" consumer-id)
+                        {:content-type    :json
+                         :body            (json/generate-string {:partition partition
+                                                                 :offset    offset})
+                         :socket-timeout  http-timeout-ms
+                         :connect-timeout http-timeout-ms
+                         :as              :json})]
+    (get-in resp [:body])))
+
+(defn get-offsets!
+  "Fetches the committed consumer offset for the given topic and consumer-id.
+   GET /v1/topics/{topic}/offsets/{consumer_id}
+   Used to verify committed offsets survive instance restarts."
+  [node topic consumer-id]
+  (let [resp (http/get (str (base-url node) "/v1/topics/" topic
+                            "/offsets/" consumer-id)
+                       {:socket-timeout  http-timeout-ms
+                        :connect-timeout http-timeout-ms
+                        :as              :json})]
+    (get-in resp [:body])))
+
 (defrecord CamuClient [node topic]
   client/Client
   (open! [this test node']
@@ -77,7 +104,17 @@
        :consume
        (let [{:keys [partition offset]} (:value op)
              messages (consume! node default-topic partition (or offset 0))]
-         (assoc op :type :ok :value messages)))
+         (assoc op :type :ok :value messages))
+
+       :commit-offsets
+       (let [{:keys [consumer-id partition offset]} (:value op)
+             result (commit-offsets! node default-topic consumer-id partition offset)]
+         (assoc op :type :ok :value result))
+
+       :get-offsets
+       (let [{:keys [consumer-id]} (:value op)
+             result (get-offsets! node default-topic consumer-id)]
+         (assoc op :type :ok :value result)))
 
      (catch ConnectException _
        (assoc op :type :fail :error :connection-refused))

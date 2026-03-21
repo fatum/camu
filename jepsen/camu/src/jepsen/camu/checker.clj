@@ -96,14 +96,87 @@
          :conflicts (when (seq conflicts)
                       (take 20 conflicts))}))))
 
+(defn availability-checker
+  "Calculates the fraction of successful operations during the test.
+   Reports ok-count, fail-count, info-count, and availability percentage.
+   validity is always true — this checker is informational, not pass/fail."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [invocations (->> history (filter #(= :invoke (:type %))))
+            oks         (->> history (filter #(= :ok    (:type %))))
+            fails       (->> history (filter #(= :fail  (:type %))))
+            infos       (->> history (filter #(= :info  (:type %))))
+            total       (count invocations)
+            availability (if (pos? total)
+                           (double (/ (count oks) total))
+                           0.0)]
+        {:valid?       true
+         :ok-count     (count oks)
+         :fail-count   (count fails)
+         :info-count   (count infos)
+         :availability availability}))))
+
+(defn lease-fencing-checker
+  "After instance rejoin events, verifies that epoch fencing prevented
+   split-brain writes. Checks that each (partition, offset) pair has at
+   most one distinct value among writes recorded after each rejoin."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [rejoin-events (->> history
+                               (filter #(and (= :nemesis (:process %))
+                                             (= :info (:type %))
+                                             (= :rejoin (:f %)))))
+            ;; Collect all consume results to find any offset conflicts
+            consumed      (drain-messages history)
+            by-key        (group-by (juxt :partition :offset) consumed)
+            conflicts     (->> by-key
+                               (filter (fn [[_ msgs]]
+                                         (> (count (distinct (map :value msgs))) 1)))
+                               (map (fn [[k msgs]]
+                                      {:partition (first k)
+                                       :offset    (second k)
+                                       :values    (distinct (map :value msgs))})))]
+        {:valid?        (empty? conflicts)
+         :rejoin-count  (count rejoin-events)
+         :conflicts     (take 10 conflicts)}))))
+
+(defn recovery-time-checker
+  "Measures time between each nemesis fault event and the first successful
+   client operation that follows it. All times are in nanoseconds."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [nemesis-events (->> history
+                                (filter #(and (= :nemesis (:process %))
+                                              (= :info (:type %)))))
+            recovery-times (for [nem nemesis-events
+                                 :let [recovery (->> history
+                                                     (filter #(and (> (:time %) (:time nem))
+                                                                   (= :ok (:type %))
+                                                                   (not= :nemesis (:process %))))
+                                                     first)]
+                                 :when recovery]
+                             (- (:time recovery) (:time nem)))]
+        {:valid?           true
+         :min-recovery-ns  (when (seq recovery-times) (apply min recovery-times))
+         :max-recovery-ns  (when (seq recovery-times) (apply max recovery-times))
+         :mean-recovery-ns (when (seq recovery-times)
+                             (long (/ (reduce + recovery-times) (count recovery-times))))
+         :count            (count recovery-times)}))))
+
 (defn combined-checker
   "Returns a composition of all camu checkers plus standard Jepsen
    checkers for timeline, stats, and perf."
   []
   (checker/compose
-   {:no-data-loss       (no-data-loss-checker)
+   {:no-data-loss        (no-data-loss-checker)
     :offset-monotonicity (offset-monotonicity-checker)
-    :no-split-brain     (no-split-brain-checker)
-    :timeline           (checker/timeline)
-    :stats              (checker/stats)
-    :perf               (checker/perf)}))
+    :no-split-brain      (no-split-brain-checker)
+    :availability        (availability-checker)
+    :lease-fencing       (lease-fencing-checker)
+    :recovery-time       (recovery-time-checker)
+    :timeline            (checker/timeline)
+    :stats               (checker/stats)
+    :perf                (checker/perf)}))

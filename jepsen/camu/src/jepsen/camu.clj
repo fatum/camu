@@ -6,8 +6,9 @@
                     [tests :as tests]]
             [jepsen.camu.client :as client]
             [jepsen.camu.nemesis :as nem]
-            [jepsen.camu.checker :as chk]
-            [jepsen.camu.db :as db]))
+            [jepsen.camu.checker :as camu-checker]
+            [jepsen.camu.db :as db]
+            [jepsen [checker :as checker]]))
 
 (def partitions 4)
 
@@ -37,26 +38,37 @@
 (defn camu-test
   "Constructs a Jepsen test map for camu."
   [opts]
-  (merge tests/noop-test
-         opts
-         {:name      "camu"
-          :os        jepsen.os/noop
-          :db        (db/db)
-          :client    (client/client)
-          :nemesis   (nem/composed-nemesis)
-          :checker   (chk/combined-checker)
-          :generator (gen/phases
-                      ;; Phase 1: produce under faults
-                      (->> (produce-generator)
-                           (gen/stagger 1/10)
-                           (gen/nemesis (nem/nemesis-generator
-                                        (:time-limit opts 120)))
-                           (gen/time-limit (:time-limit opts 120)))
-                      ;; Phase 2: recovery (nemesis already stopped by
-                      ;; nemesis-generator, just wait)
-                      (gen/sleep 15)
-                      ;; Phase 3: drain all partitions
-                      (gen/clients (drain-generator)))}))
+  (let [faults (:faults opts #{:kill :partition :pause})]
+    (merge tests/noop-test
+           opts
+           {:name      "camu"
+            :os        jepsen.os/noop
+            :db        (db/db)
+            :client    (client/client)
+            :nemesis   (nem/composed-nemesis faults)
+            :checker   (checker/compose
+                        {:no-data-loss        (camu-checker/no-data-loss-checker)
+                         :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+                         :no-split-brain      (camu-checker/no-split-brain-checker)
+                         :availability        (camu-checker/availability-checker)
+                         :lease-fencing       (camu-checker/lease-fencing-checker)
+                         :recovery-time       (camu-checker/recovery-time-checker)
+                         :timeline            (checker/timeline)
+                         :stats               (checker/stats)
+                         :perf                (checker/perf)})
+            :generator (gen/phases
+                        ;; Phase 1: produce under faults
+                        (->> (produce-generator)
+                             (gen/stagger 1/10)
+                             (gen/nemesis (nem/nemesis-generator
+                                          (:time-limit opts 120)
+                                          faults))
+                             (gen/time-limit (:time-limit opts 120)))
+                        ;; Phase 2: recovery (nemesis already stopped by
+                        ;; nemesis-generator, just wait)
+                        (gen/sleep 15)
+                        ;; Phase 3: drain all partitions
+                        (gen/clients (drain-generator)))})))
 
 (def cli-opts
   "Additional CLI options for camu tests."
@@ -68,11 +80,41 @@
     :default 8080
     :parse-fn #(Integer/parseInt %)]])
 
+(defn kill-test
+  "Test with process kills only."
+  [opts]
+  (camu-test (assoc opts :faults #{:kill})))
+
+(defn partition-test
+  "Test with network partitions only."
+  [opts]
+  (camu-test (assoc opts :faults #{:partition})))
+
+(defn pause-test
+  "Test with process pauses (SIGSTOP/SIGCONT)."
+  [opts]
+  (camu-test (assoc opts :faults #{:pause})))
+
+(defn combined-test
+  "Test with all fault types simultaneously."
+  [opts]
+  (camu-test (assoc opts :faults #{:kill :partition :pause})))
+
 (defn -main
   "Entry point for the Jepsen CLI."
   [& args]
   (cli/run!
-   (merge (cli/single-test-cmd {:test-fn  camu-test
-                                 :opt-spec cli-opts})
+   (merge (cli/single-test-cmd {:test-fn  kill-test
+                                 :opt-spec cli-opts
+                                 :test-name "kill"})
+          (cli/single-test-cmd {:test-fn  partition-test
+                                 :opt-spec cli-opts
+                                 :test-name "partition"})
+          (cli/single-test-cmd {:test-fn  pause-test
+                                 :opt-spec cli-opts
+                                 :test-name "pause"})
+          (cli/single-test-cmd {:test-fn  combined-test
+                                 :opt-spec cli-opts
+                                 :test-name "combined"})
           (cli/serve-cmd))
    args))
