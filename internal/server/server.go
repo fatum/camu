@@ -247,7 +247,7 @@ func (s *Server) acquireLeasesForTopic(ctx context.Context, topic string, numPar
 		if _, alreadyOwned := s.ownedLeases[topic][pid]; alreadyOwned {
 			continue // already own this partition
 		}
-		lease, err := s.leaseStore.Acquire(ctx, topic, pid, s.instanceID, leaseTTL)
+		lease, err := s.leaseStore.Acquire(ctx, topic, pid, s.instanceID, s.Address(), leaseTTL)
 		if err != nil {
 			slog.Debug("acquireLeasesForTopic: skipping", "topic", topic, "partition", pid, "error", err)
 			continue
@@ -321,7 +321,7 @@ func (s *Server) renewOwnedLeases(ctx context.Context) {
 
 	for topic, partitions := range s.ownedLeases {
 		for pid, lease := range partitions {
-			newLease, err := s.leaseStore.Acquire(ctx, lease.Topic, lease.PartitionID, s.instanceID, leaseTTL)
+			newLease, err := s.leaseStore.Acquire(ctx, lease.Topic, lease.PartitionID, s.instanceID, s.Address(), leaseTTL)
 			if err != nil {
 				slog.Warn("renewLeases: lost lease", "topic", topic, "partition", pid, "error", err)
 				delete(partitions, pid)
@@ -382,7 +382,7 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 			key := fmt.Sprintf("%d", lease.PartitionID)
 			resp.Partitions[key] = routingPartitionInfo{
 				InstanceID: lease.InstanceID,
-				Address:    "", // address not stored in lease; could be extended
+				Address:    lease.Address,
 			}
 		}
 	}

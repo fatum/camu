@@ -26,7 +26,7 @@ func TestLease_AcquireAndRenew(t *testing.T) {
 	store := newTestLeaseStore(t)
 	ctx := context.Background()
 
-	lease, err := store.Acquire(ctx, "topic1", 0, "instance-a", 5*time.Second)
+	lease, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
@@ -50,12 +50,12 @@ func TestLease_ConflictingAcquire(t *testing.T) {
 	store := newTestLeaseStore(t)
 	ctx := context.Background()
 
-	_, err := store.Acquire(ctx, "topic1", 0, "instance-a", 5*time.Second)
+	_, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("first Acquire failed: %v", err)
 	}
 
-	_, err = store.Acquire(ctx, "topic1", 0, "instance-b", 5*time.Second)
+	_, err = store.Acquire(ctx, "topic1", 0, "instance-b", "http://b:8080", 5*time.Second)
 	if err == nil {
 		t.Fatal("expected error when acquiring held lease, got nil")
 	}
@@ -68,14 +68,14 @@ func TestLease_AcquireExpired(t *testing.T) {
 	store := newTestLeaseStore(t)
 	ctx := context.Background()
 
-	_, err := store.Acquire(ctx, "topic1", 0, "instance-a", 1*time.Millisecond)
+	_, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 1*time.Millisecond)
 	if err != nil {
 		t.Fatalf("first Acquire failed: %v", err)
 	}
 
 	time.Sleep(10 * time.Millisecond)
 
-	lease, err := store.Acquire(ctx, "topic1", 0, "instance-b", 5*time.Second)
+	lease, err := store.Acquire(ctx, "topic1", 0, "instance-b", "http://b:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire after expiry failed: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestLease_Release(t *testing.T) {
 	store := newTestLeaseStore(t)
 	ctx := context.Background()
 
-	lease, err := store.Acquire(ctx, "topic1", 0, "instance-a", 5*time.Second)
+	lease, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestLease_Release(t *testing.T) {
 		t.Fatalf("Release failed: %v", err)
 	}
 
-	lease2, err := store.Acquire(ctx, "topic1", 0, "instance-b", 5*time.Second)
+	lease2, err := store.Acquire(ctx, "topic1", 0, "instance-b", "http://b:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire after release failed: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestLease_Get(t *testing.T) {
 	store := newTestLeaseStore(t)
 	ctx := context.Background()
 
-	acquired, err := store.Acquire(ctx, "topic1", 0, "instance-a", 5*time.Second)
+	acquired, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestLease_ListForTopic(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		_, err := store.Acquire(ctx, "topicX", i, "instance-a", 5*time.Second)
+		_, err := store.Acquire(ctx, "topicX", i, "instance-a", "http://a:8080", 5*time.Second)
 		if err != nil {
 			t.Fatalf("Acquire partition %d failed: %v", i, err)
 		}
@@ -157,13 +157,13 @@ func TestLease_ReacquireOwnLease(t *testing.T) {
 	store := newTestLeaseStore(t)
 	ctx := context.Background()
 
-	lease1, err := store.Acquire(ctx, "topic1", 0, "instance-a", 5*time.Second)
+	lease1, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("first Acquire failed: %v", err)
 	}
 
 	// Re-acquire by same instance should succeed and keep epoch.
-	lease2, err := store.Acquire(ctx, "topic1", 0, "instance-a", 5*time.Second)
+	lease2, err := store.Acquire(ctx, "topic1", 0, "instance-a", "http://a:8080", 5*time.Second)
 	if err != nil {
 		t.Fatalf("re-acquire by same instance failed: %v", err)
 	}

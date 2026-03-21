@@ -18,6 +18,7 @@ type Lease struct {
 	Topic       string    `json:"topic"`
 	PartitionID int       `json:"partition_id"`
 	InstanceID  string    `json:"instance_id"`
+	Address     string    `json:"address"`
 	Epoch       uint64    `json:"epoch"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	ETag        string    `json:"-"` // S3 etag, not serialized
@@ -40,7 +41,7 @@ func leaseKey(topic string, partitionID int) string {
 // Acquire attempts to acquire a lease for a partition.
 // If no lease exists or the existing lease has expired, a new lease is written.
 // If the lease is active and owned by another instance, ErrLeaseHeld is returned.
-func (ls *LeaseStore) Acquire(ctx context.Context, topic string, partitionID int, instanceID string, ttl time.Duration) (Lease, error) {
+func (ls *LeaseStore) Acquire(ctx context.Context, topic string, partitionID int, instanceID string, address string, ttl time.Duration) (Lease, error) {
 	key := leaseKey(topic, partitionID)
 
 	data, etag, err := ls.s3Client.GetWithETag(ctx, key)
@@ -75,6 +76,7 @@ func (ls *LeaseStore) Acquire(ctx context.Context, topic string, partitionID int
 		Topic:       topic,
 		PartitionID: partitionID,
 		InstanceID:  instanceID,
+		Address:     address,
 		Epoch:       prevEpoch + 1,
 		ExpiresAt:   time.Now().Add(ttl),
 	}
