@@ -5,8 +5,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/maksim/camu/internal/log"
 )
 
 // ErrBackpressure is returned by Append when the total buffered size across all
@@ -17,20 +15,21 @@ var ErrBackpressure = errors.New("backpressure: buffer full")
 type BatcherConfig struct {
 	MaxSize       int64
 	MaxAge        time.Duration
-	OnFlush       func(partitionID int, msgs []log.Message) error
+	OnFlush       func(partitionID int) error
 	HighWaterMark int64 // 0 means disabled
 }
 
-// partitionBuffer holds buffered messages for a single partition.
+// partitionBuffer holds size metadata for a single partition — no messages.
 type partitionBuffer struct {
-	msgs  []log.Message
+	count int
 	size  int64
 	timer *time.Timer
 	mu    sync.Mutex
 }
 
-// Batcher accumulates messages per partition and flushes them when either a
-// size or time threshold is exceeded.
+// Batcher tracks per-partition size metadata and triggers flushes when either a
+// size or time threshold is exceeded. It does not store messages — the caller
+// reads from the WAL at flush time.
 type Batcher struct {
 	cfg       BatcherConfig
 	buffers   map[int]*partitionBuffer
@@ -59,16 +58,12 @@ func (b *Batcher) getOrCreate(partitionID int) *partitionBuffer {
 	return buf
 }
 
-// Append adds msg to the partition buffer. It estimates the message size as
-// len(Key) + len(Value) + 40 bytes of overhead. If the total buffered size
-// across all partitions exceeds HighWaterMark (when non-zero), ErrBackpressure
-// is returned without buffering the message. If the partition buffer exceeds
-// MaxSize after the append, a synchronous flush is triggered. Otherwise the age
-// timer is (re)started so the buffer is flushed after MaxAge even without
-// further writes.
-func (b *Batcher) Append(partitionID int, msg log.Message) error {
-	msgSize := int64(len(msg.Key) + len(msg.Value) + 40)
-
+// Append records that msgSize bytes were added to partitionID. If the total
+// buffered size across all partitions exceeds HighWaterMark (when non-zero),
+// ErrBackpressure is returned. If the partition buffer exceeds MaxSize after the
+// append, a synchronous flush is triggered. Otherwise the age timer is
+// (re)started so the buffer is flushed after MaxAge even without further writes.
+func (b *Batcher) Append(partitionID int, msgSize int64) error {
 	// Check backpressure before buffering.
 	if b.cfg.HighWaterMark > 0 && b.totalSize.Load()+msgSize > b.cfg.HighWaterMark {
 		return ErrBackpressure
@@ -77,7 +72,7 @@ func (b *Batcher) Append(partitionID int, msg log.Message) error {
 	buf := b.getOrCreate(partitionID)
 
 	buf.mu.Lock()
-	buf.msgs = append(buf.msgs, msg)
+	buf.count++
 	buf.size += msgSize
 	b.totalSize.Add(msgSize)
 
@@ -101,7 +96,7 @@ func (b *Batcher) Append(partitionID int, msg log.Message) error {
 	return nil
 }
 
-// flushPartition drains the buffer for partitionID and calls OnFlush. It is
+// flushPartition drains the metadata for partitionID and calls OnFlush. It is
 // safe to call concurrently; the buffer mutex ensures only one flush runs at a
 // time and an empty buffer is a no-op.
 func (b *Batcher) flushPartition(partitionID int) {
@@ -113,13 +108,12 @@ func (b *Batcher) flushPartition(partitionID int) {
 	}
 
 	buf.mu.Lock()
-	if len(buf.msgs) == 0 {
+	if buf.count == 0 {
 		buf.mu.Unlock()
 		return
 	}
-	msgs := buf.msgs
 	flushedSize := buf.size
-	buf.msgs = nil
+	buf.count = 0
 	buf.size = 0
 	if buf.timer != nil {
 		buf.timer.Stop()
@@ -130,7 +124,7 @@ func (b *Batcher) flushPartition(partitionID int) {
 	b.totalSize.Add(-flushedSize)
 
 	if b.cfg.OnFlush != nil {
-		_ = b.cfg.OnFlush(partitionID, msgs)
+		_ = b.cfg.OnFlush(partitionID)
 	}
 }
 

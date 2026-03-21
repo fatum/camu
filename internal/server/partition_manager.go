@@ -243,9 +243,10 @@ func (pm *PartitionManager) Append(ctx context.Context, topic string, partitionI
 		return 0, fmt.Errorf("WAL append: %w", err)
 	}
 
-	// Add to batcher.
+	// Notify batcher of size increase (no message data).
 	globalID := pm.getGlobalID(topic, partitionID)
-	if err := pm.batcher.Append(globalID, msg); err != nil {
+	msgSize := int64(len(msg.Key) + len(msg.Value) + 40)
+	if err := pm.batcher.Append(globalID, msgSize); err != nil {
 		return 0, fmt.Errorf("batcher append: %w", err)
 	}
 
@@ -291,12 +292,14 @@ func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, parti
 		return nil, fmt.Errorf("WAL append batch: %w", err)
 	}
 
-	// Add all to batcher.
+	// Notify batcher of total size increase (no message data).
 	globalID := pm.getGlobalID(topic, partitionID)
+	totalBatchSize := int64(0)
 	for _, msg := range msgs {
-		if err := pm.batcher.Append(globalID, msg); err != nil {
-			return nil, fmt.Errorf("batcher append: %w", err)
-		}
+		totalBatchSize += int64(len(msg.Key) + len(msg.Value) + 40)
+	}
+	if err := pm.batcher.Append(globalID, totalBatchSize); err != nil {
+		return nil, fmt.Errorf("batcher append: %w", err)
 	}
 
 	return offsets, nil
@@ -352,13 +355,10 @@ func (pm *PartitionManager) Shutdown(ctx context.Context) error {
 	return firstErr
 }
 
-// onFlush is the batcher's flush callback. It serializes messages into a segment,
-// uploads to S3, writes to disk cache, updates the index, and truncates the WAL.
-func (pm *PartitionManager) onFlush(globalPartitionID int, msgs []log.Message) error {
-	if len(msgs) == 0 {
-		return nil
-	}
-
+// onFlush is the batcher's flush callback. It reads unflushed messages from the
+// WAL, serializes them into a segment, uploads to S3, writes to disk cache,
+// updates the index, and truncates the WAL.
+func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	topic, partitionID, ok := pm.resolveGlobalID(globalPartitionID)
 	if !ok {
 		return fmt.Errorf("unknown global partition ID %d", globalPartitionID)
@@ -376,6 +376,16 @@ func (pm *PartitionManager) onFlush(globalPartitionID int, msgs []log.Message) e
 		return fmt.Errorf("partition %d not found for topic %q during flush", partitionID, topic)
 	}
 	pm.mu.RUnlock()
+
+	// Read unflushed messages from WAL starting at the index's next offset.
+	startOffset := ps.index.NextOffset()
+	msgs, err := ps.wal.ReplayFrom(startOffset)
+	if err != nil {
+		return fmt.Errorf("WAL replay from offset %d: %w", startOffset, err)
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
 
 	baseOffset := msgs[0].Offset
 	endOffset := msgs[len(msgs)-1].Offset
