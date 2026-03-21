@@ -294,9 +294,28 @@ func (s *Server) startLeaseRenewal() {
 	}()
 }
 
-// renewLeases renews all owned leases by re-acquiring them.
+// renewLeases re-runs the rebalancer on each cycle to pick up new instances.
+// Renews leases for assigned partitions, releases leases for unassigned ones.
 func (s *Server) renewLeases() {
 	ctx := context.Background()
+	topics, err := s.topicStore.List(ctx)
+	if err != nil {
+		slog.Warn("renewLeases: list topics", "error", err)
+		// Fall back to just renewing what we have.
+		s.renewOwnedLeases(ctx)
+		return
+	}
+
+	for _, tc := range topics {
+		s.acquireLeasesForTopic(ctx, tc.Name, tc.Partitions)
+	}
+
+	// Renew leases we still own after rebalance.
+	s.renewOwnedLeases(ctx)
+}
+
+// renewOwnedLeases renews all currently held leases.
+func (s *Server) renewOwnedLeases(ctx context.Context) {
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 
