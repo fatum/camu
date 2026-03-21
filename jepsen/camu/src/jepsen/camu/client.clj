@@ -21,7 +21,8 @@
    (http/post (str (base-url node) "/v1/topics")
               {:content-type  :json
                :body          (json/generate-string {:name       topic
-                                                     :partitions 4})
+                                                     :partitions 4
+                                                     :retention  "24h"})
                :socket-timeout  http-timeout-ms
                :connect-timeout http-timeout-ms})
    (catch [:status 409] _
@@ -42,7 +43,7 @@
                          :socket-timeout  http-timeout-ms
                          :connect-timeout http-timeout-ms
                          :as              :json})]
-    (get-in resp [:body :offset])))
+    (first (get-in resp [:body :offsets]))))
 
 (defn consume!
   "Consumes messages from the given topic and partition, starting at the
@@ -65,8 +66,7 @@
   (let [resp (http/post (str (base-url node) "/v1/topics/" topic
                              "/offsets/" consumer-id)
                         {:content-type    :json
-                         :body            (json/generate-string {:partition partition
-                                                                 :offset    offset})
+                         :body            (json/generate-string {:offsets {(str partition) offset}})
                          :socket-timeout  http-timeout-ms
                          :connect-timeout http-timeout-ms
                          :as              :json})]
@@ -98,8 +98,11 @@
      (case (:f op)
        :produce
        (let [{:keys [key value]} (:value op)
-             offset (produce! node default-topic key value)]
-         (assoc op :type :ok :value {:key key :value value :offset offset}))
+             result (produce! node default-topic key value)]
+         (assoc op :type :ok :value {:key       key
+                                     :value     value
+                                     :partition (:partition result)
+                                     :offset    (:offset result)}))
 
        :consume
        (let [{:keys [partition offset]} (:value op)
