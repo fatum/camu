@@ -369,17 +369,32 @@ func (s *Server) releaseAllLeases(ctx context.Context) {
 // isOwnedPartition checks if this instance owns the given partition via leases.
 func (s *Server) isOwnedPartition(topic string, partitionID int) bool {
 	s.leaseMu.RLock()
-	defer s.leaseMu.RUnlock()
-
 	topicLeases, ok := s.ownedLeases[topic]
 	if !ok {
+		s.leaseMu.RUnlock()
 		return false
 	}
 	lease, ok := topicLeases[partitionID]
 	if !ok {
+		s.leaseMu.RUnlock()
 		return false
 	}
-	return time.Now().Before(lease.ExpiresAt)
+	s.leaseMu.RUnlock()
+
+	// Fast path: lease clearly valid.
+	if time.Now().Add(2 * time.Second).Before(lease.ExpiresAt) {
+		return true
+	}
+
+	// Lease near expiry or expired — re-verify from S3 to be certain.
+	s3Lease, err := s.leaseStore.Get(context.Background(), topic, partitionID)
+	if err != nil {
+		slog.Warn("isOwnedPartition: S3 verify failed, assuming not owned",
+			"topic", topic, "partition", partitionID, "error", err)
+		return false
+	}
+
+	return s3Lease.InstanceID == s.instanceID && time.Now().Before(s3Lease.ExpiresAt)
 }
 
 // getRoutingMap builds the routing response for a topic by checking leases in S3.
