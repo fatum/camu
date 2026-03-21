@@ -189,7 +189,8 @@ func (s *Server) initExistingTopics() error {
 const leaseTTL = 30 * time.Second
 const leaseRenewalInterval = 10 * time.Second
 
-// acquireAllLeases acquires leases for all partitions of all initialized topics.
+// acquireAllLeases acquires leases for this instance's assigned partitions
+// across all topics, using the rebalancer to distribute evenly.
 func (s *Server) acquireAllLeases() {
 	ctx := context.Background()
 	topics, err := s.topicStore.List(ctx)
@@ -198,42 +199,81 @@ func (s *Server) acquireAllLeases() {
 		return
 	}
 
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-
 	for _, tc := range topics {
-		if _, exists := s.ownedLeases[tc.Name]; !exists {
-			s.ownedLeases[tc.Name] = make(map[int]coordination.Lease)
-		}
-		for pid := 0; pid < tc.Partitions; pid++ {
-			lease, err := s.leaseStore.Acquire(ctx, tc.Name, pid, s.instanceID, leaseTTL)
-			if err != nil {
-				slog.Debug("acquireAllLeases: skipping partition", "topic", tc.Name, "partition", pid, "error", err)
-				continue
-			}
-			s.ownedLeases[tc.Name][pid] = lease
-		}
+		s.acquireLeasesForTopic(ctx, tc.Name, tc.Partitions)
 	}
 }
 
-// AcquireLeasesForTopic acquires leases for all partitions of a specific topic.
-// Called after topic creation so the creating instance owns its partitions.
+// AcquireLeasesForTopic acquires leases for this instance's assigned partitions
+// of a specific topic, using the rebalancer for even distribution.
 func (s *Server) AcquireLeasesForTopic(topic string, numPartitions int) {
-	ctx := context.Background()
+	s.acquireLeasesForTopic(context.Background(), topic, numPartitions)
+}
+
+func (s *Server) acquireLeasesForTopic(ctx context.Context, topic string, numPartitions int) {
+	// Discover active instances (from existing leases) + always include self.
+	registry := coordination.NewRegistry(s.s3Client, s.instanceID, s.Address())
+	active, err := registry.ActiveInstances(ctx, topic)
+	if err != nil {
+		slog.Warn("acquireLeasesForTopic: discover instances", "error", err)
+		active = nil
+	}
+
+	// Ensure this instance is in the active set.
+	found := false
+	for _, id := range active {
+		if id == s.instanceID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		active = append(active, s.instanceID)
+	}
+
+	// Use rebalancer to determine which partitions this instance should own.
+	assignments := coordination.Assign(active, numPartitions)
+	myPartitions := assignments[s.instanceID]
+
 	s.leaseMu.Lock()
 	defer s.leaseMu.Unlock()
 
 	if _, exists := s.ownedLeases[topic]; !exists {
 		s.ownedLeases[topic] = make(map[int]coordination.Lease)
 	}
-	for pid := 0; pid < numPartitions; pid++ {
+
+	// Acquire leases for assigned partitions.
+	for _, pid := range myPartitions {
+		if _, alreadyOwned := s.ownedLeases[topic][pid]; alreadyOwned {
+			continue // already own this partition
+		}
 		lease, err := s.leaseStore.Acquire(ctx, topic, pid, s.instanceID, leaseTTL)
 		if err != nil {
-			slog.Debug("AcquireLeasesForTopic: skipping", "topic", topic, "partition", pid, "error", err)
+			slog.Debug("acquireLeasesForTopic: skipping", "topic", topic, "partition", pid, "error", err)
 			continue
 		}
 		s.ownedLeases[topic][pid] = lease
 	}
+
+	// Release leases for partitions no longer assigned to us.
+	assignedSet := make(map[int]bool, len(myPartitions))
+	for _, pid := range myPartitions {
+		assignedSet[pid] = true
+	}
+	for pid, lease := range s.ownedLeases[topic] {
+		if !assignedSet[pid] {
+			if err := s.leaseStore.Release(ctx, lease); err != nil {
+				slog.Debug("acquireLeasesForTopic: release", "topic", topic, "partition", pid, "error", err)
+			}
+			delete(s.ownedLeases[topic], pid)
+		}
+	}
+
+	slog.Info("partition assignment",
+		"topic", topic,
+		"instance", s.instanceID,
+		"assigned", myPartitions,
+		"active_instances", len(active))
 }
 
 // startLeaseRenewal starts a background goroutine that renews owned leases.
