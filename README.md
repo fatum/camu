@@ -30,21 +30,6 @@ curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0"
 - You need millions of messages/sec from a single partition
 - You need the Kafka protocol for existing ecosystem compatibility
 
-## How It Compares
-
-| | Kafka | Redpanda | **Camu** |
-|---|---|---|---|
-| Storage | Local disk + replication | Local disk + Raft | **S3** ($0.023/GB/mo) |
-| Ops dependencies | ZooKeeper or KRaft | None | **None** (just S3) |
-| Protocol | Custom binary | Kafka-compatible | **HTTP/REST** |
-| Min deployment | 3 nodes | 1 node | **1 binary + S3 bucket** |
-| Cost at rest | Disk on every broker | Disk on every broker | **S3 only** (~free) |
-| Latency (p99) | <10ms | <10ms | **~5s** (flush interval) |
-| Throughput | 1M+ msgs/sec | 1M+ msgs/sec | **89K msgs/sec** (batched) |
-| Scaling | Add brokers | Add brokers | **Add instances** (stateless) |
-| Client libraries | Required | Required | **Any HTTP client** |
-| Consistency | ISR replication | Raft | **S3 + epoch fencing** |
-
 ## Quick Start
 
 ### Docker (fastest)
