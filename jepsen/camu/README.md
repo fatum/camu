@@ -19,6 +19,8 @@ Composable via `--faults` flag (comma-separated):
 | Fault | Description | What it tests |
 |-------|-------------|---------------|
 | `kill` | SIGKILL a random camu process, restart after 3s | WAL recovery, data durability, partition reassignment |
+| `leave` | Graceful SIGTERM (flushes WAL, deregisters), restart later | No data loss on graceful leave, immediate rebalance |
+| `membership` | Full leave/wait/rejoin cycle on a random node | Partition reassignment on leave, correct rebalance on rejoin |
 | `partition` | Network partition into random halves | No split-brain writes, correct 421 routing |
 | `pause` | SIGSTOP/SIGCONT a random process | Lease TTL expiry, heartbeat failure detection |
 | `rejoin` | Kill node, wait 20s for lease expiry, restart | Epoch fencing prevents stale writes |

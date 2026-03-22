@@ -355,7 +355,7 @@ cd jepsen/camu && ./run.sh partition 60 # network partitions, 60s
 
 Camu ships with a full [Jepsen](https://jepsen.io) test suite that verifies consistency guarantees under fault injection. The suite spins up a 5-node Docker cluster with MinIO, runs a mixed produce/consume workload while injecting faults, then drains all partitions and checks invariants.
 
-**Fault types:** `kill` (SIGKILL), `partition` (network splits), `pause` (SIGSTOP/SIGCONT), `rejoin` (kill + lease expiry + restart), `s3-partition` (block S3 access), `clock-skew` (time drift). Composable via `--faults kill,partition,pause`.
+**Fault types:** `kill` (SIGKILL), `leave` (graceful SIGTERM), `membership` (leave/rebalance/rejoin cycle), `partition` (network splits), `pause` (SIGSTOP/SIGCONT), `rejoin` (kill + lease expiry + restart), `s3-partition` (block S3 access), `clock-skew` (time drift). Composable via `--faults kill,leave,partition`.
 
 **Checkers:**
 
