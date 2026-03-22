@@ -348,7 +348,7 @@ Happens automatically every ~10 seconds when the leader detects a topology chang
 
 - You need sub-second end-to-end latency
 - You need `acks=all` durability guarantees (no data loss on any single node failure)
-- You need millions of messages per second per partition
+- You need very high per-partition throughput (HTTP/JSON overhead, per-partition mutex for offset assignment, and per-batch fsync cap single-partition throughput well below what Kafka achieves with its binary protocol, zero-copy reads, and client-side batching)
 - You need transactions or exactly-once semantics
 - You need log compaction (keep latest value per key)
 
