@@ -351,6 +351,39 @@ func (pm *PartitionManager) GetRouter(topic string) *producer.Router {
 	return pm.routers[topic]
 }
 
+// RefreshIndex reloads a partition's index from S3 so reads on non-owner nodes
+// see segments flushed by the current owner. This is a no-op if the partition
+// is not initialized.
+func (pm *PartitionManager) RefreshIndex(ctx context.Context, topic string, partitionID int) {
+	pm.mu.RLock()
+	tp, ok := pm.partitions[topic]
+	if !ok {
+		pm.mu.RUnlock()
+		return
+	}
+	ps, ok := tp[partitionID]
+	if !ok {
+		pm.mu.RUnlock()
+		return
+	}
+	pm.mu.RUnlock()
+
+	indexKey := fmt.Sprintf("%s/%d/index.json", topic, partitionID)
+	data, etag, err := pm.s3Client.GetWithETag(ctx, indexKey)
+	if err != nil {
+		return // stale index is better than no index
+	}
+	idx := log.NewIndex()
+	if err := idx.UnmarshalJSON(data); err != nil {
+		return
+	}
+
+	pm.mu.Lock()
+	ps.index = idx
+	ps.indexETag = etag
+	pm.mu.Unlock()
+}
+
 // GetDiskCache returns the disk cache used by the partition manager.
 func (pm *PartitionManager) GetDiskCache() *log.DiskCache {
 	return pm.diskCache

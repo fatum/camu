@@ -25,17 +25,19 @@
                :value (str "v-" n)}})))
 
 (defn consume-gen
-  "Returns a generator that consumes from a random partition at offset 0."
-  []
+  "Returns a generator that consumes from a random partition, tracking
+   the highest offset seen per partition so reads advance forward."
+  [offsets]
   (fn [_ _]
-    {:type  :invoke
-     :f     :consume
-     :value {:partition (rand-int partitions)
-              :offset   0}}))
+    (let [p (rand-int partitions)]
+      {:type  :invoke
+       :f     :consume
+       :value {:partition p
+               :offset    (get @offsets p 0)}})))
 
 (defn mixed-workload-gen
   "Returns a mixed generator: ~70% produce, ~30% consume."
-  [counter]
+  [counter offsets]
   (gen/mix [(produce-gen counter)
             (produce-gen counter)
             (produce-gen counter)
@@ -43,9 +45,9 @@
             (produce-gen counter)
             (produce-gen counter)
             (produce-gen counter)
-            (consume-gen)
-            (consume-gen)
-            (consume-gen)]))
+            (consume-gen offsets)
+            (consume-gen offsets)
+            (consume-gen offsets)]))
 
 (defn drain-gen
   "Returns a generator that drains all 4 partitions."
@@ -60,13 +62,15 @@
   "Constructs a Jepsen test map for camu."
   [opts]
   (let [faults  (:faults opts #{:kill})
-        counter (atom 0)]
+        counter         (atom 0)
+        consume-offsets (atom {})]
     (merge tests/noop-test
            opts
-           {:name      "camu"
-            :os        os/noop
-            :db        (db/db)
-            :client    (client/client)
+           {:name            "camu"
+            :os              os/noop
+            :db              (db/db)
+            :client          (client/client)
+            :consume-offsets consume-offsets
             :nemesis   (nem/composed-nemesis faults)
             :checker   (checker/compose
                         {:no-data-loss        (camu-checker/no-data-loss-checker)
@@ -83,19 +87,18 @@
              (gen/time-limit
               (:time-limit opts 300)
               (gen/nemesis
-               (gen/cycle [(gen/sleep 5)
-                           (gen/once {:type :info :f :kill :value :start})
-                           (gen/sleep 15)
-                           (gen/once {:type :info :f :kill :value :stop})
-                           (gen/sleep 5)])
+               (->> (gen/mix (nem/fault-cycles faults))
+                    (gen/stagger 5))
                (gen/clients
-                (->> (mixed-workload-gen counter)
+                (->> (mixed-workload-gen counter consume-offsets)
                      (gen/stagger 1/10)))))
-             ;; Phase 2: stop nemesis, restart all nodes
+             ;; Phase 2: stop all active faults, restart nodes
              (gen/log "Stopping nemesis, restarting all nodes...")
-             (gen/nemesis (gen/once {:type :info :f :kill :value :stop}))
-             (gen/log "Recovering — waiting 25s for cluster stabilization...")
-             (gen/sleep 25)
+             (apply gen/phases
+                    (for [fault faults]
+                      (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
+             (gen/log "Recovering — waiting 30s for cluster stabilization...")
+             (gen/sleep 30)
              ;; Phase 3: drain ALL partitions
              (gen/log "Draining all partitions for verification...")
              (gen/clients (drain-gen)))})))

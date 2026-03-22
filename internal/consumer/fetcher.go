@@ -27,49 +27,75 @@ func NewFetcher(s3Client *storage.S3Client, diskCache *log.DiskCache) *Fetcher {
 
 // Fetch retrieves messages starting at startOffset, up to limit.
 // Read path: disk cache -> S3 fetch (cached on fetch).
+// Reads across multiple segments until limit is reached or no more data.
 // Returns the messages and the next offset to fetch from.
 func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, partitionID int, startOffset uint64, limit int) ([]log.Message, uint64, error) {
 	if index == nil {
 		return nil, startOffset, nil
 	}
 
-	segRef, found := index.Lookup(startOffset)
-	if !found {
-		return nil, startOffset, nil
-	}
+	var allMsgs []log.Message
+	currentOffset := startOffset
+	remaining := limit
 
-	// 1. Try disk cache.
-	data, err := f.diskCache.Get(segRef.Key)
-	if err != nil {
-		if !errors.Is(err, log.ErrCacheMiss) {
-			return nil, 0, fmt.Errorf("disk cache get: %w", err)
+	for remaining > 0 {
+		segRef, found := index.Lookup(currentOffset)
+		if !found {
+			break
 		}
 
-		// 2. Cache miss — fetch from S3.
-		data, err = f.s3Client.Get(ctx, segRef.Key)
+		data, err := f.fetchSegmentData(ctx, segRef.Key)
 		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				return nil, startOffset, nil
+			if len(allMsgs) > 0 {
+				break // return what we have
 			}
-			return nil, 0, fmt.Errorf("s3 get: %w", err)
+			return nil, 0, err
 		}
 
-		// 3. Cache the fetched segment.
-		if putErr := f.diskCache.Put(segRef.Key, data); putErr != nil {
-			_ = putErr
+		msgs, err := log.ReadSegmentFromOffset(bytes.NewReader(data), int64(len(data)), currentOffset, remaining)
+		if err != nil {
+			if len(allMsgs) > 0 {
+				break
+			}
+			return nil, 0, fmt.Errorf("read segment: %w", err)
 		}
-	}
 
-	// 4. Parse segment.
-	msgs, err := log.ReadSegmentFromOffset(bytes.NewReader(data), int64(len(data)), startOffset, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("read segment: %w", err)
+		if len(msgs) == 0 {
+			break
+		}
+
+		allMsgs = append(allMsgs, msgs...)
+		remaining -= len(msgs)
+		currentOffset = msgs[len(msgs)-1].Offset + 1
 	}
 
 	nextOffset := startOffset
-	if len(msgs) > 0 {
-		nextOffset = msgs[len(msgs)-1].Offset + 1
+	if len(allMsgs) > 0 {
+		nextOffset = allMsgs[len(allMsgs)-1].Offset + 1
 	}
 
-	return msgs, nextOffset, nil
+	return allMsgs, nextOffset, nil
+}
+
+// fetchSegmentData reads a segment from disk cache, falling back to S3.
+func (f *Fetcher) fetchSegmentData(ctx context.Context, key string) ([]byte, error) {
+	data, err := f.diskCache.Get(key)
+	if err != nil {
+		if !errors.Is(err, log.ErrCacheMiss) {
+			return nil, fmt.Errorf("disk cache get: %w", err)
+		}
+		// Cache miss — fetch from S3.
+		data, err = f.s3Client.Get(ctx, key)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, err
+			}
+			return nil, fmt.Errorf("s3 get: %w", err)
+		}
+		// Cache the fetched segment.
+		if putErr := f.diskCache.Put(key, data); putErr != nil {
+			_ = putErr
+		}
+	}
+	return data, nil
 }
