@@ -342,33 +342,34 @@ go test ./internal/...
 # Integration tests (spins up in-memory S3 + camu instances)
 go test -tags integration ./test/integration/ -timeout 120s
 
-# Against a running deployment
-./camu test --endpoint http://camu.example.com
-
 # Benchmarks
-./camu test --bench
+go test -tags integration ./test/bench/ -bench=. -benchtime=10s
 
-# Chaos tests (random instance kills)
-./camu test --chaos
-
-# Jepsen (consistency verification with fault injection)
-cd jepsen/camu && docker compose up --abort-on-container-exit control
+# Jepsen (consistency verification under fault injection)
+cd jepsen/camu && ./run.sh              # default: kill faults, 120s
+cd jepsen/camu && ./run.sh kill 60      # kill faults, 60s
+cd jepsen/camu && ./run.sh partition 60 # network partitions, 60s
 ```
 
-### Jepsen Results
+### Jepsen Tests
 
-Verified on a 5-node cluster with process kill faults over 300 seconds. Mixed workload: 70% produce, 30% consume with kill/restart cycles every ~25s.
+Camu ships with a full [Jepsen](https://jepsen.io) test suite that verifies consistency guarantees under fault injection. The suite spins up a 5-node Docker cluster with MinIO, runs a mixed produce/consume workload while injecting faults, then drains all partitions and checks invariants.
 
-**Consistency:**
+**Fault types:** `kill` (SIGKILL), `partition` (network splits), `pause` (SIGSTOP/SIGCONT), `rejoin` (kill + lease expiry + restart), `s3-partition` (block S3 access), `clock-skew` (time drift). Composable via `--faults kill,partition,pause`.
 
-| Checker | Result | Description |
-|---------|--------|-------------|
-| No split-brain | VALID | No two writers at same (partition, offset) |
-| Total order | VALID | Offsets contiguous 0,1,2,...N per partition |
-| Offset monotonicity | VALID | No gaps or duplicates |
-| Lease fencing | VALID | Epoch fencing prevents stale writes after rejoin |
+**Checkers:**
 
-**Operations:** 2,976 total | 975 produce ok (47% availability under faults) | 779 consume ok | Mean recovery: 944ms
+| Checker | What it verifies |
+|---------|-----------------|
+| No data loss | Every ack'd produce is readable after recovery |
+| No split-brain | No two different values at the same (partition, offset) |
+| Total order | Offsets contiguous 0,1,2,...N per partition, no gaps |
+| Offset monotonicity | No duplicates or out-of-order offsets within partitions |
+| Lease fencing | Epoch fencing prevents stale writes after instance rejoin |
+| Availability | Fraction of successful operations during faults (informational) |
+| Recovery time | Time from fault injection to first successful client operation |
+
+See [`jepsen/camu/README.md`](jepsen/camu/README.md) for full details.
 
 ## Project Structure
 

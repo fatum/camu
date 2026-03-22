@@ -50,6 +50,7 @@
                            info (first (:offsets body))]
                        {:partition (:partition info) :offset (:offset info)})
       (= status 421) (throw (ex-info "misdirected" {:type :misdirected}))
+      (= status 500) (throw (ex-info "not-ready" {:type :not-ready}))
       (= status 503) (throw (ex-info "backpressure" {:type :backpressure}))
       :else          (throw (ex-info (str "produce failed: " status) {:type :error :status status})))))
 
@@ -76,24 +77,32 @@
        []))))
 
 (defn drain!
-  "Drains all messages from a partition, using a larger limit and timeout.
-   Used for the final verification phase."
+  "Drains all messages from a partition by paginating in batches of 1000
+   (the server's max limit). Used for the final verification phase."
   [node topic partition offset]
-  (let [resp (http/get (str (base-url node) "/v1/topics/" topic
-                            "/partitions/" partition "/messages")
-                       {:query-params     {:offset offset
-                                           :limit  10000}
-                        :socket-timeout   drain-timeout-ms
-                        :connect-timeout  drain-timeout-ms
-                        :throw-exceptions false})]
-    (if (= 200 (:status resp))
-      (let [body (json/parse-string (:body resp) true)]
-        (vec (map (fn [m] {:offset    (:offset m)
-                           :partition partition
-                           :key       (:key m)
-                           :value     (:value m)})
-                  (:messages body))))
-      [])))
+  (loop [current-offset offset
+         acc            []]
+    (let [resp (http/get (str (base-url node) "/v1/topics/" topic
+                              "/partitions/" partition "/messages")
+                         {:query-params     {:offset current-offset
+                                             :limit  1000}
+                          :socket-timeout   drain-timeout-ms
+                          :connect-timeout  drain-timeout-ms
+                          :throw-exceptions false})]
+      (if (= 200 (:status resp))
+        (let [body    (json/parse-string (:body resp) true)
+              msgs    (:messages body)
+              batch   (mapv (fn [m] {:offset    (:offset m)
+                                     :partition partition
+                                     :key       (:key m)
+                                     :value     (:value m)})
+                            msgs)]
+          (if (< (count msgs) 1000)
+            ;; Last page — return all accumulated messages
+            (into acc batch)
+            ;; More pages — continue from next_offset
+            (recur (:next_offset body) (into acc batch))))
+        acc))))
 
 (defn commit-offsets!
   "Commits the consumer offset for the given topic and consumer-id."
@@ -118,15 +127,39 @@
     (when (= 200 (:status resp))
       (:offsets (json/parse-string (:body resp) true)))))
 
+(defn wait-for-topic-ready!
+  "Polls nodes until at least one can serve a produce request without 500.
+   This ensures coordination has propagated topic initialization."
+  [nodes topic timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [ready? (some (fn [n]
+                           (try
+                             (let [resp (http/post (str (base-url n) "/v1/topics/" topic "/messages")
+                                                   {:content-type     :json
+                                                    :body             (json/generate-string {:key "healthcheck" :value "ping"})
+                                                    :socket-timeout   2000
+                                                    :connect-timeout  2000
+                                                    :throw-exceptions false})]
+                               ;; 200 = produced, 421 = misdirected (but topic is initialized)
+                               (#{200 421} (:status resp)))
+                             (catch Exception _ false)))
+                         nodes)]
+        (cond
+          ready?                                   (info "Topic ready on cluster")
+          (> (System/currentTimeMillis) deadline)  (warn "Timed out waiting for topic readiness")
+          :else                                    (do (Thread/sleep 2000) (recur)))))))
+
 (defrecord CamuClient [node topic]
   client/Client
   (open! [this test node']
     (assoc this :node node'))
 
   (setup! [this test]
-    ;; Create topic on ALL nodes so each instance knows about the topic
-    (doseq [n (:nodes test)]
-      (create-topic! n default-topic))
+    ;; Create topic on first available node
+    (create-topic! (first (:nodes test)) default-topic)
+    ;; Wait for coordination to propagate topic to all nodes
+    (wait-for-topic-ready! (:nodes test) default-topic 30000)
     this)
 
   (invoke! [this test op]
@@ -137,10 +170,10 @@
          ;; Try all nodes until one accepts (handles 421 misdirected)
          (loop [nodes (shuffle (:nodes test))]
            (if (empty? nodes)
-             (assoc op :type :fail :error :all-misdirected)
+             (assoc op :type :fail :error :no-node-available)
              (let [result (try (produce! (first nodes) default-topic key value)
                                (catch clojure.lang.ExceptionInfo e
-                                 (if (= :misdirected (:type (ex-data e)))
+                                 (if (#{:misdirected :not-ready} (:type (ex-data e)))
                                    ::retry
                                    (throw e))))]
                (if (= ::retry result)
@@ -153,16 +186,23 @@
        :consume
        (let [{:keys [partition offset]} (:value op)
              messages (consume! node default-topic partition (or offset 0))]
+         ;; Advance the consume-offsets tracker so next consume continues forward
+         (when-let [offsets-atom (:consume-offsets test)]
+           (when (seq messages)
+             (let [max-offset (apply max (map :offset messages))]
+               (swap! offsets-atom update partition #(max (or % 0) (inc max-offset))))))
          (assoc op :type :ok :value {:partition partition :messages messages}))
 
        :drain
        (let [{:keys [partition offset]} (:value op)
-             ;; Try all nodes for drain to maximize chance of success
+             ;; Try all nodes for drain, skipping nodes that are down
              messages (loop [nodes (shuffle (:nodes test))]
                         (if (empty? nodes)
                           []
-                          (let [msgs (drain! (first nodes) default-topic
-                                             partition (or offset 0))]
+                          (let [msgs (try (drain! (first nodes) default-topic
+                                                  partition (or offset 0))
+                                          (catch ConnectException _ nil)
+                                          (catch SocketTimeoutException _ nil))]
                             (if (seq msgs)
                               msgs
                               (recur (rest nodes))))))]
@@ -188,6 +228,7 @@
        (let [t (:type (ex-data e))]
          (case t
            :misdirected        (assoc op :type :fail :error :misdirected)
+           :not-ready          (assoc op :type :fail :error :not-ready)
            :backpressure       (assoc op :type :fail :error :service-unavailable)
            (assoc op :type :fail :error (str (.getMessage e))))))
 

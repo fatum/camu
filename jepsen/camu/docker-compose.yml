@@ -48,19 +48,6 @@ services:
         condition: service_started
     networks:
       - jepsen
-    entrypoint: >
-      bash -c "
-        echo 'Distributing SSH keys to nodes...' &&
-        for n in n1 n2 n3 n4 n5; do
-          until ssh-keyscan $$n >> /root/.ssh/known_hosts 2>/dev/null; do sleep 1; done
-          sshpass -p root ssh-copy-id -o StrictHostKeyChecking=no root@$$n 2>/dev/null || true
-        done &&
-        cp /root/.ssh/id_rsa.pub /shared-ssh/authorized_keys &&
-        echo 'SSH keys distributed. Waiting for nodes to pick up keys...' &&
-        sleep 3 &&
-        echo 'Running Jepsen test...' &&
-        exec lein run test --nodes n1,n2,n3,n4,n5 --ssh-private-key /root/.ssh/id_rsa --time-limit 60 --s3-endpoint http://minio:9000 --camu-binary /jepsen/camu/camu --faults kill
-      "
 
   n1: &node
     build:

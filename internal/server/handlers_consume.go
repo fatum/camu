@@ -54,6 +54,12 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Refresh index from S3 for non-owned partitions so we see the latest
+	// segments flushed by the current owner.
+	if !s.isOwnedPartition(topicName, partitionID) {
+		s.partitionManager.RefreshIndex(r.Context(), topicName, partitionID)
+	}
+
 	// Get the partition index.
 	index := s.partitionManager.GetIndex(topicName, partitionID)
 	if index == nil {

@@ -105,11 +105,13 @@
             results
             (reduce-kv
              (fn [acc partition msgs]
-               (let [sorted-offsets (sort (map :offset msgs))
+               (let [raw-offsets   (mapv :offset msgs)
+                     sorted-offsets (sort raw-offsets)
                      n             (count sorted-offsets)
                      expected      (range 0 n)
-                     out-of-order  (when (seq sorted-offsets)
-                                     (not= sorted-offsets (sort sorted-offsets)))
+                     ;; Check if drain returned messages out of offset order
+                     out-of-order  (when (seq raw-offsets)
+                                     (not= raw-offsets (vec sorted-offsets)))
                      missing-from-zero (when (and (seq sorted-offsets)
                                                   (not= 0 (first sorted-offsets)))
                                          (first sorted-offsets))
@@ -130,24 +132,29 @@
          :problems (when (seq results) results)}))))
 
 (defn availability-checker
-  "Calculates the fraction of successful operations during the test.
-   Reports ok-count, fail-count, info-count, and availability percentage.
-   Validity is always true — this checker is informational, not pass/fail."
+  "Calculates the fraction of successful client operations during the test.
+   Excludes nemesis events. Uses completions (ok + fail + info) as denominator.
+   Informational only — always valid."
   []
   (reify checker/Checker
     (check [_ test history opts]
-      (let [invocations (->> history (filter #(= :invoke (:type %))))
-            oks         (->> history (filter #(= :ok    (:type %))))
-            fails       (->> history (filter #(= :fail  (:type %))))
-            infos       (->> history (filter #(= :info  (:type %))))
-            total       (count invocations)
+      (let [client-ops  (->> history
+                             (filter #(not= :nemesis (:process %)))
+                             (filter #(#{:ok :fail :info} (:type %))))
+            oks         (->> client-ops (filter #(= :ok   (:type %))))
+            fails       (->> client-ops (filter #(= :fail (:type %))))
+            infos       (->> client-ops (filter #(= :info (:type %))))
+            ok-ct       (count oks)
+            fail-ct     (count fails)
+            info-ct     (count infos)
+            total       (+ ok-ct fail-ct info-ct)
             availability (if (pos? total)
-                           (double (/ (count oks) total))
+                           (double (/ ok-ct total))
                            0.0)]
         {:valid?       true
-         :ok-count     (count oks)
-         :fail-count   (count fails)
-         :info-count   (count infos)
+         :ok-count     ok-ct
+         :fail-count   fail-ct
+         :info-count   info-ct
          :availability availability}))))
 
 (defn lease-fencing-checker
@@ -175,15 +182,22 @@
          :conflicts     (take 10 conflicts)}))))
 
 (defn recovery-time-checker
-  "Measures time between each nemesis fault event and the first successful
-   client operation that follows it. All times are in nanoseconds."
+  "Measures time between each nemesis fault-start event and the first successful
+   client operation that follows it. Only :start events are meaningful —
+   :stop events are recovery actions, not faults. All times in nanoseconds."
   []
   (reify checker/Checker
     (check [_ test history opts]
-      (let [nemesis-events (->> history
-                                (filter #(and (= :nemesis (:process %))
-                                              (= :info (:type %)))))
-            recovery-times (for [nem nemesis-events
+      (let [fault-starts (->> history
+                              (filter #(and (= :nemesis (:process %))
+                                            (= :info (:type %))))
+                              ;; Only measure from fault injections, not recoveries
+                              (filter #(let [v (:value %)]
+                                         (or (= :start v)
+                                             (and (vector? v)
+                                                  (#{:killed :paused :s3-blocked :rejoined}
+                                                   (first v)))))))
+            recovery-times (for [nem fault-starts
                                  :let [recovery (->> history
                                                      (filter #(and (> (:time %) (:time nem))
                                                                    (= :ok (:type %))

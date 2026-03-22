@@ -33,7 +33,7 @@
                          "\n"
                          "segments:\n"
                          "  max_size: 1048576\n"
-                         "  max_age: \"2s\"\n"
+                         "  max_age: \"50ms\"\n"
                          "  compression: \"none\"\n"
                          "\n"
                          "cache:\n"

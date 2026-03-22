@@ -329,8 +329,17 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 
 // applyAssignmentsForTopics reads assignments from S3 and acquires/releases leases
 // for the given topics based on what is assigned to this instance.
+// Also initializes any topics that exist in the topic store but haven't been
+// initialized in the local partition manager (e.g. topics created on other nodes).
 func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.TopicConfig) {
 	for _, tc := range topics {
+		// Ensure topic is initialized locally before applying assignments.
+		if s.partitionManager.GetRouter(tc.Name) == nil {
+			epochs := s.getOwnedEpochs(tc.Name)
+			if err := s.partitionManager.InitTopic(ctx, tc, epochs); err != nil {
+				slog.Error("applyAssignments: failed to init topic", "topic", tc.Name, "error", err)
+			}
+		}
 		s.applyAssignmentsForTopic(ctx, tc.Name, tc.Partitions)
 	}
 }
