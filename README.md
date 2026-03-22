@@ -17,18 +17,10 @@ curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0"
 
 ## When to Use Camu
 
-**Use camu when:**
 - You want Kafka-style ordered partitioned logs without operating Kafka
-- Your storage costs matter more than sub-millisecond latency
 - You need a message bus that scales to zero when idle (S3 costs only)
 - You want any language to produce/consume via HTTP — no client libraries needed
 - You're already on AWS/MinIO/R2 and want to keep infrastructure simple
-
-**Use Kafka/Redpanda when:**
-- You need sub-millisecond end-to-end latency (camu has ~5s flush delay)
-- You need exactly-once semantics
-- You need millions of messages/sec from a single partition
-- You need the Kafka protocol for existing ecosystem compatibility
 
 ## Quick Start
 
