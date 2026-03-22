@@ -195,7 +195,8 @@
                               (filter #(let [v (:value %)]
                                          (or (= :start v)
                                              (and (vector? v)
-                                                  (#{:killed :paused :s3-blocked :rejoined}
+                                                  (#{:killed :paused :s3-blocked :rejoined
+                                                     :left :membership-cycle}
                                                    (first v)))))))
             recovery-times (for [nem fault-starts
                                  :let [recovery (->> history
