@@ -987,7 +987,11 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		ps.fetchDone = nil
 	}
 
-	// 4b. Replay WAL to recover true log end.
+	// 4b. Refresh index from S3 so we see segments flushed by the old leader.
+	// The follower's in-memory index may be stale.
+	s.partitionManager.RefreshIndex(ctx, topic, pid)
+
+	// 4c. Replay WAL to recover true log end.
 	// ps.nextOffset may be stale if a coordination cycle re-initialized the
 	// partition from S3 (which doesn't have follower-specific un-flushed data).
 	// The WAL is the source of truth for un-flushed messages.
@@ -1016,16 +1020,21 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		}(),
 	)
 
-	// 4c. Set HW to log end.
-	// The new leader was an ISR member — everything it has is safe to serve.
-	// All acked produces were acked because this follower (now leader) had
-	// the data (that's what caused HW to advance on the old leader).
-	// Setting HW = log end makes all this data immediately visible to
-	// consumers and allows the purgatory on new produces to work correctly.
+	// 4c. Set HW to max of WAL end and S3 index state.
+	// The new leader was an ISR member — everything in its WAL and in S3
+	// segments (visible via the refreshed index) is safe to serve.
+	// The follower's WAL may have been pruned at the old leader's flushed
+	// offset, so walEnd alone can undercount committed data that is already
+	// in S3 segments.
 	recoveredHW := walEnd
-	slog.Info("failover: set HW to log end",
+	indexNext := ps.index.NextOffset()
+	if indexNext > recoveredHW {
+		recoveredHW = indexNext
+	}
+	slog.Info("failover: recovered HW",
 		"topic", topic, "pid", pid,
-		"hw", recoveredHW, "log_end", walEnd)
+		"hw", recoveredHW, "log_end", walEnd,
+		"index_next", indexNext, "index_hw", ps.index.HighWatermark())
 
 	// 4d. Epoch history — load from S3 (authoritative), fall back to local.
 	ehPath := filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))
