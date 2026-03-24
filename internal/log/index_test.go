@@ -176,6 +176,39 @@ func TestIndex_Add_ReplacesContainedSegments(t *testing.T) {
 	}
 }
 
+func TestIndex_Add_KeepsPartiallyOverlappingSegment(t *testing.T) {
+	idx := NewIndex()
+	// Old leader flushed segments 0-0 through 12-13
+	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 0, Key: "seg-0-0"})
+	idx.Add(SegmentRef{BaseOffset: 12, EndOffset: 13, Key: "seg-12-13"})
+
+	// New leader recovery flushes 13-15 from WAL. This partially overlaps
+	// with seg-12-13 but must NOT remove it — offset 12 is only there.
+	idx.Add(SegmentRef{BaseOffset: 13, EndOffset: 15, Key: "seg-13-15"})
+
+	// Offset 12 must still be reachable via the old segment.
+	ref, ok := idx.Lookup(12)
+	if !ok {
+		t.Fatal("expected to find offset 12 from partially overlapping old segment")
+	}
+	if ref.Key != "seg-12-13" {
+		t.Fatalf("expected seg-12-13, got %s", ref.Key)
+	}
+
+	// Offset 13 should come from the new segment (higher base wins in sorted order).
+	ref, ok = idx.Lookup(14)
+	if !ok {
+		t.Fatal("expected to find offset 14")
+	}
+	if ref.Key != "seg-13-15" {
+		t.Fatalf("expected seg-13-15, got %s", ref.Key)
+	}
+
+	if got := len(idx.segments); got != 3 {
+		t.Fatalf("expected 3 segments (old kept + new), got %d", got)
+	}
+}
+
 func TestIndex_ObjectFormat(t *testing.T) {
 	idx := NewIndex()
 	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 49, Epoch: 1, Key: "seg-0"})

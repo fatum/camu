@@ -45,12 +45,14 @@ func NewIndex() *Index {
 // Add inserts ref into the index in sorted order by BaseOffset.
 func (idx *Index) Add(ref SegmentRef) {
 	// A newly flushed segment may replace the prior tail segment after leader
-	// reassignment, e.g. old tail 46-46 replaced by new 46-48. Keep only the
-	// newest ref for any overlapping range so lookups do not land on stale tails.
+	// reassignment, e.g. old tail 46-46 replaced by new 46-48. Only remove
+	// segments fully contained within the new segment's range. Partial overlaps
+	// (e.g. existing 12-13 vs new 13-15) must be kept to avoid losing offsets
+	// that only exist in the old segment.
 	filtered := idx.segments[:0]
 	for _, existing := range idx.segments {
-		overlaps := existing.BaseOffset <= ref.EndOffset && ref.BaseOffset <= existing.EndOffset
-		if !overlaps {
+		fullyContained := ref.BaseOffset <= existing.BaseOffset && existing.EndOffset <= ref.EndOffset
+		if !fullyContained {
 			filtered = append(filtered, existing)
 		}
 	}
