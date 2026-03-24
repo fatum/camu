@@ -1,0 +1,64 @@
+digraph write_path {
+    rankdir=TB
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+
+    // Colors
+    node [fillcolor="#E8F4FD" color="#2196F3"]
+
+    subgraph cluster_http {
+        label="HTTP Layer" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=12
+        req [label="POST /v1/topics/{t}/messages" shape=oval fillcolor="#BBDEFB"]
+        resp [label="HTTP 200\n{offsets: [{partition, offset}]}" shape=oval fillcolor="#C8E6C9" color="#4CAF50"]
+    }
+
+    subgraph cluster_produce {
+        label="Produce Pipeline" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=12
+        ownership [label="Ownership Check\n(zero I/O, local map)"]
+        route [label="Partition Router\nhash(key) % N | round-robin"]
+        assign [label="Offset Assignment\n(partition lock, monotonic uint64)"]
+        wal [label="WAL Append + fsync\n(CRC-protected entries)" fillcolor="#FFF9C4" color="#FFC107"]
+    }
+
+    subgraph cluster_replication {
+        label="ISR Replication (rf > 1)" style="dashed" color="#CE93D8" fontname="Helvetica" fontsize=12
+        node [fillcolor="#F3E5F5" color="#9C27B0"]
+        purgatory [label="Purgatory.Wait(offset)\nblocks until HW > offset"]
+        hw_advance [label="HW Advance\nmin(leaderOffset, followerOffsets...)\nfor all ISR members"]
+        follower_ack [label="Follower Ack\n(implicit via X-Replica-Offset)"]
+    }
+
+    subgraph cluster_flush {
+        label="Background Flush" style="dashed" color="#A5D6A7" fontname="Helvetica" fontsize=12
+        node [fillcolor="#E8F5E9" color="#4CAF50"]
+        batcher [label="Batcher Trigger\n8MB size | 50ms timer (test)\n5s timer (production)"]
+        verify [label="S3 Lease Re-verify\n(ownership still valid?)"]
+        replay [label="WAL Replay\n(read unflushed entries)"]
+        segment [label="Segment Upload\n{offset}-{epoch}.segment\nsnappy | zstd | none"]
+        cache [label="Disk Cache Write"]
+        index_update [label="Index CAS Update\nConditional PUT index.json"]
+        truncate [label="WAL Truncate\n(capped at HW for rf > 1)"]
+    }
+
+    // Flow
+    req -> ownership
+    ownership -> route [label="owned"]
+    ownership -> resp [label="not owned\n421 + routing map" style=dashed color=red]
+    route -> assign
+    assign -> wal
+    wal -> resp [label="rf=1\n(immediate ack)"]
+    wal -> purgatory [label="rf > 1"]
+    follower_ack -> hw_advance
+    hw_advance -> purgatory [label="complete" style=dashed]
+    purgatory -> resp [label="HW advanced"]
+
+    wal -> batcher [style=dashed label="size tracking"]
+    batcher -> verify
+    verify -> replay [label="still owner"]
+    verify -> truncate [label="lost\nrevoke" style=dashed color=red]
+    replay -> segment
+    segment -> cache
+    segment -> index_update
+    index_update -> truncate
+}

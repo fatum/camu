@@ -1,0 +1,45 @@
+digraph read_path {
+    rankdir=TB
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+
+    node [fillcolor="#E8F4FD" color="#2196F3"]
+
+    req [label="GET /v1/topics/{t}/partitions/{p}/messages\n?offset=N&limit=100" shape=oval fillcolor="#BBDEFB"]
+    resp [label="HTTP 200\n{messages: [...], next_offset: M}" shape=oval fillcolor="#C8E6C9" color="#4CAF50"]
+
+    hw_check [label="HW Cap (rf > 1)\nstartOffset >= HW?\nreturn empty" fillcolor="#F3E5F5" color="#9C27B0"]
+
+    subgraph cluster_index {
+        label="Index Layer" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=12
+        owned_check [label="Owned partition?\nuse local index"]
+        refresh [label="Refresh Index from S3\n(non-owner reads)"]
+        lookup [label="Index Lookup\nbinary search on SegmentRef[]"]
+    }
+
+    subgraph cluster_fetch {
+        label="Segment Fetch" style="dashed" color="#A5D6A7" fontname="Helvetica" fontsize=12
+        node [fillcolor="#E8F5E9" color="#4CAF50"]
+        disk_cache [label="Disk Cache\nLRU, SHA256 keys\nmax 10GB"]
+        s3_fetch [label="S3 Download\n+ cache write"]
+        parse [label="Segment Parse\ndecompress + frame read\nskip offset < start"]
+    }
+
+    multi [label="More segments?\noffset < limit" shape=diamond fillcolor="#FFF9C4" color="#FFC107"]
+
+    // Flow
+    req -> hw_check
+    hw_check -> owned_check [label="offset < HW"]
+    hw_check -> resp [label="offset >= HW\nempty result" style=dashed]
+    owned_check -> lookup [label="yes\nlocal"]
+    owned_check -> refresh [label="no"]
+    refresh -> lookup
+    lookup -> disk_cache
+    disk_cache -> parse [label="hit"]
+    disk_cache -> s3_fetch [label="miss"]
+    s3_fetch -> parse
+    parse -> multi
+    multi -> lookup [label="yes\nnext offset"]
+    multi -> resp [label="no\ndone"]
+}

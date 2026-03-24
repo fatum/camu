@@ -1,0 +1,49 @@
+digraph isr_states {
+    rankdir=LR
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+
+    subgraph cluster_follower_lifecycle {
+        label="Follower ISR Lifecycle" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=13
+
+        outside [label="Outside ISR\nfollower starts here\nno HW contribution" fillcolor="#FFCDD2" color="#E53935"]
+        catching_up [label="Catching Up\nfetching from leader\nlag > 1000 offsets" fillcolor="#FFF9C4" color="#FFC107"]
+        in_isr [label="In ISR\nlag <= 1000 offsets\ncontributes to HW" fillcolor="#C8E6C9" color="#4CAF50"]
+        expelled [label="Expelled\nlast contact > lag timeout\nremoved from ISR" fillcolor="#FFCDD2" color="#E53935"]
+
+        outside -> catching_up [label="fetch loop starts"]
+        catching_up -> in_isr [label="lag <= 1000\n(ISR expand)"]
+        in_isr -> expelled [label="lag timeout\n(ISR shrink)"]
+        expelled -> catching_up [label="reconnects\nresumes fetching"]
+        catching_up -> catching_up [label="still behind" style=dashed]
+    }
+
+    subgraph cluster_hw_advance {
+        label="High Watermark Advance" style="dashed" color="#A5D6A7" fontname="Helvetica" fontsize=13
+
+        node [fillcolor="#E8F5E9" color="#4CAF50"]
+        check_isr [label="len(ISR) >= minISR?" shape=diamond fillcolor="#FFF9C4" color="#FFC107"]
+        no_advance [label="HW unchanged\npurgatory blocked" fillcolor="#FFCDD2" color="#E53935"]
+        compute [label="HW = min(\n  leaderOffset,\n  follower.LastOffset\n  for each ISR member\n)"]
+        complete [label="Purgatory.Complete(HW)\nunblock produces\nwhere offset < HW"]
+
+        check_isr -> no_advance [label="no"]
+        check_isr -> compute [label="yes"]
+        compute -> complete [label="HW increased"]
+    }
+
+    subgraph cluster_purgatory {
+        label="Purgatory State Machine" style="dashed" color="#CE93D8" fontname="Helvetica" fontsize=12
+        node [fillcolor="#F3E5F5" color="#9C27B0"]
+
+        p_waiting [label="Waiting\nblocked on doneCh\ntimeout: 30s"]
+        p_completed [label="Completed\nclose(doneCh)\nreturn nil"]
+        p_timeout [label="Timeout\nreturn ErrReplicationTimeout\nHTTP 408"]
+        p_closed [label="Closed\n(partition revoked)\nreturn nil"]
+
+        p_waiting -> p_completed [label="HW > offset"]
+        p_waiting -> p_timeout [label="30s elapsed"]
+        p_waiting -> p_closed [label="purgatory.Close()"]
+    }
+}

@@ -1,0 +1,53 @@
+digraph leader_failover {
+    rankdir=TB
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+
+    subgraph cluster_timeline {
+        label="Leader Failover Sequence" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=13
+
+        // Detection
+        detect [label="1. Detect Leader Failure\nlease expired or\nassignment changed" fillcolor="#FFCDD2" color="#E53935"]
+
+        // Race prevention
+        cancel_fetch [label="2. Cancel Fetch Loop\nfetchCancel() + wait fetchDone\n(prevents in-flight append race)" fillcolor="#FFF9C4" color="#FFC107"]
+
+        // Index refresh
+        refresh [label="3. Refresh Index from S3\nget segments flushed by old leader\n(follower's local index is stale)" fillcolor="#E8F4FD" color="#2196F3"]
+
+        // WAL replay
+        wal_replay [label="4. Replay WAL\nrecover true log end\n(may include last fetched batch)" fillcolor="#E8F4FD" color="#2196F3"]
+
+        // HW recovery
+        hw [label="5. Recover HW\nmax(walEnd, index.NextOffset())\ncovers WAL + S3 segments" fillcolor="#C8E6C9" color="#4CAF50"]
+
+        // Epoch
+        epoch [label="6. Epoch History\nload from S3, append new entry\n{epoch: N+1, startOffset: walEnd}" fillcolor="#E8F4FD" color="#2196F3"]
+
+        // Materialize
+        materialize [label="7. Materialize WAL to S3\nif recoveredHW > index.NextOffset()\nflush WAL prefix into segment" fillcolor="#E8F5E9" color="#4CAF50"]
+
+        // Init replicaState
+        init_rs [label="8. Init ReplicaState\nISR = {self}, HW = recoveredHW\nadd followers, write ISR to S3" fillcolor="#F3E5F5" color="#9C27B0"]
+
+        // Ready
+        ready [label="9. Leader Ready\naccepts produces\nfollowers start fetching" fillcolor="#C8E6C9" color="#4CAF50" penwidth=2]
+
+        detect -> cancel_fetch -> refresh -> wal_replay -> hw -> epoch -> materialize -> init_rs -> ready
+    }
+
+    subgraph cluster_hw_detail {
+        label="HW Recovery Detail" style="dashed" color="#A5D6A7" fontname="Helvetica" fontsize=12
+        node [fillcolor="#E8F5E9" color="#4CAF50"]
+
+        wal_end [label="walEnd\nnext offset after\nlast WAL entry"]
+        idx_next [label="index.NextOffset()\nnext offset after\nlast S3 segment"]
+        max_op [label="max()" shape=diamond fillcolor="#FFF9C4" color="#FFC107"]
+        final_hw [label="recoveredHW" penwidth=2]
+
+        wal_end -> max_op
+        idx_next -> max_op
+        max_op -> final_hw
+    }
+}

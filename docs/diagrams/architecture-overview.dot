@@ -1,0 +1,95 @@
+digraph architecture {
+    rankdir=TB
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+    compound=true
+
+    // Clients
+    subgraph cluster_clients {
+        label="Clients (any HTTP)" style="invis"
+        node [fillcolor="#E0E0E0" color="#616161" shape=oval]
+        producer [label="Producer\ncurl / SDK / browser"]
+        consumer [label="Consumer\ncurl / SSE / SDK"]
+    }
+
+    subgraph cluster_instance1 {
+        label="Camu Instance 1" style="filled" color="#E3F2FD" fontname="Helvetica" fontsize=13 fontcolor="#1565C0"
+        node [fillcolor="#BBDEFB" color="#1565C0"]
+
+        http1 [label="HTTP Server\n/v1/topics/*"]
+
+        subgraph cluster_produce1 {
+            label="" style="invis"
+            router1 [label="Router\nkey → partition"]
+            batcher1 [label="Batcher\n8MB | 5s"]
+        }
+
+        subgraph cluster_consume1 {
+            label="" style="invis"
+            fetcher1 [label="Fetcher\npoll + SSE"]
+        }
+
+        wal1 [label="WAL\n(local disk)\nfsync per write" fillcolor="#FFF9C4" color="#FFC107"]
+        cache1 [label="Disk Cache\nLRU 10GB" fillcolor="#E8F5E9" color="#4CAF50"]
+        coord1 [label="Coordinator\nlease renewal\nassignment apply" fillcolor="#F3E5F5" color="#9C27B0"]
+    }
+
+    subgraph cluster_instance2 {
+        label="Camu Instance 2" style="filled" color="#E8F5E9" fontname="Helvetica" fontsize=13 fontcolor="#2E7D32"
+        node [fillcolor="#C8E6C9" color="#2E7D32"]
+
+        http2 [label="HTTP Server"]
+        wal2 [label="WAL"]
+        cache2 [label="Disk Cache"]
+        coord2 [label="Coordinator"]
+        repl2 [label="Follower Fetcher\nlong-poll leader" fillcolor="#F3E5F5" color="#9C27B0"]
+    }
+
+    subgraph cluster_instance3 {
+        label="Camu Instance 3" style="filled" color="#FFF3E0" fontname="Helvetica" fontsize=13 fontcolor="#E65100"
+        node [fillcolor="#FFE0B2" color="#E65100"]
+
+        http3 [label="HTTP Server"]
+        wal3 [label="WAL"]
+        cache3 [label="Disk Cache"]
+        coord3 [label="Coordinator"]
+        repl3 [label="Follower Fetcher"]
+    }
+
+    subgraph cluster_s3 {
+        label="S3 / MinIO / R2" style="filled" color="#ECEFF1" fontname="Helvetica" fontsize=13
+        node [fillcolor="#CFD8DC" color="#455A64" shape=cylinder]
+
+        segments [label="Segments\n{topic}/{pid}/{off}-{epoch}.segment"]
+        indexes [label="Indexes\n{topic}/{pid}/index.json"]
+        coordination [label="Coordination\nleader, instances,\nassignments, ISR"]
+        meta [label="Metadata\n_meta/topics/{t}.json"]
+    }
+
+    // Client flows
+    producer -> http1 [label="POST /messages"]
+    consumer -> http1 [label="GET /messages\nGET /stream"]
+    producer -> http2 [label="421 redirect" style=dashed color="#999999"]
+
+    // Instance 1 internals
+    http1 -> router1 [label="produce"]
+    router1 -> wal1
+    wal1 -> batcher1 [style=dashed]
+    batcher1 -> segments [label="upload"]
+    batcher1 -> indexes [label="CAS update"]
+    http1 -> fetcher1 [label="consume"]
+    fetcher1 -> cache1
+    cache1 -> segments [label="miss" style=dashed]
+    coord1 -> coordination [label="heartbeat\nlease renew" style=dashed]
+
+    // Replication
+    repl2 -> http1 [label="/internal/replicate\nfetch from leader" color="#9C27B0"]
+    repl3 -> http1 [label="/internal/replicate" color="#9C27B0"]
+    repl2 -> wal2 [label="append"]
+    repl3 -> wal3 [label="append"]
+
+    // Instance coordination
+    coord2 -> coordination [style=dashed]
+    coord3 -> coordination [style=dashed]
+}
