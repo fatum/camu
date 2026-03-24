@@ -2,7 +2,6 @@ package log
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -32,14 +31,14 @@ func (gc *GarbageCollector) FindOrphans(ctx context.Context, topic string, parti
 	if err != nil {
 		return nil, fmt.Errorf("gc FindOrphans: load index %q: %w", indexKey, err)
 	}
-	var refs []SegmentRef
-	if err := json.Unmarshal(data, &refs); err != nil {
+	idx := NewIndex()
+	if err := idx.UnmarshalJSON(data); err != nil {
 		return nil, fmt.Errorf("gc FindOrphans: unmarshal index: %w", err)
 	}
 
 	// Build set of indexed keys
-	indexed := make(map[string]struct{}, len(refs))
-	for _, r := range refs {
+	indexed := make(map[string]struct{}, len(idx.segments))
+	for _, r := range idx.segments {
 		indexed[r.Key] = struct{}{}
 	}
 

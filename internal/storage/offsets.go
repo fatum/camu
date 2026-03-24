@@ -50,8 +50,17 @@ func (o *OffsetStore) GetConsumer(ctx context.Context, consumerID, topic string)
 }
 
 func (o *OffsetStore) commitOffsets(ctx context.Context, key, topic string, offsets map[int]uint64) error {
-	strOffsets := make(map[string]uint64, len(offsets))
+	// Read existing offsets so a partial commit doesn't clobber other partitions.
+	existing, err := o.getOffsets(ctx, key, topic)
+	if err != nil {
+		return fmt.Errorf("read existing offsets: %w", err)
+	}
 	for k, v := range offsets {
+		existing[k] = v
+	}
+
+	strOffsets := make(map[string]uint64, len(existing))
+	for k, v := range existing {
 		strOffsets[fmt.Sprintf("%d", k)] = v
 	}
 	data := offsetData{

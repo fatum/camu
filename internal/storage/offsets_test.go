@@ -45,6 +45,37 @@ func TestOffsetStore_CommitAndGet(t *testing.T) {
 	}
 }
 
+func TestOffsetStore_PartialCommitMerges(t *testing.T) {
+	s3 := newTestS3(t)
+	store := NewOffsetStore(s3)
+	ctx := context.Background()
+
+	// Commit partitions 0, 1, 2.
+	if err := store.CommitGroup(ctx, "g1", "t1", map[int]uint64{0: 10, 1: 20, 2: 30}); err != nil {
+		t.Fatalf("initial commit: %v", err)
+	}
+
+	// Partial commit: update only partition 1.
+	if err := store.CommitGroup(ctx, "g1", "t1", map[int]uint64{1: 55}); err != nil {
+		t.Fatalf("partial commit: %v", err)
+	}
+
+	got, err := store.GetGroup(ctx, "g1", "t1")
+	if err != nil {
+		t.Fatalf("GetGroup: %v", err)
+	}
+
+	want := map[int]uint64{0: 10, 1: 55, 2: 30}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("partition %d: got %d, want %d", k, got[k], w)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d partitions, want %d", len(got), len(want))
+	}
+}
+
 func TestOffsetStore_ConsumerSpecific(t *testing.T) {
 	s3 := newTestS3(t)
 	store := NewOffsetStore(s3)

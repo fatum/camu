@@ -1,5 +1,6 @@
 (ns jepsen.camu.client
-  (:require [clojure.tools.logging :refer [info warn]]
+  (:require [clojure.string :as str]
+            [clojure.tools.logging :refer [info warn]]
             [jepsen [client :as client]]
             [clj-http.client :as http]
             [cheshire.core :as json])
@@ -9,35 +10,55 @@
 (def http-timeout-ms 5000)
 (def drain-timeout-ms 15000)
 
+(def default-read-mode :leader)
+
+(defn topic-name
+  [this test]
+  (or (:topic this) (:topic test) default-topic))
+
 (defn base-url
   "Returns the base URL for a given node."
   [node]
   (str "http://" node ":8080"))
 
+(defn normalize-base-url
+  [node-or-url]
+  (if (str/starts-with? node-or-url "http://")
+    node-or-url
+    (base-url node-or-url)))
+
 (defn create-topic!
-  "Creates the test topic. Idempotent — ignores 409 Conflict."
-  [node topic]
-  (try
-    (let [resp (http/post (str (base-url node) "/v1/topics")
-                          {:content-type      :json
-                           :body              (json/generate-string {:name       topic
-                                                                     :partitions 4
-                                                                     :retention  "24h"})
-                           :socket-timeout    http-timeout-ms
-                           :connect-timeout   http-timeout-ms
-                           :throw-exceptions  false})]
-      (when (not (#{200 201 409} (:status resp)))
-        (warn "Create topic returned" (:status resp) "on" node)))
-    (catch ConnectException _
-      (warn "Could not connect to" node "to create topic"))
-    (catch SocketTimeoutException _
-      (warn "Timeout creating topic on" node))))
+  "Creates the test topic. Idempotent — ignores 409 Conflict.
+   Accepts optional replication-factor and min-insync-replicas from test opts."
+  ([node topic]
+   (create-topic! node topic {}))
+  ([node topic opts]
+   (try
+     (let [rf  (get opts :replication-factor 1)
+           mir (get opts :min-insync-replicas 1)
+           body (cond-> {:name       topic
+                         :partitions 4
+                         :retention  "24h"}
+                  (> rf 1) (assoc :replication_factor  rf
+                                  :min_insync_replicas mir))
+           resp (http/post (str (base-url node) "/v1/topics")
+                           {:content-type      :json
+                            :body              (json/generate-string body)
+                            :socket-timeout    http-timeout-ms
+                            :connect-timeout   http-timeout-ms
+                            :throw-exceptions  false})]
+       (when (not (#{200 201 409} (:status resp)))
+         (warn "Create topic returned" (:status resp) "on" node)))
+     (catch ConnectException _
+       (warn "Could not connect to" node "to create topic"))
+     (catch SocketTimeoutException _
+       (warn "Timeout creating topic on" node)))))
 
 (defn produce!
   "Produces a message to the given topic. Returns {:partition N :offset M}
    or throws with a keyword status on failure."
   [node topic key value]
-  (let [resp (http/post (str (base-url node) "/v1/topics/" topic "/messages")
+  (let [resp (http/post (str (normalize-base-url node) "/v1/topics/" topic "/messages")
                         {:content-type      :json
                          :body              (json/generate-string {:key   key
                                                                    :value value})
@@ -46,9 +67,15 @@
                          :throw-exceptions  false})
         status (:status resp)]
     (cond
-      (= status 200) (let [body (json/parse-string (:body resp) true)
-                           info (first (:offsets body))]
-                       {:partition (:partition info) :offset (:offset info)})
+      (= status 200) (let [body   (json/parse-string (:body resp) true)
+                           pinfo  (first (:offsets body))
+                           headers (:headers resp)
+                           epoch  (when-let [e (get headers "x-leader-epoch")]
+                                    (Long/parseLong e))]
+                       (cond-> {:partition (:partition pinfo)
+                                :offset   (:offset pinfo)
+                                :node     node}
+                         epoch (assoc :leader-epoch epoch)))
       (= status 421) (throw (ex-info "misdirected" {:type :misdirected}))
       (= status 500) (throw (ex-info "not-ready" {:type :not-ready}))
       (= status 503) (throw (ex-info "backpressure" {:type :backpressure}))
@@ -60,7 +87,7 @@
   ([node topic partition offset]
    (consume! node topic partition offset 1000))
   ([node topic partition offset limit]
-   (let [resp (http/get (str (base-url node) "/v1/topics/" topic
+   (let [resp (http/get (str (normalize-base-url node) "/v1/topics/" topic
                              "/partitions/" partition "/messages")
                         {:query-params     {:offset offset
                                             :limit  limit}
@@ -68,13 +95,21 @@
                          :connect-timeout  http-timeout-ms
                          :throw-exceptions false})]
      (if (= 200 (:status resp))
-       (let [body (json/parse-string (:body resp) true)]
-         (vec (map (fn [m] {:offset    (:offset m)
-                            :partition partition
-                            :key       (:key m)
-                            :value     (:value m)})
-                   (:messages body))))
-       []))))
+       (let [body (json/parse-string (:body resp) true)
+             hw   (when-let [h (get-in resp [:headers "x-high-watermark"])]
+                    (Long/parseLong h))
+             msgs (vec (map (fn [m] {:offset    (:offset m)
+                                     :partition partition
+                                     :key       (:key m)
+                                     :value     (:value m)})
+                            (:messages body)))]
+         (cond-> {:messages msgs}
+           hw (assoc :high-watermark hw)))
+       (throw (ex-info (str "consume failed: " (:status resp))
+                       {:type :consume-failed
+                        :status (:status resp)
+                        :partition partition
+                        :offset offset}))))))
 
 (defn drain!
   "Drains all messages from a partition by paginating in batches of 1000
@@ -82,7 +117,7 @@
   [node topic partition offset]
   (loop [current-offset offset
          acc            []]
-    (let [resp (http/get (str (base-url node) "/v1/topics/" topic
+    (let [resp (http/get (str (normalize-base-url node) "/v1/topics/" topic
                               "/partitions/" partition "/messages")
                          {:query-params     {:offset current-offset
                                              :limit  1000}
@@ -102,19 +137,91 @@
             (into acc batch)
             ;; More pages — continue from next_offset
             (recur (:next_offset body) (into acc batch))))
-        acc))))
+        (throw (ex-info (str "drain failed: " (:status resp))
+                        {:type :drain-failed
+                         :status (:status resp)
+                         :partition partition
+                         :offset current-offset}))))))
+
+(defn get-routing!
+  "Queries the routing endpoint for a topic. Returns the parsed routing map
+   or nil on failure."
+  [node topic]
+  (try
+    (let [resp (http/get (str (normalize-base-url node) "/v1/topics/" topic "/routing")
+                         {:socket-timeout    http-timeout-ms
+                          :connect-timeout   http-timeout-ms
+                          :throw-exceptions  false})]
+      (when (= 200 (:status resp))
+        (json/parse-string (:body resp) true)))
+    (catch Exception _ nil)))
+
+(defn read-mode
+  [test]
+  (or (:read-mode test) default-read-mode))
+
+(defn routing-partition
+  [routing partition]
+  (or (get-in routing [:partitions (str partition)])
+      (get-in routing [:partitions (keyword (str partition))])))
+
+(defn leader-candidates
+  "Resolves candidate owners for a partition by querying routing from the cluster.
+   Multiple nodes may briefly disagree during reassignment, so we try each distinct
+   reported owner address in order."
+  [nodes topic partition]
+  (let [candidates (->> nodes
+                        shuffle
+                        (reduce (fn [acc node]
+                                  (if-let [entry (some-> (get-routing! node topic)
+                                                         (routing-partition partition))]
+                                    (let [address (:address entry)]
+                                      (if (or (nil? address) (some #{address} acc))
+                                        acc
+                                        (conj acc address)))
+                                    acc))
+                                []))]
+    (info "Leader candidates for" topic "partition" partition ":" candidates)
+    candidates))
+
+(defn read-candidates
+  "Returns the node candidates to use for read-style operations.
+   `:leader` resolves the current owner and reads only from that node.
+   `:any` preserves the previous best-effort replica read behavior."
+  [test topic partition]
+  (case (read-mode test)
+    :any
+    (shuffle (:nodes test))
+
+    :leader
+    (leader-candidates (:nodes test) topic partition)
+
+    []))
+
+(defn leader-read-deadline-ms
+  [f]
+  (case f
+    :drain 20000
+    :consume 8000
+    8000))
 
 (defn commit-offsets!
   "Commits the consumer offset for the given topic and consumer-id."
   [node topic consumer-id partition offset]
-  (http/post (str (base-url node) "/v1/topics/" topic
-                  "/offsets/" consumer-id)
-             {:content-type      :json
-              :body              (json/generate-string {:offsets {(str partition) offset}})
-              :socket-timeout    http-timeout-ms
-              :connect-timeout   http-timeout-ms
-              :throw-exceptions  false})
-  :ok)
+  (let [resp (http/post (str (base-url node) "/v1/topics/" topic
+                             "/offsets/" consumer-id)
+                        {:content-type      :json
+                         :body              (json/generate-string {:offsets {(str partition) offset}})
+                         :socket-timeout    http-timeout-ms
+                         :connect-timeout   http-timeout-ms
+                         :throw-exceptions  false})]
+    (if (= 200 (:status resp))
+      :ok
+      (throw (ex-info (str "commit offsets failed: " (:status resp))
+                      {:type :offset-commit-failed
+                       :status (:status resp)
+                       :partition partition
+                       :offset offset})))))
 
 (defn get-offsets!
   "Fetches the committed consumer offset for the given topic and consumer-id."
@@ -124,12 +231,16 @@
                        {:socket-timeout    http-timeout-ms
                         :connect-timeout   http-timeout-ms
                         :throw-exceptions  false})]
-    (when (= 200 (:status resp))
-      (:offsets (json/parse-string (:body resp) true)))))
+    (if (= 200 (:status resp))
+      (:offsets (json/parse-string (:body resp) true))
+      (throw (ex-info (str "get offsets failed: " (:status resp))
+                      {:type :offset-fetch-failed
+                       :status (:status resp)})))))
 
 (defn wait-for-topic-ready!
-  "Polls nodes until at least one can serve a produce request without 500.
-   This ensures coordination has propagated topic initialization."
+  "Polls nodes by attempting a produce until one succeeds (200).
+   This proves the full pipeline works: topic created, assignments published,
+   partitions initialized, and for rf>1 topics, replicaState + followers ready."
   [nodes topic timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
     (loop []
@@ -137,18 +248,25 @@
                            (try
                              (let [resp (http/post (str (base-url n) "/v1/topics/" topic "/messages")
                                                    {:content-type     :json
-                                                    :body             (json/generate-string {:key "healthcheck" :value "ping"})
-                                                    :socket-timeout   2000
+                                                    :body             (json/generate-string
+                                                                       {:key "readiness-probe" :value "ping"})
+                                                    :socket-timeout   5000
                                                     :connect-timeout  2000
                                                     :throw-exceptions false})]
-                               ;; 200 = produced, 421 = misdirected (but topic is initialized)
-                               (#{200 421} (:status resp)))
+                               (info "Readiness probe on" n ":" (:status resp))
+                               (= 200 (:status resp)))
                              (catch Exception _ false)))
                          nodes)]
         (cond
-          ready?                                   (info "Topic ready on cluster")
-          (> (System/currentTimeMillis) deadline)  (warn "Timed out waiting for topic readiness")
-          :else                                    (do (Thread/sleep 2000) (recur)))))))
+          ready?
+          (info "Topic" topic "ready — produce succeeded")
+
+          (> (System/currentTimeMillis) deadline)
+          (warn "Timed out waiting for topic readiness")
+
+          :else
+          (do (Thread/sleep 3000)
+              (recur)))))))
 
 (defrecord CamuClient [node topic]
   client/Client
@@ -156,66 +274,128 @@
     (assoc this :node node'))
 
   (setup! [this test]
-    ;; Create topic on first available node
-    (create-topic! (first (:nodes test)) default-topic)
-    ;; Wait for coordination to propagate topic to all nodes
-    (wait-for-topic-ready! (:nodes test) default-topic 30000)
+    (let [topic (topic-name this test)]
+      ;; Topic names are unique per test run, so setup can be idempotent.
+      (create-topic! (first (:nodes test)) topic
+                     (select-keys test [:replication-factor :min-insync-replicas]))
+    ;; All clients wait until a produce actually succeeds — proves the full replication
+    ;; pipeline is working end-to-end (topic, assignments, replicaState, followers).
+      (wait-for-topic-ready! (:nodes test) topic 60000))
     this)
 
   (invoke! [this test op]
     (try
      (case (:f op)
        :produce
-       (let [{:keys [key value]} (:value op)]
+       (let [{:keys [key value]} (:value op)
+             topic             (topic-name this test)]
          ;; Try all nodes until one accepts (handles 421 misdirected)
          (loop [nodes (shuffle (:nodes test))]
            (if (empty? nodes)
              (assoc op :type :fail :error :no-node-available)
-             (let [result (try (produce! (first nodes) default-topic key value)
+             (let [result (try (produce! (first nodes) topic key value)
                                (catch clojure.lang.ExceptionInfo e
                                  (if (#{:misdirected :not-ready} (:type (ex-data e)))
                                    ::retry
                                    (throw e))))]
                (if (= ::retry result)
                  (recur (rest nodes))
-                 (assoc op :type :ok :value {:key       key
-                                             :value     value
-                                             :partition (:partition result)
-                                             :offset    (:offset result)}))))))
+                 (assoc op :type :ok :value (merge {:key   key
+                                                    :value value}
+                                                   result)))))))
 
        :consume
        (let [{:keys [partition offset]} (:value op)
-             messages (consume! node default-topic partition (or offset 0))]
+             topic    (topic-name this test)
+             deadline (+ (System/currentTimeMillis) (leader-read-deadline-ms :consume))
+             result   (loop [nodes (read-candidates test topic partition)]
+                        (if (empty? nodes)
+                          (if (and (= (read-mode test) :leader)
+                                   (< (System/currentTimeMillis) deadline))
+                            (do (Thread/sleep 100)
+                                (recur (read-candidates test topic partition)))
+                            (throw (ex-info "consume failed on all nodes"
+                                            {:type :consume-failed
+                                             :status :no-node-available
+                                             :partition partition
+                                             :offset (or offset 0)})))
+                          (let [result (try
+                                         (consume! (first nodes) topic partition (or offset 0))
+                                         (catch ConnectException _ ::retry)
+                                         (catch SocketTimeoutException _ ::retry)
+                                         (catch clojure.lang.ExceptionInfo e
+                                           (if (= :consume-failed (:type (ex-data e)))
+                                           (if (= 421 (:status (ex-data e)))
+                                             ::retry
+                                             (throw e))
+                                           (throw e))))]
+                            (if (= ::retry result)
+                              (let [remaining (rest nodes)]
+                                (if (seq remaining)
+                                  (recur remaining)
+                                  (if (and (= (read-mode test) :leader)
+                                           (< (System/currentTimeMillis) deadline))
+                                    (do (Thread/sleep 100)
+                                        (recur (read-candidates test topic partition)))
+                                    (recur remaining))))
+                              result))))
+             messages (:messages result)
+             hw       (:high-watermark result)]
          ;; Advance the consume-offsets tracker so next consume continues forward
          (when-let [offsets-atom (:consume-offsets test)]
            (when (seq messages)
              (let [max-offset (apply max (map :offset messages))]
                (swap! offsets-atom update partition #(max (or % 0) (inc max-offset))))))
-         (assoc op :type :ok :value {:partition partition :messages messages}))
+         (assoc op :type :ok :value (cond-> {:partition partition :messages messages}
+                                      hw (assoc :high-watermark hw))))
 
        :drain
        (let [{:keys [partition offset]} (:value op)
-             ;; Try all nodes for drain, skipping nodes that are down
-             messages (loop [nodes (shuffle (:nodes test))]
+             topic    (topic-name this test)
+             deadline (+ (System/currentTimeMillis) (leader-read-deadline-ms :drain))
+             messages (loop [nodes (read-candidates test topic partition)]
                         (if (empty? nodes)
-                          []
-                          (let [msgs (try (drain! (first nodes) default-topic
-                                                  partition (or offset 0))
-                                          (catch ConnectException _ nil)
-                                          (catch SocketTimeoutException _ nil))]
-                            (if (seq msgs)
-                              msgs
-                              (recur (rest nodes))))))]
+                          (if (and (= (read-mode test) :leader)
+                                   (< (System/currentTimeMillis) deadline))
+                            (do (Thread/sleep 100)
+                                (recur (read-candidates test topic partition)))
+                            (throw (ex-info "drain failed on all nodes"
+                                            {:type :drain-failed
+                                             :status :no-node-available
+                                             :partition partition
+                                             :offset (or offset 0)})))
+                          (let [result (try
+                                         (drain! (first nodes) topic partition (or offset 0))
+                                         (catch ConnectException _ ::retry)
+                                         (catch SocketTimeoutException _ ::retry)
+                                         (catch clojure.lang.ExceptionInfo e
+                                           (if (= :drain-failed (:type (ex-data e)))
+                                           (if (= 421 (:status (ex-data e)))
+                                             ::retry
+                                             (throw e))
+                                           (throw e))))]
+                            (if (= ::retry result)
+                              (let [remaining (rest nodes)]
+                                (if (seq remaining)
+                                  (recur remaining)
+                                  (if (and (= (read-mode test) :leader)
+                                           (< (System/currentTimeMillis) deadline))
+                                    (do (Thread/sleep 100)
+                                        (recur (read-candidates test topic partition)))
+                                    (recur remaining))))
+                              result))))]
          (assoc op :type :ok :value {:partition partition :messages messages}))
 
        :commit-offsets
        (let [{:keys [consumer-id partition offset]} (:value op)
-             result (commit-offsets! node default-topic consumer-id partition offset)]
+             topic  (topic-name this test)
+             result (commit-offsets! node topic consumer-id partition offset)]
          (assoc op :type :ok :value result))
 
        :get-offsets
        (let [{:keys [consumer-id]} (:value op)
-             result (get-offsets! node default-topic consumer-id)]
+             topic  (topic-name this test)
+             result (get-offsets! node topic consumer-id)]
          (assoc op :type :ok :value result)))
 
      (catch ConnectException _
@@ -230,6 +410,10 @@
            :misdirected        (assoc op :type :fail :error :misdirected)
            :not-ready          (assoc op :type :fail :error :not-ready)
            :backpressure       (assoc op :type :fail :error :service-unavailable)
+           :consume-failed     (assoc op :type :fail :error [:consume-failed (:status (ex-data e))])
+           :drain-failed       (assoc op :type :fail :error [:drain-failed (:status (ex-data e))])
+           :offset-commit-failed (assoc op :type :fail :error [:offset-commit-failed (:status (ex-data e))])
+           :offset-fetch-failed  (assoc op :type :fail :error [:offset-fetch-failed (:status (ex-data e))])
            (assoc op :type :fail :error (str (.getMessage e))))))
 
      (catch Exception e
@@ -242,4 +426,4 @@
 (defn client
   "Constructs a new CamuClient."
   []
-  (->CamuClient nil default-topic))
+  (->CamuClient nil nil))

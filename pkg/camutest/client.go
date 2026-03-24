@@ -48,21 +48,28 @@ type apiError struct {
 
 // CreateTopic creates a topic via the API.
 func (c *Client) CreateTopic(name string, partitions int, retention time.Duration) error {
+	return c.CreateTopicWithReplication(name, partitions, retention, 1, 1)
+}
+
+// CreateTopicWithReplication creates a topic via the API with explicit replication settings.
+func (c *Client) CreateTopicWithReplication(name string, partitions int, retention time.Duration, replicationFactor int, minInsyncReplicas int) error {
 	body, _ := json.Marshal(map[string]any{
-		"name":       name,
-		"partitions": partitions,
-		"retention":  retention.String(),
+		"name":                name,
+		"partitions":          partitions,
+		"retention":           retention.String(),
+		"replication_factor":  replicationFactor,
+		"min_insync_replicas": minInsyncReplicas,
 	})
 	resp, err := c.httpClient.Post(c.baseURL+"/v1/topics", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("CreateTopic request: %w", err)
+		return fmt.Errorf("CreateTopicWithReplication request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
 		var ae apiError
 		json.NewDecoder(resp.Body).Decode(&ae)
-		return fmt.Errorf("CreateTopic: status %d: %s", resp.StatusCode, ae.Error)
+		return fmt.Errorf("CreateTopicWithReplication: status %d: %s", resp.StatusCode, ae.Error)
 	}
 	return nil
 }
@@ -155,25 +162,35 @@ type OffsetInfo struct {
 
 // Produce sends messages to a topic.
 func (c *Client) Produce(topic string, msgs []ProduceMessage) (*ProduceResponse, error) {
+	return c.ProduceToPartition(topic, -1, msgs)
+}
+
+// ProduceToPartition sends messages to a topic, optionally forcing a partition.
+// Pass partition < 0 to use the high-level routing endpoint.
+func (c *Client) ProduceToPartition(topic string, partition int, msgs []ProduceMessage) (*ProduceResponse, error) {
 	body, err := json.Marshal(msgs)
 	if err != nil {
-		return nil, fmt.Errorf("Produce marshal: %w", err)
+		return nil, fmt.Errorf("ProduceToPartition marshal: %w", err)
 	}
-	resp, err := c.httpClient.Post(c.baseURL+"/v1/topics/"+topic+"/messages", "application/json", bytes.NewReader(body))
+	url := c.baseURL + "/v1/topics/" + topic + "/messages"
+	if partition >= 0 {
+		url = fmt.Sprintf("%s/v1/topics/%s/partitions/%d/messages", c.baseURL, topic, partition)
+	}
+	resp, err := c.httpClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("Produce request: %w", err)
+		return nil, fmt.Errorf("ProduceToPartition request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		var ae apiError
 		json.NewDecoder(resp.Body).Decode(&ae)
-		return nil, fmt.Errorf("Produce: status %d: %s", resp.StatusCode, ae.Error)
+		return nil, fmt.Errorf("ProduceToPartition: status %d: %s", resp.StatusCode, ae.Error)
 	}
 
 	var pr ProduceResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		return nil, fmt.Errorf("Produce decode: %w", err)
+		return nil, fmt.Errorf("ProduceToPartition decode: %w", err)
 	}
 	return &pr, nil
 }

@@ -213,6 +213,131 @@
                              (long (/ (reduce + recovery-times) (count recovery-times))))
          :count            (count recovery-times)}))))
 
+(defn committed-durability-checker
+  "Matches acked produces to drained messages by message KEY. This is the
+   primary safety checker for replicated topics — keys are globally unique
+   so we don't depend on partition/offset stability across leader changes."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [produced-keys (->> history
+                               (filter #(and (= (:f %) :produce)
+                                             (= (:type %) :ok)))
+                               (map #(get-in % [:value :key]))
+                               set)
+            drained-keys  (->> (drain-messages history)
+                               (map :key)
+                               set)
+            lost          (set/difference produced-keys drained-keys)]
+        {:valid?       (empty? lost)
+         :acked-keys   (count produced-keys)
+         :drained-keys (count drained-keys)
+         :lost         (count lost)
+         :lost-data    (when (seq lost) (take 20 (sort lost)))}))))
+
+(defn no-ghost-reads-checker
+  "Verifies the consumer never sees data above the reported high watermark.
+   For each :ok :consume op with a high-watermark, checks that no message
+   offset exceeds the HW."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [violations (->> history
+                            (filter #(and (= (:f %) :consume)
+                                          (= (:type %) :ok)))
+                            (keep (fn [op]
+                                    (let [hw   (get-in op [:value :high-watermark])
+                                          msgs (get-in op [:value :messages])]
+                                      (when (and hw (seq msgs))
+                                        (let [above (filter #(>= (:offset %) hw) msgs)]
+                                          (when (seq above)
+                                            {:process   (:process op)
+                                             :partition (get-in op [:value :partition])
+                                             :hw        hw
+                                             :offsets   (mapv :offset above)})))))))]
+        {:valid?     (empty? violations)
+         :violations (when (seq violations) (take 20 violations))}))))
+
+(defn single-leader-checker
+  "Epoch-based leader uniqueness: for each (partition, leader-epoch) pair,
+   only one node should have acked writes. Two different nodes acking in
+   the same epoch indicates a split-brain."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [produces  (->> history
+                           (filter #(and (= (:f %) :produce)
+                                         (= (:type %) :ok)))
+                           (filter #(get-in % [:value :leader-epoch])))
+            grouped   (group-by (fn [op]
+                                  [(get-in op [:value :partition])
+                                   (get-in op [:value :leader-epoch])])
+                                produces)
+            conflicts (->> grouped
+                           (keep (fn [[[part epoch] ops]]
+                                   (let [nodes (distinct (map #(get-in % [:value :node]) ops))]
+                                     (when (> (count nodes) 1)
+                                       {:partition    part
+                                        :leader-epoch epoch
+                                        :nodes        (vec nodes)
+                                        :count        (count ops)})))))]
+        {:valid?    (empty? conflicts)
+         :checked   (count grouped)
+         :conflicts (when (seq conflicts) (take 20 conflicts))}))))
+
+(defn hw-monotonicity-checker
+  "High watermark should never decrease per partition per consumer process.
+   Checks that successive :ok :consume ops on the same (process, partition)
+   have non-decreasing high-watermark values."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [consumes (->> history
+                          (filter #(and (= (:f %) :consume)
+                                        (= (:type %) :ok)
+                                        (get-in % [:value :high-watermark]))))
+            ;; Group by [process, partition]
+            grouped  (group-by (fn [op]
+                                 [(:process op) (get-in op [:value :partition])])
+                               consumes)
+            violations
+            (reduce-kv
+             (fn [acc [proc part] ops]
+               (let [hws (map #(get-in % [:value :high-watermark]) ops)]
+                 (if (apply <= hws)
+                   acc
+                   (conj acc {:process   proc
+                              :partition part
+                              :hws       (take 20 hws)}))))
+             []
+             grouped)]
+        {:valid?     (empty? violations)
+         :checked    (count grouped)
+         :violations (when (seq violations) (take 20 violations))}))))
+
+(defn truncation-safety-checker
+  "Like committed-durability but tracks partition and offset for diagnostics.
+   Reports acked writes not found in drain, grouped by partition."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [produced    (ok-produces history)
+            drained     (drain-messages history)
+            drained-set (set (map :key drained))
+            missing     (remove #(drained-set (:key %)) produced)
+            by-part     (group-by :partition missing)]
+        {:valid?       (zero? (count missing))
+         :acked        (count produced)
+         :drained      (count drained)
+         :missing      (count missing)
+         :by-partition (when (seq by-part)
+                         (reduce-kv (fn [m p msgs]
+                                      (assoc m p {:count   (count msgs)
+                                                  :offsets (take 10 (sort (map :offset msgs)))
+                                                  :keys    (take 10 (sort (map :key msgs)))}))
+                                    {}
+                                    by-part))}))))
+
 (defn combined-checker
   "Returns a composition of all camu checkers plus standard Jepsen
    checkers for stats."

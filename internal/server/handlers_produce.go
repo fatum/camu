@@ -6,15 +6,17 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/producer"
+	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
 
 type produceMessageRequest struct {
-	Key   string            `json:"key"`
-	Value string            `json:"value"`
+	Key     string            `json:"key"`
+	Value   string            `json:"value"`
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
@@ -119,6 +121,28 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 			batch[i] = im.msg
 		}
 
+		ps := s.partitionManager.GetPartitionState(topicName, partitionID)
+		topicCfg, _ := s.topicStore.Get(r.Context(), topicName)
+
+		// For replicated topics, reject writes if replicaState not yet initialized.
+		// Don't check min_insync_replicas here — the purgatory will wait until
+		// enough ISR members ack. This avoids a chicken-and-egg problem where
+		// followers can't catch up (join ISR) if no data flows.
+		if topicCfg.ReplicationFactor > 1 {
+			if ps == nil || ps.replicaState == nil {
+				slog.Debug("produce_rejected: replicaState not ready",
+					"topic", topicName, "partition", partitionID)
+				w.Header().Set("Retry-After", "1")
+				writeError(w, 503, "partition not ready for replicated writes")
+				return
+			}
+			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+				routing := s.getRoutingMap(topicName)
+				writeJSON(w, 421, routing)
+				return
+			}
+		}
+
 		assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
 		if err != nil {
 			if errors.Is(err, producer.ErrBackpressure) {
@@ -129,6 +153,38 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 			slog.Error("produce_failed", "topic", topicName, "partition", partitionID, "error", err)
 			writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 			return
+		}
+
+		if ps != nil && ps.replicaState != nil {
+			lastOffset := assignedOffsets[len(assignedOffsets)-1]
+
+			slog.Debug("produce_awaiting_replication",
+				"topic", topicName, "partition", partitionID,
+				"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
+				"isr_size", ps.replicaState.ISRSize())
+
+			if err := ps.replicaState.Purgatory().Wait(lastOffset, 30*time.Second); err != nil {
+				if errors.Is(err, replication.ErrReplicationTimeout) {
+					slog.Warn("produce_replication_timeout",
+						"topic", topicName, "partition", partitionID,
+						"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
+						"isr_size", ps.replicaState.ISRSize())
+					writeError(w, 408, "replication timeout")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "replication error: "+err.Error())
+				return
+			}
+
+			slog.Info("produce_replicated",
+				"topic", topicName, "partition", partitionID,
+				"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
+				"isr_size", ps.replicaState.ISRSize(),
+				"epoch", ps.epoch)
+		}
+
+		if ps != nil {
+			w.Header().Set("X-Leader-Epoch", strconv.FormatUint(ps.epoch, 10))
 		}
 
 		for i, im := range group {
@@ -215,6 +271,22 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
+
+	// For replicated topics, reject writes if replicaState not yet initialized.
+	if tc.ReplicationFactor > 1 {
+		if ps == nil || ps.replicaState == nil {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, 503, "partition not ready for replicated writes")
+			return
+		}
+		if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+			routing := s.getRoutingMap(topicName)
+			writeJSON(w, 421, routing)
+			return
+		}
+	}
+
 	assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
 	if err != nil {
 		if errors.Is(err, producer.ErrBackpressure) {
@@ -225,6 +297,25 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		slog.Error("produce_failed", "topic", topicName, "partition", partitionID, "error", err)
 		writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
 		return
+	}
+
+	if ps != nil && ps.replicaState != nil {
+		lastOffset := assignedOffsets[len(assignedOffsets)-1]
+		ps.replicaState.SetLeaderOffset(lastOffset + 1)
+		ps.replicaState.NotifyNewData()
+
+		if err := ps.replicaState.Purgatory().Wait(lastOffset, 30*time.Second); err != nil {
+			if errors.Is(err, replication.ErrReplicationTimeout) {
+				writeError(w, 408, "replication timeout")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "replication error: "+err.Error())
+			return
+		}
+	}
+
+	if ps != nil {
+		w.Header().Set("X-Leader-Epoch", strconv.FormatUint(ps.epoch, 10))
 	}
 
 	offsets := make([]offsetInfo, len(assignedOffsets))

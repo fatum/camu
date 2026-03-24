@@ -41,9 +41,9 @@
                          "  max_size: 1073741824\n"
                          "\n"
                          "coordination:\n"
-                         "  lease_ttl: \"10s\"\n"
-                         "  heartbeat_interval: \"3s\"\n"
-                         "  rebalance_delay: \"5s\"\n")]
+                         "  lease_ttl: \"6s\"\n"
+                         "  heartbeat_interval: \"2s\"\n"
+                         "  rebalance_delay: \"2s\"\n")]
     (c/exec :mkdir :-p "/etc/camu")
     (c/exec :echo config :> camu-config)))
 
@@ -61,18 +61,27 @@
       (c/exec :chmod :+x camu-bin)
       ;; Write config
       (write-config! test node)
-      ;; Start camu with 'serve' subcommand
+      ;; Start camu as a daemon. Logs go to camu-log (collected by Jepsen).
+      ;; Also symlink log to container stdout so `docker logs` works.
+      (c/exec :ln :-sf "/proc/1/fd/1" "/var/log/camu-docker.log")
       (cu/start-daemon!
        {:logfile camu-log
         :pidfile camu-pid
         :chdir   camu-data}
        camu-bin
-       "serve" "--config" camu-config))
+       "serve" "--config" camu-config)
+      ;; Tail log to container stdout in background for docker logs visibility
+      (c/exec :bash :-c (str "tail -f " camu-log " > /proc/1/fd/1 2>/dev/null &")))
 
     (teardown! [_ test node]
       (info "Tearing down camu on" node)
       (cu/stop-daemon! camu-pid)
-      (c/exec :rm :-rf camu-data camu-log camu-config "/opt/camu"))
+      (c/exec
+       :bash :-lc
+       (str "rm -rf " camu-log " " camu-config " /opt/camu; "
+            "if [ -d " camu-data " ]; then "
+            "find " camu-data " -depth -exec rm -rf {} +; "
+            "fi")))
 
     db/LogFiles
     (log-files [_ test node]

@@ -264,8 +264,8 @@ type LeaderLease struct {
 }
 ```
 
-- **TTL:** 30 seconds
-- **Renewal interval:** 10 seconds
+- **Production defaults:** TTL `30s`, renewal interval `10s`
+- **Jepsen / test defaults:** TTL `10s`, renewal interval `3s`
 - If the lease is expired or missing, any instance can claim it
 - S3's atomic conditional write ensures at most one instance succeeds
 
@@ -308,7 +308,24 @@ Happens automatically every ~10 seconds when the leader detects a topology chang
 3. If the set changed, leader computes new round-robin assignment and publishes via CAS
 4. All instances pick up new assignments on their next renewal cycle
 
-**Convergence time:** ~10-13 seconds after an instance failure (lease TTL + detection + rebalance publish).
+**Convergence time:** depends on lease timing. In production defaults it is materially slower than in tests; in Jepsen and `pkg/camutest` we intentionally use shorter lease timing to make failover observable in bounded test windows.
+
+## Replication notes
+
+For replicated topics, the important durability boundary is the partition high watermark, not just S3 flush completion:
+
+- leaders advance HW only after enough replicas confirm the append
+- flush persists the current HW into `index.json`
+- WAL truncation is capped by HW, so uncommitted tail entries stay available for follower fetch
+- on leader reassignment, the new leader recovers from local WAL and persisted/index state before serving
+
+One subtle bug fixed on March 22, 2026: after leader reassignment, the first flush could write a replacement tail segment that overlapped an older tail segment already present in `index.json`. Readers could then binary-search to the stale segment and return `200 []` even though the new leader had already replicated and flushed the newer suffix. The index layer now replaces overlapping segment refs instead of keeping both.
+
+## Jepsen status
+
+The repository includes a Jepsen harness under [`jepsen/camu`](../jepsen/camu/README.md). As of March 23, 2026, the checked-in code passes 21 fault scenarios across replicated (`rf=3/minISR=2`), strict-quorum (`rf=3/minISR=3`), and control (`rf=1/minISR=1`) modes. See [`docs/reliability.md`](reliability.md) for the full verified matrix.
+
+That should be read as durability evidence, not a blanket availability claim. Hard fault windows still show substantial temporary request failure.
 
 ## Graceful shutdown
 
@@ -327,10 +344,10 @@ Happens automatically every ~10 seconds when the leader detects a topology chang
 | Decision | What you get | What you give up |
 |----------|-------------|-----------------|
 | **S3 as sole persistent store** | Unlimited capacity, 11 nines durability, no replication to manage, pay-per-use, scales to zero | ~5s visibility delay for cross-instance reads (flush interval). All coordination depends on S3 availability. |
-| **Local WAL for acks** | Fast writes (~30µs single, ~11µs/msg batched). Crash-safe on local disk. | Unflushed data lost on failover — equivalent to Kafka `acks=1`. If the owning instance dies before flushing, messages in its WAL are gone. |
+| **Local WAL for acks** | Fast writes (~30µs single, ~11µs/msg batched). Crash-safe on local disk. | In `rf=1`, unflushed data can still be lost on node failure. Replicated topics reduce this risk, but availability and failover timing still matter. |
 | **HTTP/REST API** | Any language, no client library needed, curl-debuggable, human-readable. Load balancers and proxies work out of the box. | Higher per-message overhead vs binary protocols (Kafka's TCP, Pulsar's binary). JSON serialization cost on both ends. |
-| **S3-based coordination instead of Raft** | No separate consensus cluster. No quorum requirements. No split-brain from consensus bugs. Single dependency (S3). | Lease TTL sets the floor for failure detection (~10-30s). S3 conditional writes have higher latency than in-memory consensus. Cannot coordinate faster than S3 round-trip time. |
-| **Stateless instances** | Any instance can be killed and replaced. Scale to zero. No cluster state to corrupt. Recovery = read from S3. | Rebalancing takes ~10-13s on topology change. No in-memory replication means no `acks=all` equivalent. |
+| **S3-based coordination instead of Raft** | No separate consensus cluster. No quorum requirements. No split-brain from consensus bugs. Single dependency (S3). | Lease TTL sets the floor for failure detection. S3 conditional writes have higher latency than in-memory consensus. Cannot coordinate faster than S3 round-trip time. |
+| **Stateless instances** | Any instance can be killed and replaced. Scale to zero. No cluster state to corrupt. Recovery = read from S3. | Rebalancing speed depends on lease timing and is still a meaningful availability limiter. |
 | **No in-memory message buffer** | WAL is the single source of truth for unflushed data. No memory bloat. Simple code. | Every read goes through disk cache or S3. No sub-millisecond tail reads from memory. |
 | **Deterministic round-robin assignment** | Simple, predictable. No coordination overhead for assignment decisions. | No load-aware balancing. A hot partition gets the same resources as a cold one. |
 | **Immutable segments** | No compaction complexity. Cache never needs invalidation. Simple garbage collection. | Cannot update or delete individual messages. Retention is segment-granular. |
@@ -451,8 +468,8 @@ cache:
   max_size: 10737418240        # 10 GB — LRU eviction above this
 
 coordination:
-  lease_ttl: "10s"
-  heartbeat_interval: "3s"
+  lease_ttl: "30s"
+  heartbeat_interval: "10s"
   rebalance_delay: "5s"
 ```
 

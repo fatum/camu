@@ -15,36 +15,55 @@ const topicPrefix = "_meta/topics/"
 // topicConfigJSON is the on-disk representation of a TopicConfig.
 // Retention is stored as a nanosecond integer so it round-trips correctly.
 type topicConfigJSON struct {
-	Name         string    `json:"name"`
-	Partitions   int       `json:"partitions"`
-	RetentionNs  int64     `json:"retention_ns"`
-	CreatedAt    time.Time `json:"created_at"`
+	Name                  string    `json:"name"`
+	Partitions            int       `json:"partitions"`
+	RetentionNs           int64     `json:"retention_ns"`
+	CreatedAt             time.Time `json:"created_at"`
+	ReplicationFactor     int       `json:"replication_factor"`
+	MinInsyncReplicas     int       `json:"min_insync_replicas"`
+	UncleanLeaderElection bool      `json:"unclean_leader_election"`
 }
 
 // TopicConfig holds the configuration for a single topic.
 type TopicConfig struct {
-	Name       string
-	Partitions int
-	Retention  time.Duration
-	CreatedAt  time.Time
+	Name                  string
+	Partitions            int
+	Retention             time.Duration
+	CreatedAt             time.Time
+	ReplicationFactor     int
+	MinInsyncReplicas     int
+	UncleanLeaderElection bool
 }
 
 func (tc TopicConfig) toJSON() topicConfigJSON {
 	return topicConfigJSON{
-		Name:        tc.Name,
-		Partitions:  tc.Partitions,
-		RetentionNs: int64(tc.Retention),
-		CreatedAt:   tc.CreatedAt,
+		Name:                  tc.Name,
+		Partitions:            tc.Partitions,
+		RetentionNs:           int64(tc.Retention),
+		CreatedAt:             tc.CreatedAt,
+		ReplicationFactor:     tc.ReplicationFactor,
+		MinInsyncReplicas:     tc.MinInsyncReplicas,
+		UncleanLeaderElection: tc.UncleanLeaderElection,
 	}
 }
 
 func fromJSON(j topicConfigJSON) TopicConfig {
-	return TopicConfig{
-		Name:       j.Name,
-		Partitions: j.Partitions,
-		Retention:  time.Duration(j.RetentionNs),
-		CreatedAt:  j.CreatedAt,
+	cfg := TopicConfig{
+		Name:                  j.Name,
+		Partitions:            j.Partitions,
+		Retention:             time.Duration(j.RetentionNs),
+		CreatedAt:             j.CreatedAt,
+		ReplicationFactor:     j.ReplicationFactor,
+		MinInsyncReplicas:     j.MinInsyncReplicas,
+		UncleanLeaderElection: j.UncleanLeaderElection,
 	}
+	if cfg.ReplicationFactor == 0 {
+		cfg.ReplicationFactor = 1
+	}
+	if cfg.MinInsyncReplicas == 0 {
+		cfg.MinInsyncReplicas = 1
+	}
+	return cfg
 }
 
 // TopicStore manages topic metadata stored in S3.
@@ -69,6 +88,13 @@ func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
 	}
 	if !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("Create: checking existence of %q: %w", cfg.Name, err)
+	}
+
+	if cfg.ReplicationFactor == 0 {
+		cfg.ReplicationFactor = 1
+	}
+	if cfg.MinInsyncReplicas == 0 {
+		cfg.MinInsyncReplicas = 1
 	}
 
 	data, err := json.Marshal(cfg.toJSON())

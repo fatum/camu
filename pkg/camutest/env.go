@@ -14,8 +14,8 @@ import (
 // instanceConfig holds the config used to start a particular instance so it
 // can be reused on restart.
 type instanceConfig struct {
-	cfg     *config.Config
-	walDir  string
+	cfg      *config.Config
+	walDir   string
 	cacheDir string
 }
 
@@ -57,11 +57,16 @@ func New(t testing.TB, opts ...Option) *Env {
 	}
 
 	for i := 0; i < o.Instances; i++ {
+		instanceID := fmt.Sprintf("127.0.0.%d", i+1)
+		if i < len(o.InstanceIDs) && o.InstanceIDs[i] != "" {
+			instanceID = o.InstanceIDs[i]
+		}
 		walDir := t.TempDir()
 		cacheDir := t.TempDir()
 		cfg := &config.Config{
 			Server: config.ServerConfig{
-				Address: ":0",
+				Address:    ":0",
+				InstanceID: instanceID,
 			},
 			Storage: config.StorageConfig{
 				Bucket:   "test-bucket",
@@ -79,6 +84,11 @@ func New(t testing.TB, opts ...Option) *Env {
 			Cache: config.CacheConfig{
 				Directory: cacheDir,
 				MaxSize:   104857600, // 100 MB for tests
+			},
+			Coordination: config.CoordinationConfig{
+				LeaseTTL:          "6s",
+				HeartbeatInterval: "2s",
+				RebalanceDelay:    "2s",
 			},
 		}
 
@@ -137,6 +147,21 @@ func (e *Env) KillInstance(idx int) {
 	e.instances[idx] = nil
 }
 
+// StopInstance gracefully shuts down the server instance at idx so it flushes
+// and deregisters from the cluster. The instance slot is cleared afterwards.
+func (e *Env) StopInstance(idx int) {
+	e.t.Helper()
+	if idx < 0 || idx >= len(e.instances) {
+		e.t.Fatalf("camutest: StopInstance: index %d out of range (have %d)", idx, len(e.instances))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := e.instances[idx].Shutdown(ctx); err != nil {
+		e.t.Fatalf("camutest: StopInstance %d: shutdown: %v", idx, err)
+	}
+	e.instances[idx] = nil
+}
+
 // RestartInstance creates a new server with the same config (and same WAL
 // directory) as the instance at idx and starts it. This causes WAL replay on
 // the new instance. The instance slot is updated in-place so subsequent calls
@@ -149,12 +174,12 @@ func (e *Env) RestartInstance(idx int) {
 
 	ic := e.configs[idx]
 
-	// Build a fresh config reusing the same WAL and cache directories so WAL
-	// replay can recover unflushed data, and previously flushed segments remain
-	// in the disk cache.
+	// Build a fresh config reusing the same WAL/cache directories and instance ID
+	// so WAL replay and replication routing behave like a restarted node.
 	cfg := &config.Config{
 		Server: config.ServerConfig{
-			Address: ":0", // new random port
+			Address:    ":0", // new random port
+			InstanceID: ic.cfg.Server.InstanceID,
 		},
 		Storage: config.StorageConfig{
 			Bucket:   ic.cfg.Storage.Bucket,
@@ -169,6 +194,7 @@ func (e *Env) RestartInstance(idx int) {
 			Directory: ic.cacheDir,
 			MaxSize:   ic.cfg.Cache.MaxSize,
 		},
+		Coordination: ic.cfg.Coordination,
 	}
 
 	srv, err := server.NewWithS3Client(cfg, e.s3Client)
