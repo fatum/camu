@@ -1,38 +1,48 @@
 (ns jepsen.camu.nemesis
-  (:require [clojure.tools.logging :refer [info]]
+  (:require [clojure.tools.logging :refer [info warn]]
             [jepsen [nemesis :as nemesis]
                     [generator :as gen]
                     [control :as c]]
-            [jepsen.nemesis.combined :as nc]))
+            [jepsen.nemesis.combined :as nc]
+            [jepsen.camu.client :as client]
+            [jepsen.camu.db :as db]))
+
+(defn signal-camu!
+  [signal]
+  (c/exec :bash :-lc
+          (str "if [ -f " db/camu-pid " ]; then "
+               "kill -" signal " $(cat " db/camu-pid ") >/dev/null 2>&1 || true; "
+               "fi")))
 
 (defn kill-camu!
   "Kills the camu process via SIGKILL on the current node."
   []
-  (c/exec :pkill :-9 :-f "camu" (c/lit "|| true")))
+  (signal-camu! "KILL"))
 
 (defn start-camu!
-  "Starts camu on the current node (assumes process is not running)."
+  "Starts camu on the current node if it is not already running."
   []
-  (c/exec :bash :-c
-          (str "nohup /opt/camu/camu serve --config /etc/camu/camu.yaml "
+  (c/exec :bash :-lc
+          (str "pgrep -f '/opt/camu/camu serve --config /etc/camu/camu.yaml' >/dev/null || "
+               "nohup /opt/camu/camu serve --config /etc/camu/camu.yaml "
                ">> /var/log/camu.log 2>&1 &"))
   (Thread/sleep 1000))
 
 (defn pause-camu!
   "Sends SIGSTOP to camu on the current node."
   []
-  (c/exec :pkill :-STOP :-f "camu" (c/lit "|| true")))
+  (signal-camu! "STOP"))
 
 (defn resume-camu!
   "Sends SIGCONT to camu on the current node."
   []
-  (c/exec :pkill :-CONT :-f "camu" (c/lit "|| true")))
+  (signal-camu! "CONT"))
 
 (defn stop-camu!
   "Gracefully stops camu via SIGTERM on the current node.
    Waits up to 5s for the process to exit cleanly."
   []
-  (c/exec :pkill :-TERM :-f "camu" (c/lit "|| true"))
+  (signal-camu! "TERM")
   ;; Wait for graceful shutdown (WAL flush + deregister)
   (Thread/sleep 5000))
 
@@ -179,7 +189,7 @@
         :stop
         (assoc op :value :no-op)))
     (teardown! [this test]
-      ;; Ensure all nodes are running
+      ;; Ensure all nodes are running without launching duplicates.
       (c/on-nodes test (:nodes test)
                   (fn [_ _]
                     (start-camu!))))))
@@ -204,10 +214,61 @@
   []
   (nemesis/clock-scrambler 10))
 
+(defn find-leader-node
+  "Queries the routing endpoint to find which node owns the most partitions
+   for the given topic. Returns the node name or nil."
+  [nodes topic]
+  (some (fn [node]
+          (when-let [routing (client/get-routing! node topic)]
+            (let [;; routing.partitions is a map/vec of partition info with :leader field
+                  partitions (or (:partitions routing) [])
+                  leaders    (keep :leader partitions)
+                  freqs      (frequencies leaders)]
+              (when (seq freqs)
+                (key (apply max-key val freqs))))))
+        (shuffle nodes)))
+
+(defn leader-kill-nemesis
+  "A nemesis that kills the node owning the most partitions (the busiest leader).
+   Falls back to a random node if routing info is unavailable."
+  []
+  (let [killed (atom #{})]
+    (reify nemesis/Nemesis
+      (setup! [this test] this)
+      (invoke! [this test op]
+        (case (:value op)
+          :start
+          (let [topic  (:topic test)
+                target (or (find-leader-node (:nodes test) topic)
+                           (rand-nth (:nodes test)))]
+            (info "Leader-kill nemesis: killing leader" target)
+            (c/on-nodes test [target] (fn [_ _] (kill-camu!)))
+            (swap! killed conj target)
+            (assoc op :value [:leader-killed target]))
+          :stop
+          (let [to-restart (vec @killed)]
+            (reset! killed #{})
+            (when (seq to-restart)
+              (Thread/sleep 3000)
+              (doseq [node to-restart]
+                (try
+                  (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                  (catch Exception e
+                    (info "Failed to restart" node (.getMessage e))))))
+            (assoc op :value [:restarted to-restart]))))
+      (teardown! [this test]
+        (let [to-restart (vec @killed)]
+          (when (seq to-restart)
+            (Thread/sleep 3000)
+            (doseq [node to-restart]
+              (try
+                (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                (catch Exception _)))))))))
+
 (defn composed-nemesis
   "Returns a nemesis that composes fault types specified in the faults set.
    Supported fault keys: :kill :partition :pause :rejoin :leave :membership
-                         :s3-partition :clock-skew
+                         :s3-partition :clock-skew :leader-kill
 
    For :kill — start = SIGKILL process, stop = restart process
    For :leave — start = graceful SIGTERM (deregister), stop = restart (rejoin)
@@ -240,7 +301,10 @@
       (assoc #{:s3-partition} (s3-partition-nemesis "minio"))
 
       (:clock-skew faults)
-      (assoc #{:clock-skew} (clock-skew-nemesis))))))
+      (assoc #{:clock-skew} (clock-skew-nemesis))
+
+      (:leader-kill faults)
+      (assoc #{:leader-kill} (leader-kill-nemesis))))))
 
 (defn fault-cycle
   "Returns a gen/cycle for a single fault type with appropriate timing.
@@ -253,6 +317,11 @@
                   {:type :info :f fault :value :start}
                   (gen/sleep 5)
                   {:type :info :f fault :value :stop}])
+    :leader-kill (gen/cycle
+                  [(gen/sleep 8)
+                   {:type :info :f fault :value :start}
+                   (gen/sleep 20)
+                   {:type :info :f fault :value :stop}])
     ;; Default: 5s quiet, inject fault, 10s active, stop fault
     (gen/cycle
      [(gen/sleep 5)

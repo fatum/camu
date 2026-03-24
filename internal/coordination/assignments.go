@@ -9,11 +9,18 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
-// TopicAssignments maps partition IDs to instance IDs for a single topic.
+// PartitionAssignment holds the replica set and leader for a single partition.
+type PartitionAssignment struct {
+	Replicas    []string `json:"replicas"`
+	Leader      string   `json:"leader"`
+	LeaderEpoch uint64   `json:"leader_epoch"`
+}
+
+// TopicAssignments maps partition IDs to PartitionAssignment for a single topic.
 type TopicAssignments struct {
-	Partitions map[int]string `json:"partitions"` // partitionID -> instanceID
-	Version    uint64         `json:"version"`
-	ETag       string         `json:"-"`
+	Partitions map[int]PartitionAssignment `json:"partitions"`
+	Version    uint64                      `json:"version"`
+	ETag       string                      `json:"-"`
 }
 
 // AssignmentStore reads and writes partition assignments in S3.

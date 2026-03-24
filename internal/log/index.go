@@ -1,6 +1,7 @@
 package log
 
 import (
+	"bytes"
 	"encoding/json"
 	"sort"
 	"time"
@@ -15,10 +16,25 @@ type SegmentRef struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// EpochEntry records when a new epoch started and at which offset.
+type EpochEntry struct {
+	Epoch       uint64 `json:"epoch"`
+	StartOffset uint64 `json:"start_offset"`
+}
+
+// indexJSON is the wire format for the object-style index.
+type indexJSON struct {
+	Segments      []SegmentRef `json:"segments"`
+	EpochHistory  []EpochEntry `json:"epoch_history,omitempty"`
+	HighWatermark uint64       `json:"high_watermark,omitempty"`
+}
+
 // Index maps offset ranges to S3 segment keys, sorted by BaseOffset.
 // It is stored as index.json per partition and updated after each segment flush.
 type Index struct {
-	segments []SegmentRef
+	segments      []SegmentRef
+	epochHistory  []EpochEntry
+	highWatermark uint64
 }
 
 // NewIndex returns an empty Index.
@@ -28,10 +44,23 @@ func NewIndex() *Index {
 
 // Add inserts ref into the index in sorted order by BaseOffset.
 func (idx *Index) Add(ref SegmentRef) {
+	// A newly flushed segment may replace the prior tail segment after leader
+	// reassignment, e.g. old tail 46-46 replaced by new 46-48. Only remove
+	// segments fully contained within the new segment's range. Partial overlaps
+	// (e.g. existing 12-13 vs new 13-15) must be kept to avoid losing offsets
+	// that only exist in the old segment.
+	filtered := idx.segments[:0]
+	for _, existing := range idx.segments {
+		fullyContained := ref.BaseOffset <= existing.BaseOffset && existing.EndOffset <= ref.EndOffset
+		if !fullyContained {
+			filtered = append(filtered, existing)
+		}
+	}
+	idx.segments = filtered
+
 	pos := sort.Search(len(idx.segments), func(i int) bool {
 		return idx.segments[i].BaseOffset >= ref.BaseOffset
 	})
-	// Insert at pos
 	idx.segments = append(idx.segments, SegmentRef{})
 	copy(idx.segments[pos+1:], idx.segments[pos:])
 	idx.segments[pos] = ref
@@ -97,17 +126,60 @@ func (idx *Index) NextOffset() uint64 {
 	return idx.segments[len(idx.segments)-1].EndOffset + 1
 }
 
-// MarshalJSON serializes the index to JSON for S3 storage.
-func (idx *Index) MarshalJSON() ([]byte, error) {
-	return json.Marshal(idx.segments)
+// SetHighWatermark sets the high-watermark offset on the index.
+func (idx *Index) SetHighWatermark(hw uint64) {
+	idx.highWatermark = hw
 }
 
-// UnmarshalJSON deserializes the index from JSON.
+// HighWatermark returns the high-watermark offset stored in the index.
+func (idx *Index) HighWatermark() uint64 {
+	return idx.highWatermark
+}
+
+// SetEpochHistory replaces the epoch history entries in the index.
+func (idx *Index) SetEpochHistory(eh []EpochEntry) {
+	idx.epochHistory = eh
+}
+
+// EpochHistory returns the epoch history entries stored in the index.
+func (idx *Index) EpochHistory() []EpochEntry {
+	return idx.epochHistory
+}
+
+// MarshalJSON serializes the index as an object for S3 storage.
+func (idx *Index) MarshalJSON() ([]byte, error) {
+	return json.Marshal(indexJSON{
+		Segments:      idx.segments,
+		EpochHistory:  idx.epochHistory,
+		HighWatermark: idx.highWatermark,
+	})
+}
+
+// UnmarshalJSON deserializes the index from JSON, supporting both the legacy
+// bare-array format and the current object format.
 func (idx *Index) UnmarshalJSON(data []byte) error {
-	var segs []SegmentRef
-	if err := json.Unmarshal(data, &segs); err != nil {
-		return err
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '[' {
+		// Legacy array format — segments only, no epoch history or HW.
+		var segs []SegmentRef
+		if err := json.Unmarshal(data, &segs); err != nil {
+			return err
+		}
+		idx.segments = segs
+		idx.epochHistory = nil
+		idx.highWatermark = 0
+	} else {
+		// Current object format.
+		var obj indexJSON
+		if err := json.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		idx.segments = obj.Segments
+		idx.epochHistory = obj.EpochHistory
+		idx.highWatermark = obj.HighWatermark
 	}
-	idx.segments = segs
+	sort.Slice(idx.segments, func(i, j int) bool {
+		return idx.segments[i].BaseOffset < idx.segments[j].BaseOffset
+	})
 	return nil
 }

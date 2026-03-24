@@ -54,13 +54,27 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Cap reads at the high watermark for replicated partitions.
+	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
+	if ps != nil && ps.replicaState != nil {
+		hw := ps.replicaState.HighWatermark()
+		w.Header().Set("X-High-Watermark", strconv.FormatUint(hw, 10))
+		if startOffset >= hw {
+			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
+			return
+		}
+		maxReadable := hw - startOffset
+		if uint64(limit) > maxReadable {
+			limit = int(maxReadable)
+		}
+	}
+
 	// Refresh index from S3 for non-owned partitions so we see the latest
 	// segments flushed by the current owner.
 	if !s.isOwnedPartition(topicName, partitionID) {
 		s.partitionManager.RefreshIndex(r.Context(), topicName, partitionID)
 	}
 
-	// Get the partition index.
 	index := s.partitionManager.GetIndex(topicName, partitionID)
 	if index == nil {
 		writeError(w, http.StatusNotFound, "partition not found")
@@ -130,6 +144,12 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 	if index == nil {
 		writeError(w, http.StatusNotFound, "partition not found")
 		return
+	}
+
+	// Set HW header before streaming starts (headers must be sent before body).
+	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
+	if ps != nil && ps.replicaState != nil {
+		w.Header().Set("X-High-Watermark", strconv.FormatUint(ps.replicaState.HighWatermark(), 10))
 	}
 
 	// Set SSE headers.

@@ -109,6 +109,69 @@ func TestTopicStore_Delete(t *testing.T) {
 	}
 }
 
+func TestTopicConfig_ReplicationFields(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	cfg := TopicConfig{
+		Name:                  "orders",
+		Partitions:            4,
+		Retention:             7 * 24 * time.Hour,
+		CreatedAt:             time.Now().UTC().Truncate(time.Second),
+		ReplicationFactor:     3,
+		MinInsyncReplicas:     2,
+		UncleanLeaderElection: true,
+	}
+
+	if err := store.Create(ctx, cfg); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := store.Get(ctx, "orders")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.ReplicationFactor != 3 {
+		t.Errorf("ReplicationFactor: got %d, want 3", got.ReplicationFactor)
+	}
+	if got.MinInsyncReplicas != 2 {
+		t.Errorf("MinInsyncReplicas: got %d, want 2", got.MinInsyncReplicas)
+	}
+	if !got.UncleanLeaderElection {
+		t.Errorf("UncleanLeaderElection: got false, want true")
+	}
+}
+
+func TestTopicConfig_DefaultsToOne(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	cfg := TopicConfig{
+		Name:       "events",
+		Partitions: 1,
+		Retention:  24 * time.Hour,
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+		// ReplicationFactor and MinInsyncReplicas deliberately not set (zero)
+	}
+
+	if err := store.Create(ctx, cfg); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := store.Get(ctx, "events")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.ReplicationFactor != 1 {
+		t.Errorf("ReplicationFactor: got %d, want 1 (default)", got.ReplicationFactor)
+	}
+	if got.MinInsyncReplicas != 1 {
+		t.Errorf("MinInsyncReplicas: got %d, want 1 (default)", got.MinInsyncReplicas)
+	}
+}
+
 func TestTopicStore_CreateDuplicate(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

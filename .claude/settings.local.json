@@ -6,7 +6,25 @@
       "Bash(git commit:*)",
       "mcp__plugin_context-mode_context-mode__execute_file",
       "Bash(go mod:*)",
-      "Bash(go get:*)"
+      "Bash(go get:*)",
+      "mcp__plugin_context-mode_context-mode__batch_execute",
+      "Bash(git -C /Users/maksim/Projects/camu add internal/log/index.go internal/log/index_test.go internal/log/gc.go)",
+      "Bash(git -C:*)",
+      "Bash(lein compile:*)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(done)",
+      "Bash(python3:*)",
+      "Bash(docker info:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker-compose run:*)",
+      "Bash(docker-compose build:*)",
+      "Bash(docker-compose down:*)",
+      "Bash(docker network:*)",
+      "Bash(asdf global:*)",
+      "Bash(asdf set:*)",
+      "Bash(bash jepsen/camu/run.sh kill 10 2>&1)"
     ]
   }
 }

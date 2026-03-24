@@ -1,0 +1,48 @@
+digraph coordination {
+    rankdir=TB
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+
+    subgraph cluster_s3 {
+        label="S3 Coordination Objects" style="filled" color="#FFF3E0" fontname="Helvetica" fontsize=13
+        node [fillcolor="#FFE0B2" color="#E65100"]
+
+        leader [label="_coordination/leader.json\n{instance_id, expires_at, etag}\nTTL: 30s (prod) | 6s (test)"]
+        instances [label="_coordination/instances/{id}.json\n{instance_id, address, heartbeat_at}\nTTL: 90s"]
+        assignments [label="_coordination/assignments/{topic}.json\n{partitions: {pid → {leader, replicas, epoch}}}\nCAS via ETag"]
+        isr [label="_coordination/isr/{topic}/{pid}.json\n{isr: [...], leader, hw}\nCAS via ETag"]
+    }
+
+    subgraph cluster_cycle {
+        label="Renewal Cycle (every 2-10s)" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=12
+        node [fillcolor="#E8F4FD" color="#2196F3"]
+
+        heartbeat [label="1. Heartbeat\nregister/renew instance"]
+        check_leader [label="2. Check Leadership\nacquire or renew leader lease"]
+        discover [label="3. Discover Instances\nfilter by heartbeat freshness"]
+        rebalance [label="4. Rebalance (leader only)\nround-robin assignment\nif topology changed"]
+        apply [label="5. Apply Assignments\ninit leader / follower\nper partition"]
+    }
+
+    heartbeat -> check_leader -> discover -> rebalance -> apply
+    apply -> heartbeat [style=dashed label="next cycle"]
+
+    // S3 interactions
+    heartbeat -> instances [style=dashed]
+    check_leader -> leader [style=dashed]
+    discover -> instances [style=dashed]
+    rebalance -> assignments [style=dashed]
+    apply -> isr [style=dashed]
+
+    subgraph cluster_fencing {
+        label="Epoch Fencing" style="dashed" color="#CE93D8" fontname="Helvetica" fontsize=12
+        node [fillcolor="#F3E5F5" color="#9C27B0"]
+
+        f1 [label="Every Produce\nlocal ownership check\n(zero I/O) → 421"]
+        f2 [label="Every Flush\nS3 lease re-verify\n→ revoke + skip"]
+        f3 [label="WAL Recovery\nepoch sidecar check\n→ discard stale WAL"]
+        f4 [label="Segment Filename\n{offset}-{epoch}.segment\nstale uploads detectable"]
+        f5 [label="Index Update\nConditional PUT\nCAS prevents conflicts"]
+    }
+}

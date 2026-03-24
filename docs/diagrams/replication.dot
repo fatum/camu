@@ -1,0 +1,50 @@
+digraph replication {
+    rankdir=LR
+    bgcolor="white"
+    node [fontname="Helvetica" fontsize=11 style="filled,rounded" shape=box]
+    edge [fontname="Helvetica" fontsize=9]
+
+    subgraph cluster_leader {
+        label="Leader (n1)" style="filled" color="#E3F2FD" fontname="Helvetica" fontsize=13 fontcolor="#1565C0"
+        node [fillcolor="#BBDEFB" color="#1565C0"]
+
+        l_wal [label="WAL\noffsets 0..N"]
+        l_state [label="ReplicaState\nISR: {n1, n2, n3}\nHW: 42\nleaderOffset: 45"]
+        l_purgatory [label="Purgatory\npending: [43, 44]"]
+        l_endpoint [label="/v1/internal/replicate\nGET ?from_offset=X"]
+        l_flush [label="Flush to S3\nsegments + index"]
+    }
+
+    subgraph cluster_follower1 {
+        label="Follower (n2)" style="filled" color="#E8F5E9" fontname="Helvetica" fontsize=13 fontcolor="#2E7D32"
+        node [fillcolor="#C8E6C9" color="#2E7D32"]
+
+        f1_fetcher [label="FollowerFetcher\nlong-poll leader\nlocalOffset: 42"]
+        f1_wal [label="WAL\noffsets 0..42"]
+        f1_prune [label="WAL Prune\ntruncate < flushedOffset"]
+    }
+
+    subgraph cluster_follower2 {
+        label="Follower (n3)" style="filled" color="#FFF3E0" fontname="Helvetica" fontsize=13 fontcolor="#E65100"
+        node [fillcolor="#FFE0B2" color="#E65100"]
+
+        f2_fetcher [label="FollowerFetcher\nlong-poll leader\nlocalOffset: 43"]
+        f2_wal [label="WAL\noffsets 0..43"]
+    }
+
+    // Fetch cycle
+    f1_fetcher -> l_endpoint [label="GET from_offset=42\nX-Replica-Offset: 42" color="#2E7D32"]
+    l_endpoint -> f1_fetcher [label="messages [42..44]\nX-High-Watermark: 42\nX-Flushed-Offset: 40" color="#2E7D32" style=dashed]
+    f1_fetcher -> f1_wal [label="append"]
+    f1_fetcher -> f1_prune [label="prune < 40"]
+
+    f2_fetcher -> l_endpoint [label="GET from_offset=43\nX-Replica-Offset: 43" color="#E65100"]
+    l_endpoint -> f2_fetcher [label="messages [43..44]" color="#E65100" style=dashed]
+    f2_fetcher -> f2_wal [label="append"]
+
+    // Leader internal
+    l_endpoint -> l_state [label="UpdateFollower\nimplicit ack"]
+    l_state -> l_purgatory [label="Complete(hw)\nwhen HW advances"]
+    l_wal -> l_endpoint [label="ReadFrom(offset)"]
+    l_wal -> l_flush [label="batcher trigger"]
+}

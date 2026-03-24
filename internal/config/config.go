@@ -10,11 +10,11 @@ import (
 
 // Config holds all configuration for the camu server.
 type Config struct {
-	Server       ServerConfig      `yaml:"server"`
-	Storage      StorageConfig     `yaml:"storage"`
-	WAL          WALConfig         `yaml:"wal"`
-	Segments     SegmentsConfig    `yaml:"segments"`
-	Cache        CacheConfig       `yaml:"cache"`
+	Server       ServerConfig       `yaml:"server"`
+	Storage      StorageConfig      `yaml:"storage"`
+	WAL          WALConfig          `yaml:"wal"`
+	Segments     SegmentsConfig     `yaml:"segments"`
+	Cache        CacheConfig        `yaml:"cache"`
 	Coordination CoordinationConfig `yaml:"coordination"`
 }
 
@@ -73,6 +73,31 @@ type CoordinationConfig struct {
 	RebalanceDelay    string `yaml:"rebalance_delay"`
 }
 
+const (
+	defaultLeaseTTL          = 30 * time.Second
+	defaultHeartbeatInterval = 10 * time.Second
+	defaultRebalanceDelay    = 5 * time.Second
+)
+
+func parseDurationOrDefault(raw string, fallback time.Duration) (time.Duration, error) {
+	if raw == "" {
+		return fallback, nil
+	}
+	return time.ParseDuration(raw)
+}
+
+func (c CoordinationConfig) LeaseTTLDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.LeaseTTL, defaultLeaseTTL)
+}
+
+func (c CoordinationConfig) HeartbeatIntervalDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.HeartbeatInterval, defaultHeartbeatInterval)
+}
+
+func (c CoordinationConfig) RebalanceDelayDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.RebalanceDelay, defaultRebalanceDelay)
+}
+
 // Load reads a YAML config file at path, applies defaults, and validates required fields.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -113,9 +138,9 @@ func defaults() *Config {
 			MaxSize:   10737418240,
 		},
 		Coordination: CoordinationConfig{
-			LeaseTTL:          "10s",
-			HeartbeatInterval: "3s",
-			RebalanceDelay:    "5s",
+			LeaseTTL:          defaultLeaseTTL.String(),
+			HeartbeatInterval: defaultHeartbeatInterval.String(),
+			RebalanceDelay:    defaultRebalanceDelay.String(),
 		},
 	}
 }

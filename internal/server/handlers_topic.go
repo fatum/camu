@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -13,15 +14,21 @@ import (
 )
 
 type createTopicRequest struct {
-	Name       string `json:"name"`
-	Partitions int    `json:"partitions"`
-	Retention  string `json:"retention"`
+	Name                  string `json:"name"`
+	Partitions            int    `json:"partitions"`
+	Retention             string `json:"retention"`
+	ReplicationFactor     int    `json:"replication_factor"`
+	MinInsyncReplicas     int    `json:"min_insync_replicas"`
+	UncleanLeaderElection bool   `json:"unclean_leader_election"`
 }
 
 type topicResponse struct {
-	Name       string `json:"name"`
-	Partitions int    `json:"partitions"`
-	Retention  string `json:"retention"`
+	Name                  string `json:"name"`
+	Partitions            int    `json:"partitions"`
+	Retention             string `json:"retention"`
+	ReplicationFactor     int    `json:"replication_factor"`
+	MinInsyncReplicas     int    `json:"min_insync_replicas"`
+	UncleanLeaderElection bool   `json:"unclean_leader_election"`
 }
 
 type errorResponse struct {
@@ -39,9 +46,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func topicToResponse(tc meta.TopicConfig) topicResponse {
 	return topicResponse{
-		Name:       tc.Name,
-		Partitions: tc.Partitions,
-		Retention:  tc.Retention.String(),
+		Name:                  tc.Name,
+		Partitions:            tc.Partitions,
+		Retention:             tc.Retention.String(),
+		ReplicationFactor:     tc.ReplicationFactor,
+		MinInsyncReplicas:     tc.MinInsyncReplicas,
+		UncleanLeaderElection: tc.UncleanLeaderElection,
 	}
 }
 
@@ -71,11 +81,37 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	rf := req.ReplicationFactor
+	if rf == 0 {
+		rf = 1
+	}
+	minISR := req.MinInsyncReplicas
+	if minISR == 0 {
+		minISR = 1
+	}
+
+	instances, err := s.registry.ActiveInstances(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list instances")
+		return
+	}
+	if rf > len(instances) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("replication_factor %d exceeds active instances %d", rf, len(instances)))
+		return
+	}
+	if minISR > rf {
+		writeError(w, http.StatusBadRequest, "min_insync_replicas cannot exceed replication_factor")
+		return
+	}
+
 	tc := meta.TopicConfig{
-		Name:       req.Name,
-		Partitions: req.Partitions,
-		Retention:  retention,
-		CreatedAt:  time.Now(),
+		Name:                  req.Name,
+		Partitions:            req.Partitions,
+		Retention:             retention,
+		CreatedAt:             time.Now(),
+		ReplicationFactor:     rf,
+		MinInsyncReplicas:     minISR,
+		UncleanLeaderElection: req.UncleanLeaderElection,
 	}
 
 	if err := s.topicStore.Create(r.Context(), tc); err != nil {
@@ -89,7 +125,7 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Acquire leases first so we have epochs for partition init.
-	s.AcquireLeasesForTopic(tc.Name, tc.Partitions)
+	s.AcquireLeasesForTopic(tc)
 
 	epochs := s.getOwnedEpochs(tc.Name)
 	if err := s.partitionManager.InitTopic(r.Context(), tc, epochs); err != nil {

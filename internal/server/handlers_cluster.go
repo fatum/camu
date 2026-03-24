@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/maksim/camu/internal/storage"
@@ -26,6 +25,32 @@ type routingPartitionInfo struct {
 	Address    string `json:"address"`
 }
 
+type readyResponse struct {
+	Ready  bool   `json:"ready"`
+	Status string `json:"status"`
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.shuttingDown.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, readyResponse{
+			Ready:  false,
+			Status: "shutting_down",
+		})
+		return
+	}
+	if !s.ready.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, readyResponse{
+			Ready:  false,
+			Status: "initializing",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, readyResponse{
+		Ready:  true,
+		Status: "ready",
+	})
+}
+
 func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	resp := clusterStatusResponse{
 		Instances: []instanceInfo{
@@ -42,7 +67,7 @@ func (s *Server) handleRouting(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
 
 	// Validate topic exists.
-	tc, err := s.topicStore.Get(r.Context(), topicName)
+	_, err := s.topicStore.Get(r.Context(), topicName)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "topic not found")
@@ -53,18 +78,6 @@ func (s *Server) handleRouting(w http.ResponseWriter, r *http.Request) {
 	}
 
 	routing := s.getRoutingMap(topicName)
-
-	// For any partitions without a lease, map them to this instance (fallback).
-	for pid := 0; pid < tc.Partitions; pid++ {
-		key := fmt.Sprintf("%d", pid)
-		if _, exists := routing.Partitions[key]; !exists {
-			routing.Partitions[key] = routingPartitionInfo{
-				InstanceID: s.instanceID,
-				Address:    "http://" + s.Address(),
-			}
-		}
-	}
-
-	w.Header().Set("Cache-Control", "max-age=10")
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, routing)
 }

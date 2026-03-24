@@ -175,8 +175,10 @@ func (m *memBackend) conditionalPut(_ context.Context, key string, data []byte, 
 	existing, exists := m.objects[key]
 
 	if etag == "" {
-		// Unconditional first write: allowed whether or not key exists.
-		// This matches "create or overwrite" semantics for the initial write.
+		// Create-if-not-exists: only succeed if the key doesn't exist yet.
+		if exists {
+			return "", ErrConflict
+		}
 	} else {
 		if !exists {
 			return "", ErrConflict
@@ -315,6 +317,9 @@ func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []by
 	if etag != "" {
 		quoted := `"` + etag + `"`
 		input.IfMatch = aws.String(quoted)
+	} else {
+		// Create-if-not-exists: fail if object already exists.
+		input.IfNoneMatch = aws.String("*")
 	}
 	out, err := b.client.PutObject(ctx, input)
 	if err != nil {
