@@ -42,7 +42,7 @@ func newTestServer(t *testing.T) *Server {
 	return s
 }
 
-func TestInitPartitionAsLeader_RF1InitializesReplicaStateAtLogEnd(t *testing.T) {
+func TestInitPartitionAsLeader_RF1SkipsReplicaState(t *testing.T) {
 	s := newTestServer(t)
 
 	tc := meta.TopicConfig{
@@ -72,11 +72,8 @@ func TestInitPartitionAsLeader_RF1InitializesReplicaStateAtLogEnd(t *testing.T) 
 		LeaderEpoch: 1,
 	})
 
-	if ps.replicaState == nil {
-		t.Fatal("expected replicaState for rf=1 leader")
-	}
-	if got := ps.replicaState.HighWatermark(); got != 7 {
-		t.Fatalf("replicaState.HighWatermark() = %d, want 7", got)
+	if ps.replicaState != nil {
+		t.Fatal("expected nil replicaState for rf=1 leader")
 	}
 }
 

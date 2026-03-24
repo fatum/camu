@@ -586,22 +586,24 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		}(),
 	)
 
-	ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas)
-	for _, r := range pa.Replicas {
-		if r != s.instanceID {
-			ps.replicaState.AddFollower(r)
+	if topicCfg.ReplicationFactor > 1 {
+		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas)
+		for _, r := range pa.Replicas {
+			if r != s.instanceID {
+				ps.replicaState.AddFollower(r)
+			}
 		}
-	}
 
-	// Write ISR = [self] to S3 so recovery has a consistent source of truth.
-	if err := s.isrStore.Write(ctx, topic, replication.ISRState{
-		Partition:     pid,
-		ISR:           []string{s.instanceID},
-		Leader:        s.instanceID,
-		LeaderEpoch:   pa.LeaderEpoch,
-		HighWatermark: recoveredHW,
-	}, ""); err != nil {
-		slog.Warn("initPartitionAsLeader: write ISR", "topic", topic, "partition", pid, "error", err)
+		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
+		if err := s.isrStore.Write(ctx, topic, replication.ISRState{
+			Partition:     pid,
+			ISR:           []string{s.instanceID},
+			Leader:        s.instanceID,
+			LeaderEpoch:   pa.LeaderEpoch,
+			HighWatermark: recoveredHW,
+		}, ""); err != nil {
+			slog.Warn("initPartitionAsLeader: write ISR", "topic", topic, "partition", pid, "error", err)
+		}
 	}
 
 	// If this replica was promoted with a durable tail only in local WAL,
@@ -1034,10 +1036,12 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 	ps.isLeader = true
 	ps.epoch = newEpoch
 	topicCfg, _ := s.topicStore.Get(ctx, topic)
-	ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas)
-	for _, r := range pa.Replicas {
-		if r != s.instanceID {
-			ps.replicaState.AddFollower(r)
+	if topicCfg.ReplicationFactor > 1 {
+		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas)
+		for _, r := range pa.Replicas {
+			if r != s.instanceID {
+				ps.replicaState.AddFollower(r)
+			}
 		}
 	}
 
