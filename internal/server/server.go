@@ -669,19 +669,26 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	}
 	leaderAddr := net.JoinHostPort(pa.Leader, port)
 
-	// Cancel existing fetch loop if any (e.g., leader changed).
+	// Cancel existing fetch loop and wait for it to finish.
 	if ps.fetchCancel != nil {
 		ps.fetchCancel()
+		if ps.fetchDone != nil {
+			<-ps.fetchDone
+		}
 	}
 
 	// Start follower fetch loop.
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel
+	ps.fetchDone = make(chan struct{})
 	slog.Info("partition_follower_init",
 		"topic", topic, "partition", pid,
 		"leader", pa.Leader, "leader_addr", leaderAddr,
 		"local_offset", ps.nextOffset, "epoch", ps.epoch)
-	go s.followerFetcher.Run(fetchCtx, topic, pid, leaderAddr, ps.nextOffset, ps.epoch, s.instanceID, s.partitionManager)
+	go func() {
+		defer close(ps.fetchDone)
+		s.followerFetcher.Run(fetchCtx, topic, pid, leaderAddr, ps.nextOffset, ps.epoch, s.instanceID, s.partitionManager)
+	}()
 }
 
 // startLeaseRenewal starts a background goroutine that renews owned leases.
@@ -969,10 +976,15 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		return fmt.Errorf("partition state not found")
 	}
 
-	// 4a. Cancel fetch loop.
+	// 4a. Cancel fetch loop and wait for it to finish so any in-flight
+	// WAL append completes before we replay the WAL.
 	if ps.fetchCancel != nil {
 		ps.fetchCancel()
+		if ps.fetchDone != nil {
+			<-ps.fetchDone
+		}
 		ps.fetchCancel = nil
+		ps.fetchDone = nil
 	}
 
 	// 4b. Replay WAL to recover true log end.

@@ -32,7 +32,8 @@ type partitionState struct {
 	isLeader      bool
 	flushedOffset uint64 // highest offset flushed to S3
 	epochHistory  *replication.EpochHistory
-	fetchCancel   context.CancelFunc // cancel follower fetch goroutine
+	fetchCancel context.CancelFunc // cancel follower fetch goroutine
+	fetchDone  chan struct{}       // closed when fetch goroutine exits
 }
 
 // PartitionManager manages per-partition state including WAL, index, and batching.
@@ -519,16 +520,24 @@ func (pm *PartitionManager) TruncateWAL(topic string, pid int, beforeOffset uint
 	return ps.wal.TruncateBefore(beforeOffset)
 }
 
-// CancelAllFetchLoops cancels all active follower fetch goroutines.
+// CancelAllFetchLoops cancels all active follower fetch goroutines and waits
+// for them to finish.
 func (pm *PartitionManager) CancelAllFetchLoops() {
 	pm.mu.RLock()
-	defer pm.mu.RUnlock()
+	var doneChans []chan struct{}
 	for _, parts := range pm.partitions {
 		for _, ps := range parts {
 			if ps.fetchCancel != nil {
 				ps.fetchCancel()
+				if ps.fetchDone != nil {
+					doneChans = append(doneChans, ps.fetchDone)
+				}
 			}
 		}
+	}
+	pm.mu.RUnlock()
+	for _, ch := range doneChans {
+		<-ch
 	}
 }
 
