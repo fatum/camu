@@ -2,14 +2,17 @@ package replication
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
+	"golang.org/x/net/http2"
 )
 
 // PartitionManager is the interface the fetcher needs from the server.
@@ -39,11 +42,29 @@ type FollowerFetcher struct {
 	onLeaderDown OnLeaderDown
 }
 
-// NewFollowerFetcher creates a FollowerFetcher with the given leader-down callback.
-func NewFollowerFetcher(onLeaderDown OnLeaderDown) *FollowerFetcher {
+// NewFollowerFetcher creates a FollowerFetcher with a shared HTTP client and
+// a leader-down callback. The client should be created via NewH2CClient so
+// that all partition fetches to the same leader multiplex over one connection.
+func NewFollowerFetcher(httpClient *http.Client, onLeaderDown OnLeaderDown) *FollowerFetcher {
 	return &FollowerFetcher{
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		httpClient:   httpClient,
 		onLeaderDown: onLeaderDown,
+	}
+}
+
+// NewH2CClient creates an HTTP client that speaks h2c (HTTP/2 without TLS).
+// A single client should be shared across all fetchers to multiplex
+// partition fetches over one connection per leader.
+func NewH2CClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		},
 	}
 }
 

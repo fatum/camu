@@ -17,6 +17,7 @@
         http-port   (:http-port test 8080)
         config      (str "server:\n"
                          "  address: \":" http-port "\"\n"
+                         "  internal_address: \":8081\"\n"
                          "  instance_id: \"" node "\"\n"
                          "\n"
                          "storage:\n"

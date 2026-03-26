@@ -20,8 +20,9 @@ type Config struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	Address    string `yaml:"address"`
-	InstanceID string `yaml:"instance_id"`
+	Address         string `yaml:"address"`
+	InternalAddress string `yaml:"internal_address"`
+	InstanceID      string `yaml:"instance_id"`
 }
 
 // StorageConfig holds S3-compatible object storage settings.
@@ -159,7 +160,8 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Address: ":8080",
+			Address:         ":8080",
+			InternalAddress: ":8081",
 		},
 		WAL: WALConfig{
 			Directory: "/var/lib/camu/wal",

@@ -11,28 +11,31 @@ import (
 
 // InstanceInfo represents a registered instance in the cluster.
 type InstanceInfo struct {
-	InstanceID  string    `json:"instance_id"`
-	Address     string    `json:"address"`
-	HeartbeatAt time.Time `json:"heartbeat_at"`
+	InstanceID      string    `json:"instance_id"`
+	Address         string    `json:"address"`
+	InternalAddress string    `json:"internal_address,omitempty"`
+	HeartbeatAt     time.Time `json:"heartbeat_at"`
 }
 
 // Registry provides instance discovery via S3-based registration.
 // Each instance registers itself at startup and heartbeats periodically.
 // ActiveInstances reads all registrations and filters by heartbeat freshness.
 type Registry struct {
-	s3Client   *storage.S3Client
-	instanceID string
-	address    string
-	ttl        time.Duration
+	s3Client        *storage.S3Client
+	instanceID      string
+	address         string
+	internalAddress string
+	ttl             time.Duration
 }
 
 // NewRegistry creates a new Registry.
-func NewRegistry(s3 *storage.S3Client, instanceID, address string, ttl time.Duration) *Registry {
+func NewRegistry(s3 *storage.S3Client, instanceID, address, internalAddress string, ttl time.Duration) *Registry {
 	return &Registry{
-		s3Client:   s3,
-		instanceID: instanceID,
-		address:    address,
-		ttl:        ttl,
+		s3Client:        s3,
+		instanceID:      instanceID,
+		address:         address,
+		internalAddress: internalAddress,
+		ttl:             ttl,
 	}
 }
 
@@ -44,9 +47,10 @@ func registryKey(instanceID string) string {
 // Should be called at startup and periodically as a heartbeat.
 func (r *Registry) Register(ctx context.Context) error {
 	info := InstanceInfo{
-		InstanceID:  r.instanceID,
-		Address:     r.address,
-		HeartbeatAt: time.Now(),
+		InstanceID:      r.instanceID,
+		Address:         r.address,
+		InternalAddress: r.internalAddress,
+		HeartbeatAt:     time.Now(),
 	}
 	data, err := json.Marshal(info)
 	if err != nil {

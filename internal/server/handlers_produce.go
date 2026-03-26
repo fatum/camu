@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -35,10 +37,18 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Buffer body so it can be replayed if we need to proxy to the leader.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
 	topicName := r.PathValue("topic")
 
 	// Validate topic exists.
-	_, err := s.topicStore.Get(r.Context(), topicName)
+	_, err = s.topicStore.Get(r.Context(), topicName)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "topic not found")
@@ -104,8 +114,14 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Check ownership of all target partitions before writing.
+	// If any partition is not owned, proxy the entire request to that partition's leader.
 	for partitionID := range byPartition {
 		if !s.isOwnedPartition(topicName, partitionID) {
+			if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get("X-Forwarded-By") == "" {
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				s.proxyToLeader(w, r, leaderAddr)
+				return
+			}
 			routing := s.getRoutingMap(topicName)
 			writeJSON(w, 421, routing)
 			return
@@ -141,6 +157,11 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+				if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get("X-Forwarded-By") == "" {
+					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					s.proxyToLeader(w, r, leaderAddr)
+					return
+				}
 				routing := s.getRoutingMap(topicName)
 				writeJSON(w, 421, routing)
 				return
@@ -209,6 +230,14 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Buffer body so it can be replayed if we need to proxy to the leader.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
 	topicName := r.PathValue("topic")
 	partitionStr := r.PathValue("id")
 
@@ -234,8 +263,13 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check partition ownership.
+	// Check partition ownership — proxy to leader if not owned.
 	if !s.isOwnedPartition(topicName, partitionID) {
+		if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get("X-Forwarded-By") == "" {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			s.proxyToLeader(w, r, leaderAddr)
+			return
+		}
 		routing := s.getRoutingMap(topicName)
 		writeJSON(w, 421, routing)
 		return
@@ -285,6 +319,11 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+			if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get("X-Forwarded-By") == "" {
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				s.proxyToLeader(w, r, leaderAddr)
+				return
+			}
 			routing := s.getRoutingMap(topicName)
 			writeJSON(w, 421, routing)
 			return

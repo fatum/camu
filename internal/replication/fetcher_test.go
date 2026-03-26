@@ -114,7 +114,7 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm)
@@ -182,7 +182,7 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 10, 1, "test-node", pm)
@@ -247,7 +247,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 0, "test-node", pm)
 	}()

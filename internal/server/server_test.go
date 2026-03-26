@@ -42,7 +42,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("NewWithS3Client() error = %v", err)
 	}
-	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", time.Minute)
+	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", time.Minute)
 	return s
 }
 

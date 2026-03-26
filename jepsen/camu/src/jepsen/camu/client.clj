@@ -95,7 +95,7 @@
                                     (Long/parseLong e))]
                        (cond-> {:partition (:partition pinfo)
                                 :offset   (:offset pinfo)
-                                :node     node}
+                                :node     (or (get headers "x-camu-instance-id") node)}
                          epoch (assoc :leader-epoch epoch)))
       (= status 421) (throw (ex-info "misdirected" {:type :misdirected}))
       (= status 500) (throw (ex-info "not-ready" {:type :not-ready}))
