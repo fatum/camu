@@ -9,16 +9,17 @@ import (
 // ReplicaState tracks follower offsets, computes the high watermark, manages
 // the ISR set, and holds a Purgatory for pending produce acks.
 type ReplicaState struct {
-	mu            sync.Mutex
-	leaderID      string
-	followers     map[string]*FollowerState
-	isrSet        map[string]bool // includes leader
-	highWatermark uint64
-	leaderOffset  uint64
-	minISR        int
-	purgatory     *Purgatory
-	newDataCh     chan struct{}
-	epochHistory  *EpochHistory
+	mu                    sync.Mutex
+	leaderID              string
+	followers             map[string]*FollowerState
+	isrSet                map[string]bool // includes leader
+	highWatermark         uint64
+	leaderOffset          uint64
+	minISR                int
+	purgatory             *Purgatory
+	newDataCh             chan struct{}
+	epochHistory          *EpochHistory
+	isrExpansionThreshold int
 }
 
 // FollowerState holds the last known state for a single follower replica.
@@ -29,18 +30,33 @@ type FollowerState struct {
 }
 
 // NewReplicaState creates a ReplicaState with the leader already in the ISR set.
-func NewReplicaState(leaderID string, initialHW uint64, minISR int) *ReplicaState {
-	return &ReplicaState{
-		leaderID:      leaderID,
-		followers:     make(map[string]*FollowerState),
-		isrSet:        map[string]bool{leaderID: true},
-		highWatermark: initialHW,
-		leaderOffset:  initialHW,
-		minISR:        minISR,
-		purgatory:     NewPurgatory(),
-		newDataCh:     make(chan struct{}),
-		epochHistory:  &EpochHistory{},
+func NewReplicaState(leaderID string, initialHW uint64, minISR int, isrExpansionThreshold int) *ReplicaState {
+	if isrExpansionThreshold <= 0 {
+		isrExpansionThreshold = 1000
 	}
+	return &ReplicaState{
+		leaderID:              leaderID,
+		followers:             make(map[string]*FollowerState),
+		isrSet:                map[string]bool{leaderID: true},
+		highWatermark:         initialHW,
+		leaderOffset:          initialHW,
+		minISR:                minISR,
+		purgatory:             NewPurgatory(),
+		newDataCh:             make(chan struct{}),
+		epochHistory:          &EpochHistory{},
+		isrExpansionThreshold: isrExpansionThreshold,
+	}
+}
+
+// SetEpochHistory replaces the epoch history used for divergence checks.
+// Passing nil resets it to an empty history.
+func (rs *ReplicaState) SetEpochHistory(eh *EpochHistory) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if eh == nil {
+		eh = &EpochHistory{}
+	}
+	rs.epochHistory = eh
 }
 
 // AddFollower registers a new follower. It starts OUTSIDE the ISR set
@@ -65,10 +81,10 @@ func (rs *ReplicaState) UpdateFollower(id string, offset uint64) {
 	fs.LastContactAt = time.Now()
 
 	// ISR expansion: if follower is not in ISR but has caught up to within
-	// 1000 offsets of the leader, add it to ISR.
-	if !rs.isrSet[id] && rs.leaderOffset > 0 && offset > 0 {
+	// the threshold offsets of the leader, add it to ISR.
+	if !rs.isrSet[id] && rs.leaderOffset > 0 && offset > 0 && offset <= rs.leaderOffset {
 		lag := rs.leaderOffset - offset
-		if lag <= 1000 {
+		if lag <= uint64(rs.isrExpansionThreshold) {
 			rs.isrSet[id] = true
 			slog.Info("isr_expand: follower caught up",
 				"leader", rs.leaderID, "follower", id,
@@ -93,6 +109,28 @@ func (rs *ReplicaState) HighWatermark() uint64 {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.highWatermark
+}
+
+// MinFollowerOffset returns the lowest next-offset currently reported by any
+// follower. The boolean is false when there are no registered followers.
+func (rs *ReplicaState) MinFollowerOffset() (uint64, bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if len(rs.followers) == 0 {
+		return 0, false
+	}
+	var (
+		min uint64
+		set bool
+	)
+	for _, fs := range rs.followers {
+		if !set || fs.LastOffset < min {
+			min = fs.LastOffset
+			set = true
+		}
+	}
+	return min, set
 }
 
 // Purgatory returns the purgatory held by this ReplicaState.

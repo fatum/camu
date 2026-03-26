@@ -58,6 +58,28 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+  jepsen-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Jepsen smoke test
+        run: bash jepsen/camu/scripts/smoke.sh
+        timeout-minutes: 10
+
+      - name: Upload Jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-results
+          path: jepsen/camu/store/latest/
+          retention-days: 7
+          if-no-files-found: ignore
+
   benchmarks:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

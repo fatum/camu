@@ -18,7 +18,7 @@ digraph write_path {
         ownership [label="Ownership Check\n(zero I/O, local map)"]
         route [label="Partition Router\nhash(key) % N | round-robin"]
         assign [label="Offset Assignment\n(partition lock, monotonic uint64)"]
-        wal [label="WAL Append + fsync\n(CRC-protected entries)" fillcolor="#FFF9C4" color="#FFC107"]
+        wal [label="Active WAL Chunk Append + fsync\nCRC-protected entries\nrotate at wal.chunk_size" fillcolor="#FFF9C4" color="#FFC107"]
     }
 
     subgraph cluster_replication {
@@ -32,13 +32,15 @@ digraph write_path {
     subgraph cluster_flush {
         label="Background Flush" style="dashed" color="#A5D6A7" fontname="Helvetica" fontsize=12
         node [fillcolor="#E8F5E9" color="#4CAF50"]
-        batcher [label="Batcher Trigger\n8MB size | 50ms timer (test)\n5s timer (production)"]
+        batcher [label="Batcher Trigger\nsegments.max_size |\nsegments.max_age"]
         verify [label="S3 Lease Re-verify\n(ownership still valid?)"]
-        replay [label="WAL Replay\n(read unflushed entries)"]
+        seal [label="Seal Active Chunk\nnew active chunk for writes"]
+        replay [label="Replay Sealed Chunks\n(skip flushed-retained chunks)"]
         segment [label="Segment Upload\n{offset}-{epoch}.segment\nsnappy | zstd | none"]
         cache [label="Disk Cache Write"]
         index_update [label="Index CAS Update\nConditional PUT index.json"]
-        truncate [label="WAL Truncate\n(capped at HW for rf > 1)"]
+        mark_flushed [label="Mark Flushed-Retained\nkeep WAL hot path for replicas"]
+        truncate [label="WAL Prune by Follower Progress\nremove old flushed-retained chunks +\nrewrite first retained chunk if needed"]
     }
 
     // Flow
@@ -55,10 +57,12 @@ digraph write_path {
 
     wal -> batcher [style=dashed label="size tracking"]
     batcher -> verify
-    verify -> replay [label="still owner"]
+    verify -> seal [label="still owner"]
     verify -> truncate [label="lost\nrevoke" style=dashed color=red]
+    seal -> replay
     replay -> segment
     segment -> cache
     segment -> index_update
-    index_update -> truncate
+    index_update -> mark_flushed
+    mark_flushed -> truncate
 }

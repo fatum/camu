@@ -11,8 +11,8 @@ import (
 
 // InstanceInfo represents a registered instance in the cluster.
 type InstanceInfo struct {
-	InstanceID string    `json:"instance_id"`
-	Address    string    `json:"address"`
+	InstanceID  string    `json:"instance_id"`
+	Address     string    `json:"address"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 }
 

@@ -17,6 +17,13 @@ type EpochEntry struct {
 
 // EpochHistory tracks the sequence of leader epochs and their starting offsets.
 // It is used to detect log divergence between a leader and a follower.
+//
+// Note: EpochHistory is not safe for concurrent use. Callers must ensure that
+// all mutations (Append, TruncateAfter) and reads (CheckDivergence) are serialized.
+// In practice, this is guaranteed by:
+//   - Append/TruncateAfter are only called during leadership acquisition, which is
+//     serialized by the partition's leadership state machine
+//   - CheckDivergence is called under ReplicaState.mu lock
 type EpochHistory struct {
 	Entries []EpochEntry
 }

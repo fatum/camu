@@ -82,7 +82,7 @@ func (b *Batcher) Append(partitionID int, msgSize int64) error {
 		// Start or reset the age timer.
 		if buf.timer == nil {
 			buf.timer = time.AfterFunc(b.cfg.MaxAge, func() {
-				b.flushPartition(partitionID)
+				_ = b.flushPartition(partitionID)
 			})
 		} else {
 			buf.timer.Reset(b.cfg.MaxAge)
@@ -91,7 +91,7 @@ func (b *Batcher) Append(partitionID int, msgSize int64) error {
 	buf.mu.Unlock()
 
 	if shouldFlush {
-		b.flushPartition(partitionID)
+		_ = b.flushPartition(partitionID)
 	}
 	return nil
 }

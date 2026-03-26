@@ -9,24 +9,28 @@ digraph read_path {
     req [label="GET /v1/topics/{t}/partitions/{p}/messages\n?offset=N&limit=100" shape=oval fillcolor="#BBDEFB"]
     resp [label="HTTP 200\n{messages: [...], next_offset: M}" shape=oval fillcolor="#C8E6C9" color="#4CAF50"]
 
-    hw_check [label="HW Cap (rf > 1)\nstartOffset >= HW?\nreturn empty" fillcolor="#F3E5F5" color="#9C27B0"]
+    hw_check [label="Readable HW Cap\nstartOffset >= HW?\nreturn empty" fillcolor="#F3E5F5" color="#9C27B0"]
 
     subgraph cluster_index {
         label="Index Layer" style="dashed" color="#90CAF9" fontname="Helvetica" fontsize=12
         owned_check [label="Owned partition?\nuse local index"]
         refresh [label="Refresh Index from S3\n(non-owner reads)"]
-        lookup [label="Index Lookup\nbinary search on SegmentRef[]"]
+        lookup [label="Segment Plan\nbinary search on cached base offsets\nSegmentsFrom(offset, 4)"]
     }
 
     subgraph cluster_fetch {
         label="Segment Fetch" style="dashed" color="#A5D6A7" fontname="Helvetica" fontsize=12
         node [fillcolor="#E8F5E9" color="#4CAF50"]
+        parallel_fetch [label="Parallel Segment Fetch\nup to 4 segments"]
         disk_cache [label="Disk Cache\nLRU, SHA256 keys\nmax 10GB"]
         s3_fetch [label="S3 Download\n+ cache write"]
-        parse [label="Segment Parse\ndecompress + frame read\nskip offset < start"]
+        parse [label="Sequential Decode\ndecompress + frame read\nskip offset < start"]
     }
 
-    multi [label="More segments?\noffset < limit" shape=diamond fillcolor="#FFF9C4" color="#FFC107"]
+    wal_overlay [label="Readable local WAL?\nleader/follower HW known" shape=diamond fillcolor="#FFF9C4" color="#FFC107"]
+    wal_read [label="Read WAL chunks\nactive + sealed +\nflushed-retained\nfrom startOffset"]
+    merge [label="Merge by offset\nWAL wins on overlap" fillcolor="#F3E5F5" color="#9C27B0"]
+    multi [label="More segments needed?" shape=diamond fillcolor="#FFF9C4" color="#FFC107"]
 
     // Flow
     req -> hw_check
@@ -35,11 +39,17 @@ digraph read_path {
     owned_check -> lookup [label="yes\nlocal"]
     owned_check -> refresh [label="no"]
     refresh -> lookup
-    lookup -> disk_cache
+    lookup -> parallel_fetch
+    parallel_fetch -> disk_cache
     disk_cache -> parse [label="hit"]
     disk_cache -> s3_fetch [label="miss"]
     s3_fetch -> parse
-    parse -> multi
+    parse -> wal_overlay
+    wal_overlay -> wal_read [label="yes"]
+    wal_overlay -> multi [label="no"]
+    wal_read -> merge
+    parse -> merge
+    merge -> multi
     multi -> lookup [label="yes\nnext offset"]
     multi -> resp [label="no\ndone"]
 }

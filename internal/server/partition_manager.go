@@ -31,22 +31,24 @@ type partitionState struct {
 	replicaState  *replication.ReplicaState // nil for rf=1
 	isLeader      bool
 	flushedOffset uint64 // highest offset flushed to S3
+	followerHW    uint64 // leader-advertised readable HW for follower reads
 	epochHistory  *replication.EpochHistory
-	fetchCancel context.CancelFunc // cancel follower fetch goroutine
-	fetchDone  chan struct{}       // closed when fetch goroutine exits
+	fetchCancel   context.CancelFunc // cancel follower fetch goroutine
+	fetchDone     chan struct{}      // closed when fetch goroutine exits
 }
 
 // PartitionManager manages per-partition state including WAL, index, and batching.
 type PartitionManager struct {
-	mu          sync.RWMutex
-	s3Client    *storage.S3Client
-	diskCache   *log.DiskCache
-	partitions  map[string]map[int]*partitionState // topic -> partitionID -> state
-	routers     map[string]*producer.Router
-	batcher     *producer.Batcher
-	walDir      string
-	walFsync    bool
-	segmentsCfg config.SegmentsConfig
+	mu           sync.RWMutex
+	s3Client     *storage.S3Client
+	diskCache    *log.DiskCache
+	partitions   map[string]map[int]*partitionState // topic -> partitionID -> state
+	routers      map[string]*producer.Router
+	batcher      *producer.Batcher
+	walDir       string
+	walFsync     bool
+	walChunkSize int64
+	segmentsCfg  config.SegmentsConfig
 
 	// leaseChecker validates partition ownership before flushing to S3.
 	leaseChecker func(topic string, partitionID int) bool
@@ -88,15 +90,16 @@ func NewPartitionManager(cfg *config.Config, s3Client *storage.S3Client) (*Parti
 	}
 
 	pm := &PartitionManager{
-		s3Client:    s3Client,
-		diskCache:   diskCache,
-		partitions:  make(map[string]map[int]*partitionState),
-		routers:     make(map[string]*producer.Router),
-		walDir:      walDir,
-		walFsync:    cfg.WAL.Fsync,
-		segmentsCfg: cfg.Segments,
-		globalIDMap: make(map[int]topicPartition),
-		reverseMap:  make(map[topicPartition]int),
+		s3Client:     s3Client,
+		diskCache:    diskCache,
+		partitions:   make(map[string]map[int]*partitionState),
+		routers:      make(map[string]*producer.Router),
+		walDir:       walDir,
+		walFsync:     cfg.WAL.Fsync,
+		walChunkSize: cfg.WAL.ChunkSize,
+		segmentsCfg:  cfg.Segments,
+		globalIDMap:  make(map[int]topicPartition),
+		reverseMap:   make(map[topicPartition]int),
 	}
 	pm.conditionalPutIndex = pm.s3Client.ConditionalPut
 
@@ -205,7 +208,7 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 	if err := os.MkdirAll(filepath.Dir(walPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create WAL dir: %w", err)
 	}
-	wal, err := log.OpenWAL(walPath, pm.walFsync)
+	wal, err := log.OpenWAL(walPath, pm.walFsync, pm.walChunkSize)
 	if err != nil {
 		return nil, fmt.Errorf("open WAL: %w", err)
 	}
@@ -214,7 +217,7 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 	epochFile := walPath + ".epoch"
 	var prevEpoch uint64
 	if epochData, err := os.ReadFile(epochFile); err == nil {
-		fmt.Sscanf(string(epochData), "%d", &prevEpoch)
+		_, _ = fmt.Sscanf(string(epochData), "%d", &prevEpoch)
 	}
 
 	if epoch > prevEpoch && prevEpoch > 0 {
@@ -223,9 +226,10 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 		slog.Warn("epoch fencing: discarding stale WAL",
 			"topic", topic, "partition", partitionID,
 			"wal_epoch", prevEpoch, "lease_epoch", epoch)
-		wal.Close()
-		os.Remove(walPath)
-		wal, err = log.OpenWAL(walPath, pm.walFsync)
+		_ = wal.Close()
+		_ = os.Remove(walPath)
+		_ = os.RemoveAll(walPath + ".segments")
+		wal, err = log.OpenWAL(walPath, pm.walFsync, pm.walChunkSize)
 		if err != nil {
 			return nil, fmt.Errorf("reopen WAL after epoch discard: %w", err)
 		}
@@ -233,7 +237,7 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 
 	// Write current epoch to sidecar file.
 	if err := fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", epoch)), 0o644); err != nil {
-		wal.Close()
+		_ = wal.Close()
 		return nil, fmt.Errorf("write epoch sidecar: %w", err)
 	}
 
@@ -511,6 +515,29 @@ func (pm *PartitionManager) GetPartitionState(topic string, partitionID int) *pa
 	return nil
 }
 
+// UpdateFollowerProgress records the latest leader-advertised readable
+// high-watermark and flushed offset for a follower partition.
+func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int, highWatermark, flushedOffset uint64) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	parts, ok := pm.partitions[topic]
+	if !ok {
+		return
+	}
+	ps, ok := parts[partitionID]
+	if !ok {
+		return
+	}
+
+	if highWatermark > ps.followerHW {
+		ps.followerHW = highWatermark
+	}
+	if flushedOffset > ps.flushedOffset {
+		ps.flushedOffset = flushedOffset
+	}
+}
+
 // TruncateWAL removes WAL entries before the given offset for a partition.
 func (pm *PartitionManager) TruncateWAL(topic string, pid int, beforeOffset uint64) error {
 	ps := pm.GetPartitionState(topic, pid)
@@ -595,9 +622,15 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	}
 	pm.mu.RUnlock()
 
-	// Read all messages from WAL — everything in it is unflushed by definition
-	// (TruncateBefore removes flushed entries after each flush).
-	msgs, err := ps.wal.Replay()
+	// Seal the active chunk first so new appends land in a fresh active chunk
+	// while the sealed unflushed chunks are uploaded.
+	if err := ps.wal.Seal(); err != nil {
+		return fmt.Errorf("seal WAL: %w", err)
+	}
+
+	// Read all sealed, not-yet-flushed chunks. Flushed-retained chunks stay in
+	// WAL for follower catch-up but are excluded from the flush input.
+	msgs, err := ps.wal.ReplaySealed()
 	if err != nil {
 		return fmt.Errorf("WAL replay: %w", err)
 	}
@@ -641,16 +674,45 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	if compression == "" {
 		compression = log.CompressionNone
 	}
-	if err := log.WriteSegment(&segBuf, msgs, compression); err != nil {
+	if err := log.WriteSegment(&segBuf, msgs, compression, pm.segmentsCfg.RecordBatchTargetSize); err != nil {
 		return fmt.Errorf("write segment: %w", err)
 	}
 	segData := segBuf.Bytes()
+	segIndexData, err := log.BuildSegmentOffsetIndex(segData, baseOffset, pm.segmentsCfg.IndexIntervalBytes)
+	if err != nil {
+		return fmt.Errorf("build segment offset index: %w", err)
+	}
 
-	// 2. Upload segment to S3.
+	// 2. Upload segment assets to S3.
+	// This sequence is intentionally non-atomic: the immutable segment object
+	// lands first, followed by its sidecars, and only then does index.json gain
+	// a reference to the new SegmentRef. Crashes in between can leave orphaned
+	// assets behind, which is acceptable because GC cleans up unreferenced
+	// segment, offset-index, and metadata objects.
 	segKey := fmt.Sprintf("%s/%d/%d-%d.segment", topic, partitionID, baseOffset, epoch)
+	segRef := log.SegmentRef{
+		BaseOffset:     baseOffset,
+		EndOffset:      endOffset,
+		Epoch:          epoch,
+		Key:            segKey,
+		OffsetIndexKey: log.SegmentOffsetIndexKey(segKey),
+		MetaKey:        log.SegmentMetadataKey(segKey),
+		CreatedAt:      time.Now(),
+	}
+	segIndexKey := segRef.OffsetIndexObjectKey()
+	segMetaData, err := log.BuildSegmentMetadata(segRef, len(msgs), int64(len(segData)), compression)
+	if err != nil {
+		return fmt.Errorf("build segment metadata: %w", err)
+	}
 	ctx := context.Background()
 	if err := pm.s3Client.Put(ctx, segKey, segData, storage.PutOpts{}); err != nil {
 		return fmt.Errorf("upload segment: %w", err)
+	}
+	if err := pm.s3Client.Put(ctx, segIndexKey, segIndexData, storage.PutOpts{}); err != nil {
+		return fmt.Errorf("upload segment offset index: %w", err)
+	}
+	if err := pm.s3Client.Put(ctx, segRef.MetaObjectKey(), segMetaData, storage.PutOpts{ContentType: "application/json"}); err != nil {
+		return fmt.Errorf("upload segment metadata: %w", err)
 	}
 
 	// 3. Write segment to disk cache.
@@ -658,16 +720,14 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		// Non-fatal: log but don't fail the flush.
 		_ = err
 	}
-
-	// 4. Update index with retry on conflict.
-	segRef := log.SegmentRef{
-		BaseOffset: baseOffset,
-		EndOffset:  endOffset,
-		Epoch:      epoch,
-		Key:        segKey,
-		CreatedAt:  time.Now(),
+	if err := pm.diskCache.Put(segIndexKey, segIndexData); err != nil {
+		_ = err
+	}
+	if err := pm.diskCache.Put(segRef.MetaObjectKey(), segMetaData); err != nil {
+		_ = err
 	}
 
+	// 4. Update index with retry on conflict.
 	indexKey := fmt.Sprintf("%s/%d/index.json", topic, partitionID)
 	indexUpdated := false
 	for retries := 0; retries < 5; retries++ {
@@ -746,24 +806,25 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		"size_bytes", len(segData),
 	)
 
-	// 5. Truncate WAL — but for replicated partitions, only truncate up to
-	// the high watermark. Entries above HW haven't been acked by followers
-	// yet, and followers need to read them from the WAL. Without this, the
-	// batcher truncates WAL entries before followers can fetch them.
-	truncateBefore := endOffset + 1
+	// 5. Mark flushed chunks as retained for replica catch-up. They remain
+	// readable via WAL until all followers move past them.
+	if err := ps.wal.MarkFlushed(endOffset + 1); err != nil {
+		return fmt.Errorf("mark WAL flushed: %w", err)
+	}
+
+	retainBefore := endOffset + 1
 	if ps.replicaState != nil {
-		hw := ps.replicaState.HighWatermark()
-		if hw < truncateBefore {
-			truncateBefore = hw
+		if minFollowerOffset, ok := ps.replicaState.MinFollowerOffset(); ok && minFollowerOffset < retainBefore {
+			retainBefore = minFollowerOffset
 		}
 	}
-	if truncateBefore > 0 {
-		if err := ps.wal.TruncateBefore(truncateBefore); err != nil {
-			return fmt.Errorf("truncate WAL: %w", err)
+	if retainBefore > 0 {
+		if err := ps.wal.TruncateBefore(retainBefore); err != nil {
+			return fmt.Errorf("truncate WAL retained chunks: %w", err)
 		}
 	}
-	slog.Info("wal_truncated", "topic", topic, "partition", partitionID,
-		"truncate_before", truncateBefore, "flushed_end", endOffset,
+	slog.Info("wal_retention_updated", "topic", topic, "partition", partitionID,
+		"retain_before", retainBefore, "flushed_end", endOffset,
 		"hw", func() uint64 {
 			if ps.replicaState != nil {
 				return ps.replicaState.HighWatermark()

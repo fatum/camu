@@ -145,7 +145,7 @@ func TestPartitionManagerAppendBatch_PersistsHighWatermarkBeforeFlush(t *testing
 		t.Fatal("expected partition state")
 	}
 	ps.isLeader = true
-	ps.replicaState = replication.NewReplicaState("n1", 0, 1)
+	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
 
 	_, err := pm.AppendBatch(context.Background(), "topic", 0, []log.Message{
 		{Key: []byte("k"), Value: []byte("value")},
@@ -190,7 +190,7 @@ func TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL(t *testing.T) {
 		t.Fatal("expected partition state")
 	}
 	ps.isLeader = true
-	ps.replicaState = replication.NewReplicaState("n1", 0, 1)
+	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
 
 	_, err := pm.AppendBatch(context.Background(), "topic", 0, []log.Message{
 		{Key: []byte("k"), Value: []byte("value")},
@@ -236,7 +236,7 @@ func TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(segmentKeys) != 1 {
-		t.Fatalf("expected uploaded segment to remain for diagnosis/retry, got %v", segmentKeys)
+	if len(segmentKeys) != 3 {
+		t.Fatalf("expected uploaded segment, offset index, and metadata to remain for diagnosis/retry, got %v", segmentKeys)
 	}
 }

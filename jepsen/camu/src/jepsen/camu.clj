@@ -14,16 +14,31 @@
   (:import (java.util UUID)))
 
 (def partitions 4)
+(def large-value-size-bytes (* 5 1024))
+
+(defn fixed-size-value
+  "Builds an ASCII string with exactly size-bytes characters."
+  [prefix n size-bytes]
+  (let [base       (str prefix "-" n "-")
+        filler-len (max 0 (- size-bytes (count base)))]
+    (str base (apply str (repeat filler-len \x)))))
 
 (defn produce-gen
   "Returns a generator that produces messages with unique sequential keys."
-  [counter]
+  ([counter]
+   (produce-gen counter (fn [n] (str "v-" n))))
+  ([counter value-fn]
   (fn [_ _]
     (let [n (swap! counter inc)]
       {:type  :invoke
        :f     :produce
        :value {:key   (str "k-" n)
-               :value (str "v-" n)}})))
+               :value (value-fn n)}}))))
+
+(defn large-produce-gen
+  "Returns a generator that produces 5 KB values."
+  [counter]
+  (produce-gen counter #(fixed-size-value "large-v" % large-value-size-bytes)))
 
 (defn consume-gen
   "Returns a generator that consumes from a random partition, tracking
@@ -49,6 +64,42 @@
             (consume-gen offsets)
             (consume-gen offsets)
             (consume-gen offsets)]))
+
+(defn large-requests-workload-gen
+  "Returns a mixed generator with concurrent 5 KB produces and consumes."
+  [counter offsets]
+  (gen/mix [(large-produce-gen counter)
+            (large-produce-gen counter)
+            (large-produce-gen counter)
+            (large-produce-gen counter)
+            (large-produce-gen counter)
+            (large-produce-gen counter)
+            (large-produce-gen counter)
+            (consume-gen offsets)
+            (consume-gen offsets)
+            (consume-gen offsets)]))
+
+(defn replica-flushed-reads-workload-gen
+  "Returns a produce-heavy workload intended for replica reads against flushed
+   data. Pair it with read-mode :replica and a graceful leave-style fault."
+  [counter offsets]
+  (gen/mix [(produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (consume-gen offsets)
+            (consume-gen offsets)]))
+
+(defn workload-gen
+  [opts counter offsets]
+  (case (or (:workload opts) :mixed)
+    :large-requests (large-requests-workload-gen counter offsets)
+    :replica-flushed-reads (replica-flushed-reads-workload-gen counter offsets)
+    (mixed-workload-gen counter offsets)))
 
 (defn drain-gen
   "Returns a generator that drains all 4 partitions."
@@ -119,7 +170,7 @@
                (->> (gen/mix (nem/fault-cycles faults))
                     (gen/stagger 5))
                (gen/clients
-                (->> (mixed-workload-gen counter consume-offsets)
+                (->> (workload-gen opts counter consume-offsets)
                      (gen/stagger 1/10)))))
              ;; Phase 2: stop all active faults, restart nodes
              (gen/log "Stopping nemesis, restarting all nodes...")
@@ -150,10 +201,14 @@
    [nil "--min-insync-replicas N" "Minimum in-sync replicas for ack"
     :default 1
     :parse-fn #(Integer/parseInt %)]
-   [nil "--read-mode MODE" "Read routing mode: leader or any"
+   [nil "--read-mode MODE" "Read routing mode: leader, replica, or any"
     :default :leader
     :parse-fn keyword
-    :validate [#{:leader :any} "must be one of: leader, any"]]])
+    :validate [#{:leader :replica :any} "must be one of: leader, replica, any"]]
+   [nil "--workload NAME" "Workload: mixed, large-requests, or replica-flushed-reads"
+    :default :mixed
+    :parse-fn keyword
+    :validate [#{:mixed :large-requests :replica-flushed-reads} "must be one of: mixed, large-requests, replica-flushed-reads"]]])
 
 (defn -main
   "Entry point for the Jepsen CLI."

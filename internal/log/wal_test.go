@@ -11,7 +11,7 @@ func TestWAL_AppendAndReplay(t *testing.T) {
 	path := filepath.Join(dir, "test.wal")
 
 	// Open, append 2 messages, close
-	w, err := OpenWAL(path, false)
+	w, err := OpenWAL(path, false, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestWAL_AppendAndReplay(t *testing.T) {
 	}
 
 	// Reopen and replay
-	w2, err := OpenWAL(path, false)
+	w2, err := OpenWAL(path, false, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL (reopen): %v", err)
 	}
@@ -63,7 +63,7 @@ func TestWAL_Truncate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
 
-	w, err := OpenWAL(path, false)
+	w, err := OpenWAL(path, false, 64)
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestWAL_Truncate(t *testing.T) {
 	}
 
 	// Reopen and replay
-	w2, err := OpenWAL(path, false)
+	w2, err := OpenWAL(path, false, 64)
 	if err != nil {
 		t.Fatalf("OpenWAL (reopen): %v", err)
 	}
@@ -108,7 +108,7 @@ func TestWAL_EmptyReplay(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty.wal")
 
-	w, err := OpenWAL(path, false)
+	w, err := OpenWAL(path, false, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestWAL_CorruptEntrySkipped(t *testing.T) {
 	path := filepath.Join(dir, "corrupt.wal")
 
 	// Write one good message
-	w, err := OpenWAL(path, false)
+	w, err := OpenWAL(path, false, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
@@ -140,7 +140,8 @@ func TestWAL_CorruptEntrySkipped(t *testing.T) {
 	}
 
 	// Corrupt the file by appending garbage (simulates crash mid-write)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	chunkPath := walChunkPath(walChunkDir(path), 1)
+	f, err := os.OpenFile(chunkPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		t.Fatalf("open for corrupt: %v", err)
 	}
@@ -148,7 +149,7 @@ func TestWAL_CorruptEntrySkipped(t *testing.T) {
 	f.Close()
 
 	// Replay should return only the valid message
-	w2, err := OpenWAL(path, false)
+	w2, err := OpenWAL(path, false, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL (reopen): %v", err)
 	}
@@ -170,7 +171,7 @@ func TestWAL_AppendBatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "batch.wal")
 
-	w, err := OpenWAL(path, true)
+	w, err := OpenWAL(path, true, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL() error: %v", err)
 	}
@@ -188,7 +189,7 @@ func TestWAL_AppendBatch(t *testing.T) {
 	w.Close()
 
 	// Verify replay after reopen
-	w2, err := OpenWAL(path, true)
+	w2, err := OpenWAL(path, true, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL() reopen error: %v", err)
 	}
@@ -210,7 +211,7 @@ func TestWAL_AppendBatchEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty-batch.wal")
 
-	w, err := OpenWAL(path, true)
+	w, err := OpenWAL(path, true, 1<<20)
 	if err != nil {
 		t.Fatalf("OpenWAL() error: %v", err)
 	}
@@ -221,5 +222,129 @@ func TestWAL_AppendBatchEmpty(t *testing.T) {
 	}
 	if err := w.AppendBatch([]Message{}); err != nil {
 		t.Fatalf("AppendBatch([]) error: %v", err)
+	}
+}
+
+func TestWAL_CachesChunkListInMemory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chunked.wal")
+
+	w, err := OpenWAL(path, false, 64)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+	defer w.Close()
+
+	msgs := []Message{
+		{Offset: 0, Value: []byte("aaaaaaaaaaaaaaaa")},
+		{Offset: 1, Value: []byte("bbbbbbbbbbbbbbbb")},
+		{Offset: 2, Value: []byte("cccccccccccccccc")},
+	}
+	if err := w.AppendBatch(msgs); err != nil {
+		t.Fatalf("AppendBatch() error: %v", err)
+	}
+
+	if got := len(w.chunks); got < 2 {
+		t.Fatalf("len(w.chunks) = %d, want at least 2", got)
+	}
+
+	if err := w.TruncateBefore(2); err != nil {
+		t.Fatalf("TruncateBefore() error: %v", err)
+	}
+	if got := len(w.chunks); got != 1 {
+		t.Fatalf("len(w.chunks) after truncate = %d, want 1", got)
+	}
+	if got := w.chunks[0].baseOffset; got != 2 {
+		t.Fatalf("w.chunks[0].baseOffset = %d, want 2", got)
+	}
+}
+
+func TestWAL_FlushedChunksRetainedForReadsButSkippedByReplay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "retained.wal")
+
+	w, err := OpenWAL(path, false, 64)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.AppendBatch([]Message{
+		{Offset: 0, Value: []byte("v0")},
+		{Offset: 1, Value: []byte("v1")},
+	}); err != nil {
+		t.Fatalf("AppendBatch() first error: %v", err)
+	}
+	if err := w.Seal(); err != nil {
+		t.Fatalf("Seal() error: %v", err)
+	}
+	if err := w.MarkFlushed(2); err != nil {
+		t.Fatalf("MarkFlushed() error: %v", err)
+	}
+	if err := w.AppendBatch([]Message{
+		{Offset: 2, Value: []byte("v2")},
+		{Offset: 3, Value: []byte("v3")},
+	}); err != nil {
+		t.Fatalf("AppendBatch() second error: %v", err)
+	}
+
+	replayed, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay() error: %v", err)
+	}
+	if len(replayed) != 2 {
+		t.Fatalf("Replay() returned %d messages, want 2", len(replayed))
+	}
+	if replayed[0].Offset != 2 || replayed[1].Offset != 3 {
+		t.Fatalf("Replay() offsets = [%d %d], want [2 3]", replayed[0].Offset, replayed[1].Offset)
+	}
+
+	readMsgs, err := w.ReadFrom(0, 10)
+	if err != nil {
+		t.Fatalf("ReadFrom() error: %v", err)
+	}
+	if len(readMsgs) != 4 {
+		t.Fatalf("ReadFrom() returned %d messages, want 4", len(readMsgs))
+	}
+	for i := range readMsgs {
+		if got := readMsgs[i].Offset; got != uint64(i) {
+			t.Fatalf("ReadFrom()[%d].Offset = %d, want %d", i, got, i)
+		}
+	}
+}
+
+func TestWAL_TruncateRemovesRetainedFlushedChunks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "truncate-retained.wal")
+
+	w, err := OpenWAL(path, false, 64)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.AppendBatch([]Message{
+		{Offset: 0, Value: []byte("v0")},
+		{Offset: 1, Value: []byte("v1")},
+		{Offset: 2, Value: []byte("v2")},
+	}); err != nil {
+		t.Fatalf("AppendBatch() error: %v", err)
+	}
+	if err := w.Seal(); err != nil {
+		t.Fatalf("Seal() error: %v", err)
+	}
+	if err := w.MarkFlushed(3); err != nil {
+		t.Fatalf("MarkFlushed() error: %v", err)
+	}
+	if err := w.TruncateBefore(3); err != nil {
+		t.Fatalf("TruncateBefore() error: %v", err)
+	}
+
+	msgs, err := w.ReadFrom(0, 10)
+	if err != nil {
+		t.Fatalf("ReadFrom() error: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("ReadFrom() returned %d messages after truncate, want 0", len(msgs))
 	}
 }

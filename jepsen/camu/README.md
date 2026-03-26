@@ -44,7 +44,7 @@ Recently verified matrix:
 
 The test runs in three phases:
 
-1. **Fault phase** (configurable, default 60-120s) — Mixed workload (70% produce, 30% consume) while the nemesis injects faults on random nodes. The correctness suite resolves the partition leader from routing and reads from that leader during verification.
+1. **Fault phase** (configurable, default 60-120s) — A selectable workload runs while the nemesis injects faults on random nodes. `mixed` uses the original 70% small produces / 30% consumes mix, `large-requests` uses the same shape with 5 KB produce values across concurrent clients, and `replica-flushed-reads` is a produce-heavy workload meant for follower reads after graceful flushes. The correctness suite can resolve either the current leader or a known replica from routing during verification.
 
 2. **Recovery phase** (15s) — All faults are stopped, killed nodes are restarted, cluster stabilizes.
 
@@ -91,11 +91,15 @@ Composable via `--faults` flag (comma-separated):
 ### Quick start
 
 ```bash
-./run.sh                    # kill faults, 120s
-./run.sh kill 60            # kill faults, 60s
-./run.sh partition 120      # network partitions, 120s
-./run.sh kill,partition 180 # combined faults, 180s
+./run.sh                                # kill faults, 120s
+./run.sh kill 60                        # kill faults, 60s
+./run.sh partition 120                  # network partitions, 120s
+./run.sh kill,partition 180             # combined faults, 180s
 RF=3 MIN_ISR=3 ./run.sh leader-kill,s3-partition 45 # strict quorum
+WORKLOAD=large-requests ./run.sh kill 120           # 5 KB produce values
+CONCURRENCY=25 ./run.sh kill 120                    # higher client concurrency
+CONCURRENCY=25 WORKLOAD=large-requests ./run.sh kill 120 # high concurrency + 5 KB values
+READ_MODE=replica WORKLOAD=replica-flushed-reads ./run.sh leave 10 # replica reads after graceful flush
 ```
 
 `run.sh` will:
@@ -109,6 +113,34 @@ RF=3 MIN_ISR=3 ./run.sh leader-kill,s3-partition 45 # strict quorum
 
 - `RF` to override `--replication-factor`
 - `MIN_ISR` to override `--min-insync-replicas`
+- `WORKLOAD` to override `--workload` (`mixed`, `large-requests`, or `replica-flushed-reads`)
+- `CONCURRENCY` to override Jepsen client worker count (default `5`)
+- `READ_MODE` to override `--read-mode` (`leader`, `replica`, or `any`)
+
+### Predefined Scripts
+
+Use the wrappers in `jepsen/camu/scripts/` for common scenarios:
+
+```bash
+./scripts/smoke.sh
+./scripts/large-requests.sh
+./scripts/high-concurrency-large-requests.sh
+./scripts/high-pressure-smoke.sh
+./scripts/leader-failover-smoke.sh
+./scripts/replica-flushed-reads.sh
+./scripts/s3-degraded-smoke.sh
+./scripts/strict-quorum-smoke.sh
+```
+
+`replica-flushed-reads.sh` runs `leave` faults with `READ_MODE=replica` and `WORKLOAD=replica-flushed-reads`, which checks that follower consume requests can return flushed data after a graceful leader shutdown.
+
+`strict-quorum-smoke.sh` runs the default smoke scenario with `RF=3` and `MIN_ISR=3`, which is a useful reusable baseline for validating the stricter quorum path after replication or failover changes.
+
+`leader-failover-smoke.sh` runs `leader-kill` for 10 seconds, which is a fast reassignment and promoted-leader read-path check.
+
+`high-pressure-smoke.sh` runs `kill` with `WORKLOAD=large-requests` and `CONCURRENCY=25`, which is a quick pressure test for WAL, flush, and follower recovery behavior.
+
+`s3-degraded-smoke.sh` runs `s3-partition` for 10 seconds, which is a useful baseline after changes to segment upload, cache refresh, or object-store error handling.
 
 ### Manual (inside the control container)
 
@@ -122,10 +154,12 @@ docker-compose run --rm control bash -c "
   lein run test \
     --nodes n1,n2,n3,n4,n5 \
     --ssh-private-key /root/.ssh/id_rsa \
+    --concurrency 25 \
     --time-limit 120 \
     --s3-endpoint http://minio:9000 \
     --camu-binary /jepsen/camu/camu \
-    --faults kill,partition
+    --faults kill,partition \
+    --workload large-requests
 "
 ```
 
@@ -135,13 +169,14 @@ The Jepsen test uses a tuned camu configuration for faster fault detection:
 
 | Setting | Test value | Production default | Why |
 |---------|-----------|-------------------|-----|
-| `segments.max_age` | 50ms | 5s | Minimize the gap between WAL durability and flushed visibility |
+| `segments.max_age` | 1m | 5s | Keep more unflushed data in WAL so Jepsen exercises larger in-memory/WAL batches |
 | `coordination.lease_ttl` | 6s | 30s | Faster coordinator and ownership failover in tests |
+| `coordination.instance_ttl` | 8s | `lease_ttl * 3` | Faster membership expiry for reassignment after kill faults |
 | `coordination.heartbeat_interval` | 2s | 10s | Faster lease renewal and expiry in tests |
 | `coordination.rebalance_delay` | 2s | 5s | Faster reassignment in tests |
-| `segments.max_size` | 1MB | 8MB | More frequent flushes for test volume |
+| `segments.max_size` | 100MB | 8MB | Delay flush-by-size so large Jepsen writes accumulate before segment upload |
 
-This difference is intentional. Camu has separate production and test coordination defaults, and Jepsen uses the shorter timing so failover completes inside bounded test windows.
+This difference is intentional. Camu has separate production and test defaults, and Jepsen uses more aggressive coordination timing plus larger segment thresholds to exercise failover with heavier in-flight batches inside bounded test windows.
 
 ## Output
 

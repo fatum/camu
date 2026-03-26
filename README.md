@@ -167,9 +167,12 @@ See [`camu.yaml.example`](camu.yaml.example) for all options.
 | `wal.fsync` | `true` | Fsync on every write |
 | `segments.max_size` | 8MB | Flush size threshold |
 | `segments.max_age` | 5s | Flush time threshold |
-| `segments.compression` | `none` | `none`, `snappy`, or `zstd` |
+| `segments.compression` | `none` | Record-batch compression: `none`, `snappy`, or `zstd` |
+| `segments.record_batch_target_size` | 16KB | Target uncompressed on-disk record-batch size inside a segment |
+| `segments.index_interval_bytes` | 4KB | Planned sparse per-segment offset index cadence |
 | `cache.max_size` | 10GB | Disk cache LRU limit |
 | `coordination.lease_ttl` | 30s | Lease TTL |
+| `coordination.instance_ttl` | `lease_ttl * 3` | Instance liveness TTL used for active membership |
 | `coordination.heartbeat_interval` | 10s | Lease renewal interval |
 | `coordination.rebalance_delay` | 5s | Delay before reassignment |
 

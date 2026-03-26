@@ -8,7 +8,7 @@ import (
 // TestReplicaState_AdvanceHW verifies that HW is the minimum of leaderOffset
 // and all ISR follower offsets.
 func TestReplicaState_AdvanceHW(t *testing.T) {
-	rs := NewReplicaState("a", 0, 1)
+	rs := NewReplicaState("a", 0, 1, 1000)
 	rs.AddFollower("b")
 	rs.AddFollower("c")
 
@@ -32,7 +32,7 @@ func TestReplicaState_AdvanceHW(t *testing.T) {
 
 // TestReplicaState_ISRShrink verifies that removing a member reduces ISR size.
 func TestReplicaState_ISRShrink(t *testing.T) {
-	rs := NewReplicaState("a", 0, 1)
+	rs := NewReplicaState("a", 0, 1, 1000)
 	rs.AddFollower("b")
 	rs.AddFollower("c")
 
@@ -57,7 +57,7 @@ func TestReplicaState_ISRShrink(t *testing.T) {
 
 // TestReplicaState_NotifyNewData verifies the broadcast channel pattern.
 func TestReplicaState_NotifyNewData(t *testing.T) {
-	rs := NewReplicaState("a", 0, 1)
+	rs := NewReplicaState("a", 0, 1, 1000)
 
 	notified := make(chan bool, 1)
 	go func() {
@@ -80,7 +80,7 @@ func TestReplicaState_NotifyNewData(t *testing.T) {
 // TestReplicaState_HWOnlyISR verifies that a follower removed from the ISR
 // does not constrain the HW calculation.
 func TestReplicaState_HWOnlyISR(t *testing.T) {
-	rs := NewReplicaState("a", 0, 1)
+	rs := NewReplicaState("a", 0, 1, 1000)
 	rs.AddFollower("b")
 	rs.AddFollower("c")
 
@@ -111,7 +111,7 @@ func TestReplicaState_HWOnlyISR(t *testing.T) {
 // leader, HW equals leaderOffset.
 func TestReplicaState_LeaderOnlyISR(t *testing.T) {
 	// With minISR=1, leader-only ISR can advance HW.
-	rs := NewReplicaState("a", 0, 1)
+	rs := NewReplicaState("a", 0, 1, 1000)
 	rs.SetLeaderOffset(77)
 	if rs.HighWatermark() != 77 {
 		t.Fatalf("expected HW=77 with leader-only ISR (minISR=1), got %d", rs.HighWatermark())
@@ -120,7 +120,7 @@ func TestReplicaState_LeaderOnlyISR(t *testing.T) {
 
 func TestReplicaState_LeaderOnlyISR_MinISR2(t *testing.T) {
 	// With minISR=2, leader-only ISR cannot advance HW.
-	rs := NewReplicaState("a", 0, 2)
+	rs := NewReplicaState("a", 0, 2, 1000)
 	rs.SetLeaderOffset(77)
 	if rs.HighWatermark() != 0 {
 		t.Fatalf("expected HW=0 with leader-only ISR (minISR=2), got %d", rs.HighWatermark())
@@ -137,7 +137,7 @@ func TestReplicaState_LeaderOnlyISR_MinISR2(t *testing.T) {
 // TestReplicaState_FollowerStartsOutsideISR verifies that AddFollower does NOT
 // add to ISR — followers must catch up first.
 func TestReplicaState_FollowerStartsOutsideISR(t *testing.T) {
-	rs := NewReplicaState("a", 0, 2)
+	rs := NewReplicaState("a", 0, 2, 1000)
 	rs.AddFollower("b")
 
 	// ISR should only contain leader.

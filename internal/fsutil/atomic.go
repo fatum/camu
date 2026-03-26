@@ -21,7 +21,9 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() {
-		tmp.Close()
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+		}
 		_ = os.Remove(tmpPath)
 	}
 

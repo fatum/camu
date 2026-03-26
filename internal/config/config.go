@@ -42,14 +42,24 @@ type CredentialsConfig struct {
 type WALConfig struct {
 	Directory string `yaml:"directory"`
 	Fsync     bool   `yaml:"fsync"`
+	ChunkSize int64  `yaml:"chunk_size"`
 }
+
+const defaultWALChunkSize = 64 * 1024 * 1024
 
 // SegmentsConfig holds segment management settings.
 type SegmentsConfig struct {
-	MaxSize     int64  `yaml:"max_size"`
-	MaxAge      string `yaml:"max_age"`
-	Compression string `yaml:"compression"`
+	MaxSize            int64  `yaml:"max_size"`
+	MaxAge             string `yaml:"max_age"`
+	Compression        string `yaml:"compression"`
+	RecordBatchTargetSize int64  `yaml:"record_batch_target_size"`
+	IndexIntervalBytes int    `yaml:"index_interval_bytes"`
 }
+
+const (
+	defaultSegmentRecordBatchTargetSize = 16 * 1024
+	defaultSegmentIndexIntervalBytes = 4096
+)
 
 // MaxAgeDuration parses MaxAge as a time.Duration.
 // Returns 5 * time.Second if MaxAge is empty.
@@ -68,15 +78,20 @@ type CacheConfig struct {
 
 // CoordinationConfig holds distributed coordination settings.
 type CoordinationConfig struct {
-	LeaseTTL          string `yaml:"lease_ttl"`
-	HeartbeatInterval string `yaml:"heartbeat_interval"`
-	RebalanceDelay    string `yaml:"rebalance_delay"`
+	LeaseTTL              string `yaml:"lease_ttl"`
+	HeartbeatInterval     string `yaml:"heartbeat_interval"`
+	RebalanceDelay        string `yaml:"rebalance_delay"`
+	InstanceTTL           string `yaml:"instance_ttl"`
+	ISRExpansionThreshold int    `yaml:"isr_expansion_threshold"`
+	ReplicationTimeout    string `yaml:"replication_timeout"`
 }
 
 const (
-	defaultLeaseTTL          = 30 * time.Second
-	defaultHeartbeatInterval = 10 * time.Second
-	defaultRebalanceDelay    = 5 * time.Second
+	defaultLeaseTTL              = 30 * time.Second
+	defaultHeartbeatInterval     = 10 * time.Second
+	defaultRebalanceDelay        = 5 * time.Second
+	defaultISRExpansionThreshold = 1000
+	defaultReplicationTimeout    = 30 * time.Second
 )
 
 func parseDurationOrDefault(raw string, fallback time.Duration) (time.Duration, error) {
@@ -96,6 +111,28 @@ func (c CoordinationConfig) HeartbeatIntervalDuration() (time.Duration, error) {
 
 func (c CoordinationConfig) RebalanceDelayDuration() (time.Duration, error) {
 	return parseDurationOrDefault(c.RebalanceDelay, defaultRebalanceDelay)
+}
+
+func (c CoordinationConfig) InstanceTTLDuration() (time.Duration, error) {
+	if c.InstanceTTL == "" {
+		leaseTTL, err := c.LeaseTTLDuration()
+		if err != nil {
+			return 0, err
+		}
+		return leaseTTL * 3, nil
+	}
+	return time.ParseDuration(c.InstanceTTL)
+}
+
+func (c CoordinationConfig) ISRExpansionThresholdValue() int {
+	if c.ISRExpansionThreshold <= 0 {
+		return defaultISRExpansionThreshold
+	}
+	return c.ISRExpansionThreshold
+}
+
+func (c CoordinationConfig) ReplicationTimeoutDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.ReplicationTimeout, defaultReplicationTimeout)
 }
 
 // Load reads a YAML config file at path, applies defaults, and validates required fields.
@@ -127,11 +164,14 @@ func defaults() *Config {
 		WAL: WALConfig{
 			Directory: "/var/lib/camu/wal",
 			Fsync:     true,
+			ChunkSize: defaultWALChunkSize,
 		},
 		Segments: SegmentsConfig{
-			MaxSize:     8388608,
-			MaxAge:      "5s",
-			Compression: "none",
+			MaxSize:            8388608,
+			MaxAge:             "5s",
+			Compression:        "none",
+			RecordBatchTargetSize: defaultSegmentRecordBatchTargetSize,
+			IndexIntervalBytes: defaultSegmentIndexIntervalBytes,
 		},
 		Cache: CacheConfig{
 			Directory: "/var/lib/camu/cache",

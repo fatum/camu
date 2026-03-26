@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sort"
 
 	"github.com/maksim/camu/internal/log"
 )
@@ -95,11 +96,16 @@ func marshalMessageFrame(w io.Writer, msg log.Message) error {
 	if err := binary.Write(w, binary.BigEndian, headerCount); err != nil {
 		return err
 	}
-	for k, v := range msg.Headers {
+	keys := make([]string, 0, len(msg.Headers))
+	for k := range msg.Headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		if err := wirePutBytes(w, []byte(k)); err != nil {
 			return err
 		}
-		if err := wirePutBytes(w, []byte(v)); err != nil {
+		if err := wirePutBytes(w, []byte(msg.Headers[k])); err != nil {
 			return err
 		}
 	}

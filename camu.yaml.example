@@ -11,14 +11,18 @@ storage:
 wal:
   directory: "/var/lib/camu/wal"
   fsync: true
+  chunk_size: 67108864
 segments:
   max_size: 8388608
   max_age: "5s"
   compression: "snappy"
+  record_batch_target_size: 16384
+  index_interval_bytes: 4096
 cache:
   directory: "/var/lib/camu/cache"
   max_size: 10737418240
 coordination:
   lease_ttl: "10s"
+  instance_ttl: "30s"
   heartbeat_interval: "3s"
   rebalance_delay: "5s"

@@ -9,11 +9,27 @@ import (
 
 // SegmentRef describes a single segment file stored in S3.
 type SegmentRef struct {
-	BaseOffset uint64    `json:"base_offset"`
-	EndOffset  uint64    `json:"end_offset"`
-	Epoch      uint64    `json:"epoch"`
-	Key        string    `json:"key"`
-	CreatedAt  time.Time `json:"created_at"`
+	BaseOffset     uint64    `json:"base_offset"`
+	EndOffset      uint64    `json:"end_offset"`
+	Epoch          uint64    `json:"epoch"`
+	Key            string    `json:"key"`
+	OffsetIndexKey string    `json:"offset_index_key,omitempty"`
+	MetaKey        string    `json:"meta_key,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func (r SegmentRef) OffsetIndexObjectKey() string {
+	if r.OffsetIndexKey != "" {
+		return r.OffsetIndexKey
+	}
+	return SegmentOffsetIndexKey(r.Key)
+}
+
+func (r SegmentRef) MetaObjectKey() string {
+	if r.MetaKey != "" {
+		return r.MetaKey
+	}
+	return SegmentMetadataKey(r.Key)
 }
 
 // EpochEntry records when a new epoch started and at which offset.
@@ -33,6 +49,7 @@ type indexJSON struct {
 // It is stored as index.json per partition and updated after each segment flush.
 type Index struct {
 	segments      []SegmentRef
+	baseOffsets   []uint64
 	epochHistory  []EpochEntry
 	highWatermark uint64
 }
@@ -64,15 +81,16 @@ func (idx *Index) Add(ref SegmentRef) {
 	idx.segments = append(idx.segments, SegmentRef{})
 	copy(idx.segments[pos+1:], idx.segments[pos:])
 	idx.segments[pos] = ref
+	idx.rebuildOffsets()
 }
 
 // Lookup finds the segment that contains the given offset using binary search.
 // Returns the SegmentRef and true if found, or zero value and false otherwise.
 func (idx *Index) Lookup(offset uint64) (SegmentRef, bool) {
 	// Find the rightmost segment with BaseOffset <= offset
-	n := len(idx.segments)
+	n := len(idx.baseOffsets)
 	pos := sort.Search(n, func(i int) bool {
-		return idx.segments[i].BaseOffset > offset
+		return idx.baseOffsets[i] > offset
 	})
 	// pos is the first segment with BaseOffset > offset; candidate is pos-1
 	if pos == 0 {
@@ -83,6 +101,28 @@ func (idx *Index) Lookup(offset uint64) (SegmentRef, bool) {
 		return SegmentRef{}, false
 	}
 	return ref, true
+}
+
+// SegmentsFrom returns the ordered segment refs starting with the segment that
+// contains offset. If maxSegments <= 0, all remaining segments are returned.
+func (idx *Index) SegmentsFrom(offset uint64, maxSegments int) []SegmentRef {
+	n := len(idx.baseOffsets)
+	pos := sort.Search(n, func(i int) bool {
+		return idx.baseOffsets[i] > offset
+	})
+	if pos == 0 {
+		return nil
+	}
+	start := pos - 1
+	if offset > idx.segments[start].EndOffset {
+		return nil
+	}
+
+	end := len(idx.segments)
+	if maxSegments > 0 && start+maxSegments < end {
+		end = start + maxSegments
+	}
+	return append([]SegmentRef(nil), idx.segments[start:end]...)
 }
 
 // RemoveBefore removes and returns all segments whose EndOffset is strictly
@@ -98,6 +138,7 @@ func (idx *Index) RemoveBefore(offset uint64) []SegmentRef {
 		}
 	}
 	idx.segments = keep
+	idx.rebuildOffsets()
 	return removed
 }
 
@@ -115,6 +156,7 @@ func (idx *Index) RemoveExpired(retention time.Duration) []SegmentRef {
 		}
 	}
 	idx.segments = keep
+	idx.rebuildOffsets()
 	return removed
 }
 
@@ -181,5 +223,13 @@ func (idx *Index) UnmarshalJSON(data []byte) error {
 	sort.Slice(idx.segments, func(i, j int) bool {
 		return idx.segments[i].BaseOffset < idx.segments[j].BaseOffset
 	})
+	idx.rebuildOffsets()
 	return nil
+}
+
+func (idx *Index) rebuildOffsets() {
+	idx.baseOffsets = make([]uint64, len(idx.segments))
+	for i, seg := range idx.segments {
+		idx.baseOffsets[i] = seg.BaseOffset
+	}
 }

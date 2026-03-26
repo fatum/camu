@@ -33,7 +33,7 @@ func (o *OffsetStore) CommitGroup(ctx context.Context, groupID, topic string, of
 // GetGroup reads offsets for a consumer group.
 func (o *OffsetStore) GetGroup(ctx context.Context, groupID, topic string) (map[int]uint64, error) {
 	key := fmt.Sprintf("_coordination/groups/%s/offsets.json", groupID)
-	return o.getOffsets(ctx, key, topic)
+	return o.getOffsets(ctx, key)
 }
 
 // CommitConsumer stores offsets for a standalone consumer.
@@ -46,12 +46,11 @@ func (o *OffsetStore) CommitConsumer(ctx context.Context, consumerID, topic stri
 // GetConsumer reads offsets for a standalone consumer.
 func (o *OffsetStore) GetConsumer(ctx context.Context, consumerID, topic string) (map[int]uint64, error) {
 	key := fmt.Sprintf("_coordination/consumers/%s/offsets.json", consumerID)
-	return o.getOffsets(ctx, key, topic)
+	return o.getOffsets(ctx, key)
 }
 
 func (o *OffsetStore) commitOffsets(ctx context.Context, key, topic string, offsets map[int]uint64) error {
-	// Read existing offsets so a partial commit doesn't clobber other partitions.
-	existing, err := o.getOffsets(ctx, key, topic)
+	existing, err := o.getOffsets(ctx, key)
 	if err != nil {
 		return fmt.Errorf("read existing offsets: %w", err)
 	}
@@ -74,7 +73,7 @@ func (o *OffsetStore) commitOffsets(ctx context.Context, key, topic string, offs
 	return o.s3Client.Put(ctx, key, raw, PutOpts{ContentType: "application/json"})
 }
 
-func (o *OffsetStore) getOffsets(ctx context.Context, key, topic string) (map[int]uint64, error) {
+func (o *OffsetStore) getOffsets(ctx context.Context, key string) (map[int]uint64, error) {
 	raw, err := o.s3Client.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {

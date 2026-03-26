@@ -29,8 +29,8 @@ type DiskCache struct {
 
 	mu      sync.Mutex
 	current int64
-	order   *list.List                    // front = most recently accessed
-	index   map[string]*list.Element      // key -> *list.Element (value = *cacheEntry)
+	order   *list.List               // front = most recently accessed
+	index   map[string]*list.Element // key -> *list.Element (value = *cacheEntry)
 }
 
 // NewDiskCache creates a DiskCache rooted at dir with the given byte limit.

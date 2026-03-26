@@ -8,12 +8,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -253,6 +257,20 @@ func TestGetRoutingMap_FallsBackToLeaderHostWhenRegistryMissing(t *testing.T) {
 	if got := routing.Partitions["1"].Address; got != "http://n4:8080" {
 		t.Fatalf("partition 1 address = %q, want %q", got, "http://n4:8080")
 	}
+	if got := routing.Partitions["0"].Replicas; !reflect.DeepEqual(got, []routingReplicaInfo{
+		{InstanceID: "n1", Address: "http://n1:8080"},
+		{InstanceID: "n2", Address: "http://n2:8080"},
+		{InstanceID: "n3", Address: "http://n3:8080"},
+	}) {
+		t.Fatalf("partition 0 replicas = %#v", got)
+	}
+	if got := routing.Partitions["1"].Replicas; !reflect.DeepEqual(got, []routingReplicaInfo{
+		{InstanceID: "n2", Address: "http://n2:8080"},
+		{InstanceID: "n3", Address: "http://n3:8080"},
+		{InstanceID: "n4", Address: "http://n4:8080"},
+	}) {
+		t.Fatalf("partition 1 replicas = %#v", got)
+	}
 }
 
 func TestHandleRouting_DoesNotFillMissingPartitionsWithSelf(t *testing.T) {
@@ -289,6 +307,392 @@ func TestHandleRouting_DoesNotFillMissingPartitionsWithSelf(t *testing.T) {
 	}
 	if len(resp.Partitions) != 0 {
 		t.Fatalf("partitions = %#v, want empty", resp.Partitions)
+	}
+}
+
+func TestHandleConsumeLowLevel_ReturnsCommittedWALSuffixForOwnedPartition(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 2,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	s.initPartitionAsLeader(context.Background(), "topic", 0, coordination.PartitionAssignment{
+		Replicas:    []string{"n1", "n2", "n3"},
+		Leader:      "n1",
+		LeaderEpoch: 1,
+	})
+	s.assignmentsMu.Lock()
+	s.myPartitions["topic"] = map[int]localPartitionAssignment{
+		0: {Owned: true, LeaderEpoch: 1},
+	}
+	s.assignmentsMu.Unlock()
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+	if err := ps.wal.AppendBatch([]log.Message{
+		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
+		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
+	}); err != nil {
+		t.Fatalf("wal.AppendBatch() error = %v", err)
+	}
+	ps.nextOffset = 3
+	ps.replicaState = replication.NewReplicaState("n1", 3, 2, 1000)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/topics/topic/partitions/0/messages?offset=0&limit=10", nil)
+	req.SetPathValue("topic", "topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+
+	s.handleConsumeLowLevel(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-High-Watermark"); got != "3" {
+		t.Fatalf("X-High-Watermark = %q, want %q", got, "3")
+	}
+
+	var resp consumeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3", len(resp.Messages))
+	}
+	if resp.NextOffset != 3 {
+		t.Fatalf("next_offset = %d, want 3", resp.NextOffset)
+	}
+	for i, msg := range resp.Messages {
+		if msg.Offset != uint64(i) {
+			t.Fatalf("message[%d].offset = %d, want %d", i, msg.Offset, i)
+		}
+		if msg.Key != "k"+strconv.Itoa(i) {
+			t.Fatalf("message[%d].key = %q, want %q", i, msg.Key, "k"+strconv.Itoa(i))
+		}
+		if msg.Value != "v"+strconv.Itoa(i) {
+			t.Fatalf("message[%d].value = %q, want %q", i, msg.Value, "v"+strconv.Itoa(i))
+		}
+	}
+}
+
+func TestHandleConsumeLowLevel_MergesOverlappingSegmentAndWALData(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 2,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	s.initPartitionAsLeader(context.Background(), "topic", 0, coordination.PartitionAssignment{
+		Replicas:    []string{"n1", "n2", "n3"},
+		Leader:      "n1",
+		LeaderEpoch: 1,
+	})
+	s.assignmentsMu.Lock()
+	s.myPartitions["topic"] = map[int]localPartitionAssignment{
+		0: {Owned: true, LeaderEpoch: 1},
+	}
+	s.assignmentsMu.Unlock()
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	segmentMsgs := make([]log.Message, 20)
+	for i := range segmentMsgs {
+		segmentMsgs[i] = log.Message{
+			Offset: uint64(i),
+			Key:    []byte("seg-k" + strconv.Itoa(i)),
+			Value:  []byte("seg-v" + strconv.Itoa(i)),
+		}
+	}
+	var segBuf bytes.Buffer
+	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
+		t.Fatalf("WriteSegment() error = %v", err)
+	}
+	segKey := "topic/0/0-1.segment"
+	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
+		t.Fatalf("diskCache.Put() error = %v", err)
+	}
+	ps.index.Add(log.SegmentRef{
+		BaseOffset: 0,
+		EndOffset:  19,
+		Epoch:      1,
+		Key:        segKey,
+		CreatedAt:  time.Now(),
+	})
+
+	walMsgs := make([]log.Message, 18)
+	for i := range walMsgs {
+		offset := uint64(i + 9)
+		walMsgs[i] = log.Message{
+			Offset: offset,
+			Key:    []byte("wal-k" + strconv.Itoa(int(offset))),
+			Value:  []byte("wal-v" + strconv.Itoa(int(offset))),
+		}
+	}
+	if err := ps.wal.AppendBatch(walMsgs); err != nil {
+		t.Fatalf("wal.AppendBatch() error = %v", err)
+	}
+	ps.nextOffset = 27
+	ps.replicaState = replication.NewReplicaState("n1", 27, 2, 1000)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/topics/topic/partitions/0/messages?offset=0&limit=1000", nil)
+	req.SetPathValue("topic", "topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+
+	s.handleConsumeLowLevel(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp consumeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Messages) != 27 {
+		t.Fatalf("len(messages) = %d, want 27", len(resp.Messages))
+	}
+	if resp.NextOffset != 27 {
+		t.Fatalf("next_offset = %d, want 27", resp.NextOffset)
+	}
+	for i, msg := range resp.Messages {
+		if msg.Offset != uint64(i) {
+			t.Fatalf("message[%d].offset = %d, want %d", i, msg.Offset, i)
+		}
+	}
+	if resp.Messages[9].Key != "wal-k9" {
+		t.Fatalf("message[9].key = %q, want %q", resp.Messages[9].Key, "wal-k9")
+	}
+	if resp.Messages[26].Key != "wal-k26" {
+		t.Fatalf("message[26].key = %q, want %q", resp.Messages[26].Key, "wal-k26")
+	}
+}
+
+func TestHandleConsumeLowLevel_MergesWALBeforeApplyingLimit(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 2,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	s.initPartitionAsLeader(context.Background(), "topic", 0, coordination.PartitionAssignment{
+		Replicas:    []string{"n1", "n2", "n3"},
+		Leader:      "n1",
+		LeaderEpoch: 1,
+	})
+	s.assignmentsMu.Lock()
+	s.myPartitions["topic"] = map[int]localPartitionAssignment{
+		0: {Owned: true, LeaderEpoch: 1},
+	}
+	s.assignmentsMu.Unlock()
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	segmentMsgs := make([]log.Message, 10)
+	for i := range segmentMsgs {
+		segmentMsgs[i] = log.Message{
+			Offset: uint64(i),
+			Key:    []byte("seg-k" + strconv.Itoa(i)),
+			Value:  []byte("seg-v" + strconv.Itoa(i)),
+		}
+	}
+	var segBuf bytes.Buffer
+	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
+		t.Fatalf("WriteSegment() error = %v", err)
+	}
+	segKey := "topic/0/0-1.segment"
+	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
+		t.Fatalf("diskCache.Put() error = %v", err)
+	}
+	ps.index.Add(log.SegmentRef{
+		BaseOffset: 0,
+		EndOffset:  9,
+		Epoch:      1,
+		Key:        segKey,
+		CreatedAt:  time.Now(),
+	})
+
+	walMsgs := make([]log.Message, 10)
+	for i := range walMsgs {
+		offset := uint64(i)
+		walMsgs[i] = log.Message{
+			Offset: offset,
+			Key:    []byte("wal-k" + strconv.Itoa(i)),
+			Value:  []byte("wal-v" + strconv.Itoa(i)),
+		}
+	}
+	if err := ps.wal.AppendBatch(walMsgs); err != nil {
+		t.Fatalf("wal.AppendBatch() error = %v", err)
+	}
+	ps.nextOffset = 10
+	ps.replicaState = replication.NewReplicaState("n1", 10, 2, 1000)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/topics/topic/partitions/0/messages?offset=0&limit=10", nil)
+	req.SetPathValue("topic", "topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+
+	s.handleConsumeLowLevel(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp consumeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Messages) != 10 {
+		t.Fatalf("len(messages) = %d, want 10", len(resp.Messages))
+	}
+	for i, msg := range resp.Messages {
+		if msg.Offset != uint64(i) {
+			t.Fatalf("message[%d].offset = %d, want %d", i, msg.Offset, i)
+		}
+		if msg.Key != "wal-k"+strconv.Itoa(i) {
+			t.Fatalf("message[%d].key = %q, want %q", i, msg.Key, "wal-k"+strconv.Itoa(i))
+		}
+	}
+}
+
+func TestHandleConsumeLowLevel_ReturnsReadableFollowerWALSuffix(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 2,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	s.assignmentsMu.Lock()
+	s.myPartitions["topic"] = map[int]localPartitionAssignment{}
+	s.assignmentsMu.Unlock()
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	segmentMsgs := make([]log.Message, 17)
+	for i := range segmentMsgs {
+		segmentMsgs[i] = log.Message{
+			Offset: uint64(i),
+			Key:    []byte("seg-k" + strconv.Itoa(i)),
+			Value:  []byte("seg-v" + strconv.Itoa(i)),
+		}
+	}
+	var segBuf bytes.Buffer
+	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
+		t.Fatalf("WriteSegment() error = %v", err)
+	}
+	segKey := "topic/0/0-1.segment"
+	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
+		t.Fatalf("diskCache.Put() error = %v", err)
+	}
+	ps.index.Add(log.SegmentRef{
+		BaseOffset: 0,
+		EndOffset:  16,
+		Epoch:      1,
+		Key:        segKey,
+		CreatedAt:  time.Now(),
+	})
+
+	walMsgs := make([]log.Message, 5)
+	for i := range walMsgs {
+		offset := uint64(i + 17)
+		walMsgs[i] = log.Message{
+			Offset: offset,
+			Key:    []byte("wal-k" + strconv.Itoa(int(offset))),
+			Value:  []byte("wal-v" + strconv.Itoa(int(offset))),
+		}
+	}
+	if err := ps.wal.AppendBatch(walMsgs); err != nil {
+		t.Fatalf("wal.AppendBatch() error = %v", err)
+	}
+	ps.nextOffset = 22
+	ps.followerHW = 22
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/topics/topic/partitions/0/messages?offset=0&limit=1000", nil)
+	req.SetPathValue("topic", "topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+
+	s.handleConsumeLowLevel(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-High-Watermark"); got != "22" {
+		t.Fatalf("X-High-Watermark = %q, want %q", got, "22")
+	}
+
+	var resp consumeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Messages) != 22 {
+		t.Fatalf("len(messages) = %d, want 22", len(resp.Messages))
+	}
+	if resp.NextOffset != 22 {
+		t.Fatalf("next_offset = %d, want 22", resp.NextOffset)
+	}
+	if resp.Messages[17].Key != "wal-k17" {
+		t.Fatalf("message[17].key = %q, want %q", resp.Messages[17].Key, "wal-k17")
+	}
+	if resp.Messages[21].Key != "wal-k21" {
+		t.Fatalf("message[21].key = %q, want %q", resp.Messages[21].Key, "wal-k21")
 	}
 }
 
@@ -390,8 +794,8 @@ func TestGCStaleISR(t *testing.T) {
 	for _, key := range []string{
 		"_coordination/isr/mytopic/0.json",
 		"_coordination/isr/mytopic/1.json",
-		"_coordination/isr/mytopic/5.json",        // partition beyond count
-		"_coordination/isr/deleted-topic/0.json",   // topic doesn't exist
+		"_coordination/isr/mytopic/5.json",       // partition beyond count
+		"_coordination/isr/deleted-topic/0.json", // topic doesn't exist
 	} {
 		if err := s.s3Client.Put(ctx, key, []byte(`{}`), storage.PutOpts{}); err != nil {
 			t.Fatalf("Put %s: %v", key, err)

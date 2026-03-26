@@ -37,9 +37,11 @@ func (gc *GarbageCollector) FindOrphans(ctx context.Context, topic string, parti
 	}
 
 	// Build set of indexed keys
-	indexed := make(map[string]struct{}, len(idx.segments))
+	indexed := make(map[string]struct{}, len(idx.segments)*3)
 	for _, r := range idx.segments {
 		indexed[r.Key] = struct{}{}
+		indexed[r.OffsetIndexObjectKey()] = struct{}{}
+		indexed[r.MetaObjectKey()] = struct{}{}
 	}
 
 	// List all objects under the prefix
@@ -50,7 +52,9 @@ func (gc *GarbageCollector) FindOrphans(ctx context.Context, topic string, parti
 
 	var orphans []string
 	for _, key := range allKeys {
-		if !strings.HasSuffix(key, ".segment") {
+		if !strings.HasSuffix(key, ".segment") &&
+			!strings.HasSuffix(key, ".offset.idx") &&
+			!strings.HasSuffix(key, ".meta.json") {
 			continue
 		}
 		if _, ok := indexed[key]; !ok {
