@@ -22,16 +22,17 @@ digraph architecture {
         subgraph cluster_produce1 {
             label="" style="invis"
             router1 [label="Router\nkey → partition"]
-            batcher1 [label="Batcher\n8MB | 5s"]
+            batcher1 [label="Batcher\nsegments.max_size |\nsegments.max_age"]
         }
 
         subgraph cluster_consume1 {
             label="" style="invis"
-            fetcher1 [label="Fetcher\npoll + SSE"]
+            fetcher1 [label="Fetcher\nplan + parallel fetch\npoll + SSE"]
         }
 
-        wal1 [label="WAL\n(local disk)\nfsync per write" fillcolor="#FFF9C4" color="#FFC107"]
+        wal1 [label="Chunked WAL\nactive + sealed +\nflushed-retained\nfsync per write" fillcolor="#FFF9C4" color="#FFC107"]
         cache1 [label="Disk Cache\nLRU 10GB" fillcolor="#E8F5E9" color="#4CAF50"]
+        index1 [label="Index\ncached base offsets\nsegment plans" fillcolor="#E1F5FE" color="#0288D1"]
         coord1 [label="Coordinator\nlease renewal\nassignment apply" fillcolor="#F3E5F5" color="#9C27B0"]
     }
 
@@ -40,7 +41,7 @@ digraph architecture {
         node [fillcolor="#C8E6C9" color="#2E7D32"]
 
         http2 [label="HTTP Server"]
-        wal2 [label="WAL"]
+        wal2 [label="Chunked WAL\nretained for catch-up"]
         cache2 [label="Disk Cache"]
         coord2 [label="Coordinator"]
         repl2 [label="Follower Fetcher\nlong-poll leader" fillcolor="#F3E5F5" color="#9C27B0"]
@@ -51,7 +52,7 @@ digraph architecture {
         node [fillcolor="#FFE0B2" color="#E65100"]
 
         http3 [label="HTTP Server"]
-        wal3 [label="WAL"]
+        wal3 [label="Chunked WAL\nretained for catch-up"]
         cache3 [label="Disk Cache"]
         coord3 [label="Coordinator"]
         repl3 [label="Follower Fetcher"]
@@ -79,15 +80,17 @@ digraph architecture {
     batcher1 -> segments [label="upload"]
     batcher1 -> indexes [label="CAS update"]
     http1 -> fetcher1 [label="consume"]
-    fetcher1 -> cache1
+    fetcher1 -> index1
+    index1 -> cache1
     cache1 -> segments [label="miss" style=dashed]
+    wal1 -> fetcher1 [label="readable suffix +\nretained hot window\nmerge overlay" style=dashed color="#FFC107"]
     coord1 -> coordination [label="heartbeat\nlease renew" style=dashed]
 
     // Replication
     repl2 -> http1 [label="/internal/replicate\nfetch from leader" color="#9C27B0"]
     repl3 -> http1 [label="/internal/replicate" color="#9C27B0"]
-    repl2 -> wal2 [label="append"]
-    repl3 -> wal3 [label="append"]
+    repl2 -> wal2 [label="append +\ncatch-up reads"]
+    repl3 -> wal3 [label="append +\ncatch-up reads"]
 
     // Instance coordination
     coord2 -> coordination [style=dashed]

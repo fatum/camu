@@ -16,12 +16,14 @@ import (
 type PartitionManager interface {
 	AppendReplicatedBatch(ctx context.Context, topic string, pid int, msgs []log.Message) error
 	TruncateWAL(topic string, pid int, beforeOffset uint64) error
+	UpdateFollowerProgress(topic string, pid int, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
 	Messages      []log.Message
 	TruncateTo    uint64
+	HasTruncate   bool
 	HighWatermark uint64
 	LeaderEpoch   uint64
 	FlushedOffset uint64
@@ -110,12 +112,16 @@ func (f *FollowerFetcher) Run(
 		consecutiveErrors = 0
 
 		// Handle divergence: truncate before appending anything.
-		if resp.TruncateTo > 0 {
+		if resp.HasTruncate {
 			if err := pm.TruncateWAL(topic, pid, resp.TruncateTo); err != nil {
 				slog.Warn("fetcher: TruncateWAL failed",
 					"topic", topic, "pid", pid, "truncateTo", resp.TruncateTo, "err", err)
 			}
 			localOffset = resp.TruncateTo
+			if resp.LeaderEpoch > localEpoch {
+				localEpoch = resp.LeaderEpoch
+			}
+			pm.UpdateFollowerProgress(topic, pid, resp.HighWatermark, resp.FlushedOffset)
 			continue
 		}
 
@@ -137,6 +143,10 @@ func (f *FollowerFetcher) Run(
 			}
 		}
 
+		if resp.LeaderEpoch > localEpoch {
+			localEpoch = resp.LeaderEpoch
+		}
+
 		// Prune below the leader's flushed offset.
 		if resp.FlushedOffset > 0 {
 			if err := pm.TruncateWAL(topic, pid, resp.FlushedOffset); err != nil {
@@ -144,6 +154,7 @@ func (f *FollowerFetcher) Run(
 					"topic", topic, "pid", pid, "flushedOffset", resp.FlushedOffset, "err", err)
 			}
 		}
+		pm.UpdateFollowerProgress(topic, pid, resp.HighWatermark, resp.FlushedOffset)
 	}
 }
 
@@ -191,6 +202,7 @@ func (f *FollowerFetcher) fetchFromLeader(
 		if err != nil {
 			return nil, fmt.Errorf("fetcher: parse X-Truncate-To: %w", err)
 		}
+		fr.HasTruncate = true
 	}
 	if v := httpResp.Header.Get("X-High-Watermark"); v != "" {
 		fr.HighWatermark, err = strconv.ParseUint(v, 10, 64)

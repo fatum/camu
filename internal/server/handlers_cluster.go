@@ -20,9 +20,15 @@ type routingResponse struct {
 	Partitions map[string]routingPartitionInfo `json:"partitions"`
 }
 
-type routingPartitionInfo struct {
+type routingReplicaInfo struct {
 	InstanceID string `json:"instance_id"`
 	Address    string `json:"address"`
+}
+
+type routingPartitionInfo struct {
+	InstanceID string               `json:"instance_id"`
+	Address    string               `json:"address"`
+	Replicas   []routingReplicaInfo `json:"replicas,omitempty"`
 }
 
 type readyResponse struct {

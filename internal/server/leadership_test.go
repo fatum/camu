@@ -175,14 +175,60 @@ func TestWALReplay_NextOffsetLowerThanWAL(t *testing.T) {
 }
 
 func TestReplicaState_NewReplicaStateWithHW(t *testing.T) {
-	rs := replication.NewReplicaState("n1", 5, 1)
+	rs := replication.NewReplicaState("n1", 5, 1, 1000)
 	if rs.HighWatermark() != 5 {
 		t.Fatalf("expected HW=5, got %d", rs.HighWatermark())
 	}
 }
 
+func TestInitPartitionAsLeader_PassesEpochHistoryToReplicaState(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 2,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+	ps.epochHistory = &replication.EpochHistory{
+		Entries: []replication.EpochEntry{
+			{Epoch: 1, StartOffset: 0},
+		},
+	}
+
+	s.initPartitionAsLeader(context.Background(), "topic", 0, coordination.PartitionAssignment{
+		Replicas:    []string{"n1", "n2", "n3"},
+		Leader:      "n1",
+		LeaderEpoch: 2,
+	})
+
+	if ps.replicaState == nil {
+		t.Fatal("expected replicaState")
+	}
+	truncateTo, diverged := ps.replicaState.CheckDivergence(1, 1)
+	if !diverged {
+		t.Fatal("expected divergence against older epoch history")
+	}
+	if truncateTo != 0 {
+		t.Fatalf("truncateTo = %d, want 0", truncateTo)
+	}
+}
+
 func TestReplicaState_HWAdvancesWithISRExpansion(t *testing.T) {
-	rs := replication.NewReplicaState("n1", 0, 2)
+	rs := replication.NewReplicaState("n1", 0, 2, 1000)
 
 	rs.SetLeaderOffset(10)
 
@@ -199,7 +245,7 @@ func TestReplicaState_HWAdvancesWithISRExpansion(t *testing.T) {
 }
 
 func TestReplicaState_HWWithMultipleFollowers(t *testing.T) {
-	rs := replication.NewReplicaState("n1", 0, 2)
+	rs := replication.NewReplicaState("n1", 0, 2, 1000)
 
 	rs.SetLeaderOffset(10)
 	rs.AddFollower("n2")
@@ -216,7 +262,7 @@ func TestReplicaState_HWWithMultipleFollowers(t *testing.T) {
 }
 
 func TestReplicaState_HWWithOneFollowerBehind(t *testing.T) {
-	rs := replication.NewReplicaState("n1", 0, 2)
+	rs := replication.NewReplicaState("n1", 0, 2, 1000)
 
 	rs.SetLeaderOffset(10)
 	rs.AddFollower("n2")
@@ -290,7 +336,7 @@ func TestLeadershipChange_PreservesHW(t *testing.T) {
 		t.Fatalf("expected WAL end=3, got %d", walEnd)
 	}
 
-	rs := replication.NewReplicaState("n1", walEnd, 1)
+	rs := replication.NewReplicaState("n1", walEnd, 1, 1000)
 	if rs.HighWatermark() != 3 {
 		t.Fatalf("expected new replicaState HW=3, got %d", rs.HighWatermark())
 	}

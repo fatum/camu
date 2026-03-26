@@ -41,6 +41,9 @@ func TestIndex_AddAndLookup(t *testing.T) {
 	if ok {
 		t.Error("expected offset 200 to not be found, but it was")
 	}
+	if got := idx.baseOffsets; len(got) != 2 || got[0] != 0 || got[1] != 100 {
+		t.Fatalf("baseOffsets = %v, want [0 100]", got)
+	}
 }
 
 func TestIndex_MarshalJSON(t *testing.T) {
@@ -98,6 +101,9 @@ func TestIndex_RemoveBefore(t *testing.T) {
 	}
 	if removed[0].Key != "seg-0" {
 		t.Errorf("expected removed key=seg-0, got %s", removed[0].Key)
+	}
+	if got := idx.baseOffsets; len(got) != 2 || got[0] != 100 || got[1] != 200 {
+		t.Fatalf("baseOffsets after RemoveBefore = %v, want [100 200]", got)
 	}
 
 	// Lookup offset 50 should now fail (seg-0 was removed)
@@ -254,6 +260,28 @@ func TestIndex_ObjectFormat(t *testing.T) {
 	}
 	if ref.Key != "seg-1" {
 		t.Errorf("expected Key=seg-1, got %s", ref.Key)
+	}
+	if got := idx2.baseOffsets; len(got) != 2 || got[0] != 0 || got[1] != 50 {
+		t.Fatalf("baseOffsets after round-trip = %v, want [0 50]", got)
+	}
+}
+
+func TestIndex_SegmentsFrom(t *testing.T) {
+	idx := NewIndex()
+	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 9, Key: "seg-0"})
+	idx.Add(SegmentRef{BaseOffset: 10, EndOffset: 19, Key: "seg-10"})
+	idx.Add(SegmentRef{BaseOffset: 20, EndOffset: 29, Key: "seg-20"})
+
+	segs := idx.SegmentsFrom(12, 2)
+	if len(segs) != 2 {
+		t.Fatalf("len(SegmentsFrom) = %d, want 2", len(segs))
+	}
+	if segs[0].Key != "seg-10" || segs[1].Key != "seg-20" {
+		t.Fatalf("SegmentsFrom returned keys %q, %q", segs[0].Key, segs[1].Key)
+	}
+
+	if segs := idx.SegmentsFrom(30, 0); segs != nil {
+		t.Fatalf("SegmentsFrom(30) = %v, want nil", segs)
 	}
 }
 

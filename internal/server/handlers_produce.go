@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/producer"
@@ -122,7 +121,12 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		}
 
 		ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-		topicCfg, _ := s.topicStore.Get(r.Context(), topicName)
+		topicCfg, err := s.topicStore.Get(r.Context(), topicName)
+		if err != nil {
+			slog.Error("produce_failed_get_topic", "topic", topicName, "error", err)
+			writeError(w, http.StatusInternalServerError, "topic lookup failed")
+			return
+		}
 
 		// For replicated topics, reject writes if replicaState not yet initialized.
 		// Don't check min_insync_replicas here — the purgatory will wait until
@@ -163,7 +167,7 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
 				"isr_size", ps.replicaState.ISRSize())
 
-			if err := ps.replicaState.Purgatory().Wait(lastOffset, 30*time.Second); err != nil {
+			if err := ps.replicaState.Purgatory().Wait(r.Context(), lastOffset, s.replicationTimeout); err != nil {
 				if errors.Is(err, replication.ErrReplicationTimeout) {
 					slog.Warn("produce_replication_timeout",
 						"topic", topicName, "partition", partitionID,
@@ -301,10 +305,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	if ps != nil && ps.replicaState != nil {
 		lastOffset := assignedOffsets[len(assignedOffsets)-1]
-		ps.replicaState.SetLeaderOffset(lastOffset + 1)
-		ps.replicaState.NotifyNewData()
-
-		if err := ps.replicaState.Purgatory().Wait(lastOffset, 30*time.Second); err != nil {
+		if err := ps.replicaState.Purgatory().Wait(r.Context(), lastOffset, s.replicationTimeout); err != nil {
 			if errors.Is(err, replication.ErrReplicationTimeout) {
 				writeError(w, 408, "replication timeout")
 				return

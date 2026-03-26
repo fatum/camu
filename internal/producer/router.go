@@ -7,8 +7,8 @@ import (
 
 // Router routes messages to partitions based on key hashing or round-robin.
 type Router struct {
-	numPartitions      int
-	roundRobinCounter  atomic.Uint64
+	numPartitions     int
+	roundRobinCounter atomic.Uint64
 }
 
 // NewRouter creates a new Router for the given number of partitions.

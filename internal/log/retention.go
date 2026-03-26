@@ -109,6 +109,18 @@ func (rc *RetentionCleaner) cleanPartition(ctx context.Context, p PartitionInfo)
 				"err", err,
 			)
 		}
+		if err := rc.s3Client.Delete(ctx, ref.OffsetIndexObjectKey()); err != nil {
+			slog.Error("failed to delete expired segment offset index",
+				"key", ref.OffsetIndexObjectKey(),
+				"err", err,
+			)
+		}
+		if err := rc.s3Client.Delete(ctx, ref.MetaObjectKey()); err != nil {
+			slog.Error("failed to delete expired segment metadata",
+				"key", ref.MetaObjectKey(),
+				"err", err,
+			)
+		}
 	}
 
 	slog.Info("retention cleanup removed segments",

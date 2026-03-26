@@ -1,12 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/maksim/camu/internal/consumer"
+	logstore "github.com/maksim/camu/internal/log"
 )
 
 type consumeResponse struct {
@@ -54,12 +56,24 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Cap reads at the high watermark for replicated partitions.
+	// Cap reads at the readable high watermark for replicated partitions.
 	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-	if ps != nil && ps.replicaState != nil {
-		hw := ps.replicaState.HighWatermark()
+	owned := s.isOwnedPartition(topicName, partitionID)
+	var readableHW uint64
+	var hasReadableHW bool
+	if hw, ok := readableHighWatermark(ps); ok {
+		readableHW = hw
+		hasReadableHW = true
 		w.Header().Set("X-High-Watermark", strconv.FormatUint(hw, 10))
 		if startOffset >= hw {
+			slog.Debug("consume_short_circuit_at_hw",
+				"topic", topicName,
+				"partition", partitionID,
+				"offset", startOffset,
+				"limit", limit,
+				"owned", owned,
+				"high_watermark", hw,
+			)
 			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
 			return
 		}
@@ -71,7 +85,13 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	// Refresh index from S3 for non-owned partitions so we see the latest
 	// segments flushed by the current owner.
-	if !s.isOwnedPartition(topicName, partitionID) {
+	if !owned {
+		slog.Debug("consume_refresh_index",
+			"topic", topicName,
+			"partition", partitionID,
+			"offset", startOffset,
+			"limit", limit,
+		)
 		s.partitionManager.RefreshIndex(r.Context(), topicName, partitionID)
 	}
 
@@ -81,13 +101,33 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Call fetcher (disk cache -> S3).
-	msgs, nextOffset, err := s.fetcher.Fetch(r.Context(), index, topicName, partitionID, startOffset, limit)
+	slog.Debug("consume_begin",
+		"topic", topicName,
+		"partition", partitionID,
+		"offset", startOffset,
+		"limit", limit,
+		"owned", owned,
+		"has_readable_hw", hasReadableHW,
+		"high_watermark", readableHW,
+	)
+
+	msgs, nextOffset, err := s.readMessages(r.Context(), topicName, partitionID, startOffset, limit, index, ps)
 	if err != nil {
 		slog.Error("consume_failed", "topic", topicName, "partition", partitionID, "offset", startOffset, "error", err)
 		writeError(w, http.StatusInternalServerError, "fetch failed: "+err.Error())
 		return
 	}
+
+	slog.Debug("consume_complete",
+		"topic", topicName,
+		"partition", partitionID,
+		"offset", startOffset,
+		"limit", limit,
+		"returned_messages", len(msgs),
+		"next_offset", nextOffset,
+		"owned", owned,
+		"high_watermark", readableHW,
+	)
 
 	// Build response.
 	resp := consumeResponse{
@@ -106,6 +146,134 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) readMessages(ctx context.Context, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) ([]logstore.Message, uint64, error) {
+	msgs, nextOffset, err := s.fetcher.Fetch(ctx, index, topicName, partitionID, startOffset, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	slog.Debug("consume_segment_fetch_complete",
+		"topic", topicName,
+		"partition", partitionID,
+		"offset", startOffset,
+		"limit", limit,
+		"segment_messages", len(msgs),
+		"segment_first_offset", firstMessageOffset(msgs),
+		"segment_last_offset", lastMessageOffset(msgs),
+		"segment_next_offset", nextOffset,
+	)
+
+	// Partitions can have a readable suffix that is still only present in the
+	// local WAL. Merge segment-backed data with local WAL by offset rather than
+	// assuming they are disjoint: after failover, the refreshed index can
+	// overlap a stale or partially flushed WAL window.
+	hw, ok := readableHighWatermark(ps)
+	if ps == nil || !ok {
+		return msgs, nextOffset, nil
+	}
+
+	walMsgs, err := ps.wal.ReadFrom(startOffset, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	rawWALCount := len(walMsgs)
+
+	filteredWAL := walMsgs[:0]
+	for _, msg := range walMsgs {
+		if msg.Offset >= startOffset && msg.Offset < hw {
+			filteredWAL = append(filteredWAL, msg)
+		}
+	}
+	walMsgs = filteredWAL
+	slog.Debug("consume_wal_overlay",
+		"topic", topicName,
+		"partition", partitionID,
+		"offset", startOffset,
+		"limit", limit,
+		"raw_wal_messages", rawWALCount,
+		"filtered_wal_messages", len(walMsgs),
+		"wal_first_offset", firstMessageOffset(walMsgs),
+		"wal_last_offset", lastMessageOffset(walMsgs),
+		"high_watermark", hw,
+	)
+
+	merged, nextOffset := mergeMessagesByOffset(startOffset, limit, msgs, walMsgs)
+	slog.Debug("consume_merge_complete",
+		"topic", topicName,
+		"partition", partitionID,
+		"offset", startOffset,
+		"limit", limit,
+		"segment_messages", len(msgs),
+		"wal_messages", len(walMsgs),
+		"merged_messages", len(merged),
+		"merged_first_offset", firstMessageOffset(merged),
+		"merged_last_offset", lastMessageOffset(merged),
+		"next_offset", nextOffset,
+	)
+	return merged, nextOffset, nil
+}
+
+func readableHighWatermark(ps *partitionState) (uint64, bool) {
+	if ps == nil {
+		return 0, false
+	}
+	if ps.replicaState != nil {
+		return ps.replicaState.HighWatermark(), true
+	}
+	if ps.followerHW > 0 {
+		return ps.followerHW, true
+	}
+	return 0, false
+}
+
+func mergeMessagesByOffset(startOffset uint64, limit int, segmentMsgs, walMsgs []logstore.Message) ([]logstore.Message, uint64) {
+	if limit <= 0 {
+		return nil, startOffset
+	}
+
+	merged := make([]logstore.Message, 0, limit)
+	i, j := 0, 0
+	for len(merged) < limit && (i < len(segmentMsgs) || j < len(walMsgs)) {
+		switch {
+		case i >= len(segmentMsgs):
+			merged = append(merged, walMsgs[j])
+			j++
+		case j >= len(walMsgs):
+			merged = append(merged, segmentMsgs[i])
+			i++
+		case walMsgs[j].Offset == segmentMsgs[i].Offset:
+			merged = append(merged, walMsgs[j])
+			i++
+			j++
+		case walMsgs[j].Offset < segmentMsgs[i].Offset:
+			merged = append(merged, walMsgs[j])
+			j++
+		default:
+			merged = append(merged, segmentMsgs[i])
+			i++
+		}
+	}
+
+	nextOffset := startOffset
+	if len(merged) > 0 {
+		nextOffset = merged[len(merged)-1].Offset + 1
+	}
+	return merged, nextOffset
+}
+
+func firstMessageOffset(msgs []logstore.Message) any {
+	if len(msgs) == 0 {
+		return nil
+	}
+	return msgs[0].Offset
+}
+
+func lastMessageOffset(msgs []logstore.Message) any {
+	if len(msgs) == 0 {
+		return nil
+	}
+	return msgs[len(msgs)-1].Offset
 }
 
 func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {

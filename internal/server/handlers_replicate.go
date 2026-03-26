@@ -11,11 +11,27 @@ import (
 
 func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
-	pid, _ := strconv.Atoi(r.PathValue("pid"))
-	fromOffset, _ := strconv.ParseUint(r.URL.Query().Get("from_offset"), 10, 64)
+	pid, err := strconv.Atoi(r.PathValue("pid"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid partition id")
+		return
+	}
+	fromOffset, err := strconv.ParseUint(r.URL.Query().Get("from_offset"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid from_offset")
+		return
+	}
 	replicaID := r.Header.Get("X-Replica-ID")
-	replicaOffset, _ := strconv.ParseUint(r.Header.Get("X-Replica-Offset"), 10, 64)
-	replicaEpoch, _ := strconv.ParseUint(r.Header.Get("X-Replica-Epoch"), 10, 64)
+	replicaOffset, err := strconv.ParseUint(r.Header.Get("X-Replica-Offset"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid X-Replica-Offset")
+		return
+	}
+	replicaEpoch, err := strconv.ParseUint(r.Header.Get("X-Replica-Epoch"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid X-Replica-Epoch")
+		return
+	}
 
 	ps := s.partitionManager.GetPartitionState(topic, pid)
 	if ps == nil || ps.replicaState == nil {
@@ -33,6 +49,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 			"replica_epoch", replicaEpoch, "replica_offset", replicaOffset,
 			"truncate_to", truncateTo)
 		w.Header().Set("X-Truncate-To", strconv.FormatUint(truncateTo, 10))
+		w.Header().Set("X-Leader-Epoch", strconv.FormatUint(ps.epoch, 10))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -81,8 +98,11 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	// Long-poll if still no data (waiting for new writes)
 	if len(msgs) == 0 {
 		if ps.replicaState.WaitForData(500 * time.Millisecond) {
-			msgs, _ = ps.wal.ReadFrom(fromOffset, 1000)
-			if len(msgs) > 0 {
+			msgs, err = ps.wal.ReadFrom(fromOffset, 1000)
+			if err != nil {
+				slog.Error("replica_fetch: WAL read after wait failed",
+					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
+			} else if len(msgs) > 0 {
 				slog.Info("replica_fetch: served from WAL after long-poll",
 					"topic", topic, "pid", pid, "replica", replicaID,
 					"msg_count", len(msgs))
@@ -101,5 +121,9 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Flushed-Offset", strconv.FormatUint(ps.flushedOffset, 10))
 
 	// Write binary frames
-	replication.WriteMessageFrames(w, msgs)
+	if err := replication.WriteMessageFrames(w, msgs); err != nil {
+		slog.Error("replica_fetch: WriteMessageFrames failed",
+			"topic", topic, "pid", pid, "replica", replicaID,
+			"msg_count", len(msgs), "error", err)
+	}
 }

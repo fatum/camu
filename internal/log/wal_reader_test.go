@@ -7,7 +7,7 @@ import (
 
 func TestWAL_ReadFrom(t *testing.T) {
 	dir := t.TempDir()
-	w, err := OpenWAL(filepath.Join(dir, "test.wal"), true)
+	w, err := OpenWAL(filepath.Join(dir, "test.wal"), true, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestWAL_ReadFrom(t *testing.T) {
 
 func TestWAL_ReadFrom_WithLimit(t *testing.T) {
 	dir := t.TempDir()
-	w, _ := OpenWAL(filepath.Join(dir, "test.wal"), true)
+	w, _ := OpenWAL(filepath.Join(dir, "test.wal"), true, 1<<20)
 	defer w.Close()
 	w.AppendBatch([]Message{
 		{Offset: 10}, {Offset: 11}, {Offset: 12}, {Offset: 13},
@@ -50,7 +50,7 @@ func TestWAL_ReadFrom_WithLimit(t *testing.T) {
 
 func TestWAL_ReadFrom_Empty(t *testing.T) {
 	dir := t.TempDir()
-	w, _ := OpenWAL(filepath.Join(dir, "test.wal"), true)
+	w, _ := OpenWAL(filepath.Join(dir, "test.wal"), true, 1<<20)
 	defer w.Close()
 	msgs, err := w.ReadFrom(0, 100)
 	if err != nil {

@@ -30,10 +30,11 @@
                          "wal:\n"
                          "  directory: \"" camu-data "/wal\"\n"
                          "  fsync: true\n"
+                         "  chunk_size: 67108864\n"
                          "\n"
                          "segments:\n"
-                         "  max_size: 1048576\n"
-                         "  max_age: \"50ms\"\n"
+                         "  max_size: 104857600\n"
+                         "  max_age: \"1m\"\n"
                          "  compression: \"none\"\n"
                          "\n"
                          "cache:\n"
@@ -42,6 +43,7 @@
                          "\n"
                          "coordination:\n"
                          "  lease_ttl: \"6s\"\n"
+                         "  instance_ttl: \"8s\"\n"
                          "  heartbeat_interval: \"2s\"\n"
                          "  rebalance_delay: \"2s\"\n")]
     (c/exec :mkdir :-p "/etc/camu")

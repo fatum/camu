@@ -75,6 +75,7 @@ func New(t testing.TB, opts ...Option) *Env {
 			WAL: config.WALConfig{
 				Directory: walDir,
 				Fsync:     false,
+				ChunkSize: 1 << 20,
 			},
 			Segments: config.SegmentsConfig{
 				MaxSize:     8388608,
@@ -188,6 +189,7 @@ func (e *Env) RestartInstance(idx int) {
 		WAL: config.WALConfig{
 			Directory: ic.walDir,
 			Fsync:     ic.cfg.WAL.Fsync,
+			ChunkSize: ic.cfg.WAL.ChunkSize,
 		},
 		Segments: ic.cfg.Segments,
 		Cache: config.CacheConfig{

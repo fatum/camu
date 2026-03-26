@@ -47,12 +47,33 @@
                             :socket-timeout    http-timeout-ms
                             :connect-timeout   http-timeout-ms
                             :throw-exceptions  false})]
-       (when (not (#{200 201 409} (:status resp)))
-         (warn "Create topic returned" (:status resp) "on" node)))
+       (if (#{200 201 409} (:status resp))
+         true
+         (do (warn "Create topic returned" (:status resp) "on" node)
+             false)))
      (catch ConnectException _
-       (warn "Could not connect to" node "to create topic"))
+       (warn "Could not connect to" node "to create topic")
+       false)
      (catch SocketTimeoutException _
-       (warn "Timeout creating topic on" node)))))
+       (warn "Timeout creating topic on" node)
+       false))))
+
+(defn ensure-topic-created!
+  "Retries topic creation across the cluster until one node accepts it."
+  [nodes topic opts timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [created? (some #(create-topic! % topic opts) (shuffle nodes))]
+        (cond
+          created?
+          (info "Topic" topic "created or already present")
+
+          (> (System/currentTimeMillis) deadline)
+          (warn "Timed out creating topic" topic)
+
+          :else
+          (do (Thread/sleep 1000)
+              (recur)))))))
 
 (defn produce!
   "Produces a message to the given topic. Returns {:partition N :offset M}
@@ -184,9 +205,37 @@
     (info "Leader candidates for" topic "partition" partition ":" candidates)
     candidates))
 
+(defn replica-candidates
+  "Resolves non-leader replica candidates for a partition. Multiple nodes may
+   briefly disagree during reassignment, so we try each distinct replica address
+   reported by routing in order."
+  [nodes topic partition]
+  (let [candidates (->> nodes
+                        shuffle
+                        (reduce (fn [acc node]
+                                  (if-let [entry (some-> (get-routing! node topic)
+                                                         (routing-partition partition))]
+                                    (let [leader-address (:address entry)
+                                          replicas       (or (:replicas entry) [])
+                                          addresses      (->> replicas
+                                                              (keep :address)
+                                                              (remove nil?)
+                                                              (remove #{leader-address}))]
+                                      (reduce (fn [inner address]
+                                                (if (some #{address} inner)
+                                                  inner
+                                                  (conj inner address)))
+                                              acc
+                                              addresses))
+                                    acc))
+                                []))]
+    (info "Replica candidates for" topic "partition" partition ":" candidates)
+    candidates))
+
 (defn read-candidates
   "Returns the node candidates to use for read-style operations.
    `:leader` resolves the current owner and reads only from that node.
+   `:replica` resolves known followers and reads only from them.
    `:any` preserves the previous best-effort replica read behavior."
   [test topic partition]
   (case (read-mode test)
@@ -195,6 +244,9 @@
 
     :leader
     (leader-candidates (:nodes test) topic partition)
+
+    :replica
+    (replica-candidates (:nodes test) topic partition)
 
     []))
 
@@ -276,8 +328,9 @@
   (setup! [this test]
     (let [topic (topic-name this test)]
       ;; Topic names are unique per test run, so setup can be idempotent.
-      (create-topic! (first (:nodes test)) topic
-                     (select-keys test [:replication-factor :min-insync-replicas]))
+      (ensure-topic-created! (:nodes test) topic
+                             (select-keys test [:replication-factor :min-insync-replicas])
+                             60000)
     ;; All clients wait until a produce actually succeeds — proves the full replication
     ;; pipeline is working end-to-end (topic, assignments, replicaState, followers).
       (wait-for-topic-ready! (:nodes test) topic 60000))
@@ -310,7 +363,7 @@
              deadline (+ (System/currentTimeMillis) (leader-read-deadline-ms :consume))
              result   (loop [nodes (read-candidates test topic partition)]
                         (if (empty? nodes)
-                          (if (and (= (read-mode test) :leader)
+                          (if (and (#{:leader :replica} (read-mode test))
                                    (< (System/currentTimeMillis) deadline))
                             (do (Thread/sleep 100)
                                 (recur (read-candidates test topic partition)))
@@ -333,7 +386,7 @@
                               (let [remaining (rest nodes)]
                                 (if (seq remaining)
                                   (recur remaining)
-                                  (if (and (= (read-mode test) :leader)
+                                  (if (and (#{:leader :replica} (read-mode test))
                                            (< (System/currentTimeMillis) deadline))
                                     (do (Thread/sleep 100)
                                         (recur (read-candidates test topic partition)))
@@ -355,7 +408,7 @@
              deadline (+ (System/currentTimeMillis) (leader-read-deadline-ms :drain))
              messages (loop [nodes (read-candidates test topic partition)]
                         (if (empty? nodes)
-                          (if (and (= (read-mode test) :leader)
+                          (if (and (#{:leader :replica} (read-mode test))
                                    (< (System/currentTimeMillis) deadline))
                             (do (Thread/sleep 100)
                                 (recur (read-candidates test topic partition)))
@@ -378,7 +431,7 @@
                               (let [remaining (rest nodes)]
                                 (if (seq remaining)
                                   (recur remaining)
-                                  (if (and (= (read-mode test) :leader)
+                                  (if (and (#{:leader :replica} (read-mode test))
                                            (< (System/currentTimeMillis) deadline))
                                     (do (Thread/sleep 100)
                                         (recur (read-candidates test topic partition)))

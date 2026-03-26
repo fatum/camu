@@ -4,8 +4,8 @@ Camu is a Kafka-like commit log that uses S3 as its sole persistent backend. A s
 
 ```
                           ┌─────────────────────────────┐
-                          │        HTTP Server           │
-                          │  /v1/topics/*/messages       │
+                          │        HTTP Server          │
+                          │  /v1/topics/*/messages      │
                           └──────────┬──────────────────┘
                                      │
                   ┌──────────────────┼──────────────────┐
@@ -17,11 +17,16 @@ Camu is a Kafka-like commit log that uses S3 as its sole persistent backend. A s
          │  Batcher    │    │   SSE Stream   │   │  Status    │
          └──────┬─────┘    └───────┬────────┘   └────────────┘
                 │                  │
-         ┌──────▼─────┐    ┌───────▼────────┐
-         │    WAL     │    │   Disk Cache   │
-         │  (local)   │    │   (LRU, local) │
+         ┌────────────▼────────────┐    ┌───────▼────────┐
+         │ Chunked WAL             │    │   Disk Cache   │
+         │ active + sealed +       │    │   (LRU, local) │
+         │ flushed-retained chunks │    │                │
          └──────┬─────┘    └───────┬────────┘
                 │                  │
+                │           ┌──────▼──────┐
+                │           │ Segment Index │
+                │           │ + Range Plan  │
+                │           └──────┬──────┘
                 └────────┬─────────┘
                          ▼
                 ┌────────────────┐
@@ -40,7 +45,7 @@ Camu is a Kafka-like commit log that uses S3 as its sole persistent backend. A s
 | **Partition** | Ordered, append-only log within a topic. Unit of parallelism and ownership. Identified by `{topic}/{partition_id}`. |
 | **Message** | Key (optional bytes), Value (bytes), Offset (uint64, server-assigned), Timestamp (unix nanos, server-assigned), Headers (map[string]string). |
 | **Segment** | Immutable batch of messages stored as a single S3 object. Binary format with optional compression. |
-| **Index** | Per-partition JSON file in S3 (`{topic}/{partition}/index.json`) mapping offset ranges to segment keys. |
+| **Index** | Per-partition JSON file in S3 (`{topic}/{partition}/index.json`) mapping offset ranges to segment keys. Each segment also has an `.offset.idx` sidecar for fast in-segment seeks and a `.meta.json` sidecar with record count and size. |
 | **Instance** | A running camu process. Owns a subset of partitions via S3-based leases. |
 
 ## S3 object layout
@@ -56,7 +61,9 @@ Camu is a Kafka-like commit log that uses S3 as its sole persistent backend. A s
 │   └── consumers/{consumerID}/offsets.json            # standalone consumer offsets
 └── {topic}/{partition}/
     ├── index.json                                     # sorted SegmentRef array
-    └── {baseOffset}-{epoch}.segment                   # immutable segment blob
+    ├── {baseOffset}-{epoch}.segment                   # immutable segment blob
+    ├── {baseOffset}-{epoch}.offset.idx                # sparse offset index sidecar
+    └── {baseOffset}-{epoch}.meta.json                 # segment metadata (count, size)
 ```
 
 ---
@@ -98,15 +105,21 @@ Under a partition-level lock, each message gets the next sequential offset and a
 
 ### 4. WAL append
 
-All messages in the batch are serialized into frames and written to the partition's WAL file with a single `fsync`. Each WAL entry is:
+All messages in the batch are serialized into framed WAL entries and appended to a partition-local chunked WAL with a single append critical section. The active chunk rotates when it reaches `wal.chunk_size` (default 64 MB). Each WAL entry is:
 
 ```
 [4B entry length (uint32 BE)] [message frame bytes] [4B CRC32-IEEE (uint32 BE)]
 ```
 
-The CRC protects against partial writes from crashes. On replay, an invalid CRC terminates the replay — all intact entries before it are recovered.
+The CRC protects against partial writes from crashes. On replay, an invalid CRC terminates the replay for that chunk — all intact entries before it are recovered.
 
 The HTTP response is sent after fsync completes. At this point the write is durable on local disk — equivalent to Kafka's `acks=1`.
+
+The WAL chunk lifecycle is:
+
+- **active chunk**: receives new appends.
+- **sealed chunks**: immutable chunks waiting to be flushed to S3.
+- **flushed-retained chunks**: already uploaded and indexed, but kept locally so replicas can still fetch them from the WAL hot path until they catch up.
 
 ### 5. Batcher
 
@@ -123,12 +136,14 @@ The batcher does **not** buffer messages in memory. It only tracks byte counts p
 When the batcher triggers a flush:
 
 1. **Verify ownership from S3** — re-reads the partition assignment to confirm this instance still owns the partition. If ownership changed, the partition is revoked locally and the flush is skipped.
-2. **Replay WAL** — reads all unflushed messages from the WAL file. The WAL is the single source of truth for unflushed data.
-3. **Serialize segment** — messages are serialized into the binary segment format and optionally compressed (snappy or zstd).
-4. **Upload segment to S3** — key: `{topic}/{partition}/{baseOffset}-{epoch}.segment`. The epoch embedded in the filename prevents stale writes after failover.
-5. **Write to disk cache** — the flushed segment is written to the local cache so the owning instance never needs to fetch its own segments back from S3.
-6. **Update index (CAS)** — the partition's `index.json` is read from S3 with its ETag, the new `SegmentRef` is appended, and a conditional PUT writes it back. If the ETag doesn't match (another instance modified the index concurrently), the operation retries up to 5 times with a fresh read.
-7. **Truncate WAL** — entries up to the flushed offset are removed.
+2. **Seal the active chunk** — a fresh active chunk is created for new appends while the sealed chunk joins the flush set.
+3. **Replay sealed WAL chunks** — reads sealed chunks that are not yet marked flushed. The WAL remains the source of truth for unflushed data.
+4. **Serialize segment** — messages are serialized into batch-framed format (see below) and optionally compressed per-batch (snappy or zstd).
+5. **Upload segment and sidecars to S3** — the segment blob (`{baseOffset}-{epoch}.segment`), a sparse offset index (`.offset.idx`), and segment metadata (`.meta.json`) are uploaded together. The epoch embedded in filenames prevents stale writes after failover.
+6. **Write to disk cache** — the flushed segment is written to the local cache so the owning instance never needs to fetch its own segments back from S3.
+7. **Update index (CAS)** — the partition's `index.json` is read from S3 with its ETag, the new `SegmentRef` (including `OffsetIndexKey` and `MetaKey` pointers) is appended, and a conditional PUT writes it back. If the ETag doesn't match (another instance modified the index concurrently), the operation retries up to 5 times with a fresh read.
+8. **Mark chunks flushed-retained** — sealed chunks below the flushed end are renamed into flushed-retained WAL chunks. They stay readable to followers, but are excluded from unflushed replay on restart.
+9. **Prune by follower progress** — old flushed-retained chunks are deleted only after all followers have moved past them.
 
 ### Segment binary format
 
@@ -136,21 +151,24 @@ When the batcher triggers a flush:
 [4B magic: 0x43414D55 ("CAMU")]
 [1B version: 0x01]
 [1B compression: 0=none, 1=snappy, 2=zstd]
-[compressed payload]:
-  repeated message frames:
-    [8B offset (uint64 BE)]
-    [8B timestamp (int64 BE)]
-    [4B key_len][key bytes]
-    [4B value_len][value bytes]
-    [4B header_count]
-      per header: [4B key_len][key bytes][4B val_len][val bytes]
+repeated batch frames:
+  [4B batch_len]
+  [4B message_count]
+  [batch payload (compressed independently if compression != 0)]:
+    repeated message frames:
+      [8B offset (uint64 BE)]
+      [8B timestamp (int64 BE)]
+      [4B key_len][key bytes]
+      [4B value_len][value bytes]
+      [4B header_count]
+        per header: [4B key_len][key bytes][4B val_len][val bytes]
 ```
 
 Compression is applied to the entire payload (all frames together), not per-message.
 
 ### Message frame in WAL vs segment
 
-The WAL and segment use the same message frame format. The WAL wraps each frame with a length prefix and CRC; segments concatenate frames directly and compress the batch.
+The WAL and segment use the same message frame format. The WAL wraps each frame with a length prefix and CRC inside chunk files; segments concatenate frames directly and compress the batch.
 
 ---
 
@@ -160,33 +178,37 @@ The WAL and segment use the same message frame format. The WAL wraps each frame 
 HTTP GET /v1/topics/{topic}/partitions/{id}/messages?offset=N&limit=100
   │
   ▼
-Non-owned partition? ──yes──► RefreshIndex from S3
+Cap by readable HW ──► Non-owned partition? ──yes──► RefreshIndex from S3
   │
   ▼
-Index.Lookup(offset)          ◄── binary search on SegmentRef.BaseOffset
+Index.SegmentsFrom(offset)    ◄── binary search on cached segment base offsets
   │
   ▼
-Disk cache hit? ──yes──► Parse segment, return messages
-  │ no
+Fetch up to 4 segment blobs in parallel (cache or S3)
+  │
   ▼
-S3 fetch ──► Write to disk cache ──► Parse segment, return messages
+Decode segments in offset order ──► owned/readable suffix? ──yes──► Read WAL chunks
+  │                                                        │
+  └────────────────────────────────────────────────────────┴──► Merge by offset, WAL wins on overlap
 ```
 
 ### 1. Index refresh
 
-Any instance can serve reads for any partition. For non-owned partitions, the handler fetches the latest `index.json` from S3 before looking up segments, so the reader sees segments flushed by the current owner. There is a visibility delay equal to the flush interval (default 5s) — unflushed messages in the owner's WAL are not visible to other instances.
+Any instance can serve reads for any partition. For non-owned partitions, the handler fetches the latest `index.json` from S3 before looking up segments, so the reader sees segments flushed by the current owner. Owned partitions, and followers with a leader-advertised readable high watermark, can also overlay a readable local WAL suffix on top of segment-backed data. Non-owned non-replica reads still only see flushed segment data.
 
 ### 2. Index lookup
 
-The index is a sorted array of `SegmentRef` entries. Lookup uses `sort.Search` (binary search) to find the segment whose `[BaseOffset, EndOffset]` range contains the requested offset. Time complexity: O(log N) where N is the number of segments.
+The index is a sorted array of `SegmentRef` entries. Lookup uses `sort.Search` (binary search) to find the segment whose `[BaseOffset, EndOffset]` range contains the requested offset. Time complexity: O(log N) where N is the number of segments. Once the segment is located, the per-segment `.offset.idx` sidecar (sparse Kafka-style index of `[4B relative_offset, 4B position]` entries) is fetched and cached to seek directly to the nearest batch boundary within the segment, avoiding a full scan.
 
 ```go
 type SegmentRef struct {
-    BaseOffset uint64
-    EndOffset  uint64
-    Epoch      uint64
-    Key        string    // S3 key
-    CreatedAt  time.Time
+    BaseOffset     uint64
+    EndOffset      uint64
+    Epoch          uint64
+    Key            string    // S3 segment key
+    OffsetIndexKey string    // S3 key for .offset.idx sidecar
+    MetaKey        string    // S3 key for .meta.json sidecar
+    CreatedAt      time.Time
 }
 ```
 
@@ -198,9 +220,9 @@ A flat-file LRU cache on local disk. Segment S3 keys are SHA256-hashed to produc
 - **Put:** Write file, push to front of LRU list. If total cache size exceeds `cache.max_size` (default 10 GB), evict entries from the back (least recently used) until under budget.
 - **No TTL-based expiration.** Segments are immutable once flushed, so cached copies never become stale. Only size-based LRU eviction.
 
-### 4. S3 fetch
+### 4. Segment fetch
 
-On a cache miss, the segment is downloaded from S3 and written to the disk cache before being parsed. If S3 returns an error but messages were already collected from earlier segments, a partial result is returned.
+The fetcher plans an ordered segment window from the in-memory index and fetches up to 4 segment blobs in parallel. Each blob is read from the disk cache when possible; on a cache miss it is downloaded from S3 and written back to the disk cache. If a later segment fetch fails after earlier segments already produced messages, a partial result is returned.
 
 ### 5. Segment parsing
 
@@ -208,7 +230,11 @@ The segment header is validated (magic number, version), the payload is decompre
 
 ### 6. Multi-segment reads
 
-If the requested range spans multiple segments, the fetcher loops: look up segment → fetch → parse → advance offset → repeat until `limit` is satisfied or no more segments exist.
+If the requested range spans multiple segments, the fetcher plans a bounded ordered segment batch, fetches the blobs in parallel, then parses them sequentially in offset order. That preserves deterministic ordering while reducing latency for cold multi-segment reads.
+
+### 7. WAL overlay and merge
+
+If the local partition state has a readable high watermark, the server reads matching messages from local WAL chunks starting at `startOffset`, filters them to `< highWatermark`, and merges them with the segment-backed messages by offset. WAL reads can span both unflushed chunks and flushed-retained chunks, so promoted leaders and followers can serve recent committed data without waiting for segment-only catch-up. On overlap, WAL messages win so promoted leaders and followers do not return stale segment copies over newer readable WAL data.
 
 ### Response format
 
@@ -457,6 +483,7 @@ storage:
 wal:
   directory: "/var/lib/camu/wal"
   fsync: true
+  chunk_size: 67108864
 
 segments:
   max_size: 8388608            # 8 MB — flush when partition buffer exceeds this
@@ -469,6 +496,7 @@ cache:
 
 coordination:
   lease_ttl: "30s"
+  instance_ttl: "90s"
   heartbeat_interval: "10s"
   rebalance_delay: "5s"
 ```

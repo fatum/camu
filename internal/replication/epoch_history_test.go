@@ -172,3 +172,19 @@ func TestEpochHistory_EmptyFile(t *testing.T) {
 		t.Fatalf("expected 0 entries, got %d", len(eh.Entries))
 	}
 }
+
+// TestEpochHistory_GapEpochDiverges verifies that a follower reporting an epoch
+// that falls between known epochs (but is not in the leader's history) diverges.
+func TestEpochHistory_GapEpochDiverges(t *testing.T) {
+	eh := &EpochHistory{}
+	eh.Append(EpochEntry{Epoch: 5, StartOffset: 100})
+	eh.Append(EpochEntry{Epoch: 7, StartOffset: 300})
+
+	truncateTo, diverged := eh.CheckDivergence(6, 200)
+	if !diverged {
+		t.Fatal("expected divergence for gap epoch, got none")
+	}
+	if truncateTo != 100 {
+		t.Fatalf("expected truncateTo=100 (earliest known), got %d", truncateTo)
+	}
+}

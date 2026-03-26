@@ -1,12 +1,14 @@
 package replication
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
 )
 
 var ErrReplicationTimeout = errors.New("replication timeout")
+var ErrPurgatoryClosed = errors.New("purgatory closed")
 
 // Purgatory holds pending produce requests waiting for the high watermark to
 // advance (i.e. ISR followers to acknowledge).
@@ -19,7 +21,6 @@ type Purgatory struct {
 type pendingWrite struct {
 	offset uint64
 	doneCh chan struct{}
-	timer  *time.Timer
 }
 
 // NewPurgatory creates an empty Purgatory.
@@ -28,25 +29,19 @@ func NewPurgatory() *Purgatory {
 }
 
 // Wait blocks until the high watermark advances past offset (Complete(hw) with
-// hw > offset) or until timeout elapses. Returns nil on success,
-// ErrReplicationTimeout on timeout.
-func (p *Purgatory) Wait(offset uint64, timeout time.Duration) error {
+// hw > offset), until timeout elapses, or until ctx is cancelled.
+// Returns nil on success, ErrReplicationTimeout on timeout, or ctx.Err() on
+// cancellation.
+func (p *Purgatory) Wait(ctx context.Context, offset uint64, timeout time.Duration) error {
 	pw := &pendingWrite{
 		offset: offset,
 		doneCh: make(chan struct{}),
 	}
 
-	pw.timer = time.AfterFunc(timeout, func() {
-		// Signal doneCh so the select below unblocks; the caller distinguishes
-		// timeout vs completion by whether doneCh was closed by Complete/Close.
-		// We use a separate timedOut flag via the timer itself — see below.
-	})
-
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		pw.timer.Stop()
-		return nil
+		return ErrPurgatoryClosed
 	}
 	p.pending = append(p.pending, pw)
 	p.mu.Unlock()
@@ -55,20 +50,27 @@ func (p *Purgatory) Wait(offset uint64, timeout time.Duration) error {
 
 	select {
 	case <-pw.doneCh:
-		pw.timer.Stop()
 		return nil
 	case <-timeoutCh:
-		// Remove from pending list to avoid a leak.
 		p.mu.Lock()
 		p.removeLocked(pw)
 		p.mu.Unlock()
-		pw.timer.Stop()
 		return ErrReplicationTimeout
+	case <-ctx.Done():
+		p.mu.Lock()
+		p.removeLocked(pw)
+		p.mu.Unlock()
+		return ctx.Err()
 	}
 }
 
 // Complete unblocks all pending writes whose offset is strictly less than hw.
 // HW is the next-to-commit offset, so hw=501 means offset 500 is committed.
+//
+// Safe to call multiple times: once a waiter is unblocked (channel closed), it's
+// removed from the pending list, so subsequent Complete calls won't try to close
+// it again. Additionally, waiters removed via timeout are also removed before
+// Complete can close them.
 func (p *Purgatory) Complete(hw uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

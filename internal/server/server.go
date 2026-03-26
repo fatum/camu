@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ type Server struct {
 
 	leaseTTL             time.Duration
 	leaseRenewalInterval time.Duration
+	replicationTimeout   time.Duration
 
 	// shuttingDown is set to 1 during shutdown; produce handlers check this
 	// and reject new writes with 503 before batcher/WAL are torn down.
@@ -109,11 +111,22 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parsing coordination.heartbeat_interval: %w", err)
 	}
+	instanceTTL, err := cfg.Coordination.InstanceTTLDuration()
+	if err != nil {
+		return nil, fmt.Errorf("parsing coordination.instance_ttl: %w", err)
+	}
+	replicationTimeout, err := cfg.Coordination.ReplicationTimeoutDuration()
+	if err != nil {
+		return nil, fmt.Errorf("parsing coordination.replication_timeout: %w", err)
+	}
 	if leaseTTL <= 0 {
 		return nil, fmt.Errorf("coordination.lease_ttl must be > 0")
 	}
 	if leaseRenewalInterval <= 0 {
 		return nil, fmt.Errorf("coordination.heartbeat_interval must be > 0")
+	}
+	if instanceTTL <= 0 {
+		return nil, fmt.Errorf("coordination.instance_ttl must be > 0")
 	}
 	if leaseRenewalInterval >= leaseTTL {
 		return nil, fmt.Errorf("coordination.heartbeat_interval (%s) must be less than coordination.lease_ttl (%s)", leaseRenewalInterval, leaseTTL)
@@ -139,6 +152,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		leaseStop:            make(chan struct{}),
 		leaseTTL:             leaseTTL,
 		leaseRenewalInterval: leaseRenewalInterval,
+		replicationTimeout:   replicationTimeout,
 	}
 	s.readAssignments = s.assignmentStore.Read
 
@@ -182,15 +196,21 @@ func (s *Server) StartOnPort(port int) error {
 // startWithListener completes server startup once a listener is available.
 func (s *Server) startWithListener(ln net.Listener) error {
 	s.listener = ln
-	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), s.leaseTTL*3)
-	s.registry.Register(context.Background())
+	instanceTTL, err := s.cfg.Coordination.InstanceTTLDuration()
+	if err != nil {
+		return fmt.Errorf("parsing coordination.instance_ttl: %w", err)
+	}
+	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), instanceTTL)
+	if err := s.registry.Register(context.Background()); err != nil {
+		return fmt.Errorf("register registry: %w", err)
+	}
 	if err := s.initExistingTopics(); err != nil {
 		return fmt.Errorf("init existing topics: %w", err)
 	}
 	s.initialCoordination()
 	s.ready.Store(true)
 	s.startLeaseRenewal()
-	go s.httpServer.Serve(ln)
+	go func() { _ = s.httpServer.Serve(ln) }()
 	return nil
 }
 
@@ -223,7 +243,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if httpErr != nil {
 		return httpErr
 	}
-	return pmErr
+	if pmErr != nil {
+		return pmErr
+	}
+	_ = s.registry.Deregister(ctx)
+	return nil
 }
 
 // Address returns the actual listening address (host:port).
@@ -439,18 +463,7 @@ func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.To
 func (s *Server) applyAssignmentsForTopic(ctx context.Context, topic string, numPartitions int) {
 	assigned, err := s.readAssignments(ctx, topic)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			// No assignments yet — single-instance fallback: own all partitions.
-			s.assignmentsMu.Lock()
-			s.myPartitions[topic] = make(map[int]localPartitionAssignment)
-			for i := 0; i < numPartitions; i++ {
-				s.myPartitions[topic][i] = localPartitionAssignment{Owned: true}
-			}
-			s.assignmentsMu.Unlock()
-			return
-		}
-		slog.Error("applyAssignments: read assignments", "topic", topic, "error", err)
-		s.revokeTopic(topic)
+		s.fallbackToSelfAssignmentOnError(err, topic, numPartitions)
 		return
 	}
 
@@ -458,11 +471,9 @@ func (s *Server) applyAssignmentsForTopic(ctx context.Context, topic string, num
 	for pid, pa := range assigned.Partitions {
 		isLeader := pa.Leader == s.instanceID
 		isReplica := false
-		for _, r := range pa.Replicas {
-			if r == s.instanceID {
-				isReplica = true
-				break
-			}
+
+		if slices.Contains(pa.Replicas, s.InstanceID()) {
+			isReplica = true
 		}
 
 		if isLeader {
@@ -498,6 +509,24 @@ func (s *Server) applyAssignmentsForTopic(ctx context.Context, topic string, num
 	}
 }
 
+// No assignments yet — single-instance fallback: own all partitions.
+func (s *Server) fallbackToSelfAssignmentOnError(err error, topic string, numPartitions int) {
+	if errors.Is(err, storage.ErrNotFound) {
+		s.assignmentsMu.Lock()
+		s.myPartitions[topic] = make(map[int]localPartitionAssignment)
+
+		for i := range numPartitions {
+			s.myPartitions[topic][i] = localPartitionAssignment{Owned: true}
+		}
+
+		s.assignmentsMu.Unlock()
+		return
+	}
+
+	slog.Error("applyAssignments: read assignments", "topic", topic, "error", err)
+	s.revokeTopic(topic)
+}
+
 // initPartitionAsLeader sets up replication state for a partition this instance
 // leads: loads/appends epoch history, recovers the high watermark, creates
 // ReplicaState, and writes the initial ISR to S3.
@@ -515,6 +544,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 
 	topicCfg, err := s.topicStore.Get(ctx, topic)
 	if err != nil {
+		slog.Error("initPartitionAsLeader: get topic", "topic", topic, "error", err)
 		return
 	}
 
@@ -529,21 +559,27 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	}
 	ps.nextOffset = walEnd
 
-	// Load epoch history from S3 (authoritative), fall back to local file.
-	ehPath := filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))
-	eh, err := s.isrStore.ReadEpochHistory(ctx, topic, pid)
-	if err != nil || len(eh.Entries) == 0 {
-		eh, _ = replication.LoadEpochHistory(ehPath)
-		if eh == nil {
-			eh = &replication.EpochHistory{}
+	// Load epoch history from S3 (authoritative), fall back to local file,
+	// or use existing epochHistory if already set.
+	eh := ps.epochHistory
+	if eh == nil {
+		ehPath := filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))
+		eh, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
+		if eh == nil || len(eh.Entries) == 0 {
+			eh, _ = replication.LoadEpochHistory(ehPath)
+			if eh == nil {
+				eh = &replication.EpochHistory{}
+			}
 		}
 	}
 	eh.Append(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: walEnd})
-	if err := eh.SaveToFile(ehPath); err != nil {
-		slog.Warn("initPartitionAsLeader: save epoch history locally", "topic", topic, "partition", pid, "error", err)
-	}
-	if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, eh); err != nil {
-		slog.Warn("initPartitionAsLeader: save epoch history to S3", "topic", topic, "partition", pid, "error", err)
+	if eh != ps.epochHistory {
+		if err := eh.SaveToFile(filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))); err != nil {
+			slog.Warn("initPartitionAsLeader: save epoch history locally", "topic", topic, "partition", pid, "error", err)
+		}
+		if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, eh); err != nil {
+			slog.Warn("initPartitionAsLeader: save epoch history to S3", "topic", topic, "partition", pid, "error", err)
+		}
 	}
 	ps.epochHistory = eh
 
@@ -586,8 +622,12 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		}(),
 	)
 
+	// Update the in-memory index with the recovered HW so consumers see the correct value.
+	ps.index.SetHighWatermark(recoveredHW)
+
 	if topicCfg.ReplicationFactor > 1 {
-		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas)
+		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas, s.cfg.Coordination.ISRExpansionThresholdValue())
+		ps.replicaState.SetEpochHistory(ps.epochHistory)
 		for _, r := range pa.Replicas {
 			if r != s.instanceID {
 				ps.replicaState.AddFollower(r)
@@ -857,24 +897,25 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 		return resp
 	}
 
-	// Collect unique leader instance IDs and resolve their addresses from the registry.
+	// Collect unique instance IDs and resolve their addresses from the registry.
 	addressCache := make(map[string]string)
 	for _, pa := range assigned.Partitions {
-		instanceID := pa.Leader
-		if _, ok := addressCache[instanceID]; ok {
-			continue
+		for _, instanceID := range pa.Replicas {
+			if _, ok := addressCache[instanceID]; ok {
+				continue
+			}
+			if instanceID == s.instanceID {
+				addressCache[instanceID] = routableHTTPAddress(instanceID, s.Address())
+				continue
+			}
+			info, err := s.registry.GetInstanceInfo(ctx, instanceID)
+			if err != nil {
+				slog.Debug("getRoutingMap: resolve instance", "instance", instanceID, "error", err)
+				addressCache[instanceID] = routableHTTPAddress(instanceID, "")
+				continue
+			}
+			addressCache[instanceID] = routableHTTPAddress(instanceID, info.Address)
 		}
-		if instanceID == s.instanceID {
-			addressCache[instanceID] = routableHTTPAddress(instanceID, s.Address())
-			continue
-		}
-		info, err := s.registry.GetInstanceInfo(ctx, instanceID)
-		if err != nil {
-			slog.Debug("getRoutingMap: resolve instance", "instance", instanceID, "error", err)
-			addressCache[instanceID] = routableHTTPAddress(instanceID, "")
-			continue
-		}
-		addressCache[instanceID] = routableHTTPAddress(instanceID, info.Address)
 	}
 
 	for pid, pa := range assigned.Partitions {
@@ -884,9 +925,21 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 			continue
 		}
 		key := fmt.Sprintf("%d", pid)
+		replicas := make([]routingReplicaInfo, 0, len(pa.Replicas))
+		for _, replicaID := range pa.Replicas {
+			replicaAddr, ok := addressCache[replicaID]
+			if !ok {
+				continue
+			}
+			replicas = append(replicas, routingReplicaInfo{
+				InstanceID: replicaID,
+				Address:    replicaAddr,
+			})
+		}
 		resp.Partitions[key] = routingPartitionInfo{
 			InstanceID: instanceID,
 			Address:    addr,
+			Replicas:   replicas,
 		}
 	}
 
@@ -1048,7 +1101,9 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		}
 	}
 	ps.epochHistory.Append(replication.EpochEntry{Epoch: newEpoch, StartOffset: walEnd})
-	ps.epochHistory.SaveToFile(ehPath)
+	if err := ps.epochHistory.SaveToFile(ehPath); err != nil {
+		slog.Warn("attemptPartitionLeadership: save epoch history locally", "topic", topic, "pid", pid, "error", err)
+	}
 	if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, ps.epochHistory); err != nil {
 		slog.Warn("attemptPartitionLeadership: save epoch history to S3", "topic", topic, "pid", pid, "error", err)
 	}
@@ -1056,9 +1111,14 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 	// 4d. Initialize as leader.
 	ps.isLeader = true
 	ps.epoch = newEpoch
-	topicCfg, _ := s.topicStore.Get(ctx, topic)
+	topicCfg, err := s.topicStore.Get(ctx, topic)
+	if err != nil {
+		slog.Error("attemptPartitionLeadership: get topic config", "topic", topic, "pid", pid, "error", err)
+		return err
+	}
 	if topicCfg.ReplicationFactor > 1 {
-		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas)
+		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas, s.cfg.Coordination.ISRExpansionThresholdValue())
+		ps.replicaState.SetEpochHistory(ps.epochHistory)
 		for _, r := range pa.Replicas {
 			if r != s.instanceID {
 				ps.replicaState.AddFollower(r)
@@ -1066,14 +1126,19 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		}
 	}
 
+	// Update the in-memory index with the recovered HW so consumers see the correct value immediately.
+	ps.index.SetHighWatermark(recoveredHW)
+
 	// 4e. Write ISR = [self] to S3.
-	s.isrStore.Write(ctx, topic, replication.ISRState{
+	if err := s.isrStore.Write(ctx, topic, replication.ISRState{
 		Partition:     pid,
 		ISR:           []string{s.instanceID},
 		Leader:        s.instanceID,
 		LeaderEpoch:   newEpoch,
 		HighWatermark: recoveredHW,
-	}, "")
+	}, ""); err != nil {
+		slog.Warn("attemptPartitionLeadership: write ISR", "topic", topic, "pid", pid, "error", err)
+	}
 
 	// 4f. Update ownership cache.
 	s.assignmentsMu.Lock()
@@ -1101,13 +1166,15 @@ func (s *Server) checkISRLag(ctx context.Context) {
 				changed := ps.replicaState.CheckISRLag(30 * time.Second)
 				if changed {
 					isr := ps.replicaState.GetISRMembers()
-					s.isrStore.Write(ctx, topic, replication.ISRState{
+					if err := s.isrStore.Write(ctx, topic, replication.ISRState{
 						Partition:     pid,
 						ISR:           isr,
 						Leader:        s.instanceID,
 						LeaderEpoch:   ps.epoch,
 						HighWatermark: ps.replicaState.HighWatermark(),
-					}, "")
+					}, ""); err != nil {
+						slog.Warn("checkISRExpansion: write ISR", "topic", topic, "pid", pid, "error", err)
+					}
 				}
 			}
 		}
