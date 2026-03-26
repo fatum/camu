@@ -78,23 +78,23 @@ Implemented so far on this branch:
 
 Still missing:
 
-- manifest/head replacement for `index.json`
+- manifest/head replacement for `index.json` (partition-level index is still a single CAS-updated JSON file)
 - mmap-backed index loading
 
-### Offset index
+### Offset index (implemented)
 
-Kafka's key idea is:
+Follows Kafka's key idea:
 
 - the partition first picks the right segment by base offset
 - then a per-segment sparse index maps relative offsets to byte positions in that segment
 
-Suggested file:
+File:
 
 ```text
 {baseOffset}-{epoch}.offset.idx
 ```
 
-Kafka-style entry format:
+Entry format:
 
 ```text
 [4B relative_offset][4B position]

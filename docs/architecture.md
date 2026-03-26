@@ -45,7 +45,7 @@ Camu is a Kafka-like commit log that uses S3 as its sole persistent backend. A s
 | **Partition** | Ordered, append-only log within a topic. Unit of parallelism and ownership. Identified by `{topic}/{partition_id}`. |
 | **Message** | Key (optional bytes), Value (bytes), Offset (uint64, server-assigned), Timestamp (unix nanos, server-assigned), Headers (map[string]string). |
 | **Segment** | Immutable batch of messages stored as a single S3 object. Binary format with optional compression. |
-| **Index** | Per-partition JSON file in S3 (`{topic}/{partition}/index.json`) mapping offset ranges to segment keys. |
+| **Index** | Per-partition JSON file in S3 (`{topic}/{partition}/index.json`) mapping offset ranges to segment keys. Each segment also has an `.offset.idx` sidecar for fast in-segment seeks and a `.meta.json` sidecar with record count and size. |
 | **Instance** | A running camu process. Owns a subset of partitions via S3-based leases. |
 
 ## S3 object layout
@@ -61,7 +61,9 @@ Camu is a Kafka-like commit log that uses S3 as its sole persistent backend. A s
 │   └── consumers/{consumerID}/offsets.json            # standalone consumer offsets
 └── {topic}/{partition}/
     ├── index.json                                     # sorted SegmentRef array
-    └── {baseOffset}-{epoch}.segment                   # immutable segment blob
+    ├── {baseOffset}-{epoch}.segment                   # immutable segment blob
+    ├── {baseOffset}-{epoch}.offset.idx                # sparse offset index sidecar
+    └── {baseOffset}-{epoch}.meta.json                 # segment metadata (count, size)
 ```
 
 ---
@@ -136,10 +138,10 @@ When the batcher triggers a flush:
 1. **Verify ownership from S3** — re-reads the partition assignment to confirm this instance still owns the partition. If ownership changed, the partition is revoked locally and the flush is skipped.
 2. **Seal the active chunk** — a fresh active chunk is created for new appends while the sealed chunk joins the flush set.
 3. **Replay sealed WAL chunks** — reads sealed chunks that are not yet marked flushed. The WAL remains the source of truth for unflushed data.
-4. **Serialize segment** — messages are serialized into the binary segment format and optionally compressed (snappy or zstd).
-5. **Upload segment to S3** — key: `{topic}/{partition}/{baseOffset}-{epoch}.segment`. The epoch embedded in the filename prevents stale writes after failover.
+4. **Serialize segment** — messages are serialized into batch-framed format (see below) and optionally compressed per-batch (snappy or zstd).
+5. **Upload segment and sidecars to S3** — the segment blob (`{baseOffset}-{epoch}.segment`), a sparse offset index (`.offset.idx`), and segment metadata (`.meta.json`) are uploaded together. The epoch embedded in filenames prevents stale writes after failover.
 6. **Write to disk cache** — the flushed segment is written to the local cache so the owning instance never needs to fetch its own segments back from S3.
-7. **Update index (CAS)** — the partition's `index.json` is read from S3 with its ETag, the new `SegmentRef` is appended, and a conditional PUT writes it back. If the ETag doesn't match (another instance modified the index concurrently), the operation retries up to 5 times with a fresh read.
+7. **Update index (CAS)** — the partition's `index.json` is read from S3 with its ETag, the new `SegmentRef` (including `OffsetIndexKey` and `MetaKey` pointers) is appended, and a conditional PUT writes it back. If the ETag doesn't match (another instance modified the index concurrently), the operation retries up to 5 times with a fresh read.
 8. **Mark chunks flushed-retained** — sealed chunks below the flushed end are renamed into flushed-retained WAL chunks. They stay readable to followers, but are excluded from unflushed replay on restart.
 9. **Prune by follower progress** — old flushed-retained chunks are deleted only after all followers have moved past them.
 
@@ -149,14 +151,17 @@ When the batcher triggers a flush:
 [4B magic: 0x43414D55 ("CAMU")]
 [1B version: 0x01]
 [1B compression: 0=none, 1=snappy, 2=zstd]
-[compressed payload]:
-  repeated message frames:
-    [8B offset (uint64 BE)]
-    [8B timestamp (int64 BE)]
-    [4B key_len][key bytes]
-    [4B value_len][value bytes]
-    [4B header_count]
-      per header: [4B key_len][key bytes][4B val_len][val bytes]
+repeated batch frames:
+  [4B batch_len]
+  [4B message_count]
+  [batch payload (compressed independently if compression != 0)]:
+    repeated message frames:
+      [8B offset (uint64 BE)]
+      [8B timestamp (int64 BE)]
+      [4B key_len][key bytes]
+      [4B value_len][value bytes]
+      [4B header_count]
+        per header: [4B key_len][key bytes][4B val_len][val bytes]
 ```
 
 Compression is applied to the entire payload (all frames together), not per-message.
@@ -193,15 +198,17 @@ Any instance can serve reads for any partition. For non-owned partitions, the ha
 
 ### 2. Index lookup
 
-The index is a sorted array of `SegmentRef` entries. Lookup uses `sort.Search` (binary search) to find the segment whose `[BaseOffset, EndOffset]` range contains the requested offset. Time complexity: O(log N) where N is the number of segments.
+The index is a sorted array of `SegmentRef` entries. Lookup uses `sort.Search` (binary search) to find the segment whose `[BaseOffset, EndOffset]` range contains the requested offset. Time complexity: O(log N) where N is the number of segments. Once the segment is located, the per-segment `.offset.idx` sidecar (sparse Kafka-style index of `[4B relative_offset, 4B position]` entries) is fetched and cached to seek directly to the nearest batch boundary within the segment, avoiding a full scan.
 
 ```go
 type SegmentRef struct {
-    BaseOffset uint64
-    EndOffset  uint64
-    Epoch      uint64
-    Key        string    // S3 key
-    CreatedAt  time.Time
+    BaseOffset     uint64
+    EndOffset      uint64
+    Epoch          uint64
+    Key            string    // S3 segment key
+    OffsetIndexKey string    // S3 key for .offset.idx sidecar
+    MetaKey        string    // S3 key for .meta.json sidecar
+    CreatedAt      time.Time
 }
 ```
 

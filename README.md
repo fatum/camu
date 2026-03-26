@@ -169,7 +169,7 @@ See [`camu.yaml.example`](camu.yaml.example) for all options.
 | `segments.max_age` | 5s | Flush time threshold |
 | `segments.compression` | `none` | Record-batch compression: `none`, `snappy`, or `zstd` |
 | `segments.record_batch_target_size` | 16KB | Target uncompressed on-disk record-batch size inside a segment |
-| `segments.index_interval_bytes` | 4KB | Planned sparse per-segment offset index cadence |
+| `segments.index_interval_bytes` | 4KB | Sparse per-segment offset index cadence |
 | `cache.max_size` | 10GB | Disk cache LRU limit |
 | `coordination.lease_ttl` | 30s | Lease TTL |
 | `coordination.instance_ttl` | `lease_ttl * 3` | Instance liveness TTL used for active membership |

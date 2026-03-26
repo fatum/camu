@@ -11,12 +11,14 @@ digraph s3_layout {
 
     topic [label="{orders/|partition 0..3}" fillcolor="#FFF9C4"]
 
-    p0 [label="{orders/0/|index.json\n0-1.segment\n5-1.segment\n10-2.segment}" fillcolor="#E8F5E9"]
-    p1 [label="{orders/1/|index.json\n0-1.segment\n8-1.segment}" fillcolor="#E8F5E9"]
+    p0 [label="{orders/0/|index.json\n0-1.segment\n0-1.offset.idx\n0-1.meta.json\n5-1.segment\n5-1.offset.idx\n5-1.meta.json\n10-2.segment\n10-2.offset.idx\n10-2.meta.json}" fillcolor="#E8F5E9"]
+    p1 [label="{orders/1/|index.json\n0-1.segment\n0-1.offset.idx\n0-1.meta.json\n8-1.segment\n8-1.offset.idx\n8-1.meta.json}" fillcolor="#E8F5E9"]
 
-    index_detail [label="index.json\n\nsegments: [{base,end,epoch,key}...]\nepoch_history: [{epoch,start}...]\nhigh_watermark: 15" fillcolor="#FFFDE7" fontsize=9 shape=note]
+    index_detail [label="index.json\n\nsegments: [{base,end,epoch,key,\n  offset_index_key,meta_key}...]\nepoch_history: [{epoch,start}...]\nhigh_watermark: 15" fillcolor="#FFFDE7" fontsize=9 shape=note]
 
-    segment_detail [label="segment binary format\n\n[4B magic: 0x43414D55]\n[1B version] [1B compression]\n[compressed payload:]\n  [8B offset][8B timestamp]\n  [4B key_len][key]\n  [4B val_len][val]\n  [headers...] repeated" fillcolor="#FFFDE7" fontsize=9 shape=note]
+    segment_detail [label="segment binary format\n\n[4B magic: 0x43414D55]\n[1B version] [1B compression]\nrepeated batch frames:\n  [4B batch_len][4B msg_count]\n  [batch payload (per-batch compression):]\n    [8B offset][8B timestamp]\n    [4B key_len][key]\n    [4B val_len][val]\n    [headers...] repeated" fillcolor="#FFFDE7" fontsize=9 shape=note]
+
+    sidecar_detail [label="per-segment sidecars\n\n.offset.idx: sparse index\n  [4B rel_offset, 4B position]...\n\n.meta.json: segment metadata\n  {count, size, base, end}" fillcolor="#FFFDE7" fontsize=9 shape=note]
 
     bucket -> meta
     bucket -> coord
@@ -25,4 +27,5 @@ digraph s3_layout {
     topic -> p1
     p0 -> index_detail [style=dashed label="index.json structure"]
     p0 -> segment_detail [style=dashed label="segment format"]
+    p0 -> sidecar_detail [style=dashed label="sidecars"]
 }
