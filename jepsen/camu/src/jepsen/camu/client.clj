@@ -95,12 +95,59 @@
                                     (Long/parseLong e))]
                        (cond-> {:partition (:partition pinfo)
                                 :offset   (:offset pinfo)
-                                :node     node}
+                                :node     (or (get headers "x-camu-instance-id") node)}
                          epoch (assoc :leader-epoch epoch)))
       (= status 421) (throw (ex-info "misdirected" {:type :misdirected}))
       (= status 500) (throw (ex-info "not-ready" {:type :not-ready}))
       (= status 503) (throw (ex-info "backpressure" {:type :backpressure}))
       :else          (throw (ex-info (str "produce failed: " status) {:type :error :status status})))))
+
+(defn init-producer!
+  "Initializes a producer on the given node. Returns the producer ID."
+  [node]
+  (let [resp (http/post (str (normalize-base-url node) "/v1/producers/init")
+                        {:content-type      :json
+                         :socket-timeout    http-timeout-ms
+                         :connect-timeout   http-timeout-ms
+                         :throw-exceptions  false})]
+    (if (= 201 (:status resp))
+      (:producer_id (json/parse-string (:body resp) true))
+      (throw (ex-info (str "init-producer failed: " (:status resp))
+                      {:type :init-producer-failed :status (:status resp)})))))
+
+(defn idempotent-produce!
+  "Produces a message with idempotency fields to a specific partition.
+   Returns a map with :partition/:offset on success, or {:duplicate true}
+   if the server detected a duplicate (and confirmed replication)."
+  [node topic partition producer-id sequence key value]
+  (let [resp (http/post (str (normalize-base-url node) "/v1/topics/" topic
+                             "/partitions/" partition "/messages")
+                        {:content-type      :json
+                         :body              (json/generate-string
+                                             {:producer_id producer-id
+                                              :sequence    sequence
+                                              :messages    [{:key key :value value}]})
+                         :socket-timeout    http-timeout-ms
+                         :connect-timeout   http-timeout-ms
+                         :throw-exceptions  false})
+        status (:status resp)]
+    (cond
+      (= status 200) (let [body    (json/parse-string (:body resp) true)
+                           headers (:headers resp)]
+                       (if (:duplicate body)
+                         {:duplicate true
+                          :node      (or (get headers "x-camu-instance-id") node)}
+                         (let [pinfo (first (:offsets body))
+                               epoch (when-let [e (get headers "x-leader-epoch")]
+                                       (Long/parseLong e))]
+                           (cond-> {:partition (:partition pinfo)
+                                    :offset   (:offset pinfo)
+                                    :node     (or (get headers "x-camu-instance-id") node)}
+                             epoch (assoc :leader-epoch epoch)))))
+      (= status 421) (throw (ex-info "misdirected" {:type :misdirected}))
+      (= status 422) (throw (ex-info "sequence error" {:type :sequence-error}))
+      (= status 503) (throw (ex-info "backpressure" {:type :backpressure}))
+      :else          (throw (ex-info (str "idempotent produce failed: " status) {:type :error :status status})))))
 
 (defn consume!
   "Consumes messages from the given topic and partition. Returns a vec of
@@ -257,6 +304,45 @@
     :consume 8000
     8000))
 
+(defn drain-with-candidates
+  "Drains a partition by trying nodes returned by candidate-fn. Retries within
+   deadline. candidate-fn is called as (candidate-fn) and must return a seq of
+   addresses. When retry-guard-fn is provided it must return true for deadline
+   retries to proceed; otherwise retries always proceed within the deadline."
+  [topic partition offset candidate-fn retry-guard-fn]
+  (let [deadline (+ (System/currentTimeMillis) (leader-read-deadline-ms :drain))]
+    (loop [nodes (candidate-fn)]
+      (if (empty? nodes)
+        (if (and (if retry-guard-fn (retry-guard-fn) true)
+                 (< (System/currentTimeMillis) deadline))
+          (do (Thread/sleep 100)
+              (recur (candidate-fn)))
+          (throw (ex-info "drain failed on all nodes"
+                          {:type :drain-failed
+                           :status :no-node-available
+                           :partition partition
+                           :offset (or offset 0)})))
+        (let [result (try
+                       (drain! (first nodes) topic partition (or offset 0))
+                       (catch ConnectException _ ::retry)
+                       (catch SocketTimeoutException _ ::retry)
+                       (catch clojure.lang.ExceptionInfo e
+                         (if (= :drain-failed (:type (ex-data e)))
+                           (if (= 421 (:status (ex-data e)))
+                             ::retry
+                             (throw e))
+                           (throw e))))]
+          (if (= ::retry result)
+            (let [remaining (rest nodes)]
+              (if (seq remaining)
+                (recur remaining)
+                (if (and (if retry-guard-fn (retry-guard-fn) true)
+                         (< (System/currentTimeMillis) deadline))
+                  (do (Thread/sleep 100)
+                      (recur (candidate-fn)))
+                  (recur remaining))))
+            result))))))
+
 (defn commit-offsets!
   "Commits the consumer offset for the given topic and consumer-id."
   [node topic consumer-id partition offset]
@@ -323,7 +409,20 @@
 (defrecord CamuClient [node topic]
   client/Client
   (open! [this test node']
-    (assoc this :node node'))
+    (let [this' (assoc this :node node')]
+      (if (= :idempotent (:workload test))
+        ;; Each client thread gets its own producer ID and per-partition sequence counters.
+        (let [pid (loop [nodes (shuffle (:nodes test))]
+                    (if (empty? nodes)
+                      (throw (ex-info "cannot init producer" {:type :init-failed}))
+                      (let [result (try (init-producer! (first nodes))
+                                       (catch Exception _ nil))]
+                        (or result (recur (rest nodes))))))
+              num-partitions (get test :num-partitions 4)
+              ;; One sequence atom per partition.
+              seqs (into {} (map (fn [p] [p (atom 0)]) (range num-partitions)))]
+          (assoc this' :producer-id pid :sequences seqs :num-partitions num-partitions))
+        this')))
 
   (setup! [this test]
     (let [topic (topic-name this test)]
@@ -339,6 +438,48 @@
   (invoke! [this test op]
     (try
      (case (:f op)
+       :idempotent-produce
+       (let [{:keys [key value]} (:value op)
+             topic       (topic-name this test)
+             producer-id (:producer-id this)
+             ;; Hash key to a partition (same as camu's FNV-32a routing).
+             partition   (mod (Math/abs (.hashCode ^String key)) (:num-partitions this))
+             seq-atom    (get (:sequences this) partition)
+             seq-val     @seq-atom]
+         ;; Any node can proxy to the partition leader — just pick one.
+         ;; Only retry on connection refused (node down) with a different node.
+         (loop [nodes (shuffle (:nodes test))]
+           (if (empty? nodes)
+             ;; All nodes failed — but a node may have committed before the
+             ;; connection dropped. Advance the sequence to avoid reusing this
+             ;; slot with a different key (which would be silently deduped).
+             (do (swap! seq-atom + 1)
+                 (assoc op :type :info :error :no-node-available))
+             (let [result (try (idempotent-produce!
+                                 (first nodes) topic partition
+                                 producer-id seq-val key value)
+                               (catch ConnectException _ ::retry)
+                               (catch SocketTimeoutException _ ::retry)
+                               (catch clojure.lang.ExceptionInfo e
+                                 (case (:type (ex-data e))
+                                   :misdirected ::retry
+                                   :backpressure ::retry
+                                   :not-ready ::retry
+                                   :error ::retry
+                                   :sequence-error (throw e)
+                                   (throw e))))]
+               (if (= ::retry result)
+                 (recur (rest nodes))
+                 (do
+                   ;; Advance this partition's sequence by batch size (1 message).
+                   (swap! seq-atom + 1)
+                   (assoc op :type :ok
+                          :value (merge {:key key :value value
+                                         :producer-id producer-id
+                                         :sequence seq-val
+                                         :partition partition}
+                                        result))))))))
+
        :produce
        (let [{:keys [key value]} (:value op)
              topic             (topic-name this test)]
@@ -405,38 +546,20 @@
        :drain
        (let [{:keys [partition offset]} (:value op)
              topic    (topic-name this test)
-             deadline (+ (System/currentTimeMillis) (leader-read-deadline-ms :drain))
-             messages (loop [nodes (read-candidates test topic partition)]
-                        (if (empty? nodes)
-                          (if (and (#{:leader :replica} (read-mode test))
-                                   (< (System/currentTimeMillis) deadline))
-                            (do (Thread/sleep 100)
-                                (recur (read-candidates test topic partition)))
-                            (throw (ex-info "drain failed on all nodes"
-                                            {:type :drain-failed
-                                             :status :no-node-available
-                                             :partition partition
-                                             :offset (or offset 0)})))
-                          (let [result (try
-                                         (drain! (first nodes) topic partition (or offset 0))
-                                         (catch ConnectException _ ::retry)
-                                         (catch SocketTimeoutException _ ::retry)
-                                         (catch clojure.lang.ExceptionInfo e
-                                           (if (= :drain-failed (:type (ex-data e)))
-                                           (if (= 421 (:status (ex-data e)))
-                                             ::retry
-                                             (throw e))
-                                           (throw e))))]
-                            (if (= ::retry result)
-                              (let [remaining (rest nodes)]
-                                (if (seq remaining)
-                                  (recur remaining)
-                                  (if (and (#{:leader :replica} (read-mode test))
-                                           (< (System/currentTimeMillis) deadline))
-                                    (do (Thread/sleep 100)
-                                        (recur (read-candidates test topic partition)))
-                                    (recur remaining))))
-                              result))))]
+             ;; Drain always reads from the leader for authoritative HW.
+             messages (drain-with-candidates
+                       topic partition offset
+                       #(leader-candidates (:nodes test) topic partition)
+                       #(#{:leader :replica} (read-mode test)))]
+         (assoc op :type :ok :value {:partition partition :messages messages}))
+
+       :replica-drain
+       (let [{:keys [partition offset]} (:value op)
+             topic    (topic-name this test)
+             messages (drain-with-candidates
+                       topic partition offset
+                       #(replica-candidates (:nodes test) topic partition)
+                       nil)]
          (assoc op :type :ok :value {:partition partition :messages messages}))
 
        :commit-offsets
@@ -463,6 +586,7 @@
            :misdirected        (assoc op :type :fail :error :misdirected)
            :not-ready          (assoc op :type :fail :error :not-ready)
            :backpressure       (assoc op :type :fail :error :service-unavailable)
+           :sequence-error     (assoc op :type :fail :error :sequence-error)
            :consume-failed     (assoc op :type :fail :error [:consume-failed (:status (ex-data e))])
            :drain-failed       (assoc op :type :fail :error [:drain-failed (:status (ex-data e))])
            :offset-commit-failed (assoc op :type :fail :error [:offset-commit-failed (:status (ex-data e))])

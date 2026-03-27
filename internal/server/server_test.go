@@ -42,7 +42,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatalf("NewWithS3Client() error = %v", err)
 	}
-	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", time.Minute)
+	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", time.Minute)
 	return s
 }
 
@@ -637,9 +637,12 @@ func TestHandleConsumeLowLevel_ReturnsReadableFollowerWALSuffix(t *testing.T) {
 	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
 		t.Fatalf("WriteSegment() error = %v", err)
 	}
-	segKey := "topic/0/0-1.segment"
+	segKey := log.FormatSegmentKey("topic", 0, 0, 16, 1)
 	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
+	}
+	if err := s.s3Client.Put(context.Background(), segKey, segBuf.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatalf("s3Client.Put() error = %v", err)
 	}
 	ps.index.Add(log.SegmentRef{
 		BaseOffset: 0,
@@ -773,6 +776,269 @@ func TestGCStaleInstances(t *testing.T) {
 	}
 }
 
+func TestInitProducer(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/producers/init", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var resp struct {
+		ProducerID uint64 `json:"producer_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if resp.ProducerID == 0 {
+		t.Fatal("expected non-zero producer_id")
+	}
+
+	// Second call should return a different ID.
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/producers/init", nil)
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	var resp2 struct {
+		ProducerID uint64 `json:"producer_id"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if resp2.ProducerID == resp.ProducerID {
+		t.Fatalf("expected different producer_id, got %d both times", resp.ProducerID)
+	}
+}
+
+func setupTestTopicAndOwnership(t *testing.T, s *Server) {
+	t.Helper()
+	tc := meta.TopicConfig{
+		Name: "test-topic", Partitions: 1, Retention: time.Hour,
+		CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["test-topic"] = map[int]localPartitionAssignment{0: {Owned: true}}
+	s.assignmentsMu.Unlock()
+}
+
+func TestProduceIdempotent_Dedup(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+	setupTestTopicAndOwnership(t, s)
+
+	// Init producer.
+	initReq := httptest.NewRequest(http.MethodPost, "/v1/producers/init", nil)
+	initRec := httptest.NewRecorder()
+	handler.ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusCreated {
+		t.Fatalf("init status = %d, want %d", initRec.Code, http.StatusCreated)
+	}
+	var initResp struct {
+		ProducerID uint64 `json:"producer_id"`
+	}
+	if err := json.Unmarshal(initRec.Body.Bytes(), &initResp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	pid := initResp.ProducerID
+
+	// Produce with seq=0 via partition-specific endpoint.
+	body := []byte(`{"producer_id":` + strconv.FormatUint(pid, 10) + `,"sequence":0,"messages":[{"key":"k1","value":"v1"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/partitions/0/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first produce status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var firstResp struct {
+		Offsets []struct {
+			Partition int    `json:"partition"`
+			Offset    uint64 `json:"offset"`
+		} `json:"offsets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &firstResp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	// Retry same seq=0 — should get 200 with duplicate flag.
+	body2 := []byte(`{"producer_id":` + strconv.FormatUint(pid, 10) + `,"sequence":0,"messages":[{"key":"k1","value":"v1"}]}`)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/partitions/0/messages", bytes.NewReader(body2))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("retry produce status = %d, want %d; body=%s", rec2.Code, http.StatusOK, rec2.Body.String())
+	}
+
+	var retryResp struct {
+		Duplicate bool `json:"duplicate"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &retryResp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !retryResp.Duplicate {
+		t.Fatal("expected duplicate=true on retry")
+	}
+}
+
+func TestProduceIdempotent_SequenceGap(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+	setupTestTopicAndOwnership(t, s)
+
+	// Init producer.
+	initReq := httptest.NewRequest(http.MethodPost, "/v1/producers/init", nil)
+	initRec := httptest.NewRecorder()
+	handler.ServeHTTP(initRec, initReq)
+	var initResp struct {
+		ProducerID uint64 `json:"producer_id"`
+	}
+	if err := json.Unmarshal(initRec.Body.Bytes(), &initResp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	pid := initResp.ProducerID
+
+	// Send seq=5 (skip 0) via partition-specific endpoint — should get 422.
+	body := []byte(`{"producer_id":` + strconv.FormatUint(pid, 10) + `,"sequence":5,"messages":[{"key":"k1","value":"v1"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/partitions/0/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 422 {
+		t.Fatalf("status = %d, want 422; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProduceWithoutProducerID_BackwardsCompatible(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+	setupTestTopicAndOwnership(t, s)
+
+	// Produce without producer_id — should succeed as before.
+	body := []byte(`[{"key":"k1","value":"v1"}]`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/messages", bytes.NewReader(body))
+	req.SetPathValue("topic", "test-topic")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp struct {
+		Offsets []struct {
+			Partition int    `json:"partition"`
+			Offset    uint64 `json:"offset"`
+		} `json:"offsets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Offsets) != 1 {
+		t.Fatalf("expected 1 offset, got %d", len(resp.Offsets))
+	}
+}
+
+func TestIdempotency_EndToEnd(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+	setupTestTopicAndOwnership(t, s)
+
+	// Helper: do a produce request via the partition-specific endpoint.
+	produce := func(body string) (int, []uint64) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/partitions/0/messages", bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code == http.StatusOK {
+			var resp struct {
+				Offsets []struct {
+					Offset uint64 `json:"offset"`
+				} `json:"offsets"`
+			}
+			json.Unmarshal(rec.Body.Bytes(), &resp)
+			offsets := make([]uint64, len(resp.Offsets))
+			for i, o := range resp.Offsets {
+				offsets[i] = o.Offset
+			}
+			return rec.Code, offsets
+		}
+		return rec.Code, nil
+	}
+
+	// 1. Init producer.
+	initReq := httptest.NewRequest(http.MethodPost, "/v1/producers/init", nil)
+	initRec := httptest.NewRecorder()
+	handler.ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusCreated {
+		t.Fatalf("init status = %d, want 201", initRec.Code)
+	}
+	var initResp struct {
+		ProducerID uint64 `json:"producer_id"`
+	}
+	json.Unmarshal(initRec.Body.Bytes(), &initResp)
+	pid := strconv.FormatUint(initResp.ProducerID, 10)
+
+	// 2. Produce batch of 3 msgs with seq=0 → offsets [0,1,2].
+	code, offsets1 := produce(`{"producer_id":` + pid + `,"sequence":0,"messages":[{"value":"a"},{"value":"b"},{"value":"c"}]}`)
+	if code != 200 {
+		t.Fatalf("step 2: status=%d, want 200", code)
+	}
+	if len(offsets1) != 3 || offsets1[0] != 0 || offsets1[1] != 1 || offsets1[2] != 2 {
+		t.Fatalf("step 2: offsets=%v, want [0 1 2]", offsets1)
+	}
+
+	// 3. Produce next batch of 2 msgs with seq=3 → offsets [3,4].
+	code, offsets2 := produce(`{"producer_id":` + pid + `,"sequence":3,"messages":[{"value":"d"},{"value":"e"}]}`)
+	if code != 200 {
+		t.Fatalf("step 3: status=%d, want 200", code)
+	}
+	if len(offsets2) != 2 || offsets2[0] != 3 || offsets2[1] != 4 {
+		t.Fatalf("step 3: offsets=%v, want [3 4]", offsets2)
+	}
+
+	// 4. Retry batch with seq=0 → 200 duplicate (no new data written).
+	code, _ = produce(`{"producer_id":` + pid + `,"sequence":0,"messages":[{"value":"a"},{"value":"b"},{"value":"c"}]}`)
+	if code != 200 {
+		t.Fatalf("step 4: status=%d, want 200 (duplicate)", code)
+	}
+
+	// 5. Produce with seq=10 (gap) → 422.
+	code, _ = produce(`{"producer_id":` + pid + `,"sequence":10,"messages":[{"value":"f"}]}`)
+	if code != 422 {
+		t.Fatalf("step 5: status=%d, want 422", code)
+	}
+
+	// 6. Produce without producer_id → backwards compat, offset 5.
+	code, offsets4 := produce(`{"value":"no-idem"}`)
+	if code != 200 {
+		t.Fatalf("step 6: status=%d, want 200", code)
+	}
+	if len(offsets4) != 1 || offsets4[0] != 5 {
+		t.Fatalf("step 6: offsets=%v, want [5]", offsets4)
+	}
+
+	// 7. Verify next valid sequence after the gap rejection still works (seq=5).
+	code, offsets5 := produce(`{"producer_id":` + pid + `,"sequence":5,"messages":[{"value":"f"}]}`)
+	if code != 200 {
+		t.Fatalf("step 7: status=%d, want 200", code)
+	}
+	if len(offsets5) != 1 || offsets5[0] != 6 {
+		t.Fatalf("step 7: offsets=%v, want [6]", offsets5)
+	}
+}
+
 func TestGCStaleISR(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
@@ -814,5 +1080,88 @@ func TestGCStaleISR(t *testing.T) {
 	keys, _ = s.s3Client.List(ctx, "_coordination/isr/")
 	if len(keys) != 2 {
 		t.Fatalf("expected 2 ISR files after GC, got %d: %v", len(keys), keys)
+	}
+}
+
+func TestHandleDeleteTopic_CleansUpAllS3Data(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// Create topic.
+	tc := meta.TopicConfig{
+		Name:              "doomed",
+		Partitions:        2,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	// Seed S3 with partition data, assignment, and epoch files.
+	seedKeys := []string{
+		"doomed/0/state.json",
+		"doomed/0/00000000000000000000.seg",
+		"doomed/0/00000000000000000000.idx",
+		"doomed/0/00000000000000000000.meta.json",
+		"doomed/0/producers.checkpoint",
+		"doomed/1/state.json",
+		"doomed/1/00000000000000000000.seg",
+		"_coordination/assignments/doomed.json",
+		"_coordination/epochs/doomed/0.json",
+		"_coordination/epochs/doomed/1.json",
+	}
+	for _, key := range seedKeys {
+		if err := s.s3Client.Put(ctx, key, []byte(`{}`), storage.PutOpts{}); err != nil {
+			t.Fatalf("s3Client.Put(%s) error = %v", key, err)
+		}
+	}
+
+	// Send DELETE request.
+	req := httptest.NewRequest(http.MethodDelete, "/v1/topics/doomed", nil)
+	req.SetPathValue("topic", "doomed")
+	rec := httptest.NewRecorder()
+	s.handleDeleteTopic(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify topic metadata is gone.
+	if _, err := s.topicStore.Get(ctx, "doomed"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for deleted topic, got %v", err)
+	}
+
+	// Verify all partition data is gone.
+	keys, _ := s.s3Client.List(ctx, "doomed/")
+	if len(keys) != 0 {
+		t.Fatalf("expected 0 objects under doomed/, got %d: %v", len(keys), keys)
+	}
+
+	// Verify assignment is gone.
+	keys, _ = s.s3Client.List(ctx, "_coordination/assignments/doomed")
+	if len(keys) != 0 {
+		t.Fatalf("expected 0 assignment files, got %d: %v", len(keys), keys)
+	}
+
+	// Verify epoch files are gone.
+	keys, _ = s.s3Client.List(ctx, "_coordination/epochs/doomed/")
+	if len(keys) != 0 {
+		t.Fatalf("expected 0 epoch files, got %d: %v", len(keys), keys)
+	}
+}
+
+func TestHandleDeleteTopic_NotFound(t *testing.T) {
+	s := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/topics/nonexistent", nil)
+	req.SetPathValue("topic", "nonexistent")
+	rec := httptest.NewRecorder()
+	s.handleDeleteTopic(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

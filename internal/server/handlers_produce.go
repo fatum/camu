@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 
+	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/producer"
 	"github.com/maksim/camu/internal/replication"
@@ -17,6 +21,14 @@ type produceMessageRequest struct {
 	Key     string            `json:"key"`
 	Value   string            `json:"value"`
 	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// produceBatchRequest is the idempotent produce format:
+// {"producer_id": N, "sequence": M, "messages": [...]}
+type produceBatchRequest struct {
+	ProducerID uint64                  `json:"producer_id"`
+	Sequence   uint64                  `json:"sequence"`
+	Messages   []produceMessageRequest `json:"messages"`
 }
 
 type produceResponse struct {
@@ -35,10 +47,18 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Buffer body so it can be replayed if we need to proxy to the leader.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
 	topicName := r.PathValue("topic")
 
-	// Validate topic exists.
-	_, err := s.topicStore.Get(r.Context(), topicName)
+	// Validate topic exists and cache config for the per-partition loop.
+	topicCfg, err := s.topicStore.Get(r.Context(), topicName)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "topic not found")
@@ -48,17 +68,23 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse body: either a JSON array or single object.
+	// Parse body: JSON array or single object. Idempotent batch format is
+	// not allowed on the high-level endpoint — use the partition-specific
+	// endpoint for idempotent produce.
 	var msgs []produceMessageRequest
-	decoder := json.NewDecoder(r.Body)
-	// Try to detect if it's an array or object by peeking.
 	var raw json.RawMessage
-	if err := decoder.Decode(&raw); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	// Try array first, then single object.
+	// Reject idempotent batch format on this endpoint.
+	var probe produceBatchRequest
+	if err := json.Unmarshal(raw, &probe); err == nil && probe.ProducerID != 0 {
+		writeError(w, http.StatusBadRequest, "idempotent produce requires the partition-specific endpoint: POST /v1/topics/{topic}/partitions/{id}/messages")
+		return
+	}
+
 	if err := json.Unmarshal(raw, &msgs); err != nil {
 		var single produceMessageRequest
 		if err2 := json.Unmarshal(raw, &single); err2 != nil {
@@ -103,12 +129,21 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 
-	// Check ownership of all target partitions before writing.
-	for partitionID := range byPartition {
-		if !s.isOwnedPartition(topicName, partitionID) {
-			routing := s.getRoutingMap(topicName)
-			writeJSON(w, 421, routing)
-			return
+	// For non-replicated topics, check ownership early to avoid unnecessary work.
+	// Replicated topics defer the check to verifyProduceLeadership which checks
+	// both ownership and epoch in a single assignmentsMu.RLock.
+	if topicCfg.ReplicationFactor <= 1 {
+		for partitionID := range byPartition {
+			if !s.isOwnedPartition(topicName, partitionID) {
+				if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
+					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					s.proxyToLeader(w, r, leaderAddr)
+					return
+				}
+				routing := s.getRoutingMap(topicName)
+				writeJSON(w, 421, routing)
+				return
+			}
 		}
 	}
 
@@ -121,10 +156,8 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		}
 
 		ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-		topicCfg, err := s.topicStore.Get(r.Context(), topicName)
-		if err != nil {
-			slog.Error("produce_failed_get_topic", "topic", topicName, "error", err)
-			writeError(w, http.StatusInternalServerError, "topic lookup failed")
+		if ps == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
 			return
 		}
 
@@ -132,8 +165,10 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		// Don't check min_insync_replicas here — the purgatory will wait until
 		// enough ISR members ack. This avoids a chicken-and-egg problem where
 		// followers can't catch up (join ISR) if no data flows.
+		// verifyProduceLeadership checks both ownership and epoch in a single
+		// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
 		if topicCfg.ReplicationFactor > 1 {
-			if ps == nil || ps.replicaState == nil {
+			if ps.replicaState == nil {
 				slog.Debug("produce_rejected: replicaState not ready",
 					"topic", topicName, "partition", partitionID)
 				w.Header().Set("Retry-After", "1")
@@ -141,13 +176,18 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+				if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
+					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					s.proxyToLeader(w, r, leaderAddr)
+					return
+				}
 				routing := s.getRoutingMap(topicName)
 				writeJSON(w, 421, routing)
 				return
 			}
 		}
 
-		assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
+		assignedOffsets, err := s.partitionManager.appendBatchToPS(ps, topicName, partitionID, batch)
 		if err != nil {
 			if errors.Is(err, producer.ErrBackpressure) {
 				w.Header().Set("Retry-After", "1")
@@ -234,24 +274,43 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check partition ownership.
-	if !s.isOwnedPartition(topicName, partitionID) {
-		routing := s.getRoutingMap(topicName)
-		writeJSON(w, 421, routing)
-		return
+	// For non-replicated topics, check ownership early to skip body parsing
+	// for non-owned partitions. Replicated topics defer the check to
+	// verifyProduceLeadership which checks both ownership and epoch in one
+	// lock acquisition.
+	if tc.ReplicationFactor <= 1 {
+		if !s.isOwnedPartition(topicName, partitionID) {
+			if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
+				s.proxyToLeader(w, r, leaderAddr)
+				return
+			}
+			routing := s.getRoutingMap(topicName)
+			writeJSON(w, 421, routing)
+			return
+		}
 	}
 
-	// Parse body.
-	var msgs []produceMessageRequest
+	// Parse body: idempotent batch, JSON array, or single object.
+	var (
+		msgs       []produceMessageRequest
+		producerID uint64
+		sequence   uint64
+	)
 	var raw json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := json.Unmarshal(raw, &msgs); err != nil {
+
+	var batchReq produceBatchRequest
+	if err := json.Unmarshal(raw, &batchReq); err == nil && batchReq.Messages != nil {
+		msgs = batchReq.Messages
+		producerID = batchReq.ProducerID
+		sequence = batchReq.Sequence
+	} else if err := json.Unmarshal(raw, &msgs); err != nil {
 		var single produceMessageRequest
 		if err2 := json.Unmarshal(raw, &single); err2 != nil {
-			writeError(w, http.StatusBadRequest, "invalid request body: expected array or object")
+			writeError(w, http.StatusBadRequest, "invalid request body: expected batch, array, or object")
 			return
 		}
 		msgs = []produceMessageRequest{single}
@@ -276,10 +335,16 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
+	if ps == nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
+		return
+	}
 
 	// For replicated topics, reject writes if replicaState not yet initialized.
+	// verifyProduceLeadership checks both ownership and epoch in a single
+	// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
 	if tc.ReplicationFactor > 1 {
-		if ps == nil || ps.replicaState == nil {
+		if ps.replicaState == nil {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, 503, "partition not ready for replicated writes")
 			return
@@ -291,11 +356,47 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	assignedOffsets, err := s.partitionManager.AppendBatch(r.Context(), topicName, partitionID, batch)
+	var assignedOffsets []uint64
+	if producerID != 0 {
+		pkey := idempotency.PartitionKey{Topic: topicName, Partition: partitionID}
+		assignedOffsets, err = s.partitionManager.appendBatchWithMetaToPS(ps, topicName, partitionID, log.Batch{
+			ProducerID: producerID,
+			Sequence:   sequence,
+			Messages:   batch,
+		}, &IdempotencyOpts{
+			Manager:  s.idempotencyManager,
+			Key:      pkey,
+			Sequence: sequence,
+		})
+		if errors.Is(err, idempotency.ErrDuplicateSequence) {
+			// Join the replication purgatory for the original batch —
+			// only return success once the data is committed.
+			if ps != nil && ps.replicaState != nil {
+				if lastOff, ok := s.idempotencyManager.GetLastOffset(producerID, pkey); ok {
+					if waitErr := ps.replicaState.Purgatory().Wait(r.Context(), lastOff, s.replicationTimeout); waitErr != nil {
+						if errors.Is(waitErr, replication.ErrReplicationTimeout) {
+							writeError(w, 408, "replication timeout")
+							return
+						}
+						writeError(w, http.StatusInternalServerError, "replication error: "+waitErr.Error())
+						return
+					}
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+			return
+		}
+	} else {
+		assignedOffsets, err = s.partitionManager.appendBatchToPS(ps, topicName, partitionID, batch)
+	}
 	if err != nil {
 		if errors.Is(err, producer.ErrBackpressure) {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, "backpressure: buffer full")
+			return
+		}
+		if errors.Is(err, idempotency.ErrSequenceGap) || errors.Is(err, idempotency.ErrUnknownProducer) {
+			writeError(w, 422, err.Error())
 			return
 		}
 		slog.Error("produce_failed", "topic", topicName, "partition", partitionID, "error", err)

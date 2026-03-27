@@ -18,7 +18,7 @@ import (
 
 const (
 	segmentMagic   uint32 = 0x43414D55 // "CAMU"
-	segmentVersion byte   = 1
+	segmentVersion byte   = 2
 
 	CompressionNone   = "none"
 	CompressionSnappy = "snappy"
@@ -55,7 +55,7 @@ var (
 // WriteSegment writes a segment header followed by independently readable
 // message batches. Header format: [4B magic][1B version][1B compression].
 // Each batch is:
-// [4B stored batch length][4B message count][batch bytes]
+// [4B stored batch length][4B message count][8B producer id][8B sequence][batch bytes]
 // where batch bytes are either the raw concatenated message frames or a
 // compressed batch payload, depending on the segment compression flag.
 func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSize int64) error {
@@ -95,6 +95,12 @@ func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSi
 		if err := binary.Write(w, binary.BigEndian, uint32(batch.count)); err != nil {
 			return fmt.Errorf("write batch count %d: %w", i, err)
 		}
+		if err := binary.Write(w, binary.BigEndian, batch.producerID); err != nil {
+			return fmt.Errorf("write batch producer id %d: %w", i, err)
+		}
+		if err := binary.Write(w, binary.BigEndian, batch.sequence); err != nil {
+			return fmt.Errorf("write batch sequence %d: %w", i, err)
+		}
 		if _, err := w.Write(storedBatch); err != nil {
 			return fmt.Errorf("write batch %d: %w", i, err)
 		}
@@ -103,8 +109,10 @@ func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSi
 }
 
 type segmentBatch struct {
-	payload []byte
-	count   int
+	payload    []byte
+	count      int
+	producerID uint64
+	sequence   uint64
 }
 
 func buildSegmentBatches(msgs []Message, batchTargetSize int64) ([]segmentBatch, error) {
@@ -322,6 +330,23 @@ func readSegmentFromOffset(r io.ReaderAt, size int64, offsetIndex []byte, baseOf
 			return nil, fmt.Errorf("read batch count: %w", err)
 		}
 
+		// Read producer metadata (informational, not used on the read path yet).
+		var producerID, sequence uint64
+		_ = producerID
+		_ = sequence
+		if err := binary.Read(sr, binary.BigEndian, &producerID); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return nil, fmt.Errorf("read batch producer id: %w", err)
+		}
+		if err := binary.Read(sr, binary.BigEndian, &sequence); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return nil, fmt.Errorf("read batch sequence: %w", err)
+		}
+
 		batch := make([]byte, batchLen)
 		if _, err := io.ReadFull(sr, batch); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -461,6 +486,15 @@ func BuildSegmentOffsetIndex(segment []byte, baseOffset uint64, intervalBytes in
 			return nil, fmt.Errorf("read batch count: %w", err)
 		}
 
+		// Skip producer metadata (8B producer id + 8B sequence).
+		var producerID, sequence uint64
+		if err := binary.Read(reader, binary.BigEndian, &producerID); err != nil {
+			return nil, fmt.Errorf("read batch producer id: %w", err)
+		}
+		if err := binary.Read(reader, binary.BigEndian, &sequence); err != nil {
+			return nil, fmt.Errorf("read batch sequence: %w", err)
+		}
+
 		payload := make([]byte, batchLen)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			return nil, fmt.Errorf("read batch payload: %w", err)
@@ -589,6 +623,38 @@ func readMessageFrame(r io.Reader) (Message, error) {
 	return msg, nil
 }
 
+func readMessageFrameOffset(r io.Reader) (uint64, error) {
+	var offset uint64
+	if err := binary.Read(r, binary.BigEndian, &offset); err != nil {
+		return 0, err
+	}
+
+	var timestamp int64
+	if err := binary.Read(r, binary.BigEndian, &timestamp); err != nil {
+		return 0, err
+	}
+	if err := skipBytes(r); err != nil {
+		return 0, err
+	}
+	if err := skipBytes(r); err != nil {
+		return 0, err
+	}
+
+	var headerCount uint32
+	if err := binary.Read(r, binary.BigEndian, &headerCount); err != nil {
+		return 0, err
+	}
+	for i := uint32(0); i < headerCount; i++ {
+		if err := skipBytes(r); err != nil {
+			return 0, err
+		}
+		if err := skipBytes(r); err != nil {
+			return 0, err
+		}
+	}
+	return offset, nil
+}
+
 // readBytes reads a 4-byte length-prefixed byte slice.
 // Returns nil (not an error) when length is 0.
 func readBytes(r io.Reader) ([]byte, error) {
@@ -604,4 +670,16 @@ func readBytes(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+func skipBytes(r io.Reader) error {
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return err
+	}
+	if length == 0 {
+		return nil
+	}
+	_, err := io.CopyN(io.Discard, r, int64(length))
+	return err
 }

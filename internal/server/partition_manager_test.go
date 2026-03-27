@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/config"
+	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
@@ -170,7 +170,10 @@ func TestPartitionManagerAppendBatch_PersistsHighWatermarkBeforeFlush(t *testing
 	}
 }
 
-func TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL(t *testing.T) {
+// TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL was removed:
+// index.json CAS loop has been replaced by a simple state.json PUT.
+
+func TestPartitionManagerScanWALForProducerStateUsesBatchMetadata(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
 	tc := meta.TopicConfig{
@@ -189,54 +192,44 @@ func TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL(t *testing.T) {
 	if ps == nil {
 		t.Fatal("expected partition state")
 	}
-	ps.isLeader = true
-	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
 
-	_, err := pm.AppendBatch(context.Background(), "topic", 0, []log.Message{
-		{Key: []byte("k"), Value: []byte("value")},
-	})
-	if err != nil {
-		t.Fatalf("AppendBatch() error = %v", err)
+	if err := ps.wal.AppendBatchWithMeta(log.Batch{
+		ProducerID: 1,
+		Sequence:   0,
+		Messages: []log.Message{
+			{Offset: 0, Key: []byte("k0"), Value: []byte("v0"), Headers: map[string]string{"a": "1"}},
+			{Offset: 1, Key: []byte("k1"), Value: []byte("v1"), Headers: map[string]string{"b": "2"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendBatchWithMeta(first) error = %v", err)
 	}
-
-	var casCalls int
-	pm.conditionalPutIndex = func(ctx context.Context, key string, data []byte, etag string) (string, error) {
-		casCalls++
-		return "", storage.ErrConflict
-	}
-
-	err = pm.onFlush(pm.getGlobalID("topic", 0))
-	if err == nil {
-		t.Fatal("onFlush() should fail when index CAS exhausts retries")
-	}
-	if casCalls != 5 {
-		t.Fatalf("conditionalPutIndex called %d times, want 5", casCalls)
-	}
-	if !errors.Is(err, storage.ErrConflict) && err.Error() != "flush index exhausted after retries" {
-		t.Fatalf("onFlush() error = %v, want index exhaustion", err)
+	if err := ps.wal.AppendBatchWithMeta(log.Batch{
+		ProducerID: 2,
+		Sequence:   5,
+		Messages: []log.Message{
+			{Offset: 2, Key: []byte("k2"), Value: []byte("v2"), Headers: map[string]string{"c": "3"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendBatchWithMeta(second) error = %v", err)
 	}
 
-	msgs, err := ps.wal.Replay()
-	if err != nil {
-		t.Fatalf("wal.Replay() error = %v", err)
-	}
-	if len(msgs) != 1 {
-		t.Fatalf("expected WAL to retain 1 message after failed flush, found %d", len(msgs))
-	}
-	if ps.flushedOffset != 0 {
-		t.Fatalf("flushedOffset = %d, want 0 after failed flush", ps.flushedOffset)
-	}
+	ps.flushedOffset = 2
 
-	indexKey := "topic/0/index.json"
-	if _, err := pm.s3Client.Get(context.Background(), indexKey); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("index.json should not be written on failed flush, got err=%v", err)
+	got := pm.ScanWALForProducerState("topic", 0)
+	want := []idempotency.BatchInfo{
+		{
+			ProducerID: 2,
+			Sequence:   5,
+			BatchSize:  1,
+			Key:        idempotency.PartitionKey{Topic: "topic", Partition: 0},
+		},
 	}
-
-	segmentKeys, err := pm.s3Client.List(context.Background(), "topic/0/")
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
+	if len(got) != len(want) {
+		t.Fatalf("ScanWALForProducerState() returned %d batches, want %d", len(got), len(want))
 	}
-	if len(segmentKeys) != 3 {
-		t.Fatalf("expected uploaded segment, offset index, and metadata to remain for diagnosis/retry, got %v", segmentKeys)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ScanWALForProducerState()[%d] = %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }

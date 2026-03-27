@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -16,19 +17,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/consumer"
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
 
+const headerForwardedBy = "X-Forwarded-By"
+
 // Server is the HTTP server for camu.
 type Server struct {
 	cfg              *config.Config
 	httpServer       *http.Server
+	internalServer   *http.Server
+	internalListener net.Listener
 	s3Client         *storage.S3Client
 	topicStore       *meta.TopicStore
 	partitionManager *PartitionManager
@@ -45,7 +53,9 @@ type Server struct {
 	leaderLease     coordination.LeaderLease
 	readAssignments func(ctx context.Context, topic string) (coordination.TopicAssignments, error)
 
-	followerFetcher *replication.FollowerFetcher
+	idempotencyManager *idempotency.Manager
+	followerFetcher    *replication.FollowerFetcher
+	internalClient     *http.Client
 
 	// assignmentsMu protects myPartitions.
 	assignmentsMu sync.RWMutex
@@ -137,6 +147,8 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		return nil, fmt.Errorf("creating partition manager: %w", err)
 	}
 
+	idempotencyMgr := idempotency.NewManager(s3Client)
+
 	s := &Server{
 		cfg:                  cfg,
 		s3Client:             s3Client,
@@ -147,6 +159,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		leaderElection:       coordination.NewLeaderElection(s3Client, instanceID, leaseTTL),
 		assignmentStore:      coordination.NewAssignmentStore(s3Client),
 		isrStore:             replication.NewISRStore(s3Client),
+		idempotencyManager:   idempotencyMgr,
 		instanceID:           instanceID,
 		myPartitions:         make(map[string]map[int]localPartitionAssignment),
 		leaseStop:            make(chan struct{}),
@@ -156,19 +169,27 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	}
 	s.readAssignments = s.assignmentStore.Read
 
-	s.followerFetcher = replication.NewFollowerFetcher(func(topic string, pid int) {
+	s.internalClient = replication.NewH2CClient(replicationTimeout)
+	s.followerFetcher = replication.NewFollowerFetcher(s.internalClient, func(topic string, pid int) {
 		slog.Warn("leader down detected, attempting leadership", "topic", topic, "pid", pid)
 		if err := s.attemptPartitionLeadership(topic, pid); err != nil {
 			slog.Error("failed to acquire partition leadership", "topic", topic, "pid", pid, "error", err)
 		}
 	})
 
+	pm.idempotencyMgr = idempotencyMgr
+
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
 	pm.SetLeaseChecker(s.verifyOwnershipFromS3)
 
 	s.httpServer = &http.Server{
-		Handler: s.routes(),
+		Handler: s.publicRoutes(),
+	}
+
+	h2s := &http2.Server{}
+	s.internalServer = &http.Server{
+		Handler: h2c.NewHandler(s.internalRoutes(), h2s),
 	}
 
 	return s, nil
@@ -200,7 +221,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	if err != nil {
 		return fmt.Errorf("parsing coordination.instance_ttl: %w", err)
 	}
-	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), instanceTTL)
+	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), s.InternalAddress(), instanceTTL)
 	if err := s.registry.Register(context.Background()); err != nil {
 		return fmt.Errorf("register registry: %w", err)
 	}
@@ -211,6 +232,15 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	s.ready.Store(true)
 	s.startLeaseRenewal()
 	go func() { _ = s.httpServer.Serve(ln) }()
+
+	internalLn, err := net.Listen("tcp", s.cfg.Server.InternalAddress)
+	if err != nil {
+		return fmt.Errorf("listen internal on %s: %w", s.cfg.Server.InternalAddress, err)
+	}
+	s.internalListener = internalLn
+	slog.Info("internal_server_started", "address", s.cfg.Server.InternalAddress, "protocol", "h2c")
+	go func() { _ = s.internalServer.Serve(internalLn) }()
+
 	return nil
 }
 
@@ -224,8 +254,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// 1. Stop accepting new writes.
 	s.shuttingDown.Store(true)
 
-	// 2. Shut down HTTP server (waits for in-flight requests to finish).
+	// 2. Shut down HTTP servers (waits for in-flight requests to finish).
 	httpErr := s.httpServer.Shutdown(ctx)
+	if err := s.internalServer.Shutdown(ctx); err != nil && httpErr == nil {
+		httpErr = err
+	}
 
 	// 3. Cancel all follower fetch loops.
 	s.partitionManager.CancelAllFetchLoops()
@@ -256,6 +289,13 @@ func (s *Server) Address() string {
 		return s.listener.Addr().String()
 	}
 	return s.cfg.Server.Address
+}
+
+func (s *Server) InternalAddress() string {
+	if s.internalListener != nil {
+		return s.internalListener.Addr().String()
+	}
+	return s.cfg.Server.InternalAddress
 }
 
 func routableHTTPAddress(instanceID, rawAddr string) string {
@@ -663,6 +703,22 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		}
 	}
 
+	// Recover producer idempotency state from S3 checkpoint + WAL tail.
+	if s.idempotencyManager != nil {
+		checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
+		if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
+			s.idempotencyManager.LoadCheckpoint(data)
+			slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
+		}
+
+		if batches := s.partitionManager.ScanWALForProducerState(topic, pid); len(batches) > 0 {
+			s.idempotencyManager.RebuildFromBatches(batches)
+			slog.Info("idempotency_wal_recovery", "topic", topic, "partition", pid, "batches", len(batches))
+		}
+	}
+
 	slog.Info("partition_leader_init", "topic", topic, "partition", pid,
 		"epoch", pa.LeaderEpoch, "hw", recoveredHW, "next_offset", ps.nextOffset, "replicas", len(pa.Replicas))
 }
@@ -695,17 +751,22 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		"index_hw", ps.index.HighWatermark(),
 	)
 
-	// Resolve leader address. The registry stores the listener address
-	// (e.g. "[::]:8080") which is useless for inter-node comms. Extract
-	// the port and combine with the leader's instanceID (hostname).
+	// Resolve leader address. Use the internal address (h2c) for replication
+	// traffic. The registry stores the listener bind address (e.g. "[::]:8081")
+	// which is useless for inter-node comms — extract port and combine with
+	// the leader's instanceID (hostname).
 	leaderInfo, err := s.registry.GetInstanceInfo(ctx, pa.Leader)
 	if err != nil {
 		slog.Warn("initPartitionAsFollower: resolve leader", "leader", pa.Leader, "error", err)
 		return
 	}
-	_, port, _ := net.SplitHostPort(leaderInfo.Address)
+	addr := leaderInfo.InternalAddress
+	if addr == "" {
+		addr = leaderInfo.Address // fallback for rolling upgrades
+	}
+	_, port, _ := net.SplitHostPort(addr)
 	if port == "" {
-		port = "8080"
+		port = "8081"
 	}
 	leaderAddr := net.JoinHostPort(pa.Leader, port)
 
@@ -804,6 +865,13 @@ func (s *Server) renewLeases() {
 	if s.amLeader() && s.coordinationGCTick%10 == 0 {
 		s.coordinationGC(ctx, topics)
 	}
+
+	// Evict stale idempotent producers every 10th tick.
+	if s.idempotencyManager != nil && s.coordinationGCTick%10 == 0 {
+		if evicted := s.idempotencyManager.EvictStale(30 * time.Minute); evicted > 0 {
+			slog.Info("idempotency_evicted_stale_producers", "count", evicted)
+		}
+	}
 }
 
 // isOwnedPartition checks if this instance owns the given partition.
@@ -843,6 +911,9 @@ func (s *Server) verifyOwnershipFromS3(topic string, partitionID int) bool {
 // locally applied assignment epoch. This avoids an assignment-store read on
 // every produce while still rejecting any producer request that raced a
 // reassignment before the partition state was updated.
+//
+// It also checks ownership, so callers can skip a separate isOwnedPartition
+// call on the produce hot path.
 func (s *Server) verifyProduceLeadership(topic string, partitionID int, localEpoch uint64) bool {
 	s.assignmentsMu.RLock()
 	defer s.assignmentsMu.RUnlock()
@@ -944,6 +1015,64 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 	}
 
 	return resp
+}
+
+// leaderInternalAddr resolves the internal (h2c) address for the leader of the
+// given topic/partition. Returns "" if the leader cannot be determined.
+func (s *Server) leaderInternalAddr(topic string, pid int) string {
+	ctx := context.Background()
+	assigned, err := s.assignmentStore.Read(ctx, topic)
+	if err != nil {
+		return ""
+	}
+	pa, ok := assigned.Partitions[pid]
+	if !ok {
+		return ""
+	}
+	leaderID := pa.Leader
+	if leaderID == "" || leaderID == s.instanceID {
+		return ""
+	}
+	info, err := s.registry.GetInstanceInfo(ctx, leaderID)
+	if err != nil {
+		return ""
+	}
+	addr := info.InternalAddress
+	if addr == "" {
+		addr = info.Address
+	}
+	_, port, _ := net.SplitHostPort(addr)
+	if port == "" {
+		port = "8081"
+	}
+	return net.JoinHostPort(leaderID, port)
+}
+
+// proxyToLeader forwards the request to the leader node over the h2c internal
+// transport. The leader's public-facing produce handler processes the request
+// and the response is streamed back to the original client.
+func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, leaderAddr string) {
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = leaderAddr
+			req.Host = leaderAddr
+			req.Header.Set(headerForwardedBy, s.instanceID)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// Propagate the leader's instance ID so clients and checkers
+			// see the true leader, not the proxy node.
+			if id := resp.Header.Get("X-Camu-Instance-ID"); id != "" {
+				resp.Header.Set("X-Camu-Instance-ID", id)
+			}
+			return nil
+		},
+		Transport: s.internalClient.Transport,
+	}
+	// Clear headers set by middleware — the proxy response replaces them.
+	w.Header().Del("X-Camu-Instance-ID")
+	w.Header().Del("Content-Type")
+	proxy.ServeHTTP(w, r)
 }
 
 // attemptPartitionLeadership is called when a follower detects the leader is

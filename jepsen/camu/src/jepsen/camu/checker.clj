@@ -181,6 +181,40 @@
          :rejoin-count  (count rejoin-events)
          :conflicts     (take 10 conflicts)}))))
 
+(defn replica-drain-messages
+  "Extracts all consumed messages from :replica-drain operations in the history."
+  [history]
+  (->> history
+       (filter #(and (= (:f %) :replica-drain)
+                     (= (:type %) :ok)))
+       (mapcat (fn [op] (get-in op [:value :messages])))))
+
+(defn replica-convergence-checker
+  "Verifies that every acked produce is eventually readable from replicas after
+   recovery. Compares acked keys against keys returned by :replica-drain ops."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [produced-keys (->> (ok-produces history) (map :key) set)
+            replica-keys  (->> (replica-drain-messages history)
+                               (map :key)
+                               set)
+            leader-keys   (->> (drain-messages history)
+                               (map :key)
+                               set)
+            missing-from-replicas (set/difference produced-keys replica-keys)
+            ;; Keys present on leader but missing from replicas indicate
+            ;; replication lag that wasn't resolved after recovery.
+            leader-only           (set/difference leader-keys replica-keys)]
+        {:valid?               (empty? missing-from-replicas)
+         :acked-keys           (count produced-keys)
+         :replica-drained-keys (count replica-keys)
+         :leader-drained-keys  (count leader-keys)
+         :missing-from-replicas (count missing-from-replicas)
+         :leader-only          (count leader-only)
+         :missing-data         (when (seq missing-from-replicas)
+                                 (take 20 (sort missing-from-replicas)))}))))
+
 (defn recovery-time-checker
   "Measures time between each nemesis fault-start event and the first successful
    client operation that follows it. Only :start events are meaningful —
@@ -220,11 +254,7 @@
   []
   (reify checker/Checker
     (check [_ test history opts]
-      (let [produced-keys (->> history
-                               (filter #(and (= (:f %) :produce)
-                                             (= (:type %) :ok)))
-                               (map #(get-in % [:value :key]))
-                               set)
+      (let [produced-keys (->> (ok-produces history) (map :key) set)
             drained-keys  (->> (drain-messages history)
                                (map :key)
                                set)
@@ -337,6 +367,55 @@
                                                   :keys    (take 10 (sort (map :key msgs)))}))
                                     {}
                                     by-part))}))))
+
+(defn exactly-once-checker
+  "Verifies exactly-once delivery for idempotent produce:
+   1. Every confirmed (:ok) key appears in drain exactly once (no duplicates).
+   2. Every confirmed key appears in drain (no data loss).
+   3. No key in drain was never attempted — keys from :info (indeterminate)
+      ops are allowed in drain since the write may have succeeded."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [;; Keys confirmed by the client (:ok).
+            acked-keys    (->> history
+                               (filter #(and (= (:f %) :idempotent-produce)
+                                             (= (:type %) :ok)))
+                               (map #(get-in % [:value :key]))
+                               set)
+            ;; Keys from indeterminate ops (:info) — may or may not have been written.
+            inflight-keys (->> history
+                               (filter #(and (= (:f %) :idempotent-produce)
+                                             (= (:type %) :info)))
+                               (map #(get-in % [:value :key]))
+                               set)
+            drained       (drain-messages history)
+            ;; Only consider keys matching the idempotent produce pattern (k-N).
+            drained-keys  (->> (map :key drained)
+                               (filter #(and (some? %) (.startsWith ^String % "k-"))))
+            drained-set   (set drained-keys)
+            key-freq      (frequencies drained-keys)
+            duplicate-keys (->> key-freq
+                                (filter (fn [[_ cnt]] (> cnt 1)))
+                                (into {}))
+            ;; Missing: acked but not in drain = data loss.
+            missing       (set/difference acked-keys drained-set)
+            ;; Ghosts: in drain but never acked AND never inflight.
+            ;; Inflight keys appearing in drain is expected (write succeeded,
+            ;; response was lost).
+            ghosts        (set/difference drained-set (set/union acked-keys inflight-keys))]
+        {:valid?          (and (empty? duplicate-keys)
+                               (empty? missing)
+                               (empty? ghosts))
+         :acked-count     (count acked-keys)
+         :inflight-count  (count inflight-keys)
+         :drained-count   (count drained-keys)
+         :duplicate-count (count duplicate-keys)
+         :duplicates      (when (seq duplicate-keys) (take 20 duplicate-keys))
+         :missing-count   (count missing)
+         :missing         (when (seq missing) (take 20 missing))
+         :ghost-count     (count ghosts)
+         :ghosts          (when (seq ghosts) (take 20 ghosts))}))))
 
 (defn combined-checker
   "Returns a composition of all camu checkers plus standard Jepsen

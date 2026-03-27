@@ -64,23 +64,6 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	if hw, ok := readableHighWatermark(ps); ok {
 		readableHW = hw
 		hasReadableHW = true
-		w.Header().Set("X-High-Watermark", strconv.FormatUint(hw, 10))
-		if startOffset >= hw {
-			slog.Debug("consume_short_circuit_at_hw",
-				"topic", topicName,
-				"partition", partitionID,
-				"offset", startOffset,
-				"limit", limit,
-				"owned", owned,
-				"high_watermark", hw,
-			)
-			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
-			return
-		}
-		maxReadable := hw - startOffset
-		if uint64(limit) > maxReadable {
-			limit = int(maxReadable)
-		}
 	}
 
 	// Refresh index from S3 for non-owned partitions so we see the latest
@@ -99,6 +82,31 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	if index == nil {
 		writeError(w, http.StatusNotFound, "partition not found")
 		return
+	}
+
+	// The index HW (from S3) may be ahead of the in-memory follower HW
+	// after a leader failover. Use the higher of the two so reads aren't
+	// capped at a stale value.
+	if hasReadableHW {
+		if indexHW := index.HighWatermark(); indexHW > readableHW {
+			readableHW = indexHW
+		}
+		w.Header().Set("X-High-Watermark", strconv.FormatUint(readableHW, 10))
+		if startOffset >= readableHW {
+			slog.Debug("consume_short_circuit_at_hw",
+				"topic", topicName,
+				"partition", partitionID,
+				"offset", startOffset,
+				"limit", limit,
+				"owned", owned,
+				"high_watermark", readableHW,
+			)
+			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
+			return
+		}
+		if maxReadable := readableHW - startOffset; uint64(limit) > maxReadable {
+			limit = int(maxReadable)
+		}
 	}
 
 	slog.Debug("consume_begin",

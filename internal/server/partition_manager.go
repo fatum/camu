@@ -3,9 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +13,7 @@ import (
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/fsutil"
+	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/producer"
@@ -25,7 +26,6 @@ type partitionState struct {
 	appendMu      sync.Mutex
 	wal           *log.WAL
 	index         *log.Index
-	indexETag     string // last known ETag of index.json in S3
 	nextOffset    uint64
 	epoch         uint64                    // always 0 in single-instance mode
 	replicaState  *replication.ReplicaState // nil for rf=1
@@ -35,6 +35,8 @@ type partitionState struct {
 	epochHistory  *replication.EpochHistory
 	fetchCancel   context.CancelFunc // cancel follower fetch goroutine
 	fetchDone     chan struct{}      // closed when fetch goroutine exits
+	globalID      int  // cached batcher partition ID, set on first append
+	globalIDSet   bool // true once globalID has been resolved
 }
 
 // PartitionManager manages per-partition state including WAL, index, and batching.
@@ -50,12 +52,11 @@ type PartitionManager struct {
 	walChunkSize int64
 	segmentsCfg  config.SegmentsConfig
 
+	idempotencyMgr *idempotency.Manager
+
 	// leaseChecker validates partition ownership before flushing to S3.
 	leaseChecker func(topic string, partitionID int) bool
 
-	// conditionalPutIndex allows tests to force index CAS behavior without
-	// replacing the whole storage client.
-	conditionalPutIndex func(ctx context.Context, key string, data []byte, etag string) (string, error)
 
 	// globalID maps a unique int to (topic, partitionID) for the batcher callback.
 	globalIDMu   sync.Mutex
@@ -101,7 +102,6 @@ func NewPartitionManager(cfg *config.Config, s3Client *storage.S3Client) (*Parti
 		globalIDMap:  make(map[int]topicPartition),
 		reverseMap:   make(map[topicPartition]int),
 	}
-	pm.conditionalPutIndex = pm.s3Client.ConditionalPut
 
 	maxAge, err := cfg.Segments.MaxAgeDuration()
 	if err != nil {
@@ -185,22 +185,29 @@ func (pm *PartitionManager) InitTopic(ctx context.Context, tc meta.TopicConfig, 
 // The epoch comes from the acquired lease — if the WAL contains data from a
 // previous epoch, it is discarded (another instance already took over those offsets).
 func (pm *PartitionManager) initPartition(ctx context.Context, topic string, partitionID int, epoch uint64) (*partitionState, error) {
-	// 1. Load or create index.
-	indexKey := fmt.Sprintf("%s/%d/index.json", topic, partitionID)
-	idx := log.NewIndex()
-	var indexETag string
-
-	data, etag, err := pm.s3Client.GetWithETag(ctx, indexKey)
+	// 1. Load segment list from S3 by listing objects.
+	prefix := log.ListSegmentPrefix(topic, partitionID)
+	keys, err := pm.s3Client.List(ctx, prefix)
 	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			return nil, fmt.Errorf("load index: %w", err)
+		return nil, fmt.Errorf("list segments for %s/%d: %w", topic, partitionID, err)
+	}
+	idx := log.NewIndex()
+	for _, ref := range log.SegmentRefsFromKeys(keys) {
+		idx.Add(ref)
+	}
+
+	// Load partition state (HW + epoch history) from state.json.
+	stateKey := log.StateKey(topic, partitionID)
+	if stateData, err := pm.s3Client.Get(ctx, stateKey); err == nil {
+		var partState log.PartitionState
+		if err := partState.Unmarshal(stateData); err != nil {
+			slog.Warn("initPartition: bad state.json", "topic", topic, "partition", partitionID, "error", err)
+		} else {
+			idx.SetHighWatermark(partState.HighWatermark)
+			if len(partState.EpochHistory) > 0 {
+				idx.SetEpochHistory(partState.EpochHistory)
+			}
 		}
-		// Index doesn't exist yet — use empty index.
-	} else {
-		if err := idx.UnmarshalJSON(data); err != nil {
-			return nil, fmt.Errorf("unmarshal index: %w", err)
-		}
-		indexETag = etag
 	}
 
 	// 2. Open WAL.
@@ -282,7 +289,6 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 	return &partitionState{
 		wal:        wal,
 		index:      idx,
-		indexETag:  indexETag,
 		nextOffset: nextOffset,
 		epoch:      epoch,
 	}, nil
@@ -344,8 +350,12 @@ func (pm *PartitionManager) Append(ctx context.Context, topic string, partitionI
 		ps.replicaState.NotifyNewData()
 	}
 
-	// Notify batcher of size increase (no message data).
-	globalID := pm.getGlobalID(topic, partitionID)
+	// Use cached globalID — set lazily on first append under appendMu.
+	if !ps.globalIDSet {
+		ps.globalID = pm.getGlobalID(topic, partitionID)
+		ps.globalIDSet = true
+	}
+	globalID := ps.globalID
 	msgSize := int64(len(msg.Key) + len(msg.Value) + 40)
 	if err := pm.batcher.Append(globalID, msgSize); err != nil {
 		return 0, fmt.Errorf("batcher append: %w", err)
@@ -374,11 +384,17 @@ func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, parti
 	}
 	pm.mu.RUnlock()
 
+	return pm.appendBatchToPS(ps, topic, partitionID, msgs)
+}
+
+// appendBatchToPS is the inner implementation of AppendBatch that operates
+// directly on a known partitionState, avoiding a redundant pm.mu.RLock lookup.
+func (pm *PartitionManager) appendBatchToPS(ps *partitionState, topic string, partitionID int, msgs []log.Message) ([]uint64, error) {
 	// Assign offsets for the entire batch.
+	// appendMu serialises all access to ps.nextOffset — no additional lock needed.
 	ps.appendMu.Lock()
 	defer ps.appendMu.Unlock()
 
-	pm.mu.Lock()
 	offsets := make([]uint64, len(msgs))
 	now := time.Now().UnixNano()
 	for i := range msgs {
@@ -389,28 +405,113 @@ func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, parti
 			msgs[i].Timestamp = now
 		}
 	}
-	pm.mu.Unlock()
 
 	// Write entire batch to WAL with a single fsync.
 	if err := ps.wal.AppendBatch(msgs); err != nil {
 		return nil, fmt.Errorf("WAL append batch: %w", err)
 	}
+	return offsets, pm.postAppend(ps, topic, partitionID, msgs, offsets)
+}
+
+// IdempotencyOpts carries idempotency parameters for AppendBatchWithMeta.
+// When non-nil, the idempotency check, WAL write, and offset recording all
+// happen atomically under appendMu — preventing sequence advance without
+// data write and ensuring LastOffset is set before the lock releases.
+type IdempotencyOpts struct {
+	Manager  *idempotency.Manager
+	Key      idempotency.PartitionKey
+	Sequence uint64
+}
+
+// AppendBatchWithMeta writes messages with producer metadata to the WAL.
+// If idem is non-nil, the idempotency check is performed atomically with
+// the WAL write under appendMu. Returns ErrDuplicateSequence if duplicate.
+func (pm *PartitionManager) AppendBatchWithMeta(ctx context.Context, topic string, partitionID int, batch log.Batch, idem *IdempotencyOpts) ([]uint64, error) {
+	if len(batch.Messages) == 0 {
+		return nil, nil
+	}
+
+	pm.mu.RLock()
+	topicPartitions, ok := pm.partitions[topic]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil, fmt.Errorf("topic %q not initialized", topic)
+	}
+	ps, ok := topicPartitions[partitionID]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+	}
+	pm.mu.RUnlock()
+
+	return pm.appendBatchWithMetaToPS(ps, topic, partitionID, batch, idem)
+}
+
+// appendBatchWithMetaToPS is the inner implementation of AppendBatchWithMeta
+// that operates directly on a known partitionState, avoiding a redundant
+// pm.mu.RLock lookup when the caller already has ps.
+func (pm *PartitionManager) appendBatchWithMetaToPS(ps *partitionState, topic string, partitionID int, batch log.Batch, idem *IdempotencyOpts) ([]uint64, error) {
+	ps.appendMu.Lock()
+	defer ps.appendMu.Unlock()
+
+	// Idempotency gate under appendMu — atomic with WAL write.
+	if idem != nil {
+		if err := idem.Manager.CheckAndAdvance(batch.ProducerID, idem.Key, idem.Sequence, len(batch.Messages)); err != nil {
+			return nil, err
+		}
+	}
+
+	// Assign offsets — appendMu serialises all access to nextOffset,
+	// so no additional pm.mu lock is needed here.
+	offsets := make([]uint64, len(batch.Messages))
+	now := time.Now().UnixNano()
+	for i := range batch.Messages {
+		offsets[i] = ps.nextOffset
+		batch.Messages[i].Offset = ps.nextOffset
+		ps.nextOffset++
+		if batch.Messages[i].Timestamp == 0 {
+			batch.Messages[i].Timestamp = now
+		}
+	}
+
+	if err := ps.wal.AppendBatchWithMeta(batch); err != nil {
+		// Rollback sequence on WAL failure so the producer can retry.
+		if idem != nil {
+			idem.Manager.RollbackSequence(batch.ProducerID, idem.Key, idem.Sequence)
+		}
+		return nil, fmt.Errorf("WAL append batch: %w", err)
+	}
+
+	// Record offset for purgatory join on duplicate — under appendMu so
+	// it's always set before a duplicate retry can read it.
+	if idem != nil {
+		idem.Manager.RecordLastOffset(batch.ProducerID, idem.Key, offsets[len(offsets)-1])
+	}
+
+	return offsets, pm.postAppend(ps, topic, partitionID, batch.Messages, offsets)
+}
+
+func (pm *PartitionManager) postAppend(ps *partitionState, topic string, partitionID int, msgs []log.Message, offsets []uint64) error {
 	if ps.replicaState != nil {
 		ps.replicaState.SetLeaderOffset(offsets[len(offsets)-1] + 1)
 		ps.replicaState.NotifyNewData()
 	}
 
-	// Notify batcher of total size increase (no message data).
-	globalID := pm.getGlobalID(topic, partitionID)
+	// Use cached globalID — set lazily on first append under appendMu.
+	if !ps.globalIDSet {
+		ps.globalID = pm.getGlobalID(topic, partitionID)
+		ps.globalIDSet = true
+	}
+	globalID := ps.globalID
 	totalBatchSize := int64(0)
 	for _, msg := range msgs {
 		totalBatchSize += int64(len(msg.Key) + len(msg.Value) + 40)
 	}
 	if err := pm.batcher.Append(globalID, totalBatchSize); err != nil {
-		return nil, fmt.Errorf("batcher append: %w", err)
+		return fmt.Errorf("batcher append: %w", err)
 	}
 
-	return offsets, nil
+	return nil
 }
 
 // AppendReplicatedBatch writes messages to the given partition preserving their
@@ -469,19 +570,28 @@ func (pm *PartitionManager) RefreshIndex(ctx context.Context, topic string, part
 	}
 	pm.mu.RUnlock()
 
-	indexKey := fmt.Sprintf("%s/%d/index.json", topic, partitionID)
-	data, etag, err := pm.s3Client.GetWithETag(ctx, indexKey)
+	prefix := log.ListSegmentPrefix(topic, partitionID)
+	keys, err := pm.s3Client.List(ctx, prefix)
 	if err != nil {
-		return // stale index is better than no index
+		slog.Warn("RefreshIndex: list failed", "topic", topic, "partition", partitionID, "error", err)
+		return
 	}
 	idx := log.NewIndex()
-	if err := idx.UnmarshalJSON(data); err != nil {
-		return
+	for _, ref := range log.SegmentRefsFromKeys(keys) {
+		idx.Add(ref)
+	}
+
+	stateKey := log.StateKey(topic, partitionID)
+	if stateData, err := pm.s3Client.Get(ctx, stateKey); err == nil {
+		var state log.PartitionState
+		if err := state.Unmarshal(stateData); err == nil {
+			idx.SetHighWatermark(state.HighWatermark)
+			idx.SetEpochHistory(state.EpochHistory)
+		}
 	}
 
 	pm.mu.Lock()
 	ps.index = idx
-	ps.indexETag = etag
 	pm.mu.Unlock()
 }
 
@@ -566,6 +676,57 @@ func (pm *PartitionManager) CancelAllFetchLoops() {
 	for _, ch := range doneChans {
 		<-ch
 	}
+}
+
+// ScanWALForProducerState reads the unflushed WAL tail for a partition and
+// extracts batch-level producer metadata for idempotency state recovery.
+// Only committed batches (offset ≤ high watermark) are included — uncommitted
+// batches may be truncated on failover and must not advance sequence state.
+func (pm *PartitionManager) ScanWALForProducerState(topic string, partitionID int) []idempotency.BatchInfo {
+	pm.mu.RLock()
+	tp, ok := pm.partitions[topic]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil
+	}
+	ps, ok := tp[partitionID]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil
+	}
+	flushedOffset := ps.flushedOffset
+	// High watermark: only batches below HW are committed.
+	// For rf=1 (no replicaState), all WAL data is committed — use max uint64.
+	hw := uint64(math.MaxUint64)
+	if ps.replicaState != nil {
+		hw = ps.replicaState.HighWatermark()
+	}
+	pm.mu.RUnlock()
+
+	batches, err := ps.wal.ReadBatchMetasFrom(flushedOffset)
+	if err != nil {
+		slog.Warn("idempotency_wal_scan_failed",
+			"topic", topic, "partition", partitionID, "error", err)
+		return nil
+	}
+
+	var infos []idempotency.BatchInfo
+	for _, b := range batches {
+		if b.ProducerID == 0 {
+			continue
+		}
+		// Skip uncommitted batches — their last offset is above HW.
+		if b.LastOffset >= hw {
+			continue
+		}
+		infos = append(infos, idempotency.BatchInfo{
+			ProducerID: b.ProducerID,
+			Sequence:   b.Sequence,
+			BatchSize:  b.MessageCount,
+			Key:        idempotency.PartitionKey{Topic: topic, Partition: partitionID},
+		})
+	}
+	return infos
 }
 
 // Shutdown stops the batcher (flushing remaining messages) and closes all WALs.
@@ -689,7 +850,7 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	// a reference to the new SegmentRef. Crashes in between can leave orphaned
 	// assets behind, which is acceptable because GC cleans up unreferenced
 	// segment, offset-index, and metadata objects.
-	segKey := fmt.Sprintf("%s/%d/%d-%d.segment", topic, partitionID, baseOffset, epoch)
+	segKey := log.FormatSegmentKey(topic, partitionID, baseOffset, endOffset, epoch)
 	segRef := log.SegmentRef{
 		BaseOffset:     baseOffset,
 		EndOffset:      endOffset,
@@ -727,76 +888,36 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		_ = err
 	}
 
-	// 4. Update index with retry on conflict.
-	indexKey := fmt.Sprintf("%s/%d/index.json", topic, partitionID)
-	indexUpdated := false
-	for retries := 0; retries < 5; retries++ {
-		// Load current index from S3 (may have changed since init).
-		currentIdx := log.NewIndex()
-		var currentETag string
-
-		data, etag, err := pm.s3Client.GetWithETag(ctx, indexKey)
-		if err != nil {
-			if !errors.Is(err, storage.ErrNotFound) {
-				return fmt.Errorf("load index for update: %w", err)
-			}
-			// Index doesn't exist yet, will create.
-		} else {
-			if err := currentIdx.UnmarshalJSON(data); err != nil {
-				return fmt.Errorf("unmarshal index for update: %w", err)
-			}
-			currentETag = etag
+	// 4. Update partition state (HW + epoch history) — simple PUT, no CAS needed.
+	hw := endOffset + 1
+	if ps.replicaState != nil {
+		hw = ps.replicaState.HighWatermark()
+	}
+	partState := log.PartitionState{
+		HighWatermark: hw,
+	}
+	if ps.epochHistory != nil {
+		for _, e := range ps.epochHistory.Entries {
+			partState.EpochHistory = append(partState.EpochHistory, log.EpochEntry{
+				Epoch:       e.Epoch,
+				StartOffset: e.StartOffset,
+			})
 		}
-
-		// Add new segment ref.
-		currentIdx.Add(segRef)
-		hw := endOffset + 1
-		if ps.replicaState != nil {
-			hw = ps.replicaState.HighWatermark()
-		}
-		currentIdx.SetHighWatermark(hw)
-
-		idxData, err := currentIdx.MarshalJSON()
-		if err != nil {
-			return fmt.Errorf("marshal updated index: %w", err)
-		}
-
-		newETag, err := pm.conditionalPutIndex(ctx, indexKey, idxData, currentETag)
-		if err != nil {
-			if errors.Is(err, storage.ErrConflict) {
-				slog.Warn("flush_index_conflict",
-					"topic", topic,
-					"partition", partitionID,
-					"epoch", epoch,
-					"base_offset", baseOffset,
-					"end_offset", endOffset,
-					"retry", retries+1,
-				)
-				continue // retry
-			}
-			return fmt.Errorf("conditional put index: %w", err)
-		}
-
-		// Update in-memory index and etag.
-		pm.mu.Lock()
-		ps.index = currentIdx
-		ps.indexETag = newETag
-		pm.mu.Unlock()
-		indexUpdated = true
-		break
+	}
+	stateData, err := partState.Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal state: %w", err)
+	}
+	stateKey := log.StateKey(topic, partitionID)
+	if err := pm.s3Client.Put(ctx, stateKey, stateData, storage.PutOpts{}); err != nil {
+		return fmt.Errorf("upload state.json: %w", err)
 	}
 
-	if !indexUpdated {
-		slog.Error("flush_index_exhausted",
-			"topic", topic,
-			"partition", partitionID,
-			"epoch", epoch,
-			"base_offset", baseOffset,
-			"end_offset", endOffset,
-			"segment_key", segKey,
-		)
-		return fmt.Errorf("flush index exhausted after retries")
-	}
+	// Update in-memory segment index.
+	pm.mu.Lock()
+	ps.index.Add(segRef)
+	ps.index.SetHighWatermark(hw)
+	pm.mu.Unlock()
 
 	slog.Info("segment_flushed",
 		"topic", topic,
@@ -805,6 +926,20 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		"end_offset", endOffset,
 		"size_bytes", len(segData),
 	)
+
+	// Upload per-partition producer idempotency checkpoint.
+	if pm.idempotencyMgr != nil {
+		pkey := idempotency.PartitionKey{Topic: topic, Partition: partitionID}
+		checkpointData, err := pm.idempotencyMgr.CheckpointPartition(pkey)
+		if err != nil {
+			slog.Warn("flush_idempotency_checkpoint_failed", "topic", topic, "partition", partitionID, "error", err)
+		} else if len(checkpointData) > 0 {
+			checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, partitionID)
+			if err := pm.s3Client.Put(ctx, checkpointKey, checkpointData, storage.PutOpts{}); err != nil {
+				slog.Warn("flush_idempotency_checkpoint_upload_failed", "topic", topic, "partition", partitionID, "error", err)
+			}
+		}
+	}
 
 	// 5. Mark flushed chunks as retained for replica catch-up. They remain
 	// readable via WAL until all followers move past them.

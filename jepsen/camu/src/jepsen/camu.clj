@@ -94,21 +94,43 @@
             (consume-gen offsets)
             (consume-gen offsets)]))
 
+(defn idempotent-produce-gen
+  "Generator for idempotent produce operations."
+  [counter]
+  (fn [_ _]
+    (let [n (swap! counter inc)]
+      {:type  :invoke
+       :f     :idempotent-produce
+       :value {:key   (str "k-" n)
+               :value (str "v-" n)}})))
+
 (defn workload-gen
   [opts counter offsets]
   (case (or (:workload opts) :mixed)
+    :idempotent (gen/mix [(idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (consume-gen offsets)
+                          (consume-gen offsets)
+                          (consume-gen offsets)])
     :large-requests (large-requests-workload-gen counter offsets)
     :replica-flushed-reads (replica-flushed-reads-workload-gen counter offsets)
     (mixed-workload-gen counter offsets)))
 
 (defn drain-gen
-  "Returns a generator that drains all 4 partitions."
-  []
-  (map (fn [p]
-         {:type  :invoke
-          :f     :drain
-          :value {:partition p :offset 0}})
-       (range partitions)))
+  "Returns a generator that drains all partitions using the given operation.
+   Defaults to :drain (leader reads)."
+  ([] (drain-gen :drain))
+  ([op]
+   (map (fn [p]
+          {:type  :invoke
+           :f     op
+           :value {:partition p :offset 0}})
+        (range partitions))))
 
 (defn replicated?
   "Returns true if the test opts request replication (RF > 1)."
@@ -119,19 +141,28 @@
   "Returns the appropriate checker composition based on whether the test
    is running in replicated mode."
   [opts]
-  (if (replicated? opts)
+  (if (= :idempotent (:workload opts))
+    (checker/compose
+     {:exactly-once       (camu-checker/exactly-once-checker)
+      :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+      :total-order        (camu-checker/total-order-checker)
+      :availability       (camu-checker/availability-checker)
+      :recovery-time      (camu-checker/recovery-time-checker)
+      :stats              (checker/stats)})
+    (if (replicated? opts)
     ;; Replicated: use key-based durability and epoch-based leader checks
     (checker/compose
-     {:committed-durability (camu-checker/committed-durability-checker)
-      :no-ghost-reads       (camu-checker/no-ghost-reads-checker)
-      :single-leader        (camu-checker/single-leader-checker)
-      :hw-monotonicity      (camu-checker/hw-monotonicity-checker)
-      :truncation-safety    (camu-checker/truncation-safety-checker)
-      :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
-      :total-order          (camu-checker/total-order-checker)
-      :availability         (camu-checker/availability-checker)
-      :recovery-time        (camu-checker/recovery-time-checker)
-      :stats                (checker/stats)})
+     {:committed-durability  (camu-checker/committed-durability-checker)
+      :no-ghost-reads        (camu-checker/no-ghost-reads-checker)
+      :single-leader         (camu-checker/single-leader-checker)
+      :hw-monotonicity       (camu-checker/hw-monotonicity-checker)
+      :truncation-safety     (camu-checker/truncation-safety-checker)
+      :offset-monotonicity   (camu-checker/offset-monotonicity-checker)
+      :total-order           (camu-checker/total-order-checker)
+      :replica-convergence   (camu-checker/replica-convergence-checker)
+      :availability          (camu-checker/availability-checker)
+      :recovery-time         (camu-checker/recovery-time-checker)
+      :stats                 (checker/stats)})
     ;; Unreplicated: original checkers
     (checker/compose
      {:no-data-loss        (camu-checker/no-data-loss-checker)
@@ -141,7 +172,7 @@
       :availability        (camu-checker/availability-checker)
       :lease-fencing       (camu-checker/lease-fencing-checker)
       :recovery-time       (camu-checker/recovery-time-checker)
-      :stats               (checker/stats)})))
+      :stats               (checker/stats)}))))
 
 (defn camu-test
   "Constructs a Jepsen test map for camu."
@@ -162,26 +193,31 @@
             :nemesis   (nem/composed-nemesis faults)
             :checker   (checker-suite opts)
             :generator
-            (gen/phases
-             ;; Phase 1: clients produce+consume while nemesis injects faults
-             (gen/time-limit
-              (:time-limit opts 300)
-              (gen/nemesis
-               (->> (gen/mix (nem/fault-cycles faults))
-                    (gen/stagger 5))
-               (gen/clients
-                (->> (workload-gen opts counter consume-offsets)
-                     (gen/stagger 1/10)))))
-             ;; Phase 2: stop all active faults, restart nodes
-             (gen/log "Stopping nemesis, restarting all nodes...")
-             (apply gen/phases
-                    (for [fault faults]
-                      (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
-             (gen/log "Recovering — waiting 15s for cluster stabilization...")
-             (gen/sleep 15)
-             ;; Phase 3: drain ALL partitions
-             (gen/log "Draining all partitions for verification...")
-             (gen/clients (drain-gen)))})))
+            (apply gen/phases
+             (concat
+              [;; Phase 1: clients produce+consume while nemesis injects faults
+               (gen/time-limit
+                (:time-limit opts 300)
+                (gen/nemesis
+                 (->> (gen/mix (nem/fault-cycles faults))
+                      (gen/stagger 5))
+                 (gen/clients
+                  (->> (workload-gen opts counter consume-offsets)
+                       (gen/stagger 1/10)))))
+               ;; Phase 2: stop all active faults, restart nodes
+               (gen/log "Stopping nemesis, restarting all nodes...")
+               (apply gen/phases
+                      (for [fault faults]
+                        (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
+               (gen/log "Recovering — waiting 15s for cluster stabilization...")
+               (gen/sleep 15)
+               ;; Phase 3: drain ALL partitions from leader
+               (gen/log "Draining all partitions for verification...")
+               (gen/clients (drain-gen))]
+              ;; Phase 4: drain ALL partitions from replicas to verify convergence
+              (when (replicated? opts)
+                [(gen/log "Draining all partitions from replicas...")
+                 (gen/clients (drain-gen :replica-drain))])))})))
 
 (def cli-opts
   "Additional CLI options for camu tests."
@@ -205,10 +241,10 @@
     :default :leader
     :parse-fn keyword
     :validate [#{:leader :replica :any} "must be one of: leader, replica, any"]]
-   [nil "--workload NAME" "Workload: mixed, large-requests, or replica-flushed-reads"
+   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, or idempotent"
     :default :mixed
     :parse-fn keyword
-    :validate [#{:mixed :large-requests :replica-flushed-reads} "must be one of: mixed, large-requests, replica-flushed-reads"]]])
+    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent"]]])
 
 (defn -main
   "Entry point for the Jepsen CLI."

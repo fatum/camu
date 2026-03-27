@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func (s *Server) routes() http.Handler {
+func (s *Server) publicRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/topics", s.handleCreateTopic)
 	mux.HandleFunc("GET /v1/topics", s.handleListTopics)
@@ -23,7 +23,18 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/topics/{topic}/offsets/{consumer_id}", s.handleGetConsumerOffsets)
 	mux.HandleFunc("POST /v1/groups/{group_id}/commit", s.handleCommitOffsets)
 	mux.HandleFunc("GET /v1/groups/{group_id}/offsets", s.handleGetOffsets)
+	mux.HandleFunc("POST /v1/producers/init", s.handleInitProducer)
+	return s.withMiddleware(mux)
+}
+
+func (s *Server) internalRoutes() http.Handler {
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/internal/replicate/{topic}/{pid}", s.handleReplicaFetch)
+	mux.HandleFunc("GET /v1/ready", s.handleReady)
+	// Produce endpoints are registered here so proxied requests from
+	// non-leader nodes can be handled by the leader's internal server.
+	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
+	mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
 	return s.withMiddleware(mux)
 }
 

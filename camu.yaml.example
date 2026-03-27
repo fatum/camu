@@ -1,5 +1,6 @@
 server:
   address: ":8080"
+  internal_address: ":8081"
   instance_id: ""
 storage:
   bucket: "camu-data"
@@ -15,14 +16,15 @@ wal:
 segments:
   max_size: 8388608
   max_age: "5s"
-  compression: "snappy"
+  compression: "none"
   record_batch_target_size: 16384
   index_interval_bytes: 4096
 cache:
   directory: "/var/lib/camu/cache"
   max_size: 10737418240
 coordination:
-  lease_ttl: "10s"
-  instance_ttl: "30s"
-  heartbeat_interval: "3s"
+  lease_ttl: "30s"
   rebalance_delay: "5s"
+  heartbeat_interval: "10s"
+  isr_expansion_threshold: 1000
+  replication_timeout: "30s"

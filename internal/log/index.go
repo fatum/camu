@@ -1,8 +1,6 @@
 package log
 
 import (
-	"bytes"
-	"encoding/json"
 	"sort"
 	"time"
 )
@@ -38,15 +36,8 @@ type EpochEntry struct {
 	StartOffset uint64 `json:"start_offset"`
 }
 
-// indexJSON is the wire format for the object-style index.
-type indexJSON struct {
-	Segments      []SegmentRef `json:"segments"`
-	EpochHistory  []EpochEntry `json:"epoch_history,omitempty"`
-	HighWatermark uint64       `json:"high_watermark,omitempty"`
-}
-
 // Index maps offset ranges to S3 segment keys, sorted by BaseOffset.
-// It is stored as index.json per partition and updated after each segment flush.
+// It is an in-memory cache populated from S3 LIST on startup and updated on flush.
 type Index struct {
 	segments      []SegmentRef
 	baseOffsets   []uint64
@@ -188,44 +179,6 @@ func (idx *Index) EpochHistory() []EpochEntry {
 	return idx.epochHistory
 }
 
-// MarshalJSON serializes the index as an object for S3 storage.
-func (idx *Index) MarshalJSON() ([]byte, error) {
-	return json.Marshal(indexJSON{
-		Segments:      idx.segments,
-		EpochHistory:  idx.epochHistory,
-		HighWatermark: idx.highWatermark,
-	})
-}
-
-// UnmarshalJSON deserializes the index from JSON, supporting both the legacy
-// bare-array format and the current object format.
-func (idx *Index) UnmarshalJSON(data []byte) error {
-	data = bytes.TrimSpace(data)
-	if len(data) > 0 && data[0] == '[' {
-		// Legacy array format — segments only, no epoch history or HW.
-		var segs []SegmentRef
-		if err := json.Unmarshal(data, &segs); err != nil {
-			return err
-		}
-		idx.segments = segs
-		idx.epochHistory = nil
-		idx.highWatermark = 0
-	} else {
-		// Current object format.
-		var obj indexJSON
-		if err := json.Unmarshal(data, &obj); err != nil {
-			return err
-		}
-		idx.segments = obj.Segments
-		idx.epochHistory = obj.EpochHistory
-		idx.highWatermark = obj.HighWatermark
-	}
-	sort.Slice(idx.segments, func(i, j int) bool {
-		return idx.segments[i].BaseOffset < idx.segments[j].BaseOffset
-	})
-	idx.rebuildOffsets()
-	return nil
-}
 
 func (idx *Index) rebuildOffsets() {
 	idx.baseOffsets = make([]uint64, len(idx.segments))

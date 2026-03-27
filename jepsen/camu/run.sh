@@ -26,7 +26,16 @@ until docker compose run --rm setup-minio sh -c "mc alias set local http://minio
 done
 
 echo "Clearing existing S3 state from bucket $MINIO_BUCKET..."
-docker compose run --rm --entrypoint sh setup-minio -c "mc alias set local http://minio:9000 $MINIO_USER $MINIO_PASS >/dev/null 2>&1 && mc rb --force local/$MINIO_BUCKET 2>/dev/null; mc mb local/$MINIO_BUCKET"
+docker compose run --rm --entrypoint sh setup-minio -c "
+  mc alias set local http://minio:9000 $MINIO_USER $MINIO_PASS >/dev/null 2>&1
+  mc rb --force local/$MINIO_BUCKET 2>/dev/null
+  mc mb local/$MINIO_BUCKET
+  # Verify bucket is empty before proceeding.
+  until [ \$(mc ls local/$MINIO_BUCKET/ 2>/dev/null | wc -l) -eq 0 ]; do
+    sleep 0.5
+  done
+  echo 'Bucket $MINIO_BUCKET cleared and verified empty.'
+"
 
 echo "Rebuilding Jepsen control image..."
 docker compose build control

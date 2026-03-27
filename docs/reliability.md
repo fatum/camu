@@ -1,86 +1,93 @@
 # Reliability and Correctness
 
-Camu is designed around a simple promise: if a write is acknowledged, it should survive crashes, failovers, reassignment, and recovery without silently disappearing or being rewritten as something else.
+This document describes what Camu is currently claiming, what has been exercised in tests, and where the strongest evidence lives.
 
-This document explains what is currently verified, how it is verified, and where the evidence lives in the repository.
+The current repository evidence is anchored to runs completed on **March 22-23, 2026**.
 
-## What Camu is claiming
+## Current Claim Surface
 
-For the replicated mode currently tested (`rf=3`, `minISR=2`):
+For the replicated mode that has been exercised most heavily, `rf=3` and `minISR=2`, Camu is claiming:
 
-- acknowledged writes survive the tested fault matrix
-- recovered partitions do not truncate committed suffixes
-- failover preserves single-writer ordering per partition
-- final partition drains remain consistent with acknowledged history
+- acknowledged writes survive the current Jepsen fault matrix
+- leader failover preserves committed prefixes
+- recovered leaders do not silently truncate committed suffixes
+- final partition drains match acknowledged history
 
-For the single-replica control mode (`rf=1`, `minISR=1`):
+For strict quorum, `rf=3` and `minISR=3`, the repository now also has passing evidence for the currently checked scenarios.
 
-- acknowledged writes survive node kill and restart in the tested control run
+For control mode, `rf=1` and `minISR=1`, there is only a narrow durability claim around the tested kill-and-restart path.
 
-This is a durability and correctness claim, not a claim of perfect availability under all conditions.
+This is a correctness and durability claim, not a blanket claim of uninterrupted availability.
 
-## How correctness is verified
+## Verification Layers
 
-The project includes three layers of verification:
+### Unit Tests
 
-1. Unit tests
-   - WAL replay
-   - leader initialization and epoch fencing
-   - index replacement and overlapping-tail handling
-   - partition append serialization and flush behavior
+Unit coverage targets the components most likely to break the contract:
 
-2. Integration tests
-   - real multi-instance leadership transitions
-   - reassignment preserving committed prefixes
-   - failover recovery with actual server instances
+- WAL replay and corruption cutoff
+- segment encoding, decoding, and sparse indexes
+- epoch fencing and leader initialization
+- partition append serialization
+- overlapping-tail index replacement
+- idempotent produce bookkeeping
 
-3. Jepsen
-   - five-node fault-injection cluster
-   - replicated and control configurations
-   - random produce/consume workload plus final full-partition drain
+### Integration Tests
 
-Jepsen is the highest-signal evidence here because it validates the real distributed system under process death, network faults, churn, and storage isolation.
+The integration suite exercises real server instances and shared storage:
 
-## Jepsen read model
+- leadership transitions
+- reassignment preserving committed prefixes
+- multi-instance recovery
+- replication and readable failover behavior
 
-The correctness suite uses leader-directed reads.
+### Jepsen
 
-That choice is deliberate. Camu acknowledges writes after they are durable in the local WAL and replicated according to the configured quorum rules. Replica reads are a separate semantic question: a follower may lag in flush visibility even when the durable committed prefix already exists.
+Jepsen is the highest-signal layer because it drives the real distributed system under adversarial faults:
 
-So the main Jepsen suite verifies the primary client contract:
+- five Docker nodes
+- MinIO-backed object storage
+- random produce and consume workload
+- recovery phase
+- full final drain and invariant checking
 
-- leader-visible committed data is preserved
-- leader failover does not lose acknowledged writes
-- drained partitions match acknowledged history after recovery
-
-This avoids conflating follower visibility lag with actual data loss.
-
-## What the Jepsen checkers prove
+## What The Current Checkers Prove
 
 The checked-in Jepsen harness verifies:
 
 - `committed-durability`
-  - every acknowledged produce appears in the final drain
+  - every acknowledged write appears in the final drain
 - `truncation-safety`
-  - no committed suffix disappears after recovery
+  - a committed suffix does not disappear after failover or recovery
 - `single-leader`
-  - no conflicting leaders produce different values at the same partition/offset
-- `hw-monotonicity`
-  - observed high-watermarks do not move backward
-- `offset-monotonicity`
-  - partition offsets remain monotonic
+  - no conflicting values appear at the same `(partition, offset)`
 - `total-order`
-  - partition histories remain ordered and contiguous
+  - partition histories stay ordered and contiguous
+- `offset-monotonicity`
+  - offsets never move backward or duplicate within a partition history
+- `hw-monotonicity`
+  - observed high watermarks do not regress
 - `no-ghost-reads`
-  - reads do not fabricate data that was never acknowledged
-- `recovery-time`
-  - time from fault start to next successful client operation
+  - reads do not fabricate unacknowledged data
 - `availability`
-  - operational success rate during the injected fault window
+  - fraction of successful operations during the fault window
+- `recovery-time`
+  - time from fault injection to the next successful client operation
 
-## Verified matrix
+## Read Model Used In Jepsen
 
-### Replicated mode: `rf=3`, `minISR=2`
+The main correctness suite uses leader-directed reads.
+
+That is intentional. In Camu, acknowledged durability and random-node flush visibility are separate semantics:
+
+- ack is tied to WAL durability and replicated high watermark
+- non-owner reads may still lag until a segment flush is visible through `index.json`
+
+The current Jepsen suite is therefore aimed at the primary durability contract, not at proving replica-read freshness.
+
+## Verified Matrix
+
+### Replicated Mode: `rf=3`, `minISR=2`
 
 | Faults | Duration | Result | Availability | Artifact |
 |--------|----------|--------|--------------|----------|
@@ -101,7 +108,7 @@ The checked-in Jepsen harness verifies:
 | `kill,partition` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T090840.074Z/results.edn` |
 | `leader-kill,s3-partition` | 45s | Pass | `0.980` | `jepsen/camu/store/camu/20260323T092658.775Z/results.edn` |
 
-### Strict quorum: `rf=3`, `minISR=3`
+### Strict Quorum: `rf=3`, `minISR=3`
 
 | Faults | Duration | Result | Availability | Artifact |
 |--------|----------|--------|--------------|----------|
@@ -111,104 +118,76 @@ The checked-in Jepsen harness verifies:
 | `s3-partition` | 45s | Pass | `0.948` | `jepsen/camu/store/camu/20260323T092501.527Z/results.edn` |
 | `leader-kill,s3-partition` | 45s | Pass | `0.936` | `jepsen/camu/store/camu/20260323T093306.441Z/results.edn` |
 
-### Control mode: `rf=1`, `minISR=1`
+### Control Mode: `rf=1`, `minISR=1`
 
 | Faults | Duration | Result | Artifact |
 |--------|----------|--------|----------|
 | `kill` | 10s | Pass | `jepsen/camu/store/camu/20260322T195907.172Z/results.edn` |
 
-## Why this evidence matters
+## Why These Runs Matter
 
-These passes are not accidental “happy-path” runs. The current matrix covers:
+The matrix covers the failure modes that most directly threaten Camu's design:
 
 - abrupt process death
-- leader-targeted process death
+- leader-targeted death
 - network partitions
-- process pauses and lease expiry
+- process pause and lease expiry
 - graceful leave and rejoin
-- full membership churn
-- S3 connectivity loss on a node
+- membership churn
+- per-node object-store isolation
 - clock skew
-- overlapping kill plus network partition
-- overlapping leader kill plus storage isolation
-- strict quorum with `minISR=3`
+- overlapping multi-fault windows
 
-That is enough to test the difficult parts of Camu’s design:
+Those are the scenarios where stale leaders, overlapping tails, replay bugs, and flush/index races tend to surface.
 
-- WAL durability before flush
-- fencing stale leaders after reassignment
-- preserving committed data across leader transitions
-- recovering readable state from WAL on promotion
-- keeping indexes consistent across overlapping tails and failover
+## Fixes Reflected In These Results
 
-## Important fixes that made the matrix pass
+The passing matrix depends on concrete correctness work, including:
 
-The current results are backed by concrete correctness fixes, not by loosening the checker.
+- high-watermark recovery on promoted leaders
+- append serialization for same-partition concurrent writes
+- overlap replacement in the segment index
+- stronger stale-leader fencing during reassignment
+- WAL-backed readable recovery after failover
+- batcher error handling that avoids silent drop on flush failure
+- harness cleanup and routing fixes so results represent the system, not the test harness
 
-Examples:
+## Known Limits
 
-- high watermark recovery on leader promotion
-  - prevents leaders from truncating committed WAL prefixes after reassignment
-- batcher error handling
-  - prevents silent data drop on flush failure
-- append serialization
-  - prevents concurrent same-partition writes from producing impossible offset/WAL ordering
-- overlapping segment index replacement
-  - prevents stale tails from hiding newer committed suffixes after failover
-- leader epoch fencing
-  - prevents old leaders from continuing to accept writes after reassignment
-- WAL-to-segment materialization on promoted leaders
-  - makes recovered committed prefixes immediately readable after failover
-- harness cleanup and routing fixes
-  - ensures Jepsen results represent the system, not harness artifacts
+The evidence is meaningful, but not exhaustive.
 
-## What is still intentionally narrow
+Current boundaries:
 
-The current evidence is strong, but it is not infinite.
+- most scenarios still start as short smoke runs
+- only selected higher-risk paths have 45-second follow-up runs
+- leader-directed reads are the primary correctness path
+- the narrowest-tested mode remains `rf=3`, `minISR=2`
+- the repository does not yet claim transactional semantics
 
-Current limits:
+The strongest next steps would be:
 
-- most workloads were first validated as `10s` smoke runs
-- only the riskiest paths currently have `45s` follow-up runs
-- the main correctness suite uses leader-directed reads
-- the primary replicated configuration is still `rf=3`, `minISR=2`, even though strict-quorum `kill`, `leader-kill`, and `membership` runs are now verified
+- more combined strict-quorum faults
+- longer churn windows
+- higher concurrency and larger payload runs
+- a dedicated replica-read semantics matrix
 
-What would strengthen the case further:
+## How To Audit A Run
 
-- more strict-quorum coverage such as `rf=3`, `minISR=3` on additional combined fault types
-- higher concurrency and longer runs
-- more combined faults such as `leader-kill,s3-partition`
-- longer rolling churn workloads
-- a separate replica-read semantics suite
+For each artifact bundle:
 
-## How to audit the evidence yourself
-
-The artifact paths referenced in this document are generated local Jepsen outputs from the verification runs. They are not committed repository files.
-
-For any run:
-
-1. open `results.edn`
+1. read `results.edn`
 2. inspect `history.edn`
 3. correlate with per-node `camu.log`
 
-The main artifact bundle for each run contains:
+The usual artifact set contains:
 
 - `results.edn`
 - `history.edn`
 - `jepsen.log`
 - `n1/camu.log` through `n5/camu.log`
 
-That means every claim in this document can be independently traced back to checked-in code and stored fault artifacts.
+That is enough to trace a claim from checker output back to operation history and node-level behavior.
 
-## Bottom line
+## Bottom Line
 
-Camu now has repository-local evidence that its replicated durability path holds under the current Jepsen matrix.
-
-That does not mean “finished forever”. It means the project is in a much stronger state than an unverified broker-shaped prototype:
-
-- the contract is explicit
-- the fault model is concrete
-- the artifacts are preserved
-- the fixes were validated against adversarial tests, not just unit coverage
-
-For an object-storage-native event log, that is the kind of proof you want to see before trusting it with real data.
+As of March 23, 2026, Camu has repository-local evidence that its current replicated durability path survives the documented Jepsen matrix without losing acknowledged writes. That is a much stronger statement than "the tests pass": the failure model is explicit, the artifacts are inspectable, and the important corner cases are being exercised under adversarial conditions.
