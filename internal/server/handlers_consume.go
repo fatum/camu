@@ -61,9 +61,14 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	owned := s.isOwnedPartition(topicName, partitionID)
 	var readableHW uint64
 	var hasReadableHW bool
-	if hw, ok := readableHighWatermark(ps); ok {
-		readableHW = hw
-		hasReadableHW = true
+	if ps != nil {
+		ps.mu.RLock()
+		hw, ok := readableHighWatermark(ps)
+		ps.mu.RUnlock()
+		if ok {
+			readableHW = hw
+			hasReadableHW = true
+		}
 	}
 
 	// Refresh index from S3 for non-owned partitions so we see the latest
@@ -176,12 +181,18 @@ func (s *Server) readMessages(ctx context.Context, topicName string, partitionID
 	// local WAL. Merge segment-backed data with local WAL by offset rather than
 	// assuming they are disjoint: after failover, the refreshed index can
 	// overlap a stale or partially flushed WAL window.
-	hw, ok := readableHighWatermark(ps)
-	if ps == nil || !ok {
+	if ps == nil {
 		return msgs, nextOffset, nil
 	}
 
-	walMsgs, err := ps.wal.ReadFrom(startOffset, limit)
+	ps.mu.RLock()
+	hw, ok := readableHighWatermark(ps)
+	if !ok {
+		ps.mu.RUnlock()
+		return msgs, nextOffset, nil
+	}
+	walMsgs, err := ps.wal.ReadFromLocked(startOffset, limit)
+	ps.mu.RUnlock()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -324,8 +335,12 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	// Set HW header before streaming starts (headers must be sent before body).
 	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-	if ps != nil && ps.replicaState != nil {
-		w.Header().Set("X-High-Watermark", strconv.FormatUint(ps.replicaState.HighWatermark(), 10))
+	if ps != nil {
+		ps.mu.RLock()
+		if ps.replicaState != nil {
+			w.Header().Set("X-High-Watermark", strconv.FormatUint(ps.replicaState.HighWatermark(), 10))
+		}
+		ps.mu.RUnlock()
 	}
 
 	// Set SSE headers.

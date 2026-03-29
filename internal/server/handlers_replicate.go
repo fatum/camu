@@ -41,15 +41,19 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check epoch divergence
+	// Check epoch divergence and implicit ack under ps.mu.Lock
+	// because UpdateFollower mutates replica state.
+	ps.mu.Lock()
 	truncateTo, diverged := ps.replicaState.CheckDivergence(replicaEpoch, replicaOffset)
 	if diverged {
+		epoch := ps.epoch
+		ps.mu.Unlock()
 		slog.Info("replica_fetch: epoch divergence, requesting truncation",
 			"topic", topic, "pid", pid, "replica", replicaID,
 			"replica_epoch", replicaEpoch, "replica_offset", replicaOffset,
 			"truncate_to", truncateTo)
 		w.Header().Set("X-Truncate-To", strconv.FormatUint(truncateTo, 10))
-		w.Header().Set("X-Leader-Epoch", strconv.FormatUint(ps.epoch, 10))
+		w.Header().Set("X-Leader-Epoch", strconv.FormatUint(epoch, 10))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -58,7 +62,9 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	ps.replicaState.UpdateFollower(replicaID, replicaOffset)
 
 	// Try WAL first (hot path for real-time replication)
-	msgs, err := ps.wal.ReadFrom(fromOffset, 1000)
+	msgs, err := ps.wal.ReadFromLocked(fromOffset, 1000)
+	hw := ps.replicaState.HighWatermark()
+	ps.mu.Unlock()
 	if err != nil {
 		slog.Error("replica_fetch: WAL read failed",
 			"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
@@ -71,7 +77,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 			"topic", topic, "pid", pid, "replica", replicaID,
 			"from_offset", fromOffset, "msg_count", len(msgs),
 			"first", msgs[0].Offset, "last", msgs[len(msgs)-1].Offset,
-			"hw", ps.replicaState.HighWatermark())
+			"hw", hw)
 	}
 
 	// Fall back to flushed segments if WAL doesn't have the data
@@ -96,9 +102,12 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Long-poll if still no data (waiting for new writes)
+	// WaitForData uses its own internal signalling — don't hold ps.mu.
 	if len(msgs) == 0 {
 		if ps.replicaState.WaitForData(500 * time.Millisecond) {
-			msgs, err = ps.wal.ReadFrom(fromOffset, 1000)
+			ps.mu.RLock()
+			msgs, err = ps.wal.ReadFromLocked(fromOffset, 1000)
+			ps.mu.RUnlock()
 			if err != nil {
 				slog.Error("replica_fetch: WAL read after wait failed",
 					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
@@ -110,15 +119,22 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Snapshot state under lock for response headers.
+	ps.mu.RLock()
+	respHW := ps.replicaState.HighWatermark()
+	respEpoch := ps.epoch
+	respFlushed := ps.flushedOffset
+	ps.mu.RUnlock()
+
 	slog.Debug("replica_fetch: serving",
 		"topic", topic, "pid", pid, "replica", replicaID,
 		"from_offset", fromOffset, "msg_count", len(msgs),
-		"hw", ps.replicaState.HighWatermark(), "epoch", ps.epoch)
+		"hw", respHW, "epoch", respEpoch)
 
 	// Response headers
-	w.Header().Set("X-High-Watermark", strconv.FormatUint(ps.replicaState.HighWatermark(), 10))
-	w.Header().Set("X-Leader-Epoch", strconv.FormatUint(ps.epoch, 10))
-	w.Header().Set("X-Flushed-Offset", strconv.FormatUint(ps.flushedOffset, 10))
+	w.Header().Set("X-High-Watermark", strconv.FormatUint(respHW, 10))
+	w.Header().Set("X-Leader-Epoch", strconv.FormatUint(respEpoch, 10))
+	w.Header().Set("X-Flushed-Offset", strconv.FormatUint(respFlushed, 10))
 
 	// Write binary frames
 	if err := replication.WriteMessageFrames(w, msgs); err != nil {

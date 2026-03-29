@@ -754,6 +754,12 @@ func (w *WAL) AppendBatch(msgs []Message) error {
 	return w.AppendBatchWithMeta(Batch{Messages: msgs})
 }
 
+// AppendBatchLocked is like AppendBatch but assumes the caller already holds
+// the partition-level lock.
+func (w *WAL) AppendBatchLocked(msgs []Message) error {
+	return w.AppendBatchWithMetaLocked(Batch{Messages: msgs})
+}
+
 // AppendBatchWithMeta appends a batch (with producer metadata) to the active
 // WAL chunk, rotating when the configured chunk size is reached. Each call
 // writes exactly one batch envelope.
@@ -770,6 +776,25 @@ func (w *WAL) AppendBatchWithMeta(batch Batch) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.appendBatchWithMetaLocked(batch, data)
+}
+
+// AppendBatchWithMetaLocked is like AppendBatchWithMeta but assumes the caller
+// already holds the partition-level lock. The WAL's internal mutex is not acquired.
+func (w *WAL) AppendBatchWithMetaLocked(batch Batch) error {
+	if len(batch.Messages) == 0 {
+		return nil
+	}
+
+	data, err := serializeWALBatch(batch)
+	if err != nil {
+		return err
+	}
+
+	return w.appendBatchWithMetaLocked(batch, data)
+}
+
+func (w *WAL) appendBatchWithMetaLocked(batch Batch, data []byte) error {
 	firstOffset := batch.Messages[0].Offset
 	lastOffset := batch.Messages[len(batch.Messages)-1].Offset
 
@@ -817,6 +842,16 @@ func (w *WAL) Replay() ([]Message, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
+	return w.replayLocked()
+}
+
+// ReplayLocked is like Replay but assumes the caller already holds the
+// partition-level lock.
+func (w *WAL) ReplayLocked() ([]Message, error) {
+	return w.replayLocked()
+}
+
+func (w *WAL) replayLocked() ([]Message, error) {
 	chunks := w.snapshotChunksLocked(true, false)
 	msgs := make([]Message, 0, len(chunks))
 	for _, chunk := range chunks {
@@ -834,7 +869,12 @@ func (w *WAL) Seal() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.sealActiveLocked()
+}
 
+// SealLocked is like Seal but assumes the caller already holds the
+// partition-level lock.
+func (w *WAL) SealLocked() error {
 	return w.sealActiveLocked()
 }
 
@@ -845,6 +885,16 @@ func (w *WAL) ReplaySealed() ([]Message, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
+	return w.replaySealedLocked()
+}
+
+// ReplaySealedLocked is like ReplaySealed but assumes the caller already holds
+// the partition-level lock.
+func (w *WAL) ReplaySealedLocked() ([]Message, error) {
+	return w.replaySealedLocked()
+}
+
+func (w *WAL) replaySealedLocked() ([]Message, error) {
 	chunks := w.snapshotChunksLocked(false, false)
 	msgs := make([]Message, 0, len(chunks))
 	for _, chunk := range chunks {
@@ -862,7 +912,12 @@ func (w *WAL) MarkFlushed(beforeOffset uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.markFlushedLocked(beforeOffset)
+}
 
+// MarkFlushedLocked is like MarkFlushed but assumes the caller already holds
+// the partition-level lock.
+func (w *WAL) MarkFlushedLocked(beforeOffset uint64) error {
 	return w.markFlushedLocked(beforeOffset)
 }
 
@@ -882,7 +937,16 @@ func (w *WAL) TruncateBefore(offset uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.truncateBeforeLocked(offset)
+}
 
+// TruncateBeforeLocked is like TruncateBefore but assumes the caller already
+// holds the partition-level lock.
+func (w *WAL) TruncateBeforeLocked(offset uint64) error {
+	return w.truncateBeforeLocked(offset)
+}
+
+func (w *WAL) truncateBeforeLocked(offset uint64) error {
 	if len(w.chunks) == 0 {
 		return nil
 	}

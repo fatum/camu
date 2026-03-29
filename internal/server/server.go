@@ -177,8 +177,6 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		}
 	})
 
-	pm.idempotencyMgr = idempotencyMgr
-
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
 	pm.SetLeaseChecker(s.verifyOwnershipFromS3)
@@ -704,19 +702,16 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	}
 
 	// Recover producer idempotency state from S3 checkpoint + WAL tail.
-	if s.idempotencyManager != nil {
-		checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
-		if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
-			s.idempotencyManager.LoadCheckpoint(data)
-			slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
-		}
+	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
+	if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
+		ps.loadProducerCheckpoint(data)
+		slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
+	}
 
-		if batches := s.partitionManager.ScanWALForProducerState(topic, pid); len(batches) > 0 {
-			s.idempotencyManager.RebuildFromBatches(batches)
-			slog.Info("idempotency_wal_recovery", "topic", topic, "partition", pid, "batches", len(batches))
-		}
+	if n := s.partitionManager.ScanAndRebuildProducerState(topic, pid); n > 0 {
+		slog.Info("idempotency_wal_recovery", "topic", topic, "partition", pid, "batches", n)
 	}
 
 	slog.Info("partition_leader_init", "topic", topic, "partition", pid,
@@ -867,8 +862,8 @@ func (s *Server) renewLeases() {
 	}
 
 	// Evict stale idempotent producers every 10th tick.
-	if s.idempotencyManager != nil && s.coordinationGCTick%10 == 0 {
-		if evicted := s.idempotencyManager.EvictStale(30 * time.Minute); evicted > 0 {
+	if s.coordinationGCTick%10 == 0 {
+		if evicted := s.partitionManager.EvictStaleProducers(30 * time.Minute); evicted > 0 {
 			slog.Info("idempotency_evicted_stale_producers", "count", evicted)
 		}
 	}

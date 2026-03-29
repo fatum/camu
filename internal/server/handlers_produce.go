@@ -358,21 +358,18 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	var assignedOffsets []uint64
 	if producerID != 0 {
-		pkey := idempotency.PartitionKey{Topic: topicName, Partition: partitionID}
 		assignedOffsets, err = s.partitionManager.appendBatchWithMetaToPS(ps, topicName, partitionID, log.Batch{
 			ProducerID: producerID,
 			Sequence:   sequence,
 			Messages:   batch,
 		}, &IdempotencyOpts{
-			Manager:  s.idempotencyManager,
-			Key:      pkey,
 			Sequence: sequence,
 		})
 		if errors.Is(err, idempotency.ErrDuplicateSequence) {
 			// Join the replication purgatory for the original batch —
 			// only return success once the data is committed.
 			if ps != nil && ps.replicaState != nil {
-				if lastOff, ok := s.idempotencyManager.GetLastOffset(producerID, pkey); ok {
+				if lastOff, ok := ps.getLastOffset(producerID); ok {
 					if waitErr := ps.replicaState.Purgatory().Wait(r.Context(), lastOff, s.replicationTimeout); waitErr != nil {
 						if errors.Is(waitErr, replication.ErrReplicationTimeout) {
 							writeError(w, 408, "replication timeout")

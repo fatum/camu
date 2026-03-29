@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/config"
-	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
@@ -173,7 +172,7 @@ func TestPartitionManagerAppendBatch_PersistsHighWatermarkBeforeFlush(t *testing
 // TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL was removed:
 // index.json CAS loop has been replaced by a simple state.json PUT.
 
-func TestPartitionManagerScanWALForProducerStateUsesBatchMetadata(t *testing.T) {
+func TestPartitionManagerScanAndRebuildProducerState(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
 	tc := meta.TopicConfig{
@@ -213,23 +212,25 @@ func TestPartitionManagerScanWALForProducerStateUsesBatchMetadata(t *testing.T) 
 		t.Fatalf("AppendBatchWithMeta(second) error = %v", err)
 	}
 
+	// Only batches at or above flushedOffset are scanned.
 	ps.flushedOffset = 2
 
-	got := pm.ScanWALForProducerState("topic", 0)
-	want := []idempotency.BatchInfo{
-		{
-			ProducerID: 2,
-			Sequence:   5,
-			BatchSize:  1,
-			Key:        idempotency.PartitionKey{Topic: "topic", Partition: 0},
-		},
+	n := pm.ScanAndRebuildProducerState("topic", 0)
+	if n != 1 {
+		t.Fatalf("ScanAndRebuildProducerState() rebuilt %d batches, want 1", n)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("ScanWALForProducerState() returned %d batches, want %d", len(got), len(want))
+
+	// Verify producer 2's sequence state was rebuilt.
+	state, ok := ps.producerSeqs[2]
+	if !ok {
+		t.Fatal("expected producerSeqs entry for producer 2")
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("ScanWALForProducerState()[%d] = %+v, want %+v", i, got[i], want[i])
-		}
+	if state.NextSeq != 6 { // sequence 5 + batch size 1
+		t.Fatalf("producer 2 NextSeq = %d, want 6", state.NextSeq)
+	}
+
+	// Producer 1 should NOT be present (its batch was below flushedOffset).
+	if _, ok := ps.producerSeqs[1]; ok {
+		t.Fatal("producer 1 should not be in producerSeqs (below flushedOffset)")
 	}
 }

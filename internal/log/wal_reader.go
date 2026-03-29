@@ -15,6 +15,20 @@ func (w *WAL) ReadFrom(startOffset uint64, limit int) ([]Message, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
+	return w.readFromLocked(startOffset, limit)
+}
+
+// ReadFromLocked is like ReadFrom but assumes the caller already holds the
+// partition-level lock.
+func (w *WAL) ReadFromLocked(startOffset uint64, limit int) ([]Message, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	return w.readFromLocked(startOffset, limit)
+}
+
+func (w *WAL) readFromLocked(startOffset uint64, limit int) ([]Message, error) {
 	chunks := append([]walChunk(nil), w.chunks...)
 	startIdx := sort.Search(len(chunks), func(i int) bool { return chunks[i].maxOffset >= startOffset })
 
@@ -39,6 +53,16 @@ func (w *WAL) ReadBatchesFrom(startOffset uint64) ([]Batch, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
+	return w.readBatchesFromLocked(startOffset)
+}
+
+// ReadBatchesFromLocked is like ReadBatchesFrom but assumes the caller already
+// holds the partition-level lock.
+func (w *WAL) ReadBatchesFromLocked(startOffset uint64) ([]Batch, error) {
+	return w.readBatchesFromLocked(startOffset)
+}
+
+func (w *WAL) readBatchesFromLocked(startOffset uint64) ([]Batch, error) {
 	chunks := append([]walChunk(nil), w.chunks...)
 	startIdx := sort.Search(len(chunks), func(i int) bool { return chunks[i].maxOffset >= startOffset })
 
