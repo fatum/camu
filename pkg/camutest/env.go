@@ -65,8 +65,9 @@ func New(t testing.TB, opts ...Option) *Env {
 		cacheDir := t.TempDir()
 		cfg := &config.Config{
 			Server: config.ServerConfig{
-				Address:    ":0",
-				InstanceID: instanceID,
+				Address:         ":0",
+				InternalAddress: "127.0.0.1:0",
+				InstanceID:      instanceID,
 			},
 			Storage: config.StorageConfig{
 				Bucket:   "test-bucket",
@@ -131,6 +132,19 @@ func (e *Env) InstanceAddress(idx int) string {
 	return e.instances[idx].Address()
 }
 
+// S3Client exposes the shared test S3 client so integration tests can inspect persisted state.
+func (e *Env) S3Client() *storage.S3Client {
+	return e.s3Client
+}
+
+// Server returns the server instance at idx.
+func (e *Env) Server(idx int) *server.Server {
+	if idx < 0 || idx >= len(e.instances) {
+		e.t.Fatalf("camutest: server index %d out of range (have %d)", idx, len(e.instances))
+	}
+	return e.instances[idx]
+}
+
 // KillInstance forcefully stops the server instance at idx without a graceful
 // shutdown (no WAL flush). It uses a zero-timeout context so the HTTP listener
 // is closed immediately.
@@ -179,8 +193,9 @@ func (e *Env) RestartInstance(idx int) {
 	// so WAL replay and replication routing behave like a restarted node.
 	cfg := &config.Config{
 		Server: config.ServerConfig{
-			Address:    ":0", // new random port
-			InstanceID: ic.cfg.Server.InstanceID,
+			Address:         ":0", // new random port
+			InternalAddress: "127.0.0.1:0",
+			InstanceID:      ic.cfg.Server.InstanceID,
 		},
 		Storage: config.StorageConfig{
 			Bucket:   ic.cfg.Storage.Bucket,

@@ -39,24 +39,26 @@ type producerCheckpointEntry struct {
 
 // partitionState holds per-partition runtime state.
 type partitionState struct {
-	mu sync.RWMutex // unified per-partition lock for all read/write access
+	mu            sync.RWMutex // unified per-partition lock for all read/write access
 	wal           *log.WAL
 	index         *log.Index
 	nextOffset    uint64
 	epoch         uint64                    // always 0 in single-instance mode
 	replicaState  *replication.ReplicaState // nil for rf=1
 	isLeader      bool
+	leaderID      string // current leader for follower fetch state; empty when local leader
 	flushedOffset uint64 // highest offset flushed to S3
 	followerHW    uint64 // leader-advertised readable HW for follower reads
 	epochHistory  *replication.EpochHistory
-	fetchCancel   context.CancelFunc // cancel follower fetch goroutine
-	fetchDone     chan struct{}      // closed when fetch goroutine exits
-	globalID      int  // cached batcher partition ID, set on first append
-	globalIDSet   bool // true once globalID has been resolved
+	fetchCancel   context.CancelFunc                 // cancel follower fetch goroutine
+	fetchDone     chan struct{}                      // closed when fetch goroutine exits
+	globalID      int                                // cached batcher partition ID, set on first append
+	globalIDSet   bool                               // true once globalID has been resolved
 	producerSeqs  map[uint64]*producerPartitionState // producerID -> sequence state
 }
 
 func (ps *partitionState) checkAndAdvanceSeq(producerID, sequence uint64, batchSize int) error {
+	now := time.Now()
 	state, ok := ps.producerSeqs[producerID]
 	if !ok {
 		if sequence != 0 {
@@ -64,7 +66,7 @@ func (ps *partitionState) checkAndAdvanceSeq(producerID, sequence uint64, batchS
 		}
 		ps.producerSeqs[producerID] = &producerPartitionState{
 			NextSeq:      uint64(batchSize),
-			LastActiveAt: time.Now(),
+			LastActiveAt: now,
 		}
 		return nil
 	}
@@ -75,7 +77,7 @@ func (ps *partitionState) checkAndAdvanceSeq(producerID, sequence uint64, batchS
 		return idempotency.ErrSequenceGap
 	}
 	state.NextSeq = sequence + uint64(batchSize)
-	state.LastActiveAt = time.Now()
+	state.LastActiveAt = now
 	return nil
 }
 
@@ -112,6 +114,7 @@ func (ps *partitionState) snapshotProducerSeqs() map[uint64]*producerPartitionSt
 // rebuildProducerSeqsFromBatches replays WAL batch metadata to advance sequence
 // counters past whatever the checkpoint contained.
 func (ps *partitionState) rebuildProducerSeqsFromBatches(batches []log.BatchMeta) {
+	now := time.Now()
 	for _, b := range batches {
 		if b.ProducerID == 0 {
 			continue
@@ -125,12 +128,14 @@ func (ps *partitionState) rebuildProducerSeqsFromBatches(batches []log.BatchMeta
 		if end > state.NextSeq {
 			state.NextSeq = end
 		}
+		state.LastActiveAt = now
 	}
 }
 
 // loadProducerCheckpoint restores producer sequence state from NDJSON bytes
 // produced during flush. It merges into existing state.
 func (ps *partitionState) loadProducerCheckpoint(data []byte) {
+	now := time.Now()
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		var ce producerCheckpointEntry
@@ -138,8 +143,9 @@ func (ps *partitionState) loadProducerCheckpoint(data []byte) {
 			continue
 		}
 		ps.producerSeqs[ce.ProducerID] = &producerPartitionState{
-			NextSeq:    ce.NextSeq,
-			LastOffset: ce.LastOffset,
+			NextSeq:      ce.NextSeq,
+			LastOffset:   ce.LastOffset,
+			LastActiveAt: now,
 		}
 	}
 }
@@ -149,6 +155,9 @@ func (ps *partitionState) evictStaleProducers(ttl time.Duration) int {
 	cutoff := time.Now().Add(-ttl)
 	var n int
 	for id, state := range ps.producerSeqs {
+		if state.LastActiveAt.IsZero() {
+			continue
+		}
 		if state.LastActiveAt.Before(cutoff) {
 			delete(ps.producerSeqs, id)
 			n++
@@ -172,7 +181,6 @@ type PartitionManager struct {
 
 	// leaseChecker validates partition ownership before flushing to S3.
 	leaseChecker func(topic string, partitionID int) bool
-
 
 	// globalID maps a unique int to (topic, partitionID) for the batcher callback.
 	globalIDMu   sync.Mutex
@@ -623,9 +631,9 @@ func (pm *PartitionManager) notifyBatcher(ps *partitionState, msgs []log.Message
 	return nil
 }
 
-// AppendReplicatedBatch writes messages to the given partition preserving their
-// existing offsets (set by the leader). It does NOT reassign offsets.
-func (pm *PartitionManager) AppendReplicatedBatch(ctx context.Context, topic string, partitionID int, msgs []log.Message) error {
+// AppendReplicatedBatches writes batches to the given partition preserving their
+// existing offsets (set by the leader) and producer metadata. It does NOT reassign offsets.
+func (pm *PartitionManager) AppendReplicatedBatches(ctx context.Context, topic string, partitionID int, batches []log.Batch) error {
 	pm.mu.RLock()
 	ps, ok := pm.partitions[topic][partitionID]
 	pm.mu.RUnlock()
@@ -636,13 +644,15 @@ func (pm *PartitionManager) AppendReplicatedBatch(ctx context.Context, topic str
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	// Write with existing offsets — do NOT reassign
-	if err := ps.wal.AppendBatchLocked(msgs); err != nil {
-		return err
-	}
-	// Advance nextOffset to max(incoming) + 1
-	if len(msgs) > 0 {
-		maxOffset := msgs[len(msgs)-1].Offset
+	for _, batch := range batches {
+		if len(batch.Messages) == 0 {
+			continue
+		}
+		// Write with producer metadata preserved in WAL envelope.
+		if err := ps.wal.AppendBatchWithMetaLocked(batch); err != nil {
+			return err
+		}
+		maxOffset := batch.Messages[len(batch.Messages)-1].Offset
 		if maxOffset+1 > ps.nextOffset {
 			ps.nextOffset = maxOffset + 1
 		}
@@ -815,6 +825,7 @@ func (pm *PartitionManager) ScanAndRebuildProducerState(topic string, partitionI
 		pm.mu.RUnlock()
 		return 0
 	}
+	ps.mu.RLock()
 	flushedOffset := ps.flushedOffset
 	// High watermark: only batches below HW are committed.
 	// For rf=1 (no replicaState), all WAL data is committed — use max uint64.
@@ -822,6 +833,7 @@ func (pm *PartitionManager) ScanAndRebuildProducerState(topic string, partitionI
 	if ps.replicaState != nil {
 		hw = ps.replicaState.HighWatermark()
 	}
+	ps.mu.RUnlock()
 	pm.mu.RUnlock()
 
 	batches, err := ps.wal.ReadBatchMetasFrom(flushedOffset)
@@ -843,7 +855,9 @@ func (pm *PartitionManager) ScanAndRebuildProducerState(topic string, partitionI
 		committed = append(committed, b)
 	}
 	if len(committed) > 0 {
+		ps.mu.Lock()
 		ps.rebuildProducerSeqsFromBatches(committed)
+		ps.mu.Unlock()
 	}
 	return len(committed)
 }

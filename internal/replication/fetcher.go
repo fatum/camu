@@ -17,14 +17,14 @@ import (
 
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
-	AppendReplicatedBatch(ctx context.Context, topic string, pid int, msgs []log.Message) error
+	AppendReplicatedBatches(ctx context.Context, topic string, pid int, batches []log.Batch) error
 	TruncateWAL(topic string, pid int, beforeOffset uint64) error
 	UpdateFollowerProgress(topic string, pid int, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
-	Messages      []log.Message
+	Batches       []log.Batch
 	TruncateTo    uint64
 	HasTruncate   bool
 	HighWatermark uint64
@@ -146,20 +146,28 @@ func (f *FollowerFetcher) Run(
 			continue
 		}
 
-		// Append new messages.
-		if len(resp.Messages) > 0 {
-			first := resp.Messages[0].Offset
-			last := resp.Messages[len(resp.Messages)-1].Offset
-			if err := pm.AppendReplicatedBatch(ctx, topic, pid, resp.Messages); err != nil {
-				slog.Warn("fetcher: AppendReplicatedBatch failed",
+		// Append new batches (preserving producer metadata for idempotency recovery).
+		if len(resp.Batches) > 0 {
+			var first, last uint64
+			for _, b := range resp.Batches {
+				if len(b.Messages) > 0 {
+					if first == 0 || b.Messages[0].Offset < first {
+						first = b.Messages[0].Offset
+					}
+					if b.Messages[len(b.Messages)-1].Offset > last {
+						last = b.Messages[len(b.Messages)-1].Offset
+					}
+				}
+			}
+			if err := pm.AppendReplicatedBatches(ctx, topic, pid, resp.Batches); err != nil {
+				slog.Warn("fetcher: AppendReplicatedBatches failed",
 					"topic", topic, "pid", pid, "err", err)
 			} else {
-				slog.Debug("fetcher: replicated batch",
+				slog.Debug("fetcher: replicated batches",
 					"topic", topic, "pid", pid,
-					"count", len(resp.Messages),
+					"batch_count", len(resp.Batches),
 					"offsets", fmt.Sprintf("%d-%d", first, last),
 					"leader_hw", resp.HighWatermark)
-				// Advance local offset past the last appended message.
 				localOffset = last + 1
 			}
 		}
@@ -244,11 +252,11 @@ func (f *FollowerFetcher) fetchFromLeader(
 		}
 	}
 
-	msgs, err := ReadMessageFrames(httpResp.Body)
+	batches, err := ReadBatchFrames(httpResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("fetcher: read message frames: %w", err)
+		return nil, fmt.Errorf("fetcher: read batch frames: %w", err)
 	}
-	fr.Messages = msgs
+	fr.Batches = batches
 
 	return &fr, nil
 }

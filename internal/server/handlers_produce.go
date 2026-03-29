@@ -368,9 +368,18 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, idempotency.ErrDuplicateSequence) {
 			// Join the replication purgatory for the original batch —
 			// only return success once the data is committed.
-			if ps != nil && ps.replicaState != nil {
-				if lastOff, ok := ps.getLastOffset(producerID); ok {
-					if waitErr := ps.replicaState.Purgatory().Wait(r.Context(), lastOff, s.replicationTimeout); waitErr != nil {
+			if ps != nil {
+				ps.mu.RLock()
+				lastOff, ok := ps.getLastOffset(producerID)
+				hw, hwOK := readableHighWatermark(ps)
+				replicaState := ps.replicaState
+				ps.mu.RUnlock()
+				if ok && hwOK && hw > lastOff {
+					writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+					return
+				}
+				if ok && replicaState != nil {
+					if waitErr := replicaState.Purgatory().Wait(r.Context(), lastOff, s.replicationTimeout); waitErr != nil {
 						if errors.Is(waitErr, replication.ErrReplicationTimeout) {
 							writeError(w, 408, "replication timeout")
 							return

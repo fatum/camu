@@ -21,12 +21,14 @@ type mockPartitionManager struct {
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedBatch(_ context.Context, _ string, _ int, msgs []log.Message) error {
+func (m *mockPartitionManager) AppendReplicatedBatches(_ context.Context, _ string, _ int, batches []log.Batch) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := make([]log.Message, len(msgs))
-	copy(cp, msgs)
-	m.appended = append(m.appended, cp)
+	for _, b := range batches {
+		cp := make([]log.Message, len(b.Messages))
+		copy(cp, b.Messages)
+		m.appended = append(m.appended, cp)
+	}
 	return nil
 }
 

@@ -172,6 +172,55 @@ func TestApplyAssignmentsForTopic_NotFoundFallsBackToSingleInstanceOwnership(t *
 	}
 }
 
+func TestPublishAssignmentsForTopics_DoesNotShrinkReplicaSetsOnActiveLoss(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 3,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.registry.Register(context.Background()); err != nil {
+		t.Fatalf("registry.Register() error = %v", err)
+	}
+	initial := coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {
+				Replicas:    []string{"n1", "n2", "n3"},
+				Leader:      "n1",
+				LeaderEpoch: 5,
+			},
+		},
+		Version: 1,
+	}
+	if err := s.assignmentStore.Write(context.Background(), "topic", initial, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+
+	s.publishAssignmentsForTopics(context.Background(), []meta.TopicConfig{tc})
+
+	got, err := s.assignmentStore.Read(context.Background(), "topic")
+	if err != nil {
+		t.Fatalf("assignmentStore.Read() error = %v", err)
+	}
+	if got.Version != 1 {
+		t.Fatalf("version = %d, want 1", got.Version)
+	}
+	partition := got.Partitions[0]
+	if !reflect.DeepEqual(partition.Replicas, []string{"n1", "n2", "n3"}) {
+		t.Fatalf("replicas = %v, want [n1 n2 n3]", partition.Replicas)
+	}
+	if partition.Leader != "n1" {
+		t.Fatalf("leader = %q, want %q", partition.Leader, "n1")
+	}
+}
+
 func TestVerifyOwnershipFromS3_ReadErrorFailsClosed(t *testing.T) {
 	s := newTestServer(t)
 

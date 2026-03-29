@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -232,5 +233,60 @@ func TestPartitionManagerScanAndRebuildProducerState(t *testing.T) {
 	// Producer 1 should NOT be present (its batch was below flushedOffset).
 	if _, ok := ps.producerSeqs[1]; ok {
 		t.Fatal("producer 1 should not be in producerSeqs (below flushedOffset)")
+	}
+}
+
+func TestPartitionStateLoadProducerCheckpoint_DoesNotImmediateExpire(t *testing.T) {
+	ps := &partitionState{
+		producerSeqs: make(map[uint64]*producerPartitionState),
+	}
+
+	var buf []byte
+	line, err := json.Marshal(producerCheckpointEntry{
+		ProducerID: 7,
+		NextSeq:    11,
+		LastOffset: 10,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	buf = append(buf, line...)
+	buf = append(buf, '\n')
+
+	ps.loadProducerCheckpoint(buf)
+
+	if got := ps.evictStaleProducers(time.Hour); got != 0 {
+		t.Fatalf("evictStaleProducers() = %d, want 0 immediately after load", got)
+	}
+	state, ok := ps.producerSeqs[7]
+	if !ok {
+		t.Fatal("expected restored producer state")
+	}
+	if state.LastActiveAt.IsZero() {
+		t.Fatal("expected LastActiveAt to be populated on checkpoint load")
+	}
+}
+
+func TestPartitionStateRebuildProducerSeqsFromBatches_DoesNotImmediateExpire(t *testing.T) {
+	ps := &partitionState{
+		producerSeqs: make(map[uint64]*producerPartitionState),
+	}
+
+	ps.rebuildProducerSeqsFromBatches([]log.BatchMeta{
+		{ProducerID: 5, Sequence: 3, MessageCount: 2},
+	})
+
+	if got := ps.evictStaleProducers(time.Hour); got != 0 {
+		t.Fatalf("evictStaleProducers() = %d, want 0 immediately after rebuild", got)
+	}
+	state, ok := ps.producerSeqs[5]
+	if !ok {
+		t.Fatal("expected rebuilt producer state")
+	}
+	if got := state.NextSeq; got != 5 {
+		t.Fatalf("state.NextSeq = %d, want 5", got)
+	}
+	if state.LastActiveAt.IsZero() {
+		t.Fatal("expected LastActiveAt to be populated on WAL rebuild")
 	}
 }
