@@ -383,14 +383,18 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	// verifyProduceLeadership checks both ownership and epoch in a single
 	// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
 	if tc.ReplicationFactor > 1 {
+		if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+			if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
+				s.proxyToLeader(w, r, leaderAddr)
+				return
+			}
+			routing := s.getRoutingMap(topicName)
+			writeJSON(w, 421, routing)
+			return
+		}
 		if ps.replicaState == nil {
 			w.Header().Set("Retry-After", "1")
 			writeError(w, 503, "partition not ready for replicated writes")
-			return
-		}
-		if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
-			routing := s.getRoutingMap(topicName)
-			writeJSON(w, 421, routing)
 			return
 		}
 	}

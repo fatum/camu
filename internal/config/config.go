@@ -50,16 +50,16 @@ const defaultWALChunkSize = 64 * 1024 * 1024
 
 // SegmentsConfig holds segment management settings.
 type SegmentsConfig struct {
-	MaxSize            int64  `yaml:"max_size"`
-	MaxAge             string `yaml:"max_age"`
-	Compression        string `yaml:"compression"`
+	MaxSize               int64  `yaml:"max_size"`
+	MaxAge                string `yaml:"max_age"`
+	Compression           string `yaml:"compression"`
 	RecordBatchTargetSize int64  `yaml:"record_batch_target_size"`
-	IndexIntervalBytes int    `yaml:"index_interval_bytes"`
+	IndexIntervalBytes    int    `yaml:"index_interval_bytes"`
 }
 
 const (
 	defaultSegmentRecordBatchTargetSize = 16 * 1024
-	defaultSegmentIndexIntervalBytes = 4096
+	defaultSegmentIndexIntervalBytes    = 4096
 )
 
 // MaxAgeDuration parses MaxAge as a time.Duration.
@@ -169,11 +169,11 @@ func defaults() *Config {
 			ChunkSize: defaultWALChunkSize,
 		},
 		Segments: SegmentsConfig{
-			MaxSize:            8388608,
-			MaxAge:             "5s",
-			Compression:        "none",
+			MaxSize:               8388608,
+			MaxAge:                "5s",
+			Compression:           "none",
 			RecordBatchTargetSize: defaultSegmentRecordBatchTargetSize,
-			IndexIntervalBytes: defaultSegmentIndexIntervalBytes,
+			IndexIntervalBytes:    defaultSegmentIndexIntervalBytes,
 		},
 		Cache: CacheConfig{
 			Directory: "/var/lib/camu/cache",

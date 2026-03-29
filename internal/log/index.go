@@ -179,7 +179,6 @@ func (idx *Index) EpochHistory() []EpochEntry {
 	return idx.epochHistory
 }
 
-
 func (idx *Index) rebuildOffsets() {
 	idx.baseOffsets = make([]uint64, len(idx.segments))
 	for i, seg := range idx.segments {

@@ -214,19 +214,30 @@
   []
   (nemesis/clock-scrambler 10))
 
+(defn- address->node
+  "Extracts the hostname from an address like \"n1:8080\" → \"n1\"."
+  [addr]
+  (when addr
+    (first (clojure.string/split addr #":"))))
+
 (defn find-leader-node
   "Queries the routing endpoint to find which node owns the most partitions
    for the given topic. Returns the node name or nil."
   [nodes topic]
-  (some (fn [node]
-          (when-let [routing (client/get-routing! node topic)]
-            (let [;; routing.partitions is a map/vec of partition info with :leader field
-                  partitions (or (:partitions routing) [])
-                  leaders    (keep :leader partitions)
-                  freqs      (frequencies leaders)]
-              (when (seq freqs)
-                (key (apply max-key val freqs))))))
-        (shuffle nodes)))
+  (let [node-set (set nodes)]
+    (some (fn [node]
+            (when-let [routing (client/get-routing! node topic)]
+              (let [;; routing.partitions is a map keyed by partition ID string,
+                    ;; each value has :address (e.g. "n1:8080").
+                    partitions (or (:partitions routing) {})
+                    leaders    (->> (vals partitions)
+                                    (keep (comp address->node :address)))
+                    freqs      (frequencies leaders)]
+                (when (seq freqs)
+                  (let [candidate (key (apply max-key val freqs))]
+                    (when (node-set candidate)
+                      candidate))))))
+          (shuffle nodes))))
 
 (defn leader-kill-nemesis
   "A nemesis that kills the node owning the most partitions (the busiest leader).

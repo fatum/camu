@@ -310,4 +310,3 @@ func (m *Manager) RebuildFromBatches(batches []BatchInfo) {
 func partitionKeyStr(k PartitionKey) string {
 	return k.Topic + ":" + strconv.Itoa(k.Partition)
 }
-

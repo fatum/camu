@@ -8,6 +8,10 @@ MIN_INSYNC_REPLICAS="${MIN_ISR:-2}"
 WORKLOAD="${WORKLOAD:-mixed}"
 CONCURRENCY="${CONCURRENCY:-5}"
 READ_MODE="${READ_MODE:-leader}"
+NUM_PARTITIONS="${NUM_PARTITIONS:-4}"
+WAL_CHUNK_SIZE="${WAL_CHUNK_SIZE:-67108864}"
+SEGMENT_MAX_SIZE="${SEGMENT_MAX_SIZE:-104857600}"
+SEGMENT_MAX_AGE="${SEGMENT_MAX_AGE:-1m}"
 MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASS="${MINIO_PASS:-minioadmin}"
 MINIO_BUCKET="${MINIO_BUCKET:-camu-data}"
@@ -43,8 +47,11 @@ docker compose build control
 echo "Waiting for services to be ready..."
 sleep 10
 
-echo "Running Jepsen tests (faults=$FAULTS, time-limit=$TIME_LIMIT, rf=$REPLICATION_FACTOR, minISR=$MIN_INSYNC_REPLICAS, workload=$WORKLOAD, concurrency=$CONCURRENCY, read-mode=$READ_MODE)..."
-docker compose run --rm control bash -c "
+echo "Running Jepsen tests (faults=$FAULTS, time-limit=$TIME_LIMIT, rf=$REPLICATION_FACTOR, minISR=$MIN_INSYNC_REPLICAS, partitions=$NUM_PARTITIONS, workload=$WORKLOAD, concurrency=$CONCURRENCY, read-mode=$READ_MODE, wal_chunk_size=$WAL_CHUNK_SIZE, segment_max_size=$SEGMENT_MAX_SIZE, segment_max_age=$SEGMENT_MAX_AGE)..."
+docker compose run --rm \
+  -e CAMU_DISABLE_NODE_LOGS \
+  -e CAMU_QUIET_CLIENT_LOGS \
+  control bash -c "
   echo 'Distributing SSH keys to nodes...' &&
   for n in n1 n2 n3 n4 n5; do
     until ssh-keyscan \$n >> /root/.ssh/known_hosts 2>/dev/null; do sleep 1; done
@@ -61,6 +68,10 @@ docker compose run --rm control bash -c "
     --faults $FAULTS \
     --workload $WORKLOAD \
     --read-mode $READ_MODE \
+    --num-partitions $NUM_PARTITIONS \
+    --wal-chunk-size $WAL_CHUNK_SIZE \
+    --segment-max-size $SEGMENT_MAX_SIZE \
+    --segment-max-age $SEGMENT_MAX_AGE \
     --replication-factor $REPLICATION_FACTOR \
     --min-insync-replicas $MIN_INSYNC_REPLICAS
 "

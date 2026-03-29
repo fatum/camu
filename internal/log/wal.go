@@ -132,7 +132,7 @@ func serializeWALBatch(batch Batch) ([]byte, error) {
 		frameStart := len(out)
 		out = binary.BigEndian.AppendUint32(out, uint32(encodedMessageFrameSize(msg)))
 		out = appendMessageFrame(out, msg)
-		out = binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(out[frameStart+4:len(out)]))
+		out = binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(out[frameStart+4:]))
 	}
 
 	// CRC covers everything after total_envelope_length (i.e. payload bytes).

@@ -42,7 +42,6 @@ func TestIndex_AddAndLookup(t *testing.T) {
 	}
 }
 
-
 func TestIndex_RemoveBefore(t *testing.T) {
 	idx := NewIndex()
 	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 99, Key: "seg-0"})
@@ -191,4 +190,3 @@ func TestIndex_SegmentsFrom(t *testing.T) {
 		t.Fatalf("SegmentsFrom(30) = %v, want nil", segs)
 	}
 }
-
