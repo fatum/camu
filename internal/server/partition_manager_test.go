@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -170,7 +170,10 @@ func TestPartitionManagerAppendBatch_PersistsHighWatermarkBeforeFlush(t *testing
 	}
 }
 
-func TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL(t *testing.T) {
+// TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL was removed:
+// index.json CAS loop has been replaced by a simple state.json PUT.
+
+func TestPartitionManagerScanAndRebuildProducerState(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
 	tc := meta.TopicConfig{
@@ -189,54 +192,101 @@ func TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL(t *testing.T) {
 	if ps == nil {
 		t.Fatal("expected partition state")
 	}
-	ps.isLeader = true
-	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
 
-	_, err := pm.AppendBatch(context.Background(), "topic", 0, []log.Message{
-		{Key: []byte("k"), Value: []byte("value")},
+	if err := ps.wal.AppendBatchWithMeta(log.Batch{
+		ProducerID: 1,
+		Sequence:   0,
+		Messages: []log.Message{
+			{Offset: 0, Key: []byte("k0"), Value: []byte("v0"), Headers: map[string]string{"a": "1"}},
+			{Offset: 1, Key: []byte("k1"), Value: []byte("v1"), Headers: map[string]string{"b": "2"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendBatchWithMeta(first) error = %v", err)
+	}
+	if err := ps.wal.AppendBatchWithMeta(log.Batch{
+		ProducerID: 2,
+		Sequence:   5,
+		Messages: []log.Message{
+			{Offset: 2, Key: []byte("k2"), Value: []byte("v2"), Headers: map[string]string{"c": "3"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendBatchWithMeta(second) error = %v", err)
+	}
+
+	// Only batches at or above flushedOffset are scanned.
+	ps.flushedOffset = 2
+
+	n := pm.ScanAndRebuildProducerState("topic", 0)
+	if n != 1 {
+		t.Fatalf("ScanAndRebuildProducerState() rebuilt %d batches, want 1", n)
+	}
+
+	// Verify producer 2's sequence state was rebuilt.
+	state, ok := ps.producerSeqs[2]
+	if !ok {
+		t.Fatal("expected producerSeqs entry for producer 2")
+	}
+	if state.NextSeq != 6 { // sequence 5 + batch size 1
+		t.Fatalf("producer 2 NextSeq = %d, want 6", state.NextSeq)
+	}
+
+	// Producer 1 should NOT be present (its batch was below flushedOffset).
+	if _, ok := ps.producerSeqs[1]; ok {
+		t.Fatal("producer 1 should not be in producerSeqs (below flushedOffset)")
+	}
+}
+
+func TestPartitionStateLoadProducerCheckpoint_DoesNotImmediateExpire(t *testing.T) {
+	ps := &partitionState{
+		producerSeqs: make(map[uint64]*producerPartitionState),
+	}
+
+	var buf []byte
+	line, err := json.Marshal(producerCheckpointEntry{
+		ProducerID: 7,
+		NextSeq:    11,
+		LastOffset: 10,
 	})
 	if err != nil {
-		t.Fatalf("AppendBatch() error = %v", err)
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	buf = append(buf, line...)
+	buf = append(buf, '\n')
+
+	ps.loadProducerCheckpoint(buf)
+
+	if got := ps.evictStaleProducers(time.Hour); got != 0 {
+		t.Fatalf("evictStaleProducers() = %d, want 0 immediately after load", got)
+	}
+	state, ok := ps.producerSeqs[7]
+	if !ok {
+		t.Fatal("expected restored producer state")
+	}
+	if state.LastActiveAt.IsZero() {
+		t.Fatal("expected LastActiveAt to be populated on checkpoint load")
+	}
+}
+
+func TestPartitionStateRebuildProducerSeqsFromBatches_DoesNotImmediateExpire(t *testing.T) {
+	ps := &partitionState{
+		producerSeqs: make(map[uint64]*producerPartitionState),
 	}
 
-	var casCalls int
-	pm.conditionalPutIndex = func(ctx context.Context, key string, data []byte, etag string) (string, error) {
-		casCalls++
-		return "", storage.ErrConflict
-	}
+	ps.rebuildProducerSeqsFromBatches([]log.BatchMeta{
+		{ProducerID: 5, Sequence: 3, MessageCount: 2},
+	})
 
-	err = pm.onFlush(pm.getGlobalID("topic", 0))
-	if err == nil {
-		t.Fatal("onFlush() should fail when index CAS exhausts retries")
+	if got := ps.evictStaleProducers(time.Hour); got != 0 {
+		t.Fatalf("evictStaleProducers() = %d, want 0 immediately after rebuild", got)
 	}
-	if casCalls != 5 {
-		t.Fatalf("conditionalPutIndex called %d times, want 5", casCalls)
+	state, ok := ps.producerSeqs[5]
+	if !ok {
+		t.Fatal("expected rebuilt producer state")
 	}
-	if !errors.Is(err, storage.ErrConflict) && err.Error() != "flush index exhausted after retries" {
-		t.Fatalf("onFlush() error = %v, want index exhaustion", err)
+	if got := state.NextSeq; got != 5 {
+		t.Fatalf("state.NextSeq = %d, want 5", got)
 	}
-
-	msgs, err := ps.wal.Replay()
-	if err != nil {
-		t.Fatalf("wal.Replay() error = %v", err)
-	}
-	if len(msgs) != 1 {
-		t.Fatalf("expected WAL to retain 1 message after failed flush, found %d", len(msgs))
-	}
-	if ps.flushedOffset != 0 {
-		t.Fatalf("flushedOffset = %d, want 0 after failed flush", ps.flushedOffset)
-	}
-
-	indexKey := "topic/0/index.json"
-	if _, err := pm.s3Client.Get(context.Background(), indexKey); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("index.json should not be written on failed flush, got err=%v", err)
-	}
-
-	segmentKeys, err := pm.s3Client.List(context.Background(), "topic/0/")
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-	if len(segmentKeys) != 3 {
-		t.Fatalf("expected uploaded segment, offset index, and metadata to remain for diagnosis/retry, got %v", segmentKeys)
+	if state.LastActiveAt.IsZero() {
+		t.Fatal("expected LastActiveAt to be populated on WAL rebuild")
 	}
 }

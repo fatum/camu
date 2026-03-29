@@ -235,13 +235,12 @@ func TestWAL_CachesChunkListInMemory(t *testing.T) {
 	}
 	defer w.Close()
 
-	msgs := []Message{
-		{Offset: 0, Value: []byte("aaaaaaaaaaaaaaaa")},
-		{Offset: 1, Value: []byte("bbbbbbbbbbbbbbbb")},
-		{Offset: 2, Value: []byte("cccccccccccccccc")},
-	}
-	if err := w.AppendBatch(msgs); err != nil {
-		t.Fatalf("AppendBatch() error: %v", err)
+	// Append individually so each message gets its own envelope and can
+	// trigger chunk rotation at the small 64-byte chunk size.
+	for i := 0; i < 3; i++ {
+		if err := w.Append(Message{Offset: uint64(i), Value: []byte("aaaaaaaaaaaaaaaa")}); err != nil {
+			t.Fatalf("Append(%d) error: %v", i, err)
+		}
 	}
 
 	if got := len(w.chunks); got < 2 {
@@ -310,6 +309,232 @@ func TestWAL_FlushedChunksRetainedForReadsButSkippedByReplay(t *testing.T) {
 		if got := readMsgs[i].Offset; got != uint64(i) {
 			t.Fatalf("ReadFrom()[%d].Offset = %d, want %d", i, got, i)
 		}
+	}
+}
+
+func TestWAL_BatchEnvelopeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "envelope.wal")
+
+	w, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+
+	batch := Batch{
+		ProducerID: 42,
+		Sequence:   7,
+		Messages: []Message{
+			{Offset: 10, Timestamp: 1000, Key: []byte("k0"), Value: []byte("v0")},
+			{Offset: 11, Timestamp: 2000, Key: []byte("k1"), Value: []byte("v1")},
+		},
+	}
+	if err := w.AppendBatchWithMeta(batch); err != nil {
+		t.Fatalf("AppendBatchWithMeta() error: %v", err)
+	}
+	w.Close()
+
+	w2, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() reopen error: %v", err)
+	}
+	defer w2.Close()
+
+	replayed, err := w2.Replay()
+	if err != nil {
+		t.Fatalf("Replay() error: %v", err)
+	}
+	if len(replayed) != 2 {
+		t.Fatalf("Replay() = %d messages, want 2", len(replayed))
+	}
+	if replayed[0].Offset != 10 || replayed[1].Offset != 11 {
+		t.Fatalf("offsets = [%d %d], want [10 11]", replayed[0].Offset, replayed[1].Offset)
+	}
+	if string(replayed[0].Key) != "k0" {
+		t.Errorf("replayed[0].Key = %q, want %q", replayed[0].Key, "k0")
+	}
+	if string(replayed[1].Value) != "v1" {
+		t.Errorf("replayed[1].Value = %q, want %q", replayed[1].Value, "v1")
+	}
+}
+
+func TestWAL_AppendBatchBackwardsCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compat.wal")
+
+	w, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+
+	msgs := []Message{
+		{Offset: 0, Timestamp: 100, Key: []byte("a"), Value: []byte("b")},
+		{Offset: 1, Timestamp: 200, Key: []byte("c"), Value: []byte("d")},
+	}
+	if err := w.AppendBatch(msgs); err != nil {
+		t.Fatalf("AppendBatch() error: %v", err)
+	}
+	w.Close()
+
+	w2, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() reopen error: %v", err)
+	}
+	defer w2.Close()
+
+	replayed, err := w2.Replay()
+	if err != nil {
+		t.Fatalf("Replay() error: %v", err)
+	}
+	if len(replayed) != 2 {
+		t.Fatalf("Replay() = %d messages, want 2", len(replayed))
+	}
+	for i, want := range msgs {
+		got := replayed[i]
+		if got.Offset != want.Offset || got.Timestamp != want.Timestamp {
+			t.Errorf("msg[%d] offset/ts mismatch: got (%d,%d), want (%d,%d)",
+				i, got.Offset, got.Timestamp, want.Offset, want.Timestamp)
+		}
+		if string(got.Key) != string(want.Key) || string(got.Value) != string(want.Value) {
+			t.Errorf("msg[%d] key/value mismatch", i)
+		}
+	}
+}
+
+func TestWAL_ScanBatchesReturnsBatchMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scan-batches.wal")
+
+	w, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+
+	b1 := Batch{
+		ProducerID: 1,
+		Sequence:   10,
+		Messages: []Message{
+			{Offset: 0, Value: []byte("a")},
+			{Offset: 1, Value: []byte("b")},
+		},
+	}
+	b2 := Batch{
+		ProducerID: 2,
+		Sequence:   20,
+		Messages: []Message{
+			{Offset: 2, Value: []byte("c")},
+		},
+	}
+	if err := w.AppendBatchWithMeta(b1); err != nil {
+		t.Fatalf("AppendBatchWithMeta(b1) error: %v", err)
+	}
+	if err := w.AppendBatchWithMeta(b2); err != nil {
+		t.Fatalf("AppendBatchWithMeta(b2) error: %v", err)
+	}
+	w.Close()
+
+	// Read the active chunk directly with scanWALBatches.
+	chunkPath := walActiveChunkPath(walChunkDir(path))
+	// After close+reopen the active chunk gets sealed; find whatever chunk exists.
+	w2, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() reopen error: %v", err)
+	}
+	defer w2.Close()
+
+	w2.mu.RLock()
+	chunks := w2.snapshotChunksLocked(true, true)
+	w2.mu.RUnlock()
+
+	var batches []Batch
+	for _, chunk := range chunks {
+		p := w2.chunkPathLocked(chunk)
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatalf("open chunk %q: %v", chunkPath, err)
+		}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			t.Fatalf("stat chunk: %v", err)
+		}
+		_, _, _, err = scanWALBatches(f, info.Size(), 0, func(b Batch) bool {
+			batches = append(batches, b)
+			return true
+		})
+		f.Close()
+		if err != nil {
+			t.Fatalf("scanWALBatches() error: %v", err)
+		}
+	}
+
+	if len(batches) != 2 {
+		t.Fatalf("scanWALBatches() = %d batches, want 2", len(batches))
+	}
+	if batches[0].ProducerID != 1 || batches[0].Sequence != 10 {
+		t.Errorf("batch[0] = (pid=%d, seq=%d), want (1, 10)", batches[0].ProducerID, batches[0].Sequence)
+	}
+	if len(batches[0].Messages) != 2 {
+		t.Errorf("batch[0] has %d messages, want 2", len(batches[0].Messages))
+	}
+	if batches[1].ProducerID != 2 || batches[1].Sequence != 20 {
+		t.Errorf("batch[1] = (pid=%d, seq=%d), want (2, 20)", batches[1].ProducerID, batches[1].Sequence)
+	}
+	if len(batches[1].Messages) != 1 {
+		t.Errorf("batch[1] has %d messages, want 1", len(batches[1].Messages))
+	}
+}
+
+func TestWAL_ReadBatchMetasFrom(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "batch-metas.wal")
+
+	w, err := OpenWAL(path, false, 1<<20)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.AppendBatchWithMeta(Batch{
+		ProducerID: 7,
+		Sequence:   11,
+		Messages: []Message{
+			{Offset: 0, Key: []byte("k0"), Value: []byte("v0"), Headers: map[string]string{"a": "1"}},
+			{Offset: 1, Key: []byte("k1"), Value: []byte("v1"), Headers: map[string]string{"b": "2"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendBatchWithMeta(first) error: %v", err)
+	}
+	if err := w.AppendBatchWithMeta(Batch{
+		ProducerID: 9,
+		Sequence:   20,
+		Messages: []Message{
+			{Offset: 2, Key: []byte("k2"), Value: []byte("v2"), Headers: map[string]string{"c": "3"}},
+		},
+	}); err != nil {
+		t.Fatalf("AppendBatchWithMeta(second) error: %v", err)
+	}
+
+	metas, err := w.ReadBatchMetasFrom(1)
+	if err != nil {
+		t.Fatalf("ReadBatchMetasFrom() error: %v", err)
+	}
+	if len(metas) != 2 {
+		t.Fatalf("ReadBatchMetasFrom() returned %d metas, want 2", len(metas))
+	}
+
+	if metas[0].ProducerID != 7 || metas[0].Sequence != 11 {
+		t.Fatalf("meta[0] = (pid=%d, seq=%d), want (7, 11)", metas[0].ProducerID, metas[0].Sequence)
+	}
+	if metas[0].MessageCount != 2 || metas[0].FirstOffset != 0 || metas[0].LastOffset != 1 {
+		t.Fatalf("meta[0] = %+v, want count=2 first=0 last=1", metas[0])
+	}
+
+	if metas[1].ProducerID != 9 || metas[1].Sequence != 20 {
+		t.Fatalf("meta[1] = (pid=%d, seq=%d), want (9, 20)", metas[1].ProducerID, metas[1].Sequence)
+	}
+	if metas[1].MessageCount != 1 || metas[1].FirstOffset != 2 || metas[1].LastOffset != 2 {
+		t.Fatalf("meta[1] = %+v, want count=1 first=2 last=2", metas[1])
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/maksim/camu/internal/storage"
@@ -69,6 +70,7 @@ func fromJSON(j topicConfigJSON) TopicConfig {
 // TopicStore manages topic metadata stored in S3.
 type TopicStore struct {
 	s3Client *storage.S3Client
+	cache    sync.Map // name -> TopicConfig
 }
 
 // NewTopicStore creates a new TopicStore backed by the given S3 client.
@@ -107,11 +109,18 @@ func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
 	}); err != nil {
 		return fmt.Errorf("Create: put %q: %w", cfg.Name, err)
 	}
+	ts.cache.Store(cfg.Name, cfg)
 	return nil
 }
 
 // Get retrieves a topic configuration by name. Returns a wrapped storage.ErrNotFound if missing.
 func (ts *TopicStore) Get(ctx context.Context, name string) (TopicConfig, error) {
+	// Check cache first.
+	if v, ok := ts.cache.Load(name); ok {
+		return v.(TopicConfig), nil
+	}
+
+	// Cache miss — fetch from S3.
 	data, err := ts.s3Client.Get(ctx, topicKey(name))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -124,7 +133,9 @@ func (ts *TopicStore) Get(ctx context.Context, name string) (TopicConfig, error)
 	if err := json.Unmarshal(data, &j); err != nil {
 		return TopicConfig{}, fmt.Errorf("Get %q: unmarshal: %w", name, err)
 	}
-	return fromJSON(j), nil
+	cfg := fromJSON(j)
+	ts.cache.Store(name, cfg)
+	return cfg, nil
 }
 
 // List returns all topic configurations stored in S3.
@@ -146,6 +157,21 @@ func (ts *TopicStore) List(ctx context.Context) ([]TopicConfig, error) {
 		}
 		topics = append(topics, fromJSON(j))
 	}
+
+	// Sync cache: replace with fresh S3 state. This evicts topics deleted
+	// by other instances and populates topics created by other instances.
+	live := make(map[string]struct{}, len(topics))
+	for _, tc := range topics {
+		ts.cache.Store(tc.Name, tc)
+		live[tc.Name] = struct{}{}
+	}
+	ts.cache.Range(func(key, _ any) bool {
+		if _, ok := live[key.(string)]; !ok {
+			ts.cache.Delete(key)
+		}
+		return true
+	})
+
 	return topics, nil
 }
 
@@ -154,5 +180,6 @@ func (ts *TopicStore) Delete(ctx context.Context, name string) error {
 	if err := ts.s3Client.Delete(ctx, topicKey(name)); err != nil {
 		return fmt.Errorf("Delete %q: %w", name, err)
 	}
+	ts.cache.Delete(name)
 	return nil
 }

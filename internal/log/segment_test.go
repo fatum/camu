@@ -8,6 +8,7 @@ import (
 )
 
 const testSegmentBatchSize = 16 * 1024
+
 // testSegmentBatchSize is the default on-disk batch target used by segment
 // tests unless a case needs smaller batches to force multiple batch boundaries.
 
@@ -334,6 +335,63 @@ func TestWriteSegment_DeterministicHeaderEncoding(t *testing.T) {
 
 	if !bytes.Equal(buf1.Bytes(), buf2.Bytes()) {
 		t.Fatal("segment encoding should be deterministic for identical input")
+	}
+}
+
+func TestSegment_V3WALBatchEnvelopeRoundTrip(t *testing.T) {
+	msgs := []Message{
+		{Offset: 0, Timestamp: 1000, Key: []byte("k0"), Value: []byte("hello")},
+		{Offset: 1, Timestamp: 2000, Key: []byte("k1"), Value: []byte("world")},
+		{Offset: 2, Timestamp: 3000, Key: nil, Value: []byte("no-key"), Headers: map[string]string{"h": "v"}},
+	}
+
+	for _, compression := range []string{CompressionNone, CompressionSnappy, CompressionZstd} {
+		t.Run(compression, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteSegment(&buf, msgs, compression, testSegmentBatchSize); err != nil {
+				t.Fatalf("WriteSegment(%s) failed: %v", compression, err)
+			}
+
+			// Verify version byte is 3.
+			raw := buf.Bytes()
+			if raw[4] != 3 {
+				t.Fatalf("segment version = %d, want 3", raw[4])
+			}
+
+			got, err := ReadSegment(bytes.NewReader(raw), int64(len(raw)))
+			if err != nil {
+				t.Fatalf("ReadSegment(%s) failed: %v", compression, err)
+			}
+			if len(got) != len(msgs) {
+				t.Fatalf("got %d messages, want %d", len(got), len(msgs))
+			}
+			for i, want := range msgs {
+				g := got[i]
+				if g.Offset != want.Offset {
+					t.Errorf("msg[%d]: offset: want %d, got %d", i, want.Offset, g.Offset)
+				}
+				if g.Timestamp != want.Timestamp {
+					t.Errorf("msg[%d]: timestamp: want %d, got %d", i, want.Timestamp, g.Timestamp)
+				}
+				if !bytes.Equal(g.Key, want.Key) {
+					t.Errorf("msg[%d]: key: want %q, got %q", i, want.Key, g.Key)
+				}
+				if !bytes.Equal(g.Value, want.Value) {
+					t.Errorf("msg[%d]: value: want %q, got %q", i, want.Value, g.Value)
+				}
+				for k, v := range want.Headers {
+					if g.Headers[k] != v {
+						t.Errorf("msg[%d]: header[%q]: want %q, got %q", i, k, v, g.Headers[k])
+					}
+				}
+			}
+
+			// Also verify the offset index builds successfully with the v3 format.
+			_, err = BuildSegmentOffsetIndex(raw, 0, 1)
+			if err != nil {
+				t.Fatalf("BuildSegmentOffsetIndex(%s) failed: %v", compression, err)
+			}
+		})
 	}
 }
 

@@ -2,26 +2,29 @@ package replication
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
+	"golang.org/x/net/http2"
 )
 
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
-	AppendReplicatedBatch(ctx context.Context, topic string, pid int, msgs []log.Message) error
+	AppendReplicatedBatchFrames(ctx context.Context, topic string, pid int, frames []log.BatchFrame) error
 	TruncateWAL(topic string, pid int, beforeOffset uint64) error
 	UpdateFollowerProgress(topic string, pid int, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
-	Messages      []log.Message
+	Frames        []log.BatchFrame
 	TruncateTo    uint64
 	HasTruncate   bool
 	HighWatermark uint64
@@ -39,11 +42,29 @@ type FollowerFetcher struct {
 	onLeaderDown OnLeaderDown
 }
 
-// NewFollowerFetcher creates a FollowerFetcher with the given leader-down callback.
-func NewFollowerFetcher(onLeaderDown OnLeaderDown) *FollowerFetcher {
+// NewFollowerFetcher creates a FollowerFetcher with a shared HTTP client and
+// a leader-down callback. The client should be created via NewH2CClient so
+// that all partition fetches to the same leader multiplex over one connection.
+func NewFollowerFetcher(httpClient *http.Client, onLeaderDown OnLeaderDown) *FollowerFetcher {
 	return &FollowerFetcher{
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		httpClient:   httpClient,
 		onLeaderDown: onLeaderDown,
+	}
+}
+
+// NewH2CClient creates an HTTP client that speaks h2c (HTTP/2 without TLS).
+// A single client should be shared across all fetchers to multiplex
+// partition fetches over one connection per leader.
+func NewH2CClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		},
 	}
 }
 
@@ -125,20 +146,28 @@ func (f *FollowerFetcher) Run(
 			continue
 		}
 
-		// Append new messages.
-		if len(resp.Messages) > 0 {
-			first := resp.Messages[0].Offset
-			last := resp.Messages[len(resp.Messages)-1].Offset
-			if err := pm.AppendReplicatedBatch(ctx, topic, pid, resp.Messages); err != nil {
-				slog.Warn("fetcher: AppendReplicatedBatch failed",
+		// Append new batches (preserving producer metadata for idempotency recovery).
+		if len(resp.Frames) > 0 {
+			var first, last uint64
+			for _, frame := range resp.Frames {
+				if frame.Meta.MessageCount > 0 {
+					if first == 0 || frame.Meta.FirstOffset < first {
+						first = frame.Meta.FirstOffset
+					}
+					if frame.Meta.LastOffset > last {
+						last = frame.Meta.LastOffset
+					}
+				}
+			}
+			if err := pm.AppendReplicatedBatchFrames(ctx, topic, pid, resp.Frames); err != nil {
+				slog.Warn("fetcher: AppendReplicatedBatchFrames failed",
 					"topic", topic, "pid", pid, "err", err)
 			} else {
-				slog.Debug("fetcher: replicated batch",
+				slog.Debug("fetcher: replicated batches",
 					"topic", topic, "pid", pid,
-					"count", len(resp.Messages),
+					"batch_count", len(resp.Frames),
 					"offsets", fmt.Sprintf("%d-%d", first, last),
 					"leader_hw", resp.HighWatermark)
-				// Advance local offset past the last appended message.
 				localOffset = last + 1
 			}
 		}
@@ -223,11 +252,11 @@ func (f *FollowerFetcher) fetchFromLeader(
 		}
 	}
 
-	msgs, err := ReadMessageFrames(httpResp.Body)
+	frames, err := ReadBatchFrames(httpResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("fetcher: read message frames: %w", err)
+		return nil, fmt.Errorf("fetcher: read batch frames: %w", err)
 	}
-	fr.Messages = msgs
+	fr.Frames = frames
 
 	return &fr, nil
 }

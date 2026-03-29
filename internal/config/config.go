@@ -20,8 +20,9 @@ type Config struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	Address    string `yaml:"address"`
-	InstanceID string `yaml:"instance_id"`
+	Address         string `yaml:"address"`
+	InternalAddress string `yaml:"internal_address"`
+	InstanceID      string `yaml:"instance_id"`
 }
 
 // StorageConfig holds S3-compatible object storage settings.
@@ -49,16 +50,16 @@ const defaultWALChunkSize = 64 * 1024 * 1024
 
 // SegmentsConfig holds segment management settings.
 type SegmentsConfig struct {
-	MaxSize            int64  `yaml:"max_size"`
-	MaxAge             string `yaml:"max_age"`
-	Compression        string `yaml:"compression"`
+	MaxSize               int64  `yaml:"max_size"`
+	MaxAge                string `yaml:"max_age"`
+	Compression           string `yaml:"compression"`
 	RecordBatchTargetSize int64  `yaml:"record_batch_target_size"`
-	IndexIntervalBytes int    `yaml:"index_interval_bytes"`
+	IndexIntervalBytes    int    `yaml:"index_interval_bytes"`
 }
 
 const (
 	defaultSegmentRecordBatchTargetSize = 16 * 1024
-	defaultSegmentIndexIntervalBytes = 4096
+	defaultSegmentIndexIntervalBytes    = 4096
 )
 
 // MaxAgeDuration parses MaxAge as a time.Duration.
@@ -159,7 +160,8 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Address: ":8080",
+			Address:         ":8080",
+			InternalAddress: ":8081",
 		},
 		WAL: WALConfig{
 			Directory: "/var/lib/camu/wal",
@@ -167,11 +169,11 @@ func defaults() *Config {
 			ChunkSize: defaultWALChunkSize,
 		},
 		Segments: SegmentsConfig{
-			MaxSize:            8388608,
-			MaxAge:             "5s",
-			Compression:        "none",
+			MaxSize:               8388608,
+			MaxAge:                "5s",
+			Compression:           "none",
 			RecordBatchTargetSize: defaultSegmentRecordBatchTargetSize,
-			IndexIntervalBytes: defaultSegmentIndexIntervalBytes,
+			IndexIntervalBytes:    defaultSegmentIndexIntervalBytes,
 		},
 		Cache: CacheConfig{
 			Directory: "/var/lib/camu/cache",

@@ -13,7 +13,7 @@
             [jepsen.camu.db :as db])
   (:import (java.util UUID)))
 
-(def partitions 4)
+(def default-partitions 4)
 (def large-value-size-bytes (* 5 1024))
 
 (defn fixed-size-value
@@ -43,7 +43,7 @@
 (defn consume-gen
   "Returns a generator that consumes from a random partition, tracking
    the highest offset seen per partition so reads advance forward."
-  [offsets]
+  [partitions offsets]
   (fn [_ _]
     (let [p (rand-int partitions)]
       {:type  :invoke
@@ -53,7 +53,7 @@
 
 (defn mixed-workload-gen
   "Returns a mixed generator: ~70% produce, ~30% consume."
-  [counter offsets]
+  [partitions counter offsets]
   (gen/mix [(produce-gen counter)
             (produce-gen counter)
             (produce-gen counter)
@@ -61,13 +61,13 @@
             (produce-gen counter)
             (produce-gen counter)
             (produce-gen counter)
-            (consume-gen offsets)
-            (consume-gen offsets)
-            (consume-gen offsets)]))
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)]))
 
 (defn large-requests-workload-gen
   "Returns a mixed generator with concurrent 5 KB produces and consumes."
-  [counter offsets]
+  [partitions counter offsets]
   (gen/mix [(large-produce-gen counter)
             (large-produce-gen counter)
             (large-produce-gen counter)
@@ -75,14 +75,14 @@
             (large-produce-gen counter)
             (large-produce-gen counter)
             (large-produce-gen counter)
-            (consume-gen offsets)
-            (consume-gen offsets)
-            (consume-gen offsets)]))
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)]))
 
 (defn replica-flushed-reads-workload-gen
   "Returns a produce-heavy workload intended for replica reads against flushed
    data. Pair it with read-mode :replica and a graceful leave-style fault."
-  [counter offsets]
+  [partitions counter offsets]
   (gen/mix [(produce-gen counter)
             (produce-gen counter)
             (produce-gen counter)
@@ -91,24 +91,51 @@
             (produce-gen counter)
             (produce-gen counter)
             (produce-gen counter)
-            (consume-gen offsets)
-            (consume-gen offsets)]))
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)]))
+
+(defn num-partitions
+  [opts]
+  (get opts :num-partitions default-partitions))
+
+(defn idempotent-produce-gen
+  "Generator for idempotent produce operations."
+  [counter]
+  (fn [_ _]
+    (let [n (swap! counter inc)]
+      {:type  :invoke
+       :f     :idempotent-produce
+       :value {:key   (str "k-" n)
+               :value (str "v-" n)}})))
 
 (defn workload-gen
   [opts counter offsets]
-  (case (or (:workload opts) :mixed)
-    :large-requests (large-requests-workload-gen counter offsets)
-    :replica-flushed-reads (replica-flushed-reads-workload-gen counter offsets)
-    (mixed-workload-gen counter offsets)))
+  (let [partitions (num-partitions opts)]
+    (case (or (:workload opts) :mixed)
+    :idempotent (gen/mix [(idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (idempotent-produce-gen counter)
+                          (consume-gen partitions offsets)
+                          (consume-gen partitions offsets)
+                          (consume-gen partitions offsets)])
+    :large-requests (large-requests-workload-gen partitions counter offsets)
+    :replica-flushed-reads (replica-flushed-reads-workload-gen partitions counter offsets)
+    (mixed-workload-gen partitions counter offsets))))
 
 (defn drain-gen
-  "Returns a generator that drains all 4 partitions."
-  []
-  (map (fn [p]
-         {:type  :invoke
-          :f     :drain
-          :value {:partition p :offset 0}})
-       (range partitions)))
+  "Returns a generator that drains all partitions using the given operation.
+   Defaults to :drain (leader reads)."
+  ([partitions] (drain-gen partitions :drain))
+  ([partitions op]
+   (map (fn [p]
+          {:type  :invoke
+           :f     op
+           :value {:partition p :offset 0}})
+        (range partitions))))
 
 (defn replicated?
   "Returns true if the test opts request replication (RF > 1)."
@@ -119,19 +146,28 @@
   "Returns the appropriate checker composition based on whether the test
    is running in replicated mode."
   [opts]
-  (if (replicated? opts)
+  (if (= :idempotent (:workload opts))
+    (checker/compose
+     {:exactly-once       (camu-checker/exactly-once-checker)
+      :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+      :total-order        (camu-checker/total-order-checker)
+      :availability       (camu-checker/availability-checker)
+      :recovery-time      (camu-checker/recovery-time-checker)
+      :stats              (checker/stats)})
+    (if (replicated? opts)
     ;; Replicated: use key-based durability and epoch-based leader checks
     (checker/compose
-     {:committed-durability (camu-checker/committed-durability-checker)
-      :no-ghost-reads       (camu-checker/no-ghost-reads-checker)
-      :single-leader        (camu-checker/single-leader-checker)
-      :hw-monotonicity      (camu-checker/hw-monotonicity-checker)
-      :truncation-safety    (camu-checker/truncation-safety-checker)
-      :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
-      :total-order          (camu-checker/total-order-checker)
-      :availability         (camu-checker/availability-checker)
-      :recovery-time        (camu-checker/recovery-time-checker)
-      :stats                (checker/stats)})
+     {:committed-durability  (camu-checker/committed-durability-checker)
+      :no-ghost-reads        (camu-checker/no-ghost-reads-checker)
+      :single-leader         (camu-checker/single-leader-checker)
+      :hw-monotonicity       (camu-checker/hw-monotonicity-checker)
+      :truncation-safety     (camu-checker/truncation-safety-checker)
+      :offset-monotonicity   (camu-checker/offset-monotonicity-checker)
+      :total-order           (camu-checker/total-order-checker)
+      :replica-convergence   (camu-checker/replica-convergence-checker)
+      :availability          (camu-checker/availability-checker)
+      :recovery-time         (camu-checker/recovery-time-checker)
+      :stats                 (checker/stats)})
     ;; Unreplicated: original checkers
     (checker/compose
      {:no-data-loss        (camu-checker/no-data-loss-checker)
@@ -141,12 +177,13 @@
       :availability        (camu-checker/availability-checker)
       :lease-fencing       (camu-checker/lease-fencing-checker)
       :recovery-time       (camu-checker/recovery-time-checker)
-      :stats               (checker/stats)})))
+      :stats               (checker/stats)}))))
 
 (defn camu-test
   "Constructs a Jepsen test map for camu."
   [opts]
-  (let [faults  (:faults opts #{:kill})
+  (let [faults         (:faults opts #{:kill})
+        partitions     (num-partitions opts)
         topic           (str "jepsen-test-" (str (UUID/randomUUID)))
         counter         (atom 0)
         consume-offsets (atom {})]
@@ -154,6 +191,7 @@
            opts
            {:name            "camu"
             :topic           topic
+            :num-partitions  partitions
             :read-mode       (or (:read-mode opts) :leader)
             :os              os/noop
             :db              (db/db)
@@ -162,26 +200,31 @@
             :nemesis   (nem/composed-nemesis faults)
             :checker   (checker-suite opts)
             :generator
-            (gen/phases
-             ;; Phase 1: clients produce+consume while nemesis injects faults
-             (gen/time-limit
-              (:time-limit opts 300)
-              (gen/nemesis
-               (->> (gen/mix (nem/fault-cycles faults))
-                    (gen/stagger 5))
-               (gen/clients
-                (->> (workload-gen opts counter consume-offsets)
-                     (gen/stagger 1/10)))))
-             ;; Phase 2: stop all active faults, restart nodes
-             (gen/log "Stopping nemesis, restarting all nodes...")
-             (apply gen/phases
-                    (for [fault faults]
-                      (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
-             (gen/log "Recovering — waiting 15s for cluster stabilization...")
-             (gen/sleep 15)
-             ;; Phase 3: drain ALL partitions
-             (gen/log "Draining all partitions for verification...")
-             (gen/clients (drain-gen)))})))
+            (apply gen/phases
+             (concat
+              [;; Phase 1: clients produce+consume while nemesis injects faults
+               (gen/time-limit
+                (:time-limit opts 300)
+                (gen/nemesis
+                 (->> (gen/mix (nem/fault-cycles faults))
+                      (gen/stagger 5))
+                 (gen/clients
+                  (->> (workload-gen opts counter consume-offsets)
+                       (gen/stagger 1/10)))))
+               ;; Phase 2: stop all active faults, restart nodes
+               (gen/log "Stopping nemesis, restarting all nodes...")
+               (apply gen/phases
+                      (for [fault faults]
+                        (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
+               (gen/log "Recovering — waiting 15s for cluster stabilization...")
+               (gen/sleep 15)
+               ;; Phase 3: drain ALL partitions from leader
+               (gen/log "Draining all partitions for verification...")
+               (gen/clients (drain-gen partitions))]
+              ;; Phase 4: drain ALL partitions from replicas to verify convergence
+              (when (replicated? opts)
+                [(gen/log "Draining all partitions from replicas...")
+                 (gen/clients (drain-gen partitions :replica-drain))])))})))
 
 (def cli-opts
   "Additional CLI options for camu tests."
@@ -192,6 +235,9 @@
    [nil "--http-port PORT" "HTTP port for camu"
     :default 8080
     :parse-fn #(Integer/parseInt %)]
+   [nil "--num-partitions N" "Number of partitions in the Jepsen topic"
+    :default default-partitions
+    :parse-fn #(Integer/parseInt %)]
    [nil "--faults FAULTS" "Comma-separated fault types: kill,partition,pause,leader-kill"
     :default #{:kill}
     :parse-fn (fn [s] (set (map keyword (clojure.string/split s #","))))]
@@ -201,14 +247,22 @@
    [nil "--min-insync-replicas N" "Minimum in-sync replicas for ack"
     :default 1
     :parse-fn #(Integer/parseInt %)]
+   [nil "--wal-chunk-size BYTES" "WAL chunk size in bytes"
+    :default 67108864
+    :parse-fn #(Long/parseLong %)]
+   [nil "--segment-max-size BYTES" "Segment flush size threshold in bytes"
+    :default 104857600
+    :parse-fn #(Long/parseLong %)]
+   [nil "--segment-max-age DURATION" "Segment flush age threshold, e.g. 30s"
+    :default "1m"]
    [nil "--read-mode MODE" "Read routing mode: leader, replica, or any"
     :default :leader
     :parse-fn keyword
     :validate [#{:leader :replica :any} "must be one of: leader, replica, any"]]
-   [nil "--workload NAME" "Workload: mixed, large-requests, or replica-flushed-reads"
+   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, or idempotent"
     :default :mixed
     :parse-fn keyword
-    :validate [#{:mixed :large-requests :replica-flushed-reads} "must be one of: mixed, large-requests, replica-flushed-reads"]]])
+    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent"]]])
 
 (defn -main
   "Entry point for the Jepsen CLI."

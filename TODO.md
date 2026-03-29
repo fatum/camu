@@ -23,7 +23,7 @@
 
 - [x] **Segmented WAL** — `TruncateBefore` rewrites entire WAL file while holding lock (`wal.go:187-261`); use multiple small WAL files, truncation = delete old files
 - [ ] **Pipeline S3 uploads** — `onFlush` blocks on `s3Client.Put` for 50-200ms (`partition_manager.go:652`); decouple accumulation from upload with per-partition upload queue
-- [ ] **Batch index updates** — every flush does GET+PUT to S3 for index.json (`partition_manager.go:673-727`); batch updates across N segments or use append-only format
+- [x] **Batch index updates** — every flush does GET+PUT to S3 for index.json (`partition_manager.go:673-727`); batch updates across N segments or use append-only format
 - [ ] **`sync.Pool` for segment buffers** — `WriteSegment` allocates new `bytes.Buffer` per message frame (`segment.go:42-47`); pool and reuse buffers to reduce GC pressure
 - [ ] **Binary produce protocol** — JSON parsing allocates heavily with string→[]byte copies (`handlers_produce.go:54-70`); add protobuf or custom framing for high-throughput clients
 - [ ] **Server-side request coalescing** — no linger across concurrent HTTP requests; hold response for up to N ms, coalesce into single WAL write + fsync (standard Kafka/Redpanda approach)
@@ -45,20 +45,34 @@ Leaderless, zero-WAL topic type where S3 is the sole storage and durability laye
 
 Replace 307 redirects with internal proxying — any broker accepts any request and forwards to the partition owner internally.
 
-- [ ] **Internal HTTP/2 connection pool** — persistent h2/h2c connections between brokers. Shared for both request proxying and replica fetches. Multiplexed streams eliminate head-of-line blocking across partitions
-- [ ] **Proxy produce/consume to partition owner** — broker looks up owner from assignment table, forwards request, returns response. One round trip instead of two
-- [ ] **Single LB endpoint** — clients hit any broker via one DNS name. No need to know topology. Kubernetes-friendly
-- [ ] **Optional direct mode** — `?redirect=true` for clients that want to bypass proxy and go direct to partition owner
+- [x] **Internal HTTP/2 connection pool** — persistent h2/h2c connections between brokers. Shared for both request proxying and replica fetches. Multiplexed streams eliminate head-of-line blocking across partitions
+- [x] **Proxy produce/consume to partition owner** — broker looks up owner from assignment table, forwards request, returns response. One round trip instead of two
+- [x] **Single LB endpoint** — clients hit any broker via one DNS name. No need to know topology. Kubernetes-friendly
 
 ## Consumer Groups
 
 Client-side consumer groups using S3 leases for coordination. No server-side group coordinator.
 
-- [ ] **Offset commit/fetch API** — `POST /v1/groups/{gid}/offsets`, `GET /v1/groups/{gid}/offsets`. Store at `s3://bucket/offsets/{group_id}/{topic}/{partition}`
+- [x] **Offset commit/fetch API** — `POST /v1/groups/{gid}/commit`, `GET /v1/groups/{gid}/offsets`. Store at `s3://bucket/offsets/{group_id}/{topic}/{partition}`
 - [ ] **Group membership via S3 leases** — consumers heartbeat a lease key at `s3://groups/{gid}/members/{cid}`. Dead when lease expires
 - [ ] **Coordinator election** — first member to CAS a coordinator lease becomes coordinator. Reads live members, computes partition assignment (range/round-robin), writes assignments to member keys
 - [ ] **Rebalance on membership change** — coordinator detects join/leave via lease expiry on sweep, reassigns partitions. Stop-the-world initially, cooperative/incremental later
 - [ ] **Client library** — consumer group logic lives client-side. Server only provides offset storage and lease primitives
+
+## Idempotent Produce (Exactly-Once)
+
+- [x] **`Batch` struct** — per-batch producer metadata (`ProducerID`, `Sequence`)
+- [x] **Idempotency manager** — per-(producer, partition) sequence tracking, S3-based ID allocation, checkpoint/load/rebuild, stale eviction
+- [x] **Segment batch header v2** — 16 bytes producer metadata per batch
+- [x] **WAL batch envelope** — carries `ProducerID`/`Sequence` through WAL and replication wire format
+- [x] **`POST /v1/producers/init`** — S3 atomic counter for globally unique producer IDs
+- [x] **Idempotency gate** — partition-specific endpoint only; duplicate → join replication purgatory → `{"duplicate": true}`; gap → 422
+- [x] **S3 per-partition checkpoint** — uploaded during flush, downloaded on leader promotion
+- [x] **WAL recovery filtered by HW** — only committed batches rebuild idempotency state on failover
+- [x] **Stale producer eviction** — 30min TTL, runs on coordination tick
+- [x] **Jepsen exactly-once checker** — 7 test scenarios (combined faults, high concurrency, pause, S3 degradation, membership, strict quorum, soak)
+- [ ] **Per-partition sequence in segment flush** — segment batches carry `ProducerID`/`Sequence` in header but currently write 0/0; wire actual metadata through flush path for segment-level dedup on read
+- [ ] **Idempotent produce on high-level endpoint** — currently rejected with 400; could support by requiring client-side partition routing or by tracking sequences per-request (not per-partition)
 
 ## Suggestions
 

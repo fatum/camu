@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/maksim/camu/internal/consumer"
 	logstore "github.com/maksim/camu/internal/log"
@@ -23,6 +25,8 @@ type consumedMessage struct {
 	Value     string            `json:"value"`
 	Headers   map[string]string `json:"headers,omitempty"`
 }
+
+const maxConsumeLimit = 20000
 
 func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
@@ -51,8 +55,8 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid limit")
 			return
 		}
-		if limit > 1000 {
-			limit = 1000
+		if limit > maxConsumeLimit {
+			limit = maxConsumeLimit
 		}
 	}
 
@@ -61,25 +65,13 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	owned := s.isOwnedPartition(topicName, partitionID)
 	var readableHW uint64
 	var hasReadableHW bool
-	if hw, ok := readableHighWatermark(ps); ok {
-		readableHW = hw
-		hasReadableHW = true
-		w.Header().Set("X-High-Watermark", strconv.FormatUint(hw, 10))
-		if startOffset >= hw {
-			slog.Debug("consume_short_circuit_at_hw",
-				"topic", topicName,
-				"partition", partitionID,
-				"offset", startOffset,
-				"limit", limit,
-				"owned", owned,
-				"high_watermark", hw,
-			)
-			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
-			return
-		}
-		maxReadable := hw - startOffset
-		if uint64(limit) > maxReadable {
-			limit = int(maxReadable)
+	if ps != nil {
+		ps.mu.RLock()
+		hw, ok := readableHighWatermark(ps)
+		ps.mu.RUnlock()
+		if ok {
+			readableHW = hw
+			hasReadableHW = true
 		}
 	}
 
@@ -101,6 +93,31 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The index HW (from S3) may be ahead of the in-memory follower HW
+	// after a leader failover. Use the higher of the two so reads aren't
+	// capped at a stale value.
+	if hasReadableHW {
+		if indexHW := index.HighWatermark(); indexHW > readableHW {
+			readableHW = indexHW
+		}
+		w.Header().Set("X-High-Watermark", strconv.FormatUint(readableHW, 10))
+		if startOffset >= readableHW {
+			slog.Debug("consume_short_circuit_at_hw",
+				"topic", topicName,
+				"partition", partitionID,
+				"offset", startOffset,
+				"limit", limit,
+				"owned", owned,
+				"high_watermark", readableHW,
+			)
+			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
+			return
+		}
+		if maxReadable := readableHW - startOffset; uint64(limit) > maxReadable {
+			limit = int(maxReadable)
+		}
+	}
+
 	slog.Debug("consume_begin",
 		"topic", topicName,
 		"partition", partitionID,
@@ -111,10 +128,9 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		"high_watermark", readableHW,
 	)
 
-	msgs, nextOffset, err := s.readMessages(r.Context(), topicName, partitionID, startOffset, limit, index, ps)
+	streamCount, nextOffset, err := s.streamMessagesJSON(r.Context(), w, topicName, partitionID, startOffset, limit, index, ps)
 	if err != nil {
 		slog.Error("consume_failed", "topic", topicName, "partition", partitionID, "offset", startOffset, "error", err)
-		writeError(w, http.StatusInternalServerError, "fetch failed: "+err.Error())
 		return
 	}
 
@@ -123,29 +139,11 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		"partition", partitionID,
 		"offset", startOffset,
 		"limit", limit,
-		"returned_messages", len(msgs),
+		"returned_messages", streamCount,
 		"next_offset", nextOffset,
 		"owned", owned,
 		"high_watermark", readableHW,
 	)
-
-	// Build response.
-	resp := consumeResponse{
-		Messages:   make([]consumedMessage, 0, len(msgs)),
-		NextOffset: nextOffset,
-	}
-	for _, m := range msgs {
-		cm := consumedMessage{
-			Offset:    m.Offset,
-			Timestamp: m.Timestamp,
-			Key:       string(m.Key),
-			Value:     tryString(m.Value),
-			Headers:   m.Headers,
-		}
-		resp.Messages = append(resp.Messages, cm)
-	}
-
-	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) readMessages(ctx context.Context, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) ([]logstore.Message, uint64, error) {
@@ -168,12 +166,18 @@ func (s *Server) readMessages(ctx context.Context, topicName string, partitionID
 	// local WAL. Merge segment-backed data with local WAL by offset rather than
 	// assuming they are disjoint: after failover, the refreshed index can
 	// overlap a stale or partially flushed WAL window.
-	hw, ok := readableHighWatermark(ps)
-	if ps == nil || !ok {
+	if ps == nil {
 		return msgs, nextOffset, nil
 	}
 
-	walMsgs, err := ps.wal.ReadFrom(startOffset, limit)
+	ps.mu.RLock()
+	hw, ok := readableHighWatermark(ps)
+	if !ok {
+		ps.mu.RUnlock()
+		return msgs, nextOffset, nil
+	}
+	walMsgs, err := ps.wal.ReadFromLocked(startOffset, limit)
+	ps.mu.RUnlock()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -231,6 +235,26 @@ func mergeMessagesByOffset(startOffset uint64, limit int, segmentMsgs, walMsgs [
 	if limit <= 0 {
 		return nil, startOffset
 	}
+	if len(segmentMsgs) == 0 {
+		if len(walMsgs) > limit {
+			walMsgs = walMsgs[:limit]
+		}
+		nextOffset := startOffset
+		if len(walMsgs) > 0 {
+			nextOffset = walMsgs[len(walMsgs)-1].Offset + 1
+		}
+		return walMsgs, nextOffset
+	}
+	if len(walMsgs) == 0 {
+		if len(segmentMsgs) > limit {
+			segmentMsgs = segmentMsgs[:limit]
+		}
+		nextOffset := startOffset
+		if len(segmentMsgs) > 0 {
+			nextOffset = segmentMsgs[len(segmentMsgs)-1].Offset + 1
+		}
+		return segmentMsgs, nextOffset
+	}
 
 	merged := make([]logstore.Message, 0, limit)
 	i, j := 0, 0
@@ -276,6 +300,213 @@ func lastMessageOffset(msgs []logstore.Message) any {
 	return msgs[len(msgs)-1].Offset
 }
 
+func writeConsumeJSON(w http.ResponseWriter, status int, msgs []logstore.Message, nextOffset uint64) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	_, _ = w.Write([]byte(`{"messages":[`))
+	enc := json.NewEncoder(w)
+	for i, m := range msgs {
+		if i > 0 {
+			_, _ = w.Write([]byte(","))
+		}
+		if err := enc.Encode(consumedMessage{
+			Offset:    m.Offset,
+			Timestamp: m.Timestamp,
+			Key:       string(m.Key),
+			Value:     tryString(m.Value),
+			Headers:   m.Headers,
+		}); err != nil {
+			return
+		}
+	}
+	_, _ = w.Write([]byte(`],"next_offset":`))
+	_, _ = w.Write([]byte(strconv.FormatUint(nextOffset, 10)))
+	_, _ = w.Write([]byte("}"))
+}
+
+type consumeIterItem struct {
+	msg  logstore.Message
+	err  error
+	done bool
+}
+
+type consumeIterator struct {
+	ch   <-chan consumeIterItem
+	next *logstore.Message
+	err  error
+	done bool
+}
+
+func startConsumeIterator(ctx context.Context, walk func(func(logstore.Message) bool) error) *consumeIterator {
+	ch := make(chan consumeIterItem, 1)
+	go func() {
+		defer close(ch)
+		err := walk(func(msg logstore.Message) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case ch <- consumeIterItem{msg: msg}:
+				return true
+			}
+		})
+		if err != nil {
+			select {
+			case <-ctx.Done():
+			case ch <- consumeIterItem{err: err, done: true}:
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case ch <- consumeIterItem{done: true}:
+		}
+	}()
+	return &consumeIterator{ch: ch}
+}
+
+func (it *consumeIterator) peek() (*logstore.Message, error) {
+	if it.done {
+		return nil, it.err
+	}
+	if it.next != nil {
+		return it.next, nil
+	}
+	item, ok := <-it.ch
+	if !ok {
+		it.done = true
+		return nil, it.err
+	}
+	if item.err != nil {
+		it.err = item.err
+		it.done = true
+		return nil, item.err
+	}
+	if item.done {
+		it.done = true
+		return nil, nil
+	}
+	msg := item.msg
+	it.next = &msg
+	return it.next, nil
+}
+
+func (it *consumeIterator) pop() {
+	it.next = nil
+}
+
+func (s *Server) streamMessagesJSON(ctx context.Context, w http.ResponseWriter, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) (int, uint64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var readableHW uint64
+	if ps != nil {
+		ps.mu.RLock()
+		hw, ok := readableHighWatermark(ps)
+		ps.mu.RUnlock()
+		if ok {
+			readableHW = hw
+		}
+	}
+
+	segmentIter := startConsumeIterator(ctx, func(visit func(logstore.Message) bool) error {
+		_, err := s.fetcher.Walk(ctx, index, topicName, partitionID, startOffset, limit, visit)
+		return err
+	})
+
+	var walIter *consumeIterator
+	if ps != nil {
+		walIter = startConsumeIterator(ctx, func(visit func(logstore.Message) bool) error {
+			return ps.wal.WalkFrom(startOffset, limit, func(msg logstore.Message) bool {
+				if readableHW > 0 && msg.Offset >= readableHW {
+					return true
+				}
+				return visit(msg)
+			})
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"messages":[`))
+	enc := json.NewEncoder(w)
+
+	written := 0
+	nextOffset := startOffset
+	writeMsg := func(m logstore.Message) error {
+		if written > 0 {
+			if _, err := w.Write([]byte(",")); err != nil {
+				return err
+			}
+		}
+		if err := enc.Encode(consumedMessage{
+			Offset:    m.Offset,
+			Timestamp: m.Timestamp,
+			Key:       string(m.Key),
+			Value:     tryString(m.Value),
+			Headers:   m.Headers,
+		}); err != nil {
+			return err
+		}
+		written++
+		nextOffset = m.Offset + 1
+		return nil
+	}
+
+	for written < limit {
+		segMsg, err := segmentIter.peek()
+		if err != nil {
+			return written, nextOffset, err
+		}
+		var walMsg *logstore.Message
+		if walIter != nil {
+			walMsg, err = walIter.peek()
+			if err != nil {
+				return written, nextOffset, err
+			}
+		}
+
+		switch {
+		case segMsg == nil && walMsg == nil:
+			_, _ = w.Write([]byte(`],"next_offset":`))
+			_, _ = w.Write([]byte(strconv.FormatUint(nextOffset, 10)))
+			_, _ = w.Write([]byte("}"))
+			return written, nextOffset, nil
+		case segMsg == nil:
+			if err := writeMsg(*walMsg); err != nil {
+				return written, nextOffset, err
+			}
+			walIter.pop()
+		case walMsg == nil:
+			if err := writeMsg(*segMsg); err != nil {
+				return written, nextOffset, err
+			}
+			segmentIter.pop()
+		case walMsg.Offset == segMsg.Offset:
+			if err := writeMsg(*walMsg); err != nil {
+				return written, nextOffset, err
+			}
+			walIter.pop()
+			segmentIter.pop()
+		case walMsg.Offset < segMsg.Offset:
+			if err := writeMsg(*walMsg); err != nil {
+				return written, nextOffset, err
+			}
+			walIter.pop()
+		default:
+			if err := writeMsg(*segMsg); err != nil {
+				return written, nextOffset, err
+			}
+			segmentIter.pop()
+		}
+	}
+
+	_, _ = w.Write([]byte(`],"next_offset":`))
+	_, _ = w.Write([]byte(strconv.FormatUint(nextOffset, 10)))
+	_, _ = w.Write([]byte("}"))
+	return written, nextOffset, nil
+}
+
 func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
 	partitionStr := r.PathValue("id")
@@ -316,8 +547,12 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	// Set HW header before streaming starts (headers must be sent before body).
 	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-	if ps != nil && ps.replicaState != nil {
-		w.Header().Set("X-High-Watermark", strconv.FormatUint(ps.replicaState.HighWatermark(), 10))
+	if ps != nil {
+		ps.mu.RLock()
+		if ps.replicaState != nil {
+			w.Header().Set("X-High-Watermark", strconv.FormatUint(ps.replicaState.HighWatermark(), 10))
+		}
+		ps.mu.RUnlock()
 	}
 
 	// Set SSE headers.
@@ -331,12 +566,8 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 // tryString returns the string representation of b if it is valid UTF-8,
 // otherwise returns a base64-encoded version.
 func tryString(b []byte) string {
-	s := string(b)
-	// Fast path: most values are valid UTF-8 strings.
-	for _, r := range s {
-		if r == '\uFFFD' {
-			return base64.StdEncoding.EncodeToString(b)
-		}
+	if !utf8.Valid(b) {
+		return base64.StdEncoding.EncodeToString(b)
 	}
-	return s
+	return string(b)
 }

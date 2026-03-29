@@ -15,18 +15,23 @@ import (
 // mockPartitionManager records calls made by the fetcher.
 type mockPartitionManager struct {
 	mu             sync.Mutex
-	appended       [][]log.Message
+	appended       []log.BatchFrame
 	truncated      []uint64
 	highWatermarks []uint64
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedBatch(_ context.Context, _ string, _ int, msgs []log.Message) error {
+func (m *mockPartitionManager) AppendReplicatedBatchFrames(_ context.Context, _ string, _ int, frames []log.BatchFrame) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := make([]log.Message, len(msgs))
-	copy(cp, msgs)
-	m.appended = append(m.appended, cp)
+	for _, frame := range frames {
+		cp := make([]byte, len(frame.Data))
+		copy(cp, frame.Data)
+		m.appended = append(m.appended, log.BatchFrame{
+			Data: cp,
+			Meta: frame.Meta,
+		})
+	}
 	return nil
 }
 
@@ -44,7 +49,7 @@ func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, highWater
 	m.flushedOffsets = append(m.flushedOffsets, flushedOffset)
 }
 
-func (m *mockPartitionManager) appendedMessages() [][]log.Message {
+func (m *mockPartitionManager) appendedFrames() []log.BatchFrame {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.appended
@@ -114,7 +119,7 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm)
@@ -128,19 +133,19 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	}
 	cancel()
 
-	appended := pm.appendedMessages()
+	appended := pm.appendedFrames()
 	if len(appended) == 0 {
 		t.Fatal("expected at least one AppendReplicatedBatch call, got none")
 	}
-	batch := appended[0]
-	if len(batch) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(batch))
+	frame := appended[0]
+	if frame.Meta.MessageCount != 2 {
+		t.Fatalf("expected 2 messages, got %d", frame.Meta.MessageCount)
 	}
-	if batch[0].Offset != 0 || string(batch[0].Value) != "hello" {
-		t.Errorf("unexpected first message: %+v", batch[0])
+	if frame.Meta.FirstOffset != 0 {
+		t.Errorf("unexpected first offset: %d", frame.Meta.FirstOffset)
 	}
-	if batch[1].Offset != 1 || string(batch[1].Value) != "world" {
-		t.Errorf("unexpected second message: %+v", batch[1])
+	if frame.Meta.LastOffset != 1 {
+		t.Errorf("unexpected last offset: %d", frame.Meta.LastOffset)
 	}
 	hws, flushed := pm.progress()
 	if len(hws) == 0 || hws[0] != 2 {
@@ -182,7 +187,7 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 10, 1, "test-node", pm)
@@ -247,7 +252,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 0, "test-node", pm)
 	}()

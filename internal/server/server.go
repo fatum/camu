@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -16,19 +17,26 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/consumer"
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
 
+const headerForwardedBy = "X-Forwarded-By"
+
 // Server is the HTTP server for camu.
 type Server struct {
 	cfg              *config.Config
 	httpServer       *http.Server
+	internalServer   *http.Server
+	internalListener net.Listener
 	s3Client         *storage.S3Client
 	topicStore       *meta.TopicStore
 	partitionManager *PartitionManager
@@ -45,7 +53,9 @@ type Server struct {
 	leaderLease     coordination.LeaderLease
 	readAssignments func(ctx context.Context, topic string) (coordination.TopicAssignments, error)
 
-	followerFetcher *replication.FollowerFetcher
+	idempotencyManager *idempotency.Manager
+	followerFetcher    *replication.FollowerFetcher
+	internalClient     *http.Client
 
 	// assignmentsMu protects myPartitions.
 	assignmentsMu sync.RWMutex
@@ -137,6 +147,8 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		return nil, fmt.Errorf("creating partition manager: %w", err)
 	}
 
+	idempotencyMgr := idempotency.NewManager(s3Client)
+
 	s := &Server{
 		cfg:                  cfg,
 		s3Client:             s3Client,
@@ -147,6 +159,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		leaderElection:       coordination.NewLeaderElection(s3Client, instanceID, leaseTTL),
 		assignmentStore:      coordination.NewAssignmentStore(s3Client),
 		isrStore:             replication.NewISRStore(s3Client),
+		idempotencyManager:   idempotencyMgr,
 		instanceID:           instanceID,
 		myPartitions:         make(map[string]map[int]localPartitionAssignment),
 		leaseStop:            make(chan struct{}),
@@ -156,7 +169,8 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	}
 	s.readAssignments = s.assignmentStore.Read
 
-	s.followerFetcher = replication.NewFollowerFetcher(func(topic string, pid int) {
+	s.internalClient = replication.NewH2CClient(replicationTimeout)
+	s.followerFetcher = replication.NewFollowerFetcher(s.internalClient, func(topic string, pid int) {
 		slog.Warn("leader down detected, attempting leadership", "topic", topic, "pid", pid)
 		if err := s.attemptPartitionLeadership(topic, pid); err != nil {
 			slog.Error("failed to acquire partition leadership", "topic", topic, "pid", pid, "error", err)
@@ -168,7 +182,12 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	pm.SetLeaseChecker(s.verifyOwnershipFromS3)
 
 	s.httpServer = &http.Server{
-		Handler: s.routes(),
+		Handler: s.publicRoutes(),
+	}
+
+	h2s := &http2.Server{}
+	s.internalServer = &http.Server{
+		Handler: h2c.NewHandler(s.internalRoutes(), h2s),
 	}
 
 	return s, nil
@@ -196,11 +215,16 @@ func (s *Server) StartOnPort(port int) error {
 // startWithListener completes server startup once a listener is available.
 func (s *Server) startWithListener(ln net.Listener) error {
 	s.listener = ln
+	internalLn, err := net.Listen("tcp", s.cfg.Server.InternalAddress)
+	if err != nil {
+		return fmt.Errorf("listen internal on %s: %w", s.cfg.Server.InternalAddress, err)
+	}
+	s.internalListener = internalLn
 	instanceTTL, err := s.cfg.Coordination.InstanceTTLDuration()
 	if err != nil {
 		return fmt.Errorf("parsing coordination.instance_ttl: %w", err)
 	}
-	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), instanceTTL)
+	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), s.InternalAddress(), instanceTTL)
 	if err := s.registry.Register(context.Background()); err != nil {
 		return fmt.Errorf("register registry: %w", err)
 	}
@@ -211,6 +235,9 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	s.ready.Store(true)
 	s.startLeaseRenewal()
 	go func() { _ = s.httpServer.Serve(ln) }()
+	slog.Info("internal_server_started", "address", s.InternalAddress(), "protocol", "h2c")
+	go func() { _ = s.internalServer.Serve(internalLn) }()
+
 	return nil
 }
 
@@ -224,8 +251,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// 1. Stop accepting new writes.
 	s.shuttingDown.Store(true)
 
-	// 2. Shut down HTTP server (waits for in-flight requests to finish).
+	// 2. Shut down HTTP servers (waits for in-flight requests to finish).
 	httpErr := s.httpServer.Shutdown(ctx)
+	if err := s.internalServer.Shutdown(ctx); err != nil && httpErr == nil {
+		httpErr = err
+	}
 
 	// 3. Cancel all follower fetch loops.
 	s.partitionManager.CancelAllFetchLoops()
@@ -258,6 +288,13 @@ func (s *Server) Address() string {
 	return s.cfg.Server.Address
 }
 
+func (s *Server) InternalAddress() string {
+	if s.internalListener != nil {
+		return s.internalListener.Addr().String()
+	}
+	return s.cfg.Server.InternalAddress
+}
+
 func routableHTTPAddress(instanceID, rawAddr string) string {
 	host, port, err := net.SplitHostPort(rawAddr)
 	if err != nil {
@@ -275,9 +312,75 @@ func routableHTTPAddress(instanceID, rawAddr string) string {
 	return "http://" + net.JoinHostPort(host, port)
 }
 
+func routablePeerAddress(instanceID, rawAddr string) string {
+	host, port, err := net.SplitHostPort(rawAddr)
+	if err != nil {
+		if rawAddr == "" {
+			return net.JoinHostPort(instanceID, "8081")
+		}
+		return rawAddr
+	}
+	if host == "" || host == "::" || host == "0.0.0.0" {
+		host = instanceID
+	}
+	if port == "" {
+		port = "8081"
+	}
+	return net.JoinHostPort(host, port)
+}
+
 // InstanceID returns the server's unique instance ID.
 func (s *Server) InstanceID() string {
 	return s.instanceID
+}
+
+type ProducerStateSnapshot struct {
+	NextSeq    uint64
+	LastOffset uint64
+}
+
+type PartitionStateSnapshot struct {
+	NextOffset            uint64
+	FlushedOffset         uint64
+	IndexHighWatermark    uint64
+	ReadableHighWatermark uint64
+}
+
+func (s *Server) ProducerStateSnapshot(topic string, partitionID int, producerID uint64) (ProducerStateSnapshot, bool) {
+	ps := s.partitionManager.GetPartitionState(topic, partitionID)
+	if ps == nil {
+		return ProducerStateSnapshot{}, false
+	}
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	state, ok := ps.producerSeqs[producerID]
+	if !ok {
+		return ProducerStateSnapshot{}, false
+	}
+	return ProducerStateSnapshot{
+		NextSeq:    state.NextSeq,
+		LastOffset: state.LastOffset,
+	}, true
+}
+
+func (s *Server) PartitionStateSnapshot(topic string, partitionID int) (PartitionStateSnapshot, bool) {
+	ps := s.partitionManager.GetPartitionState(topic, partitionID)
+	if ps == nil {
+		return PartitionStateSnapshot{}, false
+	}
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	snapshot := PartitionStateSnapshot{
+		NextOffset:         ps.nextOffset,
+		FlushedOffset:      ps.flushedOffset,
+		IndexHighWatermark: ps.index.HighWatermark(),
+	}
+	if hw, ok := readableHighWatermark(ps); ok {
+		snapshot.ReadableHighWatermark = hw
+	} else {
+		snapshot.ReadableHighWatermark = snapshot.IndexHighWatermark
+	}
+	return snapshot, true
 }
 
 // initExistingTopics loads all topics from the topic store and initializes
@@ -397,19 +500,8 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 		newPartitions := coordination.AssignReplicated(active, tc.Partitions, tc.ReplicationFactor, currentPartitions)
 
 		if err == nil {
-			// Check if leader assignments are unchanged (ignore LeaderEpoch for comparison).
-			changed := false
-			if len(existing.Partitions) != len(newPartitions) {
-				changed = true
-			} else {
-				for pid, pa := range newPartitions {
-					if ep, ok := existing.Partitions[pid]; !ok || ep.Leader != pa.Leader {
-						changed = true
-						break
-					}
-				}
-			}
-			if !changed {
+			// Ignore version and leader epoch churn, but persist any leader or replica-set change.
+			if !partitionAssignmentsChanged(existing.Partitions, newPartitions) {
 				continue
 			}
 		}
@@ -439,6 +531,25 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 		"instance", s.instanceID,
 		"topics", len(topics),
 		"active_instances", len(active))
+}
+
+func partitionAssignmentsChanged(existing, next map[int]coordination.PartitionAssignment) bool {
+	if len(existing) != len(next) {
+		return true
+	}
+	for pid, nextPartition := range next {
+		currentPartition, ok := existing[pid]
+		if !ok {
+			return true
+		}
+		if currentPartition.Leader != nextPartition.Leader {
+			return true
+		}
+		if !slices.Equal(currentPartition.Replicas, nextPartition.Replicas) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyAssignmentsForTopics reads assignments from S3 and acquires/releases leases
@@ -535,12 +646,12 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	if ps == nil {
 		return // not yet initialized, will be set up later
 	}
+	ps.mu.RLock()
 	if ps.isLeader {
+		ps.mu.RUnlock()
 		return // already initialized as leader
 	}
-
-	ps.isLeader = true
-	ps.epoch = pa.LeaderEpoch
+	ps.mu.RUnlock()
 
 	topicCfg, err := s.topicStore.Get(ctx, topic)
 	if err != nil {
@@ -550,18 +661,21 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 
 	// WAL replay: recover true log end from WAL.
 	// ps.nextOffset may be stale if partition was re-initialized from S3.
+	ps.mu.RLock()
 	walEnd := ps.nextOffset
+	ps.mu.RUnlock()
 	if msgs, err := ps.wal.Replay(); err == nil && len(msgs) > 0 {
 		lastOffset := msgs[len(msgs)-1].Offset
 		if lastOffset+1 > walEnd {
 			walEnd = lastOffset + 1
 		}
 	}
-	ps.nextOffset = walEnd
 
 	// Load epoch history from S3 (authoritative), fall back to local file,
 	// or use existing epochHistory if already set.
+	ps.mu.RLock()
 	eh := ps.epochHistory
+	ps.mu.RUnlock()
 	if eh == nil {
 		ehPath := filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))
 		eh, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
@@ -573,7 +687,15 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		}
 	}
 	eh.Append(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: walEnd})
-	if eh != ps.epochHistory {
+	ps.mu.Lock()
+	prevEpochHistory := ps.epochHistory
+	ps.isLeader = true
+	ps.leaderID = ""
+	ps.epoch = pa.LeaderEpoch
+	ps.nextOffset = walEnd
+	ps.epochHistory = eh
+	ps.mu.Unlock()
+	if eh != prevEpochHistory {
 		if err := eh.SaveToFile(filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))); err != nil {
 			slog.Warn("initPartitionAsLeader: save epoch history locally", "topic", topic, "partition", pid, "error", err)
 		}
@@ -581,7 +703,6 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 			slog.Warn("initPartitionAsLeader: save epoch history to S3", "topic", topic, "partition", pid, "error", err)
 		}
 	}
-	ps.epochHistory = eh
 
 	// HW recovery:
 	// rf=1: everything in the local log is committed, so HW = log end.
@@ -590,7 +711,9 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	// back to the stale persisted value, the next flush truncates a safe prefix.
 	recoveredHW := walEnd
 	if topicCfg.ReplicationFactor > 1 {
+		ps.mu.RLock()
 		recoveredHW = ps.index.HighWatermark()
+		ps.mu.RUnlock()
 		isrState, err := s.isrStore.Read(ctx, topic, pid)
 		if err == nil && isrState.HighWatermark > recoveredHW {
 			recoveredHW = isrState.HighWatermark
@@ -599,17 +722,21 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 			recoveredHW = walEnd
 		}
 	}
+	ps.mu.RLock()
 	if recoveredHW > ps.nextOffset {
 		recoveredHW = ps.nextOffset
 	}
+	indexHW := ps.index.HighWatermark()
+	nextOffset := ps.nextOffset
+	ps.mu.RUnlock()
 
 	slog.Info("leader_recovery_state",
 		"topic", topic,
 		"partition", pid,
 		"epoch", pa.LeaderEpoch,
 		"wal_end", walEnd,
-		"next_offset", ps.nextOffset,
-		"index_hw", ps.index.HighWatermark(),
+		"next_offset", nextOffset,
+		"index_hw", indexHW,
 		"recovered_hw", recoveredHW,
 		"replication_factor", topicCfg.ReplicationFactor,
 		"min_isr", topicCfg.MinInsyncReplicas,
@@ -623,8 +750,8 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	)
 
 	// Update the in-memory index with the recovered HW so consumers see the correct value.
+	ps.mu.Lock()
 	ps.index.SetHighWatermark(recoveredHW)
-
 	if topicCfg.ReplicationFactor > 1 {
 		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas, s.cfg.Coordination.ISRExpansionThresholdValue())
 		ps.replicaState.SetEpochHistory(ps.epochHistory)
@@ -633,7 +760,10 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 				ps.replicaState.AddFollower(r)
 			}
 		}
+	}
+	ps.mu.Unlock()
 
+	if topicCfg.ReplicationFactor > 1 {
 		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
 		if err := s.isrStore.Write(ctx, topic, replication.ISRState{
 			Partition:     pid,
@@ -646,10 +776,32 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		}
 	}
 
+	// Recover producer idempotency state from S3 checkpoint + WAL tail.
+	// This MUST happen before any flush — onFlush uploads the checkpoint from
+	// ps.producerSeqs, so loading it first prevents overwriting a good checkpoint
+	// with an empty one.
+	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
+	if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
+		ps.mu.Lock()
+		ps.loadProducerCheckpoint(data)
+		ps.mu.Unlock()
+		slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
+	}
+
+	if n := s.partitionManager.ScanAndRebuildProducerState(topic, pid); n > 0 {
+		slog.Info("idempotency_wal_recovery", "topic", topic, "partition", pid, "batches", n)
+	}
+
 	// If this replica was promoted with a durable tail only in local WAL,
 	// persist that recovered prefix immediately so leader reads can serve it
 	// through the normal index/segment path.
-	if recoveredHW > ps.index.NextOffset() {
+	ps.mu.RLock()
+	indexNextOffset := ps.index.NextOffset()
+	logNextOffset := ps.nextOffset
+	ps.mu.RUnlock()
+	if recoveredHW > indexNextOffset {
 		globalID := s.partitionManager.getGlobalID(topic, pid)
 		if err := s.partitionManager.onFlush(globalID); err != nil {
 			slog.Warn("initPartitionAsLeader: flush recovered wal",
@@ -657,14 +809,14 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 				"partition", pid,
 				"epoch", pa.LeaderEpoch,
 				"recovered_hw", recoveredHW,
-				"index_next_offset", ps.index.NextOffset(),
+				"index_next_offset", indexNextOffset,
 				"error", err,
 			)
 		}
 	}
 
 	slog.Info("partition_leader_init", "topic", topic, "partition", pid,
-		"epoch", pa.LeaderEpoch, "hw", recoveredHW, "next_offset", ps.nextOffset, "replicas", len(pa.Replicas))
+		"epoch", pa.LeaderEpoch, "hw", recoveredHW, "next_offset", logNextOffset, "replicas", len(pa.Replicas))
 }
 
 // initPartitionAsFollower sets up a fetch loop for a partition this instance
@@ -672,62 +824,80 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 // starts a background FollowerFetcher goroutine.
 func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid int, pa coordination.PartitionAssignment) {
 	ps := s.partitionManager.GetPartitionState(topic, pid)
-	if ps != nil && !ps.isLeader && ps.fetchCancel != nil {
-		return // already following with an active fetch loop
-	}
-	// If fetchCancel is nil but we're supposed to be a follower, the previous
-	// fetch loop may have exited (leader-down or error). Re-init.
-
 	if ps == nil {
 		return // not yet initialized
 	}
 
-	ps.isLeader = false
+	ps.mu.RLock()
+	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader && ps.epoch == pa.LeaderEpoch {
+		ps.mu.RUnlock()
+		return
+	}
+	localNextOffset := ps.nextOffset
+	localEpoch := ps.epoch
+	flushedOffset := ps.flushedOffset
+	indexHW := ps.index.HighWatermark()
+	existingCancel := ps.fetchCancel
+	existingDone := ps.fetchDone
+	ps.mu.RUnlock()
+
+	// If fetchCancel is nil but we're supposed to be a follower, the previous
+	// fetch loop may have exited (leader-down or error). Re-init.
 
 	slog.Info("follower_transition",
 		"topic", topic,
 		"partition", pid,
 		"leader", pa.Leader,
 		"leader_epoch", pa.LeaderEpoch,
-		"local_next_offset", ps.nextOffset,
-		"local_epoch", ps.epoch,
-		"flushed_offset", ps.flushedOffset,
-		"index_hw", ps.index.HighWatermark(),
+		"local_next_offset", localNextOffset,
+		"local_epoch", localEpoch,
+		"flushed_offset", flushedOffset,
+		"index_hw", indexHW,
 	)
 
-	// Resolve leader address. The registry stores the listener address
-	// (e.g. "[::]:8080") which is useless for inter-node comms. Extract
-	// the port and combine with the leader's instanceID (hostname).
+	// Resolve leader address. Use the internal address (h2c) for replication
+	// traffic. The registry stores the listener bind address (e.g. "[::]:8081")
+	// which is useless for inter-node comms — extract port and combine with
+	// the leader's instanceID (hostname).
 	leaderInfo, err := s.registry.GetInstanceInfo(ctx, pa.Leader)
 	if err != nil {
 		slog.Warn("initPartitionAsFollower: resolve leader", "leader", pa.Leader, "error", err)
 		return
 	}
-	_, port, _ := net.SplitHostPort(leaderInfo.Address)
-	if port == "" {
-		port = "8080"
+	addr := leaderInfo.InternalAddress
+	if addr == "" {
+		addr = leaderInfo.Address // fallback for rolling upgrades
 	}
-	leaderAddr := net.JoinHostPort(pa.Leader, port)
+	leaderAddr := routablePeerAddress(pa.Leader, addr)
 
 	// Cancel existing fetch loop and wait for it to finish.
-	if ps.fetchCancel != nil {
-		ps.fetchCancel()
-		if ps.fetchDone != nil {
-			<-ps.fetchDone
+	if existingCancel != nil {
+		existingCancel()
+		if existingDone != nil {
+			<-existingDone
 		}
 	}
 
 	// Start follower fetch loop.
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.leaderID = pa.Leader
+	ps.epoch = pa.LeaderEpoch
+	ps.replicaState = nil
+	localOffset := ps.nextOffset
+	fetchEpoch := ps.epoch
+	fetchDone := make(chan struct{})
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel
-	ps.fetchDone = make(chan struct{})
+	ps.fetchDone = fetchDone
+	ps.mu.Unlock()
 	slog.Info("partition_follower_init",
 		"topic", topic, "partition", pid,
 		"leader", pa.Leader, "leader_addr", leaderAddr,
-		"local_offset", ps.nextOffset, "epoch", ps.epoch)
+		"local_offset", localOffset, "epoch", fetchEpoch)
 	go func() {
-		defer close(ps.fetchDone)
-		s.followerFetcher.Run(fetchCtx, topic, pid, leaderAddr, ps.nextOffset, ps.epoch, s.instanceID, s.partitionManager)
+		defer close(fetchDone)
+		s.followerFetcher.Run(fetchCtx, topic, pid, leaderAddr, localOffset, fetchEpoch, s.instanceID, s.partitionManager)
 	}()
 }
 
@@ -804,6 +974,13 @@ func (s *Server) renewLeases() {
 	if s.amLeader() && s.coordinationGCTick%10 == 0 {
 		s.coordinationGC(ctx, topics)
 	}
+
+	// Evict stale idempotent producers every 10th tick.
+	if s.coordinationGCTick%10 == 0 {
+		if evicted := s.partitionManager.EvictStaleProducers(30 * time.Minute); evicted > 0 {
+			slog.Info("idempotency_evicted_stale_producers", "count", evicted)
+		}
+	}
 }
 
 // isOwnedPartition checks if this instance owns the given partition.
@@ -843,6 +1020,9 @@ func (s *Server) verifyOwnershipFromS3(topic string, partitionID int) bool {
 // locally applied assignment epoch. This avoids an assignment-store read on
 // every produce while still rejecting any producer request that raced a
 // reassignment before the partition state was updated.
+//
+// It also checks ownership, so callers can skip a separate isOwnedPartition
+// call on the produce hot path.
 func (s *Server) verifyProduceLeadership(topic string, partitionID int, localEpoch uint64) bool {
 	s.assignmentsMu.RLock()
 	defer s.assignmentsMu.RUnlock()
@@ -944,6 +1124,64 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 	}
 
 	return resp
+}
+
+// leaderInternalAddr resolves the internal (h2c) address for the leader of the
+// given topic/partition. Returns "" if the leader cannot be determined.
+func (s *Server) leaderInternalAddr(topic string, pid int) string {
+	ctx := context.Background()
+	assigned, err := s.assignmentStore.Read(ctx, topic)
+	if err != nil {
+		return ""
+	}
+	pa, ok := assigned.Partitions[pid]
+	if !ok {
+		return ""
+	}
+	leaderID := pa.Leader
+	if leaderID == "" || leaderID == s.instanceID {
+		return ""
+	}
+	info, err := s.registry.GetInstanceInfo(ctx, leaderID)
+	if err != nil {
+		return ""
+	}
+	addr := info.InternalAddress
+	if addr == "" {
+		addr = info.Address
+	}
+	_, port, _ := net.SplitHostPort(addr)
+	if port == "" {
+		port = "8081"
+	}
+	return net.JoinHostPort(leaderID, port)
+}
+
+// proxyToLeader forwards the request to the leader node over the h2c internal
+// transport. The leader's public-facing produce handler processes the request
+// and the response is streamed back to the original client.
+func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, leaderAddr string) {
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = leaderAddr
+			req.Host = leaderAddr
+			req.Header.Set(headerForwardedBy, s.instanceID)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// Propagate the leader's instance ID so clients and checkers
+			// see the true leader, not the proxy node.
+			if id := resp.Header.Get("X-Camu-Instance-ID"); id != "" {
+				resp.Header.Set("X-Camu-Instance-ID", id)
+			}
+			return nil
+		},
+		Transport: s.internalClient.Transport,
+	}
+	// Clear headers set by middleware — the proxy response replaces them.
+	w.Header().Del("X-Camu-Instance-ID")
+	w.Header().Del("Content-Type")
+	proxy.ServeHTTP(w, r)
 }
 
 // attemptPartitionLeadership is called when a follower detects the leader is
@@ -1048,7 +1286,13 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 	// ps.nextOffset may be stale if a coordination cycle re-initialized the
 	// partition from S3 (which doesn't have follower-specific un-flushed data).
 	// The WAL is the source of truth for un-flushed messages.
+	ps.mu.RLock()
 	walEnd := ps.nextOffset
+	prevEpoch := ps.epoch
+	prevNextOffset := ps.nextOffset
+	indexHW := ps.index.HighWatermark()
+	flushedOffset := ps.flushedOffset
+	ps.mu.RUnlock()
 	if msgs, err := ps.wal.Replay(); err == nil && len(msgs) > 0 {
 		lastOffset := msgs[len(msgs)-1].Offset
 		if lastOffset+1 > walEnd {
@@ -1060,11 +1304,11 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		"topic", topic,
 		"partition", pid,
 		"new_epoch", newEpoch,
-		"previous_epoch", ps.epoch,
-		"previous_next_offset", ps.nextOffset,
+		"previous_epoch", prevEpoch,
+		"previous_next_offset", prevNextOffset,
 		"wal_end", walEnd,
-		"index_hw", ps.index.HighWatermark(),
-		"flushed_offset", ps.flushedOffset,
+		"index_hw", indexHW,
+		"flushed_offset", flushedOffset,
 		"isr_hw", func() uint64 {
 			if isrErr != nil {
 				return 0
@@ -1080,43 +1324,55 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 	// offset, so walEnd alone can undercount committed data that is already
 	// in S3 segments.
 	recoveredHW := walEnd
+	ps.mu.RLock()
 	indexNext := ps.index.NextOffset()
+	currentIndexHW := ps.index.HighWatermark()
+	ps.mu.RUnlock()
 	if indexNext > recoveredHW {
 		recoveredHW = indexNext
 	}
 	slog.Info("failover: recovered HW",
 		"topic", topic, "pid", pid,
 		"hw", recoveredHW, "log_end", walEnd,
-		"index_next", indexNext, "index_hw", ps.index.HighWatermark())
+		"index_next", indexNext, "index_hw", currentIndexHW)
 
 	// 4d. Epoch history — load from S3 (authoritative), fall back to local.
 	ehPath := filepath.Join(s.cfg.WAL.Directory, topic, fmt.Sprintf("%d.epochs", pid))
-	if ps.epochHistory == nil {
-		ps.epochHistory, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
-		if ps.epochHistory == nil || len(ps.epochHistory.Entries) == 0 {
-			ps.epochHistory, _ = replication.LoadEpochHistory(ehPath)
-			if ps.epochHistory == nil {
-				ps.epochHistory = &replication.EpochHistory{}
+	ps.mu.RLock()
+	eh := ps.epochHistory
+	ps.mu.RUnlock()
+	if eh == nil {
+		eh, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
+		if eh == nil || len(eh.Entries) == 0 {
+			eh, _ = replication.LoadEpochHistory(ehPath)
+			if eh == nil {
+				eh = &replication.EpochHistory{}
 			}
 		}
 	}
-	ps.epochHistory.Append(replication.EpochEntry{Epoch: newEpoch, StartOffset: walEnd})
-	if err := ps.epochHistory.SaveToFile(ehPath); err != nil {
+	eh.Append(replication.EpochEntry{Epoch: newEpoch, StartOffset: walEnd})
+	ps.mu.Lock()
+	ps.epochHistory = eh
+	ps.isLeader = true
+	ps.leaderID = ""
+	ps.epoch = newEpoch
+	ps.index.SetHighWatermark(recoveredHW)
+	ps.mu.Unlock()
+	if err := eh.SaveToFile(ehPath); err != nil {
 		slog.Warn("attemptPartitionLeadership: save epoch history locally", "topic", topic, "pid", pid, "error", err)
 	}
-	if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, ps.epochHistory); err != nil {
+	if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, eh); err != nil {
 		slog.Warn("attemptPartitionLeadership: save epoch history to S3", "topic", topic, "pid", pid, "error", err)
 	}
 
 	// 4d. Initialize as leader.
-	ps.isLeader = true
-	ps.epoch = newEpoch
 	topicCfg, err := s.topicStore.Get(ctx, topic)
 	if err != nil {
 		slog.Error("attemptPartitionLeadership: get topic config", "topic", topic, "pid", pid, "error", err)
 		return err
 	}
 	if topicCfg.ReplicationFactor > 1 {
+		ps.mu.Lock()
 		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas, s.cfg.Coordination.ISRExpansionThresholdValue())
 		ps.replicaState.SetEpochHistory(ps.epochHistory)
 		for _, r := range pa.Replicas {
@@ -1124,10 +1380,8 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 				ps.replicaState.AddFollower(r)
 			}
 		}
+		ps.mu.Unlock()
 	}
-
-	// Update the in-memory index with the recovered HW so consumers see the correct value immediately.
-	ps.index.SetHighWatermark(recoveredHW)
 
 	// 4e. Write ISR = [self] to S3.
 	if err := s.isrStore.Write(ctx, topic, replication.ISRState{
@@ -1138,6 +1392,41 @@ func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
 		HighWatermark: recoveredHW,
 	}, ""); err != nil {
 		slog.Warn("attemptPartitionLeadership: write ISR", "topic", topic, "pid", pid, "error", err)
+	}
+
+	// Recover producer idempotency state from S3 checkpoint + committed WAL tail.
+	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
+	if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
+		ps.mu.Lock()
+		ps.loadProducerCheckpoint(data)
+		ps.mu.Unlock()
+		slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
+	}
+
+	if n := s.partitionManager.ScanAndRebuildProducerState(topic, pid); n > 0 {
+		slog.Info("idempotency_wal_recovery", "topic", topic, "partition", pid, "batches", n)
+	}
+
+	// If promotion recovered committed data from local WAL beyond the current
+	// flushed/indexed prefix, persist it immediately so S3 and the local index
+	// reflect the promoted leader's committed state.
+	ps.mu.RLock()
+	indexNextOffset := ps.index.NextOffset()
+	ps.mu.RUnlock()
+	if recoveredHW > indexNextOffset {
+		globalID := s.partitionManager.getGlobalID(topic, pid)
+		if err := s.partitionManager.onFlush(globalID); err != nil {
+			slog.Warn("attemptPartitionLeadership: flush recovered wal",
+				"topic", topic,
+				"partition", pid,
+				"epoch", newEpoch,
+				"recovered_hw", recoveredHW,
+				"index_next_offset", indexNextOffset,
+				"error", err,
+			)
+		}
 	}
 
 	// 4f. Update ownership cache.
