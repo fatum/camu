@@ -45,7 +45,7 @@ consumer
 
 ### Produce
 
-1. Parse the request body as a single message, JSON array, or idempotent batch.
+1. Parse the request body as a JSON array, or as an idempotent batch on the partition-specific endpoint.
 2. Route messages by key with FNV-32a; keyless messages use round-robin.
 3. Check local partition ownership.
 4. For replicated topics, confirm the node is still the leader for that partition.

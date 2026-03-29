@@ -25,3 +25,10 @@ type BatchMeta struct {
 	FirstOffset  uint64
 	LastOffset   uint64
 }
+
+// BatchFrame is a raw batch envelope plus its parsed metadata.
+// Data is encoded in the WAL batch wire format.
+type BatchFrame struct {
+	Data []byte
+	Meta BatchMeta
+}

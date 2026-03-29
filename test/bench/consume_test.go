@@ -21,18 +21,18 @@ func benchmarkConsumePath(b *testing.B, limit int, waitForFlush bool) {
 	env := camutest.New(b, camutest.WithInstances(1))
 	defer env.Cleanup()
 
-	client := env.Client()
-	if err := client.CreateTopic(consumeBenchTopic, 1, 24*time.Hour); err != nil {
-		b.Fatalf("CreateTopic() error: %v", err)
+	client := newAPIBenchClient(b, env.Server(0))
+	if err := client.createTopic(consumeBenchTopic, 1, 24*time.Hour); err != nil {
+		b.Fatalf("createTopic() error: %v", err)
 	}
 
 	const totalMessages = 1000
 	for i := 0; i < totalMessages; i++ {
-		_, err := client.Produce(consumeBenchTopic, []camutest.ProduceMessage{
+		_, err := client.produce(consumeBenchTopic, []camutest.ProduceMessage{
 			{Key: fmt.Sprintf("k-%d", i), Value: fmt.Sprintf("benchmark payload %d", i)},
 		})
 		if err != nil {
-			b.Fatalf("Produce() error: %v", err)
+			b.Fatalf("produce() error: %v", err)
 		}
 	}
 
@@ -42,9 +42,9 @@ func benchmarkConsumePath(b *testing.B, limit int, waitForFlush bool) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := client.Consume(consumeBenchTopic, 0, 0, limit)
+		_, err := client.consume(consumeBenchTopic, 0, 0, limit)
 		if err != nil {
-			b.Fatalf("Consume() error: %v", err)
+			b.Fatalf("consume() error: %v", err)
 		}
 	}
 }

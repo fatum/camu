@@ -15,7 +15,7 @@ curl -X POST http://localhost:8080/v1/topics \
 # Produce
 curl -X POST http://localhost:8080/v1/topics/events/messages \
   -H 'Content-Type: application/json' \
-  -d '{"key":"user-123","value":"clicked"}'
+  -d '[{"key":"user-123","value":"clicked"}]'
 
 # Consume
 curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limit=100"
@@ -133,7 +133,7 @@ High-level produce routes by key. The same key always maps to the same partition
 ```bash
 curl -X POST http://localhost:8080/v1/topics/orders/messages \
   -H 'Content-Type: application/json' \
-  -d '{"key":"user-123","value":"order placed","headers":{"trace-id":"abc"}}'
+  -d '[{"key":"user-123","value":"order placed","headers":{"trace-id":"abc"}}]'
 
 curl -X POST http://localhost:8080/v1/topics/orders/messages \
   -H 'Content-Type: application/json' \
@@ -141,8 +141,10 @@ curl -X POST http://localhost:8080/v1/topics/orders/messages \
 
 curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
   -H 'Content-Type: application/json' \
-  -d '{"value":"direct-partition-write"}'
+  -d '[{"value":"direct-partition-write"}]'
 ```
+
+Both produce endpoints are batch-shaped: send a JSON array for regular produce, even for a single message. The partition-specific endpoint also accepts the idempotent batch object shown below.
 
 If a request lands on a non-owner, Camu either proxies internally to the leader or returns `421 Misdirected Request` with the current routing map:
 

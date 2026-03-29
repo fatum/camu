@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,7 +125,7 @@ func TestHandleProduceLowLevel_FencesStaleLeaderAfterReassignment(t *testing.T) 
 		t.Fatalf("assignmentStore.Write() error = %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"key":"k","value":"v"}`)
+	body := bytes.NewBufferString(`[{"key":"k","value":"v"}]`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/topics/topic/partitions/0/messages", body)
 	req.SetPathValue("topic", "topic")
 	req.SetPathValue("id", "0")
@@ -999,6 +1000,43 @@ func TestProduceWithoutProducerID_BackwardsCompatible(t *testing.T) {
 	}
 }
 
+func TestProduceHighLevelRejectsSingleObjectBody(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+	setupTestTopicAndOwnership(t, s)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/messages", bytes.NewBufferString(`{"key":"k1","value":"v1"}`))
+	req.SetPathValue("topic", "test-topic")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "expected array") {
+		t.Fatalf("body = %q, want error mentioning expected array", rec.Body.String())
+	}
+}
+
+func TestProduceLowLevelRejectsSingleObjectBody(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+	setupTestTopicAndOwnership(t, s)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics/test-topic/partitions/0/messages", bytes.NewBufferString(`{"key":"k1","value":"v1"}`))
+	req.SetPathValue("topic", "test-topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "expected batch or array") {
+		t.Fatalf("body = %q, want error mentioning expected batch or array", rec.Body.String())
+	}
+}
+
 func TestIdempotency_EndToEnd(t *testing.T) {
 	s := newTestServer(t)
 	handler := s.publicRoutes()
@@ -1069,8 +1107,8 @@ func TestIdempotency_EndToEnd(t *testing.T) {
 		t.Fatalf("step 5: status=%d, want 422", code)
 	}
 
-	// 6. Produce without producer_id → backwards compat, offset 5.
-	code, offsets4 := produce(`{"value":"no-idem"}`)
+	// 6. Produce without producer_id via regular batch body → backwards compat, offset 5.
+	code, offsets4 := produce(`[{"value":"no-idem"}]`)
 	if code != 200 {
 		t.Fatalf("step 6: status=%d, want 200", code)
 	}

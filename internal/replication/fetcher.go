@@ -17,14 +17,14 @@ import (
 
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
-	AppendReplicatedBatches(ctx context.Context, topic string, pid int, batches []log.Batch) error
+	AppendReplicatedBatchFrames(ctx context.Context, topic string, pid int, frames []log.BatchFrame) error
 	TruncateWAL(topic string, pid int, beforeOffset uint64) error
 	UpdateFollowerProgress(topic string, pid int, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
-	Batches       []log.Batch
+	Frames        []log.BatchFrame
 	TruncateTo    uint64
 	HasTruncate   bool
 	HighWatermark uint64
@@ -147,25 +147,25 @@ func (f *FollowerFetcher) Run(
 		}
 
 		// Append new batches (preserving producer metadata for idempotency recovery).
-		if len(resp.Batches) > 0 {
+		if len(resp.Frames) > 0 {
 			var first, last uint64
-			for _, b := range resp.Batches {
-				if len(b.Messages) > 0 {
-					if first == 0 || b.Messages[0].Offset < first {
-						first = b.Messages[0].Offset
+			for _, frame := range resp.Frames {
+				if frame.Meta.MessageCount > 0 {
+					if first == 0 || frame.Meta.FirstOffset < first {
+						first = frame.Meta.FirstOffset
 					}
-					if b.Messages[len(b.Messages)-1].Offset > last {
-						last = b.Messages[len(b.Messages)-1].Offset
+					if frame.Meta.LastOffset > last {
+						last = frame.Meta.LastOffset
 					}
 				}
 			}
-			if err := pm.AppendReplicatedBatches(ctx, topic, pid, resp.Batches); err != nil {
-				slog.Warn("fetcher: AppendReplicatedBatches failed",
+			if err := pm.AppendReplicatedBatchFrames(ctx, topic, pid, resp.Frames); err != nil {
+				slog.Warn("fetcher: AppendReplicatedBatchFrames failed",
 					"topic", topic, "pid", pid, "err", err)
 			} else {
 				slog.Debug("fetcher: replicated batches",
 					"topic", topic, "pid", pid,
-					"batch_count", len(resp.Batches),
+					"batch_count", len(resp.Frames),
 					"offsets", fmt.Sprintf("%d-%d", first, last),
 					"leader_hw", resp.HighWatermark)
 				localOffset = last + 1
@@ -252,11 +252,11 @@ func (f *FollowerFetcher) fetchFromLeader(
 		}
 	}
 
-	batches, err := ReadBatchFrames(httpResp.Body)
+	frames, err := ReadBatchFrames(httpResp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("fetcher: read batch frames: %w", err)
 	}
-	fr.Batches = batches
+	fr.Frames = frames
 
 	return &fr, nil
 }

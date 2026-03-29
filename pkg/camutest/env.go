@@ -93,6 +93,9 @@ func New(t testing.TB, opts ...Option) *Env {
 				RebalanceDelay:    "2s",
 			},
 		}
+		if o.ConfigMutator != nil {
+			o.ConfigMutator(cfg)
+		}
 
 		srv, err := server.NewWithS3Client(cfg, s3Client)
 		if err != nil {

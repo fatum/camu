@@ -7,6 +7,10 @@ import (
 )
 
 func (s *Server) publicRoutes() http.Handler {
+	return s.withMiddleware(s.publicAPIHandler())
+}
+
+func (s *Server) publicAPIHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/topics", s.handleCreateTopic)
 	mux.HandleFunc("GET /v1/topics", s.handleListTopics)
@@ -24,7 +28,18 @@ func (s *Server) publicRoutes() http.Handler {
 	mux.HandleFunc("POST /v1/groups/{group_id}/commit", s.handleCommitOffsets)
 	mux.HandleFunc("GET /v1/groups/{group_id}/offsets", s.handleGetOffsets)
 	mux.HandleFunc("POST /v1/producers/init", s.handleInitProducer)
-	return s.withMiddleware(mux)
+	return mux
+}
+
+// PublicHandler returns the server's public API handler.
+func (s *Server) PublicHandler() http.Handler {
+	return s.publicRoutes()
+}
+
+// PublicAPIHandler returns the bare public API mux without middleware.
+// Benchmarks can use this to avoid measuring logging and wrapper overhead.
+func (s *Server) PublicAPIHandler() http.Handler {
+	return s.publicAPIHandler()
 }
 
 func (s *Server) internalRoutes() http.Handler {

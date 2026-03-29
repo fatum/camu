@@ -8,6 +8,7 @@ import (
 )
 
 const testSegmentBatchSize = 16 * 1024
+
 // testSegmentBatchSize is the default on-disk batch target used by segment
 // tests unless a case needs smaller batches to force multiple batch boundaries.
 
@@ -337,7 +338,7 @@ func TestWriteSegment_DeterministicHeaderEncoding(t *testing.T) {
 	}
 }
 
-func TestSegment_V2BatchHeaderRoundTrip(t *testing.T) {
+func TestSegment_V3WALBatchEnvelopeRoundTrip(t *testing.T) {
 	msgs := []Message{
 		{Offset: 0, Timestamp: 1000, Key: []byte("k0"), Value: []byte("hello")},
 		{Offset: 1, Timestamp: 2000, Key: []byte("k1"), Value: []byte("world")},
@@ -351,10 +352,10 @@ func TestSegment_V2BatchHeaderRoundTrip(t *testing.T) {
 				t.Fatalf("WriteSegment(%s) failed: %v", compression, err)
 			}
 
-			// Verify version byte is 2.
+			// Verify version byte is 3.
 			raw := buf.Bytes()
-			if raw[4] != 2 {
-				t.Fatalf("segment version = %d, want 2", raw[4])
+			if raw[4] != 3 {
+				t.Fatalf("segment version = %d, want 3", raw[4])
 			}
 
 			got, err := ReadSegment(bytes.NewReader(raw), int64(len(raw)))
@@ -385,7 +386,7 @@ func TestSegment_V2BatchHeaderRoundTrip(t *testing.T) {
 				}
 			}
 
-			// Also verify the offset index builds successfully with the v2 format.
+			// Also verify the offset index builds successfully with the v3 format.
 			_, err = BuildSegmentOffsetIndex(raw, 0, 1)
 			if err != nil {
 				t.Fatalf("BuildSegmentOffsetIndex(%s) failed: %v", compression, err)

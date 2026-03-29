@@ -1,7 +1,6 @@
 package log
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -38,8 +37,8 @@ type walChunk struct {
 //	[message frame bytes]
 //	[4-byte CRC32 over the message frame bytes]
 type WAL struct {
-	mu        sync.RWMutex
-	path      string
+	mu         sync.RWMutex
+	path       string
 	dir        string
 	fsync      bool
 	chunkSize  int64
@@ -88,17 +87,19 @@ func walActiveChunkPath(dir string) string {
 }
 
 func serializeWALEntry(msg Message) ([]byte, error) {
-	var frameBuf bytes.Buffer
-	if err := writeMessageFrame(&frameBuf, msg); err != nil {
-		return nil, fmt.Errorf("WAL serialize message: %w", err)
-	}
-	frameBytes := frameBuf.Bytes()
+	frameBytes := make([]byte, 0, encodedMessageFrameSize(msg))
+	frameBytes = appendMessageFrame(frameBytes, msg)
 
 	entry := make([]byte, 0, 4+len(frameBytes)+4)
 	entry = binary.BigEndian.AppendUint32(entry, uint32(len(frameBytes)))
 	entry = append(entry, frameBytes...)
 	entry = binary.BigEndian.AppendUint32(entry, crc32.ChecksumIEEE(frameBytes))
 	return entry, nil
+}
+
+func encodedWALEntrySize(msg Message) int {
+	frameSize := encodedMessageFrameSize(msg)
+	return 4 + frameSize + 4
 }
 
 // serializeWALBatch serializes a Batch into the envelope wire format:
@@ -111,20 +112,13 @@ func serializeWALEntry(msg Message) ([]byte, error) {
 //	[per message: [4B frame_length][frame_bytes][4B CRC32]]
 //	[4B CRC32 over entire envelope payload (everything after total_envelope_length)]
 func serializeWALBatch(batch Batch) ([]byte, error) {
-	// Serialize all message entries first.
-	var entriesBuf bytes.Buffer
+	entriesLen := 0
 	for _, msg := range batch.Messages {
-		entry, err := serializeWALEntry(msg)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := entriesBuf.Write(entry); err != nil {
-			return nil, fmt.Errorf("buffer WAL entry: %w", err)
-		}
+		entriesLen += encodedWALEntrySize(msg)
 	}
 
 	// envelope payload = version(1) + producer_id(8) + sequence(8) + msg_count(4) + entries
-	payloadLen := 1 + 8 + 8 + 4 + entriesBuf.Len()
+	payloadLen := 1 + 8 + 8 + 4 + entriesLen
 	// total on disk = total_length(4) + payload + crc(4)
 	totalLen := 4 + payloadLen + 4
 
@@ -134,7 +128,12 @@ func serializeWALBatch(batch Batch) ([]byte, error) {
 	out = binary.BigEndian.AppendUint64(out, batch.ProducerID)
 	out = binary.BigEndian.AppendUint64(out, batch.Sequence)
 	out = binary.BigEndian.AppendUint32(out, uint32(len(batch.Messages)))
-	out = append(out, entriesBuf.Bytes()...)
+	for _, msg := range batch.Messages {
+		frameStart := len(out)
+		out = binary.BigEndian.AppendUint32(out, uint32(encodedMessageFrameSize(msg)))
+		out = appendMessageFrame(out, msg)
+		out = binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(out[frameStart+4:len(out)]))
+	}
 
 	// CRC covers everything after total_envelope_length (i.e. payload bytes).
 	crc := crc32.ChecksumIEEE(out[4:])
@@ -298,13 +297,14 @@ func scanWALBatches(r io.ReaderAt, size int64, msgLimit int, visitBatch func(Bat
 
 	for {
 		// Read total_envelope_length (4B).
-		var envLen uint32
-		if err := binary.Read(reader, binary.BigEndian, &envLen); err != nil {
+		var envLenBuf [4]byte
+		if _, err := io.ReadFull(reader, envLenBuf[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
 			return pos, lastOffset, hasMessage, fmt.Errorf("WAL read envelope length: %w", err)
 		}
+		envLen := binary.BigEndian.Uint32(envLenBuf[:])
 
 		if int64(envLen) > size-pos-4 {
 			// Not enough data for the full envelope — treat as partial write.
@@ -327,25 +327,24 @@ func scanWALBatches(r io.ReaderAt, size int64, msgLimit int, visitBatch func(Bat
 		}
 
 		// Parse header from payload.
-		pr := bytes.NewReader(payload)
-
-		var version byte
-		if err := binary.Read(pr, binary.BigEndian, &version); err != nil {
+		if len(payload) < 1 {
 			break
 		}
+		version := payload[0]
 		if version != walEnvelopeVersion {
 			break
 		}
-
-		var producerID, sequence uint64
-		var msgCount uint32
-		if err := binary.Read(pr, binary.BigEndian, &producerID); err != nil {
+		rest := payload[1:]
+		producerID, rest, ok := readUint64Bytes(rest)
+		if !ok {
 			break
 		}
-		if err := binary.Read(pr, binary.BigEndian, &sequence); err != nil {
+		sequence, rest, ok := readUint64Bytes(rest)
+		if !ok {
 			break
 		}
-		if err := binary.Read(pr, binary.BigEndian, &msgCount); err != nil {
+		msgCount, rest, ok := readUint32Bytes(rest)
+		if !ok {
 			break
 		}
 
@@ -353,31 +352,24 @@ func scanWALBatches(r io.ReaderAt, size int64, msgLimit int, visitBatch func(Bat
 		msgs := make([]Message, 0, msgCount)
 		valid := true
 		for i := uint32(0); i < msgCount; i++ {
-			var frameLen uint32
-			if err := binary.Read(pr, binary.BigEndian, &frameLen); err != nil {
+			frameLen, next, ok := readUint32Bytes(rest)
+			if !ok || uint32(len(next)) < frameLen+4 {
 				valid = false
 				break
 			}
-			frameBytes := make([]byte, frameLen)
-			if _, err := io.ReadFull(pr, frameBytes); err != nil {
-				valid = false
-				break
-			}
-			var frameCRC uint32
-			if err := binary.Read(pr, binary.BigEndian, &frameCRC); err != nil {
-				valid = false
-				break
-			}
+			frameBytes := next[:frameLen]
+			frameCRC := binary.BigEndian.Uint32(next[frameLen : frameLen+4])
 			if crc32.ChecksumIEEE(frameBytes) != frameCRC {
 				valid = false
 				break
 			}
-			msg, err := readMessageFrame(bytes.NewReader(frameBytes))
+			msg, err := readMessageFrameBytes(frameBytes)
 			if err != nil {
 				valid = false
 				break
 			}
 			msgs = append(msgs, msg)
+			rest = next[frameLen+4:]
 		}
 		if !valid {
 			break
@@ -423,13 +415,14 @@ func scanWALBatchMetas(r io.ReaderAt, size int64, msgLimit int, visitMeta func(B
 	)
 
 	for {
-		var envLen uint32
-		if err := binary.Read(reader, binary.BigEndian, &envLen); err != nil {
+		var envLenBuf [4]byte
+		if _, err := io.ReadFull(reader, envLenBuf[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
 			return pos, lastOffset, hasMessage, fmt.Errorf("WAL read envelope length: %w", err)
 		}
+		envLen := binary.BigEndian.Uint32(envLenBuf[:])
 
 		if int64(envLen) > size-pos-4 {
 			break
@@ -449,25 +442,24 @@ func scanWALBatchMetas(r io.ReaderAt, size int64, msgLimit int, visitMeta func(B
 			break
 		}
 
-		pr := bytes.NewReader(payload)
-
-		var version byte
-		if err := binary.Read(pr, binary.BigEndian, &version); err != nil {
+		if len(payload) < 1 {
 			break
 		}
+		version := payload[0]
 		if version != walEnvelopeVersion {
 			break
 		}
-
-		var producerID, sequence uint64
-		var msgCount uint32
-		if err := binary.Read(pr, binary.BigEndian, &producerID); err != nil {
+		rest := payload[1:]
+		producerID, rest, ok := readUint64Bytes(rest)
+		if !ok {
 			break
 		}
-		if err := binary.Read(pr, binary.BigEndian, &sequence); err != nil {
+		sequence, rest, ok := readUint64Bytes(rest)
+		if !ok {
 			break
 		}
-		if err := binary.Read(pr, binary.BigEndian, &msgCount); err != nil {
+		msgCount, rest, ok := readUint32Bytes(rest)
+		if !ok {
 			break
 		}
 
@@ -478,27 +470,19 @@ func scanWALBatchMetas(r io.ReaderAt, size int64, msgLimit int, visitMeta func(B
 		}
 		valid := true
 		for i := uint32(0); i < msgCount; i++ {
-			var frameLen uint32
-			if err := binary.Read(pr, binary.BigEndian, &frameLen); err != nil {
+			frameLen, next, ok := readUint32Bytes(rest)
+			if !ok || uint32(len(next)) < frameLen+4 {
 				valid = false
 				break
 			}
-			frameBytes := make([]byte, frameLen)
-			if _, err := io.ReadFull(pr, frameBytes); err != nil {
-				valid = false
-				break
-			}
-			var frameCRC uint32
-			if err := binary.Read(pr, binary.BigEndian, &frameCRC); err != nil {
-				valid = false
-				break
-			}
+			frameBytes := next[:frameLen]
+			frameCRC := binary.BigEndian.Uint32(next[frameLen : frameLen+4])
 			if crc32.ChecksumIEEE(frameBytes) != frameCRC {
 				valid = false
 				break
 			}
 
-			offset, err := readMessageFrameOffset(bytes.NewReader(frameBytes))
+			offset, err := readMessageFrameOffsetBytes(frameBytes)
 			if err != nil {
 				valid = false
 				break
@@ -507,6 +491,7 @@ func scanWALBatchMetas(r io.ReaderAt, size int64, msgLimit int, visitMeta func(B
 				meta.FirstOffset = offset
 			}
 			meta.LastOffset = offset
+			rest = next[frameLen+4:]
 		}
 		if !valid {
 			break
@@ -589,6 +574,38 @@ func readChunkMessages(path string, startOffset uint64, limit int) ([]Message, e
 		msgs = msgs[:limit]
 	}
 	return msgs, nil
+}
+
+func walkChunkMessages(path string, startOffset uint64, limit int, visit func(Message) bool) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat WAL chunk %q: %w", path, err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open WAL chunk %q: %w", path, err)
+	}
+	defer f.Close()
+
+	seen := 0
+	_, _, _, err = scanWALEntries(f, info.Size(), 0, func(msg Message) bool {
+		if msg.Offset < startOffset {
+			return true
+		}
+		seen++
+		if visit != nil && !visit(msg) {
+			return false
+		}
+		return limit <= 0 || seen < limit
+	})
+	if err != nil {
+		return fmt.Errorf("read WAL chunk %q: %w", path, err)
+	}
+	return nil
 }
 
 func appendChunkBytes(path string, data []byte, fsync bool) error {
@@ -794,6 +811,56 @@ func (w *WAL) AppendBatchWithMetaLocked(batch Batch) error {
 	return w.appendBatchWithMetaLocked(batch, data)
 }
 
+// AppendBatchFrameLocked appends a pre-serialized WAL batch envelope to the
+// active chunk. meta must match data and is used to maintain chunk metadata.
+// The caller must already hold the partition-level lock.
+func (w *WAL) AppendBatchFrameLocked(data []byte, meta BatchMeta) error {
+	if meta.MessageCount == 0 || len(data) == 0 {
+		return nil
+	}
+
+	firstOffset := meta.FirstOffset
+	lastOffset := meta.LastOffset
+
+	active := w.activeChunkLocked()
+	if active == nil {
+		w.chunks = append(w.chunks, walChunk{
+			baseOffset: firstOffset,
+			maxOffset:  firstOffset,
+			active:     true,
+		})
+		active = &w.chunks[len(w.chunks)-1]
+	}
+	if active.size > 0 && active.size+int64(len(data)) > w.chunkSize {
+		if err := w.sealActiveLocked(); err != nil {
+			return err
+		}
+		w.chunks = append(w.chunks, walChunk{
+			baseOffset: firstOffset,
+			maxOffset:  firstOffset,
+			active:     true,
+		})
+		active = &w.chunks[len(w.chunks)-1]
+	}
+	if active.size == 0 {
+		active.baseOffset = firstOffset
+	}
+	if err := w.openActiveFileLocked(); err != nil {
+		return err
+	}
+	if _, err := w.activeFile.Write(data); err != nil {
+		return fmt.Errorf("append WAL chunk: %w", err)
+	}
+	if w.fsync {
+		if err := w.activeFile.Sync(); err != nil {
+			return fmt.Errorf("fsync WAL chunk: %w", err)
+		}
+	}
+	active.size += int64(len(data))
+	active.maxOffset = lastOffset
+	return nil
+}
+
 func (w *WAL) appendBatchWithMetaLocked(batch Batch, data []byte) error {
 	firstOffset := batch.Messages[0].Offset
 	lastOffset := batch.Messages[len(batch.Messages)-1].Offset
@@ -905,6 +972,34 @@ func (w *WAL) replaySealedLocked() ([]Message, error) {
 		msgs = append(msgs, chunkMsgs...)
 	}
 	return msgs, nil
+}
+
+// ReplaySealedBatches reads only sealed WAL chunks in offset order while
+// preserving batch boundaries and producer metadata.
+func (w *WAL) ReplaySealedBatches() ([]Batch, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	return w.replaySealedBatchesLocked()
+}
+
+// ReplaySealedBatchesLocked is like ReplaySealedBatches but assumes the caller
+// already holds the partition-level lock.
+func (w *WAL) ReplaySealedBatchesLocked() ([]Batch, error) {
+	return w.replaySealedBatchesLocked()
+}
+
+func (w *WAL) replaySealedBatchesLocked() ([]Batch, error) {
+	chunks := w.snapshotChunksLocked(false, false)
+	batches := make([]Batch, 0, len(chunks))
+	for _, chunk := range chunks {
+		chunkBatches, err := readChunkBatches(w.chunkPathLocked(chunk), chunk.baseOffset)
+		if err != nil {
+			return nil, err
+		}
+		batches = append(batches, chunkBatches...)
+	}
+	return batches, nil
 }
 
 // MarkFlushed marks sealed chunks strictly below beforeOffset as flushed-retained.
@@ -1029,7 +1124,6 @@ func (w *WAL) truncateBeforeLocked(offset uint64) error {
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 
 	return w.closeActiveFileLocked()
 }

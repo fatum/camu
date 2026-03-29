@@ -87,8 +87,8 @@ func WriteBatchFrames(w io.Writer, batch log.Batch) error {
 
 // ReadBatchFrames reads batch envelopes until EOF and returns all batches
 // with their producer metadata.
-func ReadBatchFrames(r io.Reader) ([]log.Batch, error) {
-	var batches []log.Batch
+func ReadBatchFrames(r io.Reader) ([]log.BatchFrame, error) {
+	var frames []log.BatchFrame
 	for {
 		var totalLen uint32
 		if err := binary.Read(r, binary.BigEndian, &totalLen); err != nil {
@@ -125,11 +125,11 @@ func ReadBatchFrames(r io.Reader) ([]log.Batch, error) {
 			return nil, fmt.Errorf("wire: unsupported envelope version %d", version)
 		}
 
-		var batch log.Batch
-		if err := binary.Read(pr, binary.BigEndian, &batch.ProducerID); err != nil {
+		var meta log.BatchMeta
+		if err := binary.Read(pr, binary.BigEndian, &meta.ProducerID); err != nil {
 			return nil, fmt.Errorf("wire: read producer_id: %w", err)
 		}
-		if err := binary.Read(pr, binary.BigEndian, &batch.Sequence); err != nil {
+		if err := binary.Read(pr, binary.BigEndian, &meta.Sequence); err != nil {
 			return nil, fmt.Errorf("wire: read sequence: %w", err)
 		}
 
@@ -137,8 +137,7 @@ func ReadBatchFrames(r io.Reader) ([]log.Batch, error) {
 		if err := binary.Read(pr, binary.BigEndian, &msgCount); err != nil {
 			return nil, fmt.Errorf("wire: read message_count: %w", err)
 		}
-
-		batch.Messages = make([]log.Message, 0, msgCount)
+		meta.MessageCount = int(msgCount)
 		for i := range msgCount {
 			var frameLen uint32
 			if err := binary.Read(pr, binary.BigEndian, &frameLen); err != nil {
@@ -158,16 +157,22 @@ func ReadBatchFrames(r io.Reader) ([]log.Batch, error) {
 				return nil, fmt.Errorf("wire: CRC mismatch on frame %d", i)
 			}
 
-			msg, err := unmarshalMessageFrame(bytes.NewReader(frameBytes))
-			if err != nil {
-				return nil, fmt.Errorf("wire: decode message frame %d: %w", i, err)
+			if len(frameBytes) < 8 {
+				return nil, fmt.Errorf("wire: frame %d too short", i)
 			}
-			batch.Messages = append(batch.Messages, msg)
+			offset := binary.BigEndian.Uint64(frameBytes[:8])
+			if i == 0 {
+				meta.FirstOffset = offset
+			}
+			meta.LastOffset = offset
 		}
 
-		batches = append(batches, batch)
+		raw := make([]byte, 0, 4+len(envelopeBytes))
+		raw = binary.BigEndian.AppendUint32(raw, totalLen)
+		raw = append(raw, envelopeBytes...)
+		frames = append(frames, log.BatchFrame{Data: raw, Meta: meta})
 	}
-	return batches, nil
+	return frames, nil
 }
 
 // WriteMessageFrames writes messages as a single batch envelope with
@@ -188,13 +193,50 @@ func WriteMessageFrames(w io.Writer, msgs []log.Message) error {
 // discarding producer metadata. This preserves the existing API for
 // callers that don't need producer metadata.
 func ReadMessageFrames(r io.Reader) ([]log.Message, error) {
-	batches, err := ReadBatchFrames(r)
+	frames, err := ReadBatchFrames(r)
 	if err != nil {
 		return nil, err
 	}
 	var msgs []log.Message
-	for _, b := range batches {
-		msgs = append(msgs, b.Messages...)
+	for _, frame := range frames {
+		pr := bytes.NewReader(frame.Data[4 : len(frame.Data)-4])
+		var version uint8
+		if err := binary.Read(pr, binary.BigEndian, &version); err != nil {
+			return nil, err
+		}
+		if version != envelopeVersion {
+			return nil, fmt.Errorf("wire: unsupported envelope version %d", version)
+		}
+		var producerID, sequence uint64
+		var msgCount uint32
+		if err := binary.Read(pr, binary.BigEndian, &producerID); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(pr, binary.BigEndian, &sequence); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(pr, binary.BigEndian, &msgCount); err != nil {
+			return nil, err
+		}
+		for i := uint32(0); i < msgCount; i++ {
+			var frameLen uint32
+			if err := binary.Read(pr, binary.BigEndian, &frameLen); err != nil {
+				return nil, err
+			}
+			frameBytes := make([]byte, frameLen)
+			if _, err := io.ReadFull(pr, frameBytes); err != nil {
+				return nil, err
+			}
+			var frameCRC uint32
+			if err := binary.Read(pr, binary.BigEndian, &frameCRC); err != nil {
+				return nil, err
+			}
+			msg, err := unmarshalMessageFrame(bytes.NewReader(frameBytes))
+			if err != nil {
+				return nil, err
+			}
+			msgs = append(msgs, msg)
+		}
 	}
 	return msgs, nil
 }

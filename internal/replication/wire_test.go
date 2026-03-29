@@ -31,23 +31,27 @@ func TestWireFormat_BatchEnvelopeRoundTrip(t *testing.T) {
 		t.Fatalf("got %d batches, want 1", len(got))
 	}
 	b := got[0]
-	if b.ProducerID != 42 {
-		t.Errorf("ProducerID = %d, want 42", b.ProducerID)
+	if b.Meta.ProducerID != 42 {
+		t.Errorf("ProducerID = %d, want 42", b.Meta.ProducerID)
 	}
-	if b.Sequence != 7 {
-		t.Errorf("Sequence = %d, want 7", b.Sequence)
+	if b.Meta.Sequence != 7 {
+		t.Errorf("Sequence = %d, want 7", b.Meta.Sequence)
 	}
-	if len(b.Messages) != 2 {
-		t.Fatalf("got %d msgs, want 2", len(b.Messages))
+	if b.Meta.MessageCount != 2 {
+		t.Fatalf("got %d msgs, want 2", b.Meta.MessageCount)
 	}
-	if b.Messages[0].Offset != 100 || string(b.Messages[0].Key) != "k1" {
-		t.Errorf("msg 0 mismatch: %+v", b.Messages[0])
+	msgs, err := ReadMessageFrames(bytes.NewReader(b.Data))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if b.Messages[1].Offset != 101 || string(b.Messages[1].Key) != "k2" {
-		t.Errorf("msg 1 mismatch: %+v", b.Messages[1])
+	if msgs[0].Offset != 100 || string(msgs[0].Key) != "k1" {
+		t.Errorf("msg 0 mismatch: %+v", msgs[0])
 	}
-	if b.Messages[1].Headers["h1"] != "val1" {
-		t.Errorf("msg 1 header mismatch: %v", b.Messages[1].Headers)
+	if msgs[1].Offset != 101 || string(msgs[1].Key) != "k2" {
+		t.Errorf("msg 1 mismatch: %+v", msgs[1])
+	}
+	if msgs[1].Headers["h1"] != "val1" {
+		t.Errorf("msg 1 header mismatch: %v", msgs[1].Headers)
 	}
 }
 
@@ -78,11 +82,11 @@ func TestWireFormat_MultipleBatchesRoundTrip(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d batches, want 2", len(got))
 	}
-	if got[0].ProducerID != 1 || got[0].Sequence != 10 {
-		t.Errorf("batch 0 metadata mismatch: pid=%d seq=%d", got[0].ProducerID, got[0].Sequence)
+	if got[0].Meta.ProducerID != 1 || got[0].Meta.Sequence != 10 {
+		t.Errorf("batch 0 metadata mismatch: pid=%d seq=%d", got[0].Meta.ProducerID, got[0].Meta.Sequence)
 	}
-	if got[1].ProducerID != 2 || got[1].Sequence != 20 {
-		t.Errorf("batch 1 metadata mismatch: pid=%d seq=%d", got[1].ProducerID, got[1].Sequence)
+	if got[1].Meta.ProducerID != 2 || got[1].Meta.Sequence != 20 {
+		t.Errorf("batch 1 metadata mismatch: pid=%d seq=%d", got[1].Meta.ProducerID, got[1].Meta.Sequence)
 	}
 }
 
@@ -126,14 +130,14 @@ func TestWireFormat_LegacyRoundTrip_ReadAsBatch(t *testing.T) {
 	if len(batches) != 1 {
 		t.Fatalf("got %d batches, want 1", len(batches))
 	}
-	if batches[0].ProducerID != 0 {
-		t.Errorf("ProducerID = %d, want 0", batches[0].ProducerID)
+	if batches[0].Meta.ProducerID != 0 {
+		t.Errorf("ProducerID = %d, want 0", batches[0].Meta.ProducerID)
 	}
-	if batches[0].Sequence != 0 {
-		t.Errorf("Sequence = %d, want 0", batches[0].Sequence)
+	if batches[0].Meta.Sequence != 0 {
+		t.Errorf("Sequence = %d, want 0", batches[0].Meta.Sequence)
 	}
-	if len(batches[0].Messages) != 1 {
-		t.Fatalf("got %d msgs, want 1", len(batches[0].Messages))
+	if batches[0].Meta.MessageCount != 1 {
+		t.Fatalf("got %d msgs, want 1", batches[0].Meta.MessageCount)
 	}
 }
 
@@ -164,10 +168,10 @@ func TestWireFormat_EmptyBatch(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("got %d batches, want 1", len(got))
 	}
-	if got[0].ProducerID != 5 {
-		t.Errorf("ProducerID = %d, want 5", got[0].ProducerID)
+	if got[0].Meta.ProducerID != 5 {
+		t.Errorf("ProducerID = %d, want 5", got[0].Meta.ProducerID)
 	}
-	if len(got[0].Messages) != 0 {
-		t.Errorf("expected 0 messages, got %d", len(got[0].Messages))
+	if got[0].Meta.MessageCount != 0 {
+		t.Errorf("expected 0 messages, got %d", got[0].Meta.MessageCount)
 	}
 }

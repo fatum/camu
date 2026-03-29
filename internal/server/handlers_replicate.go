@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/replication"
 )
 
@@ -61,8 +63,10 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	// Implicit ack
 	ps.replicaState.UpdateFollower(replicaID, replicaOffset)
 
-	// Try WAL first (hot path for real-time replication)
-	msgs, err := ps.wal.ReadFromLocked(fromOffset, 1000)
+	// Try WAL first (hot path for real-time replication). Preserve raw WAL
+	// batch envelopes so the follower can append them directly without
+	// decoding and re-encoding.
+	frames, err := ps.wal.ReadBatchFramesFromLocked(fromOffset)
 	hw := ps.replicaState.HighWatermark()
 	ps.mu.Unlock()
 	if err != nil {
@@ -72,18 +76,22 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(msgs) > 0 {
+	if len(frames) > 0 {
+		first := frames[0].Meta.FirstOffset
+		last := frames[len(frames)-1].Meta.LastOffset
 		slog.Info("replica_fetch: served from WAL",
 			"topic", topic, "pid", pid, "replica", replicaID,
-			"from_offset", fromOffset, "msg_count", len(msgs),
-			"first", msgs[0].Offset, "last", msgs[len(msgs)-1].Offset,
+			"from_offset", fromOffset,
+			"batch_count", len(frames),
+			"first", first, "last", last,
 			"hw", hw)
 	}
 
 	// Fall back to flushed segments if WAL doesn't have the data
-	if len(msgs) == 0 {
+	if len(frames) == 0 {
 		index := s.partitionManager.GetIndex(topic, pid)
 		if index != nil {
+			var msgs []log.Message
 			var nextOff uint64
 			msgs, nextOff, err = s.fetcher.Fetch(r.Context(), index, topic, pid, fromOffset, 1000)
 			if err != nil {
@@ -97,24 +105,42 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 					"topic", topic, "pid", pid, "replica", replicaID,
 					"from_offset", fromOffset, "msg_count", len(msgs),
 					"next_offset", nextOff, "index_next", index.NextOffset())
+				frames = make([]log.BatchFrame, 0, 1)
+				var buf bytes.Buffer
+				if err := replication.WriteMessageFrames(&buf, msgs); err != nil {
+					slog.Error("replica_fetch: WriteMessageFrames failed",
+						"topic", topic, "pid", pid, "replica", replicaID,
+						"msg_count", len(msgs), "error", err)
+					writeError(w, 500, "replication encode failed")
+					return
+				}
+				segmentFrames, err := replication.ReadBatchFrames(bytes.NewReader(buf.Bytes()))
+				if err != nil {
+					slog.Error("replica_fetch: ReadBatchFrames failed",
+						"topic", topic, "pid", pid, "replica", replicaID,
+						"msg_count", len(msgs), "error", err)
+					writeError(w, 500, "replication decode failed")
+					return
+				}
+				frames = append(frames, segmentFrames...)
 			}
 		}
 	}
 
 	// Long-poll if still no data (waiting for new writes)
 	// WaitForData uses its own internal signalling — don't hold ps.mu.
-	if len(msgs) == 0 {
+	if len(frames) == 0 {
 		if ps.replicaState.WaitForData(500 * time.Millisecond) {
 			ps.mu.RLock()
-			msgs, err = ps.wal.ReadFromLocked(fromOffset, 1000)
+			frames, err = ps.wal.ReadBatchFramesFromLocked(fromOffset)
 			ps.mu.RUnlock()
 			if err != nil {
 				slog.Error("replica_fetch: WAL read after wait failed",
 					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
-			} else if len(msgs) > 0 {
+			} else if len(frames) > 0 {
 				slog.Info("replica_fetch: served from WAL after long-poll",
 					"topic", topic, "pid", pid, "replica", replicaID,
-					"msg_count", len(msgs))
+					"batch_count", len(frames))
 			}
 		}
 	}
@@ -128,7 +154,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 
 	slog.Debug("replica_fetch: serving",
 		"topic", topic, "pid", pid, "replica", replicaID,
-		"from_offset", fromOffset, "msg_count", len(msgs),
+		"from_offset", fromOffset, "batch_count", len(frames),
 		"hw", respHW, "epoch", respEpoch)
 
 	// Response headers
@@ -137,9 +163,12 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Flushed-Offset", strconv.FormatUint(respFlushed, 10))
 
 	// Write binary frames
-	if err := replication.WriteMessageFrames(w, msgs); err != nil {
-		slog.Error("replica_fetch: WriteMessageFrames failed",
-			"topic", topic, "pid", pid, "replica", replicaID,
-			"msg_count", len(msgs), "error", err)
+	for _, frame := range frames {
+		if _, err := w.Write(frame.Data); err != nil {
+			slog.Error("replica_fetch: write raw batch frame failed",
+				"topic", topic, "pid", pid, "replica", replicaID,
+				"error", err)
+			return
+		}
 	}
 }

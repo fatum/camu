@@ -633,7 +633,7 @@ func (pm *PartitionManager) notifyBatcher(ps *partitionState, msgs []log.Message
 
 // AppendReplicatedBatches writes batches to the given partition preserving their
 // existing offsets (set by the leader) and producer metadata. It does NOT reassign offsets.
-func (pm *PartitionManager) AppendReplicatedBatches(ctx context.Context, topic string, partitionID int, batches []log.Batch) error {
+func (pm *PartitionManager) AppendReplicatedBatchFrames(ctx context.Context, topic string, partitionID int, frames []log.BatchFrame) error {
 	pm.mu.RLock()
 	ps, ok := pm.partitions[topic][partitionID]
 	pm.mu.RUnlock()
@@ -644,17 +644,15 @@ func (pm *PartitionManager) AppendReplicatedBatches(ctx context.Context, topic s
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	for _, batch := range batches {
-		if len(batch.Messages) == 0 {
+	for _, frame := range frames {
+		if frame.Meta.MessageCount == 0 || len(frame.Data) == 0 {
 			continue
 		}
-		// Write with producer metadata preserved in WAL envelope.
-		if err := ps.wal.AppendBatchWithMetaLocked(batch); err != nil {
+		if err := ps.wal.AppendBatchFrameLocked(frame.Data, frame.Meta); err != nil {
 			return err
 		}
-		maxOffset := batch.Messages[len(batch.Messages)-1].Offset
-		if maxOffset+1 > ps.nextOffset {
-			ps.nextOffset = maxOffset + 1
+		if frame.Meta.LastOffset+1 > ps.nextOffset {
+			ps.nextOffset = frame.Meta.LastOffset + 1
 		}
 	}
 	return nil
@@ -943,12 +941,12 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 
 	// Read all sealed, not-yet-flushed chunks. Flushed-retained chunks stay in
 	// WAL for follower catch-up but are excluded from the flush input.
-	msgs, err := ps.wal.ReplaySealedLocked()
+	batches, err := ps.wal.ReplaySealedBatchesLocked()
 	if err != nil {
 		ps.mu.Unlock()
 		return fmt.Errorf("WAL replay: %w", err)
 	}
-	if len(msgs) == 0 {
+	if len(batches) == 0 {
 		slog.Debug("flush_skipped_empty_wal",
 			"topic", topic,
 			"partition", partitionID,
@@ -961,8 +959,13 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		return nil
 	}
 
-	baseOffset := msgs[0].Offset
-	endOffset := msgs[len(msgs)-1].Offset
+	messageCount := 0
+	for _, batch := range batches {
+		messageCount += len(batch.Messages)
+	}
+	baseOffset := batches[0].Messages[0].Offset
+	lastBatch := batches[len(batches)-1]
+	endOffset := lastBatch.Messages[len(lastBatch.Messages)-1].Offset
 	epoch := ps.epoch
 	ps.mu.Unlock()
 
@@ -980,7 +983,7 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		"topic", topic,
 		"partition", partitionID,
 		"epoch", epoch,
-		"message_count", len(msgs),
+		"message_count", messageCount,
 		"base_offset", baseOffset,
 		"end_offset", endOffset,
 		"next_offset", flushNextOffset,
@@ -995,7 +998,7 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 	if compression == "" {
 		compression = log.CompressionNone
 	}
-	if err := log.WriteSegment(&segBuf, msgs, compression, pm.segmentsCfg.RecordBatchTargetSize); err != nil {
+	if err := log.WriteSegmentBatches(&segBuf, batches, compression, pm.segmentsCfg.RecordBatchTargetSize); err != nil {
 		return fmt.Errorf("write segment: %w", err)
 	}
 	segData := segBuf.Bytes()
@@ -1021,7 +1024,7 @@ func (pm *PartitionManager) onFlush(globalPartitionID int) error {
 		CreatedAt:      time.Now(),
 	}
 	segIndexKey := segRef.OffsetIndexObjectKey()
-	segMetaData, err := log.BuildSegmentMetadata(segRef, len(msgs), int64(len(segData)), compression)
+	segMetaData, err := log.BuildSegmentMetadata(segRef, messageCount, int64(len(segData)), compression)
 	if err != nil {
 		return fmt.Errorf("build segment metadata: %w", err)
 	}

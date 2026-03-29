@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"unsafe"
 
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
@@ -40,6 +42,42 @@ type offsetInfo struct {
 	Offset    uint64 `json:"offset"`
 }
 
+func newBodyDecoder(r io.Reader) (*json.Decoder, byte, error) {
+	br := bufio.NewReader(r)
+	first, err := peekFirstNonSpaceByte(br)
+	if err != nil {
+		return nil, 0, err
+	}
+	return json.NewDecoder(br), first, nil
+}
+
+func peekFirstNonSpaceByte(r *bufio.Reader) (byte, error) {
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			if err := r.UnreadByte(); err != nil {
+				return 0, err
+			}
+			return b, nil
+		}
+	}
+}
+
+// immutableStringBytes exposes a string as a read-only byte slice without
+// copying. The returned slice must never be mutated.
+func immutableStringBytes(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
 func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) {
 	if s.shuttingDown.Load() {
 		w.Header().Set("Retry-After", "1")
@@ -68,30 +106,32 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse body: JSON array or single object. Idempotent batch format is
-	// not allowed on the high-level endpoint — use the partition-specific
-	// endpoint for idempotent produce.
+	// Parse body: JSON array only. Idempotent batch format is not allowed on
+	// the high-level endpoint — use the partition-specific endpoint for
+	// idempotent produce.
 	var msgs []produceMessageRequest
-	var raw json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+	dec, firstByte, err := newBodyDecoder(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	// Reject idempotent batch format on this endpoint.
-	var probe produceBatchRequest
-	if err := json.Unmarshal(raw, &probe); err == nil && probe.ProducerID != 0 {
-		writeError(w, http.StatusBadRequest, "idempotent produce requires the partition-specific endpoint: POST /v1/topics/{topic}/partitions/{id}/messages")
-		return
-	}
-
-	if err := json.Unmarshal(raw, &msgs); err != nil {
-		var single produceMessageRequest
-		if err2 := json.Unmarshal(raw, &single); err2 != nil {
-			writeError(w, http.StatusBadRequest, "invalid request body: expected array or object")
+	switch firstByte {
+	case '[':
+		if err := dec.Decode(&msgs); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: expected array")
 			return
 		}
-		msgs = []produceMessageRequest{single}
+	case '{':
+		var batchReq produceBatchRequest
+		if err := dec.Decode(&batchReq); err == nil && batchReq.Messages != nil {
+			writeError(w, http.StatusBadRequest, "idempotent produce requires the partition-specific endpoint: POST /v1/topics/{topic}/partitions/{id}/messages")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid request body: expected array")
+		return
+	default:
+		writeError(w, http.StatusBadRequest, "invalid request body: expected array")
+		return
 	}
 
 	if len(msgs) == 0 {
@@ -113,17 +153,14 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 	}
 	byPartition := make(map[int][]indexedMsg)
 	for i, m := range msgs {
-		var key []byte
-		if m.Key != "" {
-			key = []byte(m.Key)
-		}
+		key := immutableStringBytes(m.Key)
 		partitionID := router.Route(key)
 		byPartition[partitionID] = append(byPartition[partitionID], indexedMsg{
 			idx:       i,
 			partition: partitionID,
 			msg: log.Message{
 				Key:     key,
-				Value:   []byte(m.Value),
+				Value:   immutableStringBytes(m.Value),
 				Headers: m.Headers,
 			},
 		})
@@ -290,30 +327,35 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Parse body: idempotent batch, JSON array, or single object.
+	// Parse body: idempotent batch or JSON array.
 	var (
 		msgs       []produceMessageRequest
 		producerID uint64
 		sequence   uint64
 	)
-	var raw json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+	dec, firstByte, err := newBodyDecoder(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-
-	var batchReq produceBatchRequest
-	if err := json.Unmarshal(raw, &batchReq); err == nil && batchReq.Messages != nil {
+	switch firstByte {
+	case '{':
+		var batchReq produceBatchRequest
+		if err := dec.Decode(&batchReq); err != nil || batchReq.Messages == nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: expected batch or array")
+			return
+		}
 		msgs = batchReq.Messages
 		producerID = batchReq.ProducerID
 		sequence = batchReq.Sequence
-	} else if err := json.Unmarshal(raw, &msgs); err != nil {
-		var single produceMessageRequest
-		if err2 := json.Unmarshal(raw, &single); err2 != nil {
-			writeError(w, http.StatusBadRequest, "invalid request body: expected batch, array, or object")
+	case '[':
+		if err := dec.Decode(&msgs); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: expected batch or array")
 			return
 		}
-		msgs = []produceMessageRequest{single}
+	default:
+		writeError(w, http.StatusBadRequest, "invalid request body: expected batch or array")
+		return
 	}
 
 	if len(msgs) == 0 {
@@ -323,13 +365,10 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	batch := make([]log.Message, len(msgs))
 	for i, m := range msgs {
-		var key []byte
-		if m.Key != "" {
-			key = []byte(m.Key)
-		}
+		key := immutableStringBytes(m.Key)
 		batch[i] = log.Message{
 			Key:     key,
-			Value:   []byte(m.Value),
+			Value:   immutableStringBytes(m.Value),
 			Headers: m.Headers,
 		}
 	}

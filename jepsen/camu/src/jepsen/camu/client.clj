@@ -81,8 +81,8 @@
   [node topic key value]
   (let [resp (http/post (str (normalize-base-url node) "/v1/topics/" topic "/messages")
                         {:content-type      :json
-                         :body              (json/generate-string {:key   key
-                                                                   :value value})
+                         :body              (json/generate-string [{:key   key
+                                                                    :value value}])
                          :socket-timeout    http-timeout-ms
                          :connect-timeout   http-timeout-ms
                          :throw-exceptions  false})
@@ -387,7 +387,7 @@
                              (let [resp (http/post (str (base-url n) "/v1/topics/" topic "/messages")
                                                    {:content-type     :json
                                                     :body             (json/generate-string
-                                                                       {:key "readiness-probe" :value "ping"})
+                                                                       [{:key "readiness-probe" :value "ping"}])
                                                     :socket-timeout   5000
                                                     :connect-timeout  2000
                                                     :throw-exceptions false})]
