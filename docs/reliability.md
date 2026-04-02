@@ -2,7 +2,7 @@
 
 This document describes what Camu is currently claiming, what has been exercised in tests, and where the strongest evidence lives.
 
-The current repository evidence is anchored to runs completed on **March 22-23, 2026**.
+The current repository evidence is anchored to the Jepsen runs checked into the `jepsen/camu/store/` directory.
 
 ## Current Claim Surface
 
@@ -152,6 +152,26 @@ The passing matrix depends on concrete correctness work, including:
 - batcher error handling that avoids silent drop on flush failure
 - harness cleanup and routing fixes so results represent the system, not the test harness
 
+### Idempotent Produce: `rf=3`, `minISR=3`
+
+| Faults | Duration | Result | Availability | Artifact |
+|--------|----------|--------|--------------|----------|
+| `kill` | 45s | Pass | `0.625` | `jepsen/camu/store/camu/20260327T142208.572Z/results.edn` |
+
+Idempotent produce checker verifies exactly-once semantics: 0 duplicates, 0 missing, 0 ghosts across `:ok` and `:info` operations.
+
+## Known Coordination Bugs
+
+The following bugs have been verified via code audit but are not yet exposed by the current Jepsen matrix due to short test durations and timing probability. See [architecture/coordination.md](architecture/coordination.md) for the full analysis.
+
+- **Data races**: `checkISRLag` and `attemptPartitionLeadership` access partition state without proper locking — crash risk under concurrent failover
+- **HW regression**: `attemptPartitionLeadership` omits ISR-stored HW from recovery calculation — consumers may see HW go backwards
+- **ISR expansion not persisted**: follower rejoining ISR is in-memory only — crash before next ISR shrink loses the membership, blocking clean failover
+- **Phantom leader**: produce fencing uses a local cache updated every 10s — old leader accepts writes for up to one heartbeat interval after losing CAS
+- **leader-kill nemesis was broken**: `find-leader-node` iterated the routing map incorrectly and always fell back to random-kill — now fixed
+
+These bugs are timing-dependent and do not invalidate the existing Jepsen results, but they represent real production risks that need fixing before the system can claim robust failover guarantees.
+
 ## Known Limits
 
 The evidence is meaningful, but not exhaustive.
@@ -163,12 +183,15 @@ Current boundaries:
 - leader-directed reads are the primary correctness path
 - the narrowest-tested mode remains `rf=3`, `minISR=2`
 - the repository does not yet claim transactional semantics
+- coordination data races require `go test -race` to detect, not Jepsen
+- the phantom leader window requires targeted nemesis work to expose
 
 The strongest next steps would be:
 
-- more combined strict-quorum faults
-- longer churn windows
-- higher concurrency and larger payload runs
+- fix verified coordination bugs (data races, HW recovery, ISR persistence)
+- longer Jepsen runs (15+ minutes) with higher concurrency
+- a targeted nemesis that writes to the old leader immediately after CAS loss
+- `go test -race` on integration tests
 - a dedicated replica-read semantics matrix
 
 ## How To Audit A Run
@@ -190,4 +213,4 @@ That is enough to trace a claim from checker output back to operation history an
 
 ## Bottom Line
 
-As of March 23, 2026, Camu has repository-local evidence that its current replicated durability path survives the documented Jepsen matrix without losing acknowledged writes. That is a much stronger statement than "the tests pass": the failure model is explicit, the artifacts are inspectable, and the important corner cases are being exercised under adversarial conditions.
+Camu has repository-local evidence that its current replicated durability path survives the documented Jepsen matrix without losing acknowledged writes. That is a much stronger statement than "the tests pass": the failure model is explicit, the artifacts are inspectable, and the important corner cases are being exercised under adversarial conditions.

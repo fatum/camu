@@ -314,7 +314,7 @@ The checked-in Jepsen harness currently verifies:
 - strict quorum: `rf=3`, `minISR=3`
 - control mode: `rf=1`, `minISR=1`
 
-As of March 23, 2026, the repository documents 21 passing fault scenarios across kill, leader kill, pause, partition, rejoin, membership churn, S3 isolation, and combined-fault runs. See [docs/reliability.md](docs/reliability.md) for the matrix and [jepsen/camu/README.md](jepsen/camu/README.md) for the harness.
+The repository documents 21+ passing fault scenarios across kill, leader kill, pause, partition, rejoin, membership churn, S3 isolation, and combined-fault runs. See [docs/reliability.md](docs/reliability.md) for the matrix and [jepsen/camu/README.md](jepsen/camu/README.md) for the harness.
 
 ## Project Layout
 
@@ -350,6 +350,7 @@ RF=3 MIN_ISR=3 ./run.sh leader-kill,s3-partition 45
 ## More Docs
 
 - [docs/architecture.md](docs/architecture.md)
+- [docs/architecture/coordination.md](docs/architecture/coordination.md)
 - [docs/reliability.md](docs/reliability.md)
 - [docs/multiple-indexes.md](docs/multiple-indexes.md)
 - [jepsen/camu/README.md](jepsen/camu/README.md)

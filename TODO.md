@@ -1,6 +1,20 @@
-# ISR Replication — Post-Review Fixes
+# Camu TODO
 
-## Critical
+## Coordination Bugs (verified, not yet fixed)
+
+- [ ] **CRITICAL: `checkISRLag` data race** — reads `ps.isLeader`, `ps.replicaState`, `ps.epoch` without `ps.mu` (`server.go:1474`). Fix: add `ps.mu.RLock`.
+- [ ] **CRITICAL: `attemptPartitionLeadership` data race** — reads `ps.fetchCancel`/`ps.fetchDone` without `ps.mu` (`server.go:1292`). Fix: copy pattern from `initPartitionAsLeader:664`.
+- [ ] **HIGH: HW regression on failover** — `attemptPartitionLeadership` sets `recoveredHW = max(walEnd, indexNext)` but omits `isrState.HighWatermark` (`server.go:1346`). `initPartitionAsLeader:738` does this correctly.
+- [ ] **HIGH: ISR expansion not persisted** — `UpdateFollower` adds to ISR in memory but never writes to S3 (`replica_state.go:85`). Only ISR shrinkage triggers S3 write.
+- [ ] **HIGH: TOCTOU in `initPartitionAsLeader`** — checks `ps.isLeader` under `RLock`, then proceeds unlocked (`server.go:649`). Fix: re-check under `Lock`.
+- [ ] **HIGH: Phantom leader** — produce fencing uses local cache (`s.myPartitions`) updated on renewal tick. Old leader accepts writes for up to `heartbeat_interval` after CAS loss.
+- [ ] **MEDIUM: `state.json` flush without CAS** — stale leader can overwrite new leader's state
+- [ ] **MEDIUM: ISR writes use unconditional PUT** — no CAS guard, last writer wins under split brain
+- [ ] **MEDIUM: Epoch history `StartOffset`** — uses `walEnd` instead of `recoveredHW` (`server.go:1373`)
+
+## ISR Replication — Post-Review Fixes
+
+### Critical
 
 - [x] Guard unsigned underflow in ISR expansion (`internal/replication/replica_state.go:70`) — add `offset <= rs.leaderOffset` before subtraction
 - [x] Remove dead `time.AfterFunc` in purgatory (`internal/replication/purgatory.go:39-43`) — callback is empty, `time.After` on line 54 handles timeout
@@ -73,6 +87,13 @@ Client-side consumer groups using S3 leases for coordination. No server-side gro
 - [x] **Jepsen exactly-once checker** — 7 test scenarios (combined faults, high concurrency, pause, S3 degradation, membership, strict quorum, soak)
 - [ ] **Per-partition sequence in segment flush** — segment batches carry `ProducerID`/`Sequence` in header but currently write 0/0; wire actual metadata through flush path for segment-level dedup on read
 - [ ] **Idempotent produce on high-level endpoint** — currently rejected with 400; could support by requiring client-side partition routing or by tracking sequences per-request (not per-partition)
+
+## Future: Protocol & Transport
+
+- [ ] **Fast failure detection** — HTTP/2 PING health checking + connection error classification in fetcher (plan at `docs/superpowers/plans/2026-04-02-fast-failure-detection.md`)
+- [ ] **Internal TCP replication** — push-based, zero-copy WAL forwarding (spec at `docs/superpowers/specs/2026-03-27-internal-tcp-protocol-design.md`)
+- [ ] **Kafka protocol support** — minimal subset (ApiVersions, Metadata, Produce, Fetch) using `franz-go/pkg/kmsg`
+- [ ] **Kafka RecordBatch as canonical format** — replace WAL/segment format for zero-copy produce/fetch/replicate
 
 ## Suggestions
 

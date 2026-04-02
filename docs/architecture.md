@@ -123,22 +123,29 @@ Segments are immutable and seekable. Compression is applied per batch, not to th
 
 ```text
 [4B magic "CAMU"]
-[1B version]
-[1B compression]
+[1B version = 3]
+[1B compression flag]
 repeated:
-  [4B batch_len]
-  [4B message_count]
-  [batch payload]
+  [4B stored_batch_len]
+  [stored_batch bytes — raw or compressed WAL batch envelope]
 ```
 
-Each message frame stores:
+Each WAL batch envelope contains:
 
-- offset
-- timestamp
-- key
-- value
-- headers
-- optional producer metadata in WAL-derived batches
+```text
+[4B total_envelope_length]
+[1B envelope_version = 1]
+[8B producer_id]
+[8B sequence]
+[4B message_count]
+repeated per message:
+  [4B frame_length]
+  [frame bytes: 8B offset, 8B timestamp, 4B+key, 4B+value, 4B+headers...]
+  [4B CRC32]
+[4B envelope CRC32]
+```
+
+When compression is `none`, stored batch = raw WAL envelope. When `snappy` or `zstd`, stored batch = compressed WAL envelope.
 
 ## Replication
 
@@ -158,19 +165,12 @@ The architecture deliberately keeps those separate.
 
 ## Coordination
 
-Camu uses S3 conditional writes instead of a consensus cluster.
+Camu uses S3 conditional writes instead of a consensus cluster. See [architecture/coordination.md](architecture/coordination.md) for the full coordination deep-dive with architecture diagram, timing analysis, and known bugs.
 
-### Leader Election
+### Two Leadership Concepts
 
-The cluster leader owns assignment publication, not all data-plane traffic. It renews `_coordination/leader.json` with CAS.
-
-Default timing:
-
-- `coordination.lease_ttl = 30s`
-- `coordination.heartbeat_interval = 10s`
-- `coordination.instance_ttl = lease_ttl * 3` when omitted
-
-Test and Jepsen configurations use shorter timing to make failover observable within small runs.
+1. **Cluster coordinator** (`_coordination/leader.json`): one node holds a lease to publish partition assignments. Renewed via CAS every `heartbeat_interval=10s`, expires after `lease_ttl=30s`.
+2. **Partition leader** (`_coordination/assignments/{topic}.json`): per-partition ownership, changed via CAS. Independent from the cluster coordinator — a follower can win partition leadership via `attemptPartitionLeadership` without being the cluster coordinator.
 
 ### Partition Assignment
 
@@ -180,12 +180,16 @@ Assignments are deterministic round-robin over active instances. The assignment 
 
 Stale ownership is blocked by:
 
-- local ownership checks on every produce
+- local ownership checks on every produce (cached, up to `heartbeat_interval` stale)
 - leader verification before replicated writes
 - S3 ownership re-check before every flush
 - epoch-tagged segment filenames
 - CAS updates on `index.json`
 - WAL recovery that discards old-epoch local state when a newer owner has already taken over
+
+### Failure Detection
+
+Leader failure is detected by the follower fetch loop: >10 consecutive HTTP errors with exponential backoff (~26s for hard crash, ~330s for network hang). The follower then races to acquire partition leadership via CAS on the assignment object.
 
 ## Operational Notes
 
@@ -211,6 +215,26 @@ Camu does not coordinate every read through the leader. That keeps the read path
 | No external consensus system | One fewer cluster to run | Failover speed is bounded by lease timing and S3 round trips |
 | Immutable segments | Simple cache and retention behavior | No compaction or in-place mutation |
 | Deterministic assignment | Predictable and simple | Not load-aware |
+
+## Known Coordination Bugs
+
+See [architecture/coordination.md](architecture/coordination.md) for the full list with file:line references.
+
+**Critical (data races):**
+- `checkISRLag` reads partition state without `ps.mu` — potential nil dereference
+- `attemptPartitionLeadership` reads `ps.fetchCancel` without `ps.mu`
+
+**High (correctness):**
+- `attemptPartitionLeadership` doesn't incorporate ISR HW into recovery — HW can regress
+- ISR expansion (follower joins) is never persisted to S3
+- TOCTOU race in `initPartitionAsLeader` — double initialization possible
+- Phantom leader: produce fencing is local-cache-based, up to 10s stale after CAS loss
+
+**Medium (hardening):**
+- `state.json` flush and ISR writes use unconditional PUT (no CAS)
+- Epoch history `StartOffset` uses `walEnd` instead of `recoveredHW`
+
+These bugs are timing-dependent and rarely manifest in short Jepsen runs, but are real risks under sustained production load.
 
 ## Current Evidence
 
