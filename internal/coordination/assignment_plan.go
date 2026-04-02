@@ -37,26 +37,37 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 	result := make(map[int]PartitionAssignment, numPartitions)
 
 	for pid := range numPartitions {
-		replicas := make([]string, rf)
-		for r := range rf {
-			replicas[r] = instances[(pid+r)%n]
-		}
-		leader := replicas[0]
+		replicas := make([]string, 0, rf)
+		leader := ""
 		leaderEpoch := uint64(1)
 		if current != nil {
-			if cur, ok := current[pid]; ok {
-				// Reassignment is leader-last when possible: if the current leader
-				// still belongs to the new replica set, keep it as leader and rotate
-				// replicas so it remains replicas[0].
-				if containsReplica(replicas, cur.Leader) {
-					replicas = rotateLeaderFirst(replicas, cur.Leader)
-					leader = cur.Leader
-					leaderEpoch = cur.LeaderEpoch
-				} else {
-					leaderEpoch = cur.LeaderEpoch + 1
+			if cur, ok := current[pid]; ok && len(cur.Replicas) > 0 {
+				// Preserve the existing replica set for safety. A transiently smaller
+				// active set must not rewrite the partition onto unrelated nodes.
+				replicas = append(replicas, cur.Replicas...)
+				leader = cur.Leader
+				leaderEpoch = cur.LeaderEpoch
+				if !containsReplica(replicas, leader) {
+					leader = replicas[0]
 				}
+				if !containsReplica(instances, leader) {
+					if nextLeader, ok := firstActiveReplica(replicas, instances); ok {
+						leader = nextLeader
+						leaderEpoch++
+					}
+				}
+				result[pid] = PartitionAssignment{
+					Replicas:    replicas,
+					Leader:      leader,
+					LeaderEpoch: leaderEpoch,
+				}
+				continue
 			}
 		}
+		for r := range rf {
+			replicas = append(replicas, instances[(pid+r)%n])
+		}
+		leader = replicas[0]
 		result[pid] = PartitionAssignment{
 			Replicas:    replicas,
 			Leader:      leader,
@@ -86,4 +97,13 @@ func rotateLeaderFirst(replicas []string, leader string) []string {
 		return rotated
 	}
 	return replicas
+}
+
+func firstActiveReplica(replicas []string, active []string) (string, bool) {
+	for _, replica := range replicas {
+		if containsReplica(active, replica) {
+			return replica, true
+		}
+	}
+	return "", false
 }

@@ -1,10 +1,13 @@
 package camutest
 
+import "github.com/maksim/camu/internal/config"
+
 // Options configures a test environment.
 type Options struct {
-	Instances   int
-	UseMinIO    bool
-	InstanceIDs []string
+	Instances     int
+	UseMinIO      bool
+	InstanceIDs   []string
+	ConfigMutator func(*config.Config)
 }
 
 // Option is a functional option for configuring Options.
@@ -20,5 +23,13 @@ func WithMinIO() Option { return func(o *Options) { o.UseMinIO = true } }
 func WithInstanceIDs(ids ...string) Option {
 	return func(o *Options) {
 		o.InstanceIDs = append([]string(nil), ids...)
+	}
+}
+
+// WithConfigMutator allows tests and benchmarks to override the generated
+// server config before each instance starts.
+func WithConfigMutator(fn func(*config.Config)) Option {
+	return func(o *Options) {
+		o.ConfigMutator = fn
 	}
 }

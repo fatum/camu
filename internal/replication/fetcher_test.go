@@ -15,36 +15,49 @@ import (
 // mockPartitionManager records calls made by the fetcher.
 type mockPartitionManager struct {
 	mu             sync.Mutex
-	appended       [][]log.Message
-	truncated      []uint64
+	appended       []log.BatchFrame
+	truncatedFrom  []uint64
+	prunedBefore   []uint64
 	highWatermarks []uint64
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedBatch(_ context.Context, _ string, _ int, msgs []log.Message) error {
+func (m *mockPartitionManager) AppendReplicatedBatchFrames(_ context.Context, _ string, _ int, frames []log.BatchFrame) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := make([]log.Message, len(msgs))
-	copy(cp, msgs)
-	m.appended = append(m.appended, cp)
+	for _, frame := range frames {
+		cp := make([]byte, len(frame.Data))
+		copy(cp, frame.Data)
+		m.appended = append(m.appended, log.BatchFrame{
+			Data: cp,
+			Meta: frame.Meta,
+		})
+	}
 	return nil
 }
 
-func (m *mockPartitionManager) TruncateWAL(_ string, _ int, beforeOffset uint64) error {
+func (m *mockPartitionManager) TruncateWALFrom(_ string, _ int, offset uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.truncated = append(m.truncated, beforeOffset)
+	m.truncatedFrom = append(m.truncatedFrom, offset)
 	return nil
 }
 
-func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, highWatermark, flushedOffset uint64) {
+func (m *mockPartitionManager) PruneWALBefore(_ string, _ int, offset uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prunedBefore = append(m.prunedBefore, offset)
+	return nil
+}
+
+func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, _ uint64, highWatermark, flushedOffset uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.highWatermarks = append(m.highWatermarks, highWatermark)
 	m.flushedOffsets = append(m.flushedOffsets, flushedOffset)
 }
 
-func (m *mockPartitionManager) appendedMessages() [][]log.Message {
+func (m *mockPartitionManager) appendedFrames() []log.BatchFrame {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.appended
@@ -53,7 +66,13 @@ func (m *mockPartitionManager) appendedMessages() [][]log.Message {
 func (m *mockPartitionManager) truncatedOffsets() []uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.truncated
+	return m.truncatedFrom
+}
+
+func (m *mockPartitionManager) prunedOffsets() []uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.prunedBefore
 }
 
 func (m *mockPartitionManager) progress() ([]uint64, []uint64) {
@@ -114,7 +133,7 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm)
@@ -128,19 +147,19 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	}
 	cancel()
 
-	appended := pm.appendedMessages()
+	appended := pm.appendedFrames()
 	if len(appended) == 0 {
 		t.Fatal("expected at least one AppendReplicatedBatch call, got none")
 	}
-	batch := appended[0]
-	if len(batch) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(batch))
+	frame := appended[0]
+	if frame.Meta.MessageCount != 2 {
+		t.Fatalf("expected 2 messages, got %d", frame.Meta.MessageCount)
 	}
-	if batch[0].Offset != 0 || string(batch[0].Value) != "hello" {
-		t.Errorf("unexpected first message: %+v", batch[0])
+	if frame.Meta.FirstOffset != 0 {
+		t.Errorf("unexpected first offset: %d", frame.Meta.FirstOffset)
 	}
-	if batch[1].Offset != 1 || string(batch[1].Value) != "world" {
-		t.Errorf("unexpected second message: %+v", batch[1])
+	if frame.Meta.LastOffset != 1 {
+		t.Errorf("unexpected last offset: %d", frame.Meta.LastOffset)
 	}
 	hws, flushed := pm.progress()
 	if len(hws) == 0 || hws[0] != 2 {
@@ -182,7 +201,7 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 10, 1, "test-node", pm)
@@ -247,7 +266,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 0, "test-node", pm)
 	}()

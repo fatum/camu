@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/maksim/camu/internal/storage"
@@ -17,8 +18,8 @@ type PartitionInfo struct {
 }
 
 // RetentionCleaner runs a background loop that deletes expired segments from
-// owned partitions. It updates the index in S3 before deleting objects so that
-// readers never see a reference to a missing segment.
+// owned partitions. It lists objects in S3 and checks per-segment metadata
+// to determine which segments have expired.
 type RetentionCleaner struct {
 	s3Client  *storage.S3Client
 	interval  time.Duration
@@ -74,59 +75,77 @@ func (rc *RetentionCleaner) runOnce(ctx context.Context, partitions []PartitionI
 }
 
 func (rc *RetentionCleaner) cleanPartition(ctx context.Context, p PartitionInfo) error {
-	indexKey := fmt.Sprintf("%s/%d/index.json", p.Topic, p.PartitionID)
+	prefix := ListSegmentPrefix(p.Topic, p.PartitionID)
 
-	// Load the current index and its ETag for conditional update.
-	data, etag, err := rc.s3Client.GetWithETag(ctx, indexKey)
+	keys, err := rc.s3Client.List(ctx, prefix)
 	if err != nil {
-		return fmt.Errorf("get index %s: %w", indexKey, err)
+		return fmt.Errorf("list %s: %w", prefix, err)
 	}
 
-	idx := NewIndex()
-	if err := json.Unmarshal(data, idx); err != nil {
-		return fmt.Errorf("unmarshal index %s: %w", indexKey, err)
-	}
+	cutoff := time.Now().Add(-rc.retention)
+	var deleted int
 
-	expired := idx.RemoveExpired(rc.retention)
-	if len(expired) == 0 {
-		return nil
-	}
+	for _, key := range keys {
+		if !strings.HasSuffix(key, ".meta.json") {
+			continue
+		}
 
-	// Write updated index back to S3 before deleting objects.
-	updated, err := json.Marshal(idx)
-	if err != nil {
-		return fmt.Errorf("marshal index %s: %w", indexKey, err)
-	}
-	if _, err := rc.s3Client.ConditionalPut(ctx, indexKey, updated, etag); err != nil {
-		return fmt.Errorf("conditional put index %s: %w", indexKey, err)
-	}
+		data, err := rc.s3Client.Get(ctx, key)
+		if err != nil {
+			slog.Error("failed to get segment metadata",
+				"key", key,
+				"err", err,
+			)
+			continue
+		}
 
-	// Delete the segment objects now that the index no longer references them.
-	for _, ref := range expired {
-		if err := rc.s3Client.Delete(ctx, ref.Key); err != nil {
+		var meta SegmentMetadata
+		if err := json.Unmarshal(data, &meta); err != nil {
+			slog.Error("failed to unmarshal segment metadata",
+				"key", key,
+				"err", err,
+			)
+			continue
+		}
+
+		if meta.CreatedAt.After(cutoff) {
+			continue
+		}
+
+		// Delete the segment file, offset index, and metadata sidecar.
+		segKey := meta.SegmentKey
+		offsetIdxKey := meta.OffsetIndexKey
+		if offsetIdxKey == "" {
+			offsetIdxKey = SegmentOffsetIndexKey(segKey)
+		}
+
+		if err := rc.s3Client.Delete(ctx, segKey); err != nil {
 			slog.Error("failed to delete expired segment",
-				"key", ref.Key,
+				"key", segKey,
 				"err", err,
 			)
 		}
-		if err := rc.s3Client.Delete(ctx, ref.OffsetIndexObjectKey()); err != nil {
+		if err := rc.s3Client.Delete(ctx, offsetIdxKey); err != nil {
 			slog.Error("failed to delete expired segment offset index",
-				"key", ref.OffsetIndexObjectKey(),
+				"key", offsetIdxKey,
 				"err", err,
 			)
 		}
-		if err := rc.s3Client.Delete(ctx, ref.MetaObjectKey()); err != nil {
+		if err := rc.s3Client.Delete(ctx, key); err != nil {
 			slog.Error("failed to delete expired segment metadata",
-				"key", ref.MetaObjectKey(),
+				"key", key,
 				"err", err,
 			)
 		}
+		deleted++
 	}
 
-	slog.Info("retention cleanup removed segments",
-		"topic", p.Topic,
-		"partition", p.PartitionID,
-		"count", len(expired),
-	)
+	if deleted > 0 {
+		slog.Info("retention cleanup removed segments",
+			"topic", p.Topic,
+			"partition", p.PartitionID,
+			"count", deleted,
+		)
+	}
 	return nil
 }

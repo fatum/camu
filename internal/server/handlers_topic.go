@@ -169,9 +169,10 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("topic")
+	ctx := r.Context()
 
 	// Check if topic exists first.
-	_, err := s.topicStore.Get(r.Context(), name)
+	_, err := s.topicStore.Get(ctx, name)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "topic not found")
@@ -181,11 +182,45 @@ func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.topicStore.Delete(r.Context(), name); err != nil {
+	// Delete topic metadata.
+	if err := s.topicStore.Delete(ctx, name); err != nil {
 		slog.Error("topic_delete_failed", "topic", name, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Clean up all S3 data for this topic.
+	// Failures here are logged but do not fail the request — GC will catch leftovers.
+
+	// Delete all partition data (segments, sidecars, state.json, producers.checkpoint).
+	if keys, err := s.s3Client.List(ctx, name+"/"); err != nil {
+		slog.Warn("topic_delete_list_data_failed", "topic", name, "error", err)
+	} else {
+		for _, key := range keys {
+			if err := s.s3Client.Delete(ctx, key); err != nil {
+				slog.Warn("topic_delete_object_failed", "topic", name, "key", key, "error", err)
+			}
+		}
+	}
+
+	// Delete coordination assignment.
+	assignmentKey := fmt.Sprintf("_coordination/assignments/%s.json", name)
+	if err := s.s3Client.Delete(ctx, assignmentKey); err != nil {
+		slog.Warn("topic_delete_assignment_failed", "topic", name, "error", err)
+	}
+
+	// Delete epoch histories.
+	epochPrefix := fmt.Sprintf("_coordination/epochs/%s/", name)
+	if keys, err := s.s3Client.List(ctx, epochPrefix); err != nil {
+		slog.Warn("topic_delete_list_epochs_failed", "topic", name, "error", err)
+	} else {
+		for _, key := range keys {
+			if err := s.s3Client.Delete(ctx, key); err != nil {
+				slog.Warn("topic_delete_epoch_failed", "topic", name, "key", key, "error", err)
+			}
+		}
+	}
+
 	slog.Info("topic_deleted", "topic", name)
 	w.WriteHeader(http.StatusNoContent)
 }

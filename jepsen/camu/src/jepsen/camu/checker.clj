@@ -3,6 +3,17 @@
             [clojure.set :as set]
             [jepsen [checker :as checker]]))
 
+(defn unhandled-exception-checker
+  "Wraps Jepsen's unhandled-exceptions checker but treats any recorded
+   exception as a test failure."
+  []
+  (let [inner (checker/unhandled-exceptions)]
+    (reify checker/Checker
+      (check [_ test history opts]
+        (let [result     (checker/check inner test history opts)
+              exceptions (:exceptions result)]
+          (assoc result :valid? (empty? exceptions)))))))
+
 (defn ok-produces
   "Filters the history for successful produce operations and returns their
    value maps (containing :key :value :partition :offset)."
@@ -19,6 +30,41 @@
        (filter #(and (= (:f %) :drain)
                      (= (:type %) :ok)))
        (mapcat (fn [op] (get-in op [:value :messages])))))
+
+(defn- drain-ops
+  "Extracts all operations for the given final verification function."
+  [history f]
+  (->> history
+       (filter #(= (:f %) f))))
+
+(defn drain-coverage-checker
+  "Requires one successful final drain op per partition. Fails if any partition
+   is missing coverage, or if any drain op failed."
+  [f]
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [expected      (set (range (:num-partitions test)))
+            ops           (drain-ops history f)
+            successful    (->> ops
+                               (filter #(= (:type %) :ok))
+                               (keep #(get-in % [:value :partition]))
+                               set)
+            failures      (->> ops
+                               (filter #(= (:type %) :fail))
+                               (map (fn [op]
+                                      {:partition (get-in op [:value :partition])
+                                       :error     (:error op)}))
+                               vec)
+            missing       (set/difference expected successful)
+            unexpected    (set/difference successful expected)]
+        {:valid?               (and (empty? missing)
+                                    (empty? unexpected)
+                                    (empty? failures))
+         :expected-partitions  (count expected)
+         :successful-partitions (count successful)
+         :missing-partitions   (when (seq missing) (vec (sort missing)))
+         :unexpected-partitions (when (seq unexpected) (vec (sort unexpected)))
+         :failures             (when (seq failures) (take 20 failures))}))))
 
 (defn no-data-loss-checker
   "Verifies that every successfully acknowledged produce appears in the
@@ -181,6 +227,40 @@
          :rejoin-count  (count rejoin-events)
          :conflicts     (take 10 conflicts)}))))
 
+(defn replica-drain-messages
+  "Extracts all consumed messages from :replica-drain operations in the history."
+  [history]
+  (->> history
+       (filter #(and (= (:f %) :replica-drain)
+                     (= (:type %) :ok)))
+       (mapcat (fn [op] (get-in op [:value :messages])))))
+
+(defn replica-convergence-checker
+  "Verifies that every acked produce is eventually readable from replicas after
+   recovery. Compares acked keys against keys returned by :replica-drain ops."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [produced-keys (->> (ok-produces history) (map :key) set)
+            replica-keys  (->> (replica-drain-messages history)
+                               (map :key)
+                               set)
+            leader-keys   (->> (drain-messages history)
+                               (map :key)
+                               set)
+            missing-from-replicas (set/difference produced-keys replica-keys)
+            ;; Keys present on leader but missing from replicas indicate
+            ;; replication lag that wasn't resolved after recovery.
+            leader-only           (set/difference leader-keys replica-keys)]
+        {:valid?               (empty? missing-from-replicas)
+         :acked-keys           (count produced-keys)
+         :replica-drained-keys (count replica-keys)
+         :leader-drained-keys  (count leader-keys)
+         :missing-from-replicas (count missing-from-replicas)
+         :leader-only          (count leader-only)
+         :missing-data         (when (seq missing-from-replicas)
+                                 (take 20 (sort missing-from-replicas)))}))))
+
 (defn recovery-time-checker
   "Measures time between each nemesis fault-start event and the first successful
    client operation that follows it. Only :start events are meaningful —
@@ -220,11 +300,7 @@
   []
   (reify checker/Checker
     (check [_ test history opts]
-      (let [produced-keys (->> history
-                               (filter #(and (= (:f %) :produce)
-                                             (= (:type %) :ok)))
-                               (map #(get-in % [:value :key]))
-                               set)
+      (let [produced-keys (->> (ok-produces history) (map :key) set)
             drained-keys  (->> (drain-messages history)
                                (map :key)
                                set)
@@ -287,8 +363,11 @@
 
 (defn hw-monotonicity-checker
   "High watermark should never decrease per partition per consumer process.
-   Checks that successive :ok :consume ops on the same (process, partition)
-   have non-decreasing high-watermark values."
+   Checks that successive :ok :consume ops on the same
+   (process, partition, serving-node) have non-decreasing high-watermark
+   values. This avoids false positives during routing disagreement windows,
+   where a client in leader-read mode can retry from a dead leader to a lagging
+   follower before the new leader is universally advertised."
   []
   (reify checker/Checker
     (check [_ test history opts]
@@ -296,18 +375,21 @@
                           (filter #(and (= (:f %) :consume)
                                         (= (:type %) :ok)
                                         (get-in % [:value :high-watermark]))))
-            ;; Group by [process, partition]
+            ;; Group by [process, partition, serving node]
             grouped  (group-by (fn [op]
-                                 [(:process op) (get-in op [:value :partition])])
+                                 [(:process op)
+                                  (get-in op [:value :partition])
+                                  (get-in op [:value :node])])
                                consumes)
             violations
             (reduce-kv
-             (fn [acc [proc part] ops]
+             (fn [acc [proc part node] ops]
                (let [hws (map #(get-in % [:value :high-watermark]) ops)]
                  (if (apply <= hws)
                    acc
                    (conj acc {:process   proc
                               :partition part
+                              :node      node
                               :hws       (take 20 hws)}))))
              []
              grouped)]
@@ -337,6 +419,146 @@
                                                   :keys    (take 10 (sort (map :key msgs)))}))
                                     {}
                                     by-part))}))))
+
+(defn exactly-once-checker
+  "Verifies exactly-once delivery for idempotent produce:
+   1. Every confirmed (:ok) key appears in drain exactly once (no duplicates).
+   2. Every confirmed key appears in drain (no data loss).
+   3. No key in drain was never attempted — keys from :info (indeterminate)
+      ops are allowed in drain since the write may have succeeded."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [;; Keys confirmed by the client (:ok).
+            acked-keys    (->> history
+                               (filter #(and (= (:f %) :idempotent-produce)
+                                             (= (:type %) :ok)))
+                               (map #(get-in % [:value :key]))
+                               set)
+            ;; Keys from indeterminate ops (:info) — may or may not have been written.
+            inflight-keys (->> history
+                               (filter #(and (= (:f %) :idempotent-produce)
+                                             (= (:type %) :info)))
+                               (map #(get-in % [:value :key]))
+                               set)
+            drained       (drain-messages history)
+            ;; Only consider keys matching the idempotent produce pattern (k-N).
+            drained-keys  (->> (map :key drained)
+                               (filter #(and (some? %) (.startsWith ^String % "k-"))))
+            drained-set   (set drained-keys)
+            key-freq      (frequencies drained-keys)
+            duplicate-keys (->> key-freq
+                                (filter (fn [[_ cnt]] (> cnt 1)))
+                                (into {}))
+            ;; Missing: acked but not in drain = data loss.
+            missing       (set/difference acked-keys drained-set)
+            ;; Ghosts: in drain but never acked AND never inflight.
+            ;; Inflight keys appearing in drain is expected (write succeeded,
+            ;; response was lost).
+            ghosts        (set/difference drained-set (set/union acked-keys inflight-keys))]
+        {:valid?          (and (empty? duplicate-keys)
+                               (empty? missing)
+                               (empty? ghosts))
+         :acked-count     (count acked-keys)
+         :inflight-count  (count inflight-keys)
+         :drained-count   (count drained-keys)
+         :duplicate-count (count duplicate-keys)
+         :duplicates      (when (seq duplicate-keys) (take 20 duplicate-keys))
+         :missing-count   (count missing)
+         :missing         (when (seq missing) (take 20 missing))
+         :ghost-count     (count ghosts)
+         :ghosts          (when (seq ghosts) (take 20 ghosts))}))))
+
+(defn- parse-partition-key
+  [k]
+  (cond
+    (integer? k) k
+    (string? k) (Integer/parseInt k)
+    (keyword? k) (Integer/parseInt (name k))
+    :else nil))
+
+(defn consumer-offset-checker
+  "Checks explicit consumer offset semantics for the offsets workload:
+   committed offsets must not move backwards, must not exceed what that client
+   consumed for a partition, and fetched offsets must not exceed the latest
+   successfully committed value."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [events (sort-by :time history)
+            result (reduce
+                    (fn [{:keys [seen committed observed violations] :as acc} op]
+                      (let [proc (:process op)
+                            value (:value op)]
+                        (cond
+                          (and (= :consume (:f op))
+                               (= :ok (:type op))
+                               (seq (:messages value)))
+                          (let [partition (:partition value)
+                                next-offset (inc (apply max (map :offset (:messages value))))]
+                            (update-in acc [:seen proc partition] #(max (or % 0) next-offset)))
+
+                          (and (= :commit-offsets (:f op))
+                               (= :ok (:type op)))
+                          (let [{:keys [consumer-id partition offset]} value
+                                max-seen (get-in seen [proc partition] 0)
+                                prev-committed (get-in committed [consumer-id partition] 0)
+                                violations' (cond-> violations
+                                              (> offset max-seen)
+                                              (conj {:type :commit-ahead-of-consume
+                                                     :consumer-id consumer-id
+                                                     :process proc
+                                                     :partition partition
+                                                     :offset offset
+                                                     :max-seen max-seen})
+                                              (< offset prev-committed)
+                                              (conj {:type :commit-regressed
+                                                     :consumer-id consumer-id
+                                                     :partition partition
+                                                     :offset offset
+                                                     :prev-committed prev-committed}))]
+                            (-> acc
+                                (assoc :violations violations')
+                                (assoc-in [:committed consumer-id partition]
+                                          (max prev-committed offset))))
+
+                          (and (= :get-offsets (:f op))
+                               (= :ok (:type op)))
+                          (let [{:keys [consumer-id offsets]} value
+                                [observed' violations']
+                                (reduce-kv
+                                 (fn [[observed violations] raw-partition offset]
+                                   (let [partition (parse-partition-key raw-partition)
+                                         offset (long offset)
+                                         prev-observed (get-in observed [consumer-id partition] 0)
+                                         max-committed (get-in committed [consumer-id partition] 0)]
+                                     [(assoc-in observed [consumer-id partition]
+                                                (max prev-observed offset))
+                                      (cond-> violations
+                                        (< offset prev-observed)
+                                        (conj {:type :fetched-offset-regressed
+                                               :consumer-id consumer-id
+                                               :partition partition
+                                               :offset offset
+                                               :prev-observed prev-observed})
+                                        (> offset max-committed)
+                                        (conj {:type :fetched-offset-ahead-of-commit
+                                               :consumer-id consumer-id
+                                               :partition partition
+                                               :offset offset
+                                               :max-committed max-committed}))]))
+                                 [observed violations]
+                                 offsets)]
+                            (-> acc
+                                (assoc :observed observed')
+                                (assoc :violations violations')))
+
+                          :else acc)))
+                    {:seen {} :committed {} :observed {} :violations []}
+                    events)]
+        {:valid?     (empty? (:violations result))
+         :violations (when (seq (:violations result))
+                       (take 20 (:violations result)))}))))
 
 (defn combined-checker
   "Returns a composition of all camu checkers plus standard Jepsen

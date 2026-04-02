@@ -151,13 +151,24 @@ type ProduceMessage struct {
 
 // ProduceResponse holds the response from a produce request.
 type ProduceResponse struct {
-	Offsets []OffsetInfo `json:"offsets"`
+	Offsets   []OffsetInfo `json:"offsets"`
+	Duplicate bool         `json:"duplicate,omitempty"`
 }
 
 // OffsetInfo holds partition and offset for a produced message.
 type OffsetInfo struct {
 	Partition int    `json:"partition"`
 	Offset    uint64 `json:"offset"`
+}
+
+type InitProducerResponse struct {
+	ProducerID uint64 `json:"producer_id"`
+}
+
+type IdempotentProduceRequest struct {
+	ProducerID uint64           `json:"producer_id"`
+	Sequence   uint64           `json:"sequence"`
+	Messages   []ProduceMessage `json:"messages"`
 }
 
 // Produce sends messages to a topic.
@@ -191,6 +202,53 @@ func (c *Client) ProduceToPartition(topic string, partition int, msgs []ProduceM
 	var pr ProduceResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
 		return nil, fmt.Errorf("ProduceToPartition decode: %w", err)
+	}
+	return &pr, nil
+}
+
+// InitProducer allocates a producer ID for idempotent produce.
+func (c *Client) InitProducer() (*InitProducerResponse, error) {
+	resp, err := c.httpClient.Post(c.baseURL+"/v1/producers/init", "application/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("InitProducer request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		var ae apiError
+		json.NewDecoder(resp.Body).Decode(&ae)
+		return nil, fmt.Errorf("InitProducer: status %d: %s", resp.StatusCode, ae.Error)
+	}
+
+	var out InitProducerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("InitProducer decode: %w", err)
+	}
+	return &out, nil
+}
+
+// ProduceIdempotentToPartition sends an idempotent batch to the partition-specific endpoint.
+func (c *Client) ProduceIdempotentToPartition(topic string, partition int, reqBody IdempotentProduceRequest) (*ProduceResponse, error) {
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("ProduceIdempotentToPartition marshal: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/topics/%s/partitions/%d/messages", c.baseURL, topic, partition)
+	resp, err := c.httpClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("ProduceIdempotentToPartition request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var ae apiError
+		json.NewDecoder(resp.Body).Decode(&ae)
+		return nil, fmt.Errorf("ProduceIdempotentToPartition: status %d: %s", resp.StatusCode, ae.Error)
+	}
+
+	var pr ProduceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("ProduceIdempotentToPartition decode: %w", err)
 	}
 	return &pr, nil
 }

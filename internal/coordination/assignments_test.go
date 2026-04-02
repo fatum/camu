@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -156,5 +157,55 @@ func TestAssignmentStore_CASOverwrite(t *testing.T) {
 	}
 	if final.Partitions[0].Leader != "b" {
 		t.Errorf("partition 0: expected leader b, got %q", final.Partitions[0].Leader)
+	}
+}
+
+func TestAssignReplicated_PreservesReplicaSetWhenActiveShrinks(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 7,
+		},
+	}
+
+	got := AssignReplicated([]string{"n3"}, 1, 3, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if !reflect.DeepEqual(partition.Replicas, []string{"n1", "n2", "n3"}) {
+		t.Fatalf("replicas = %v, want [n1 n2 n3]", partition.Replicas)
+	}
+	if partition.Leader != "n3" {
+		t.Fatalf("leader = %q, want %q", partition.Leader, "n3")
+	}
+	if partition.LeaderEpoch != 8 {
+		t.Fatalf("leader_epoch = %d, want 8", partition.LeaderEpoch)
+	}
+}
+
+func TestAssignReplicated_KeepsAssignmentWhenNoReplicaIsActive(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 4,
+		},
+	}
+
+	got := AssignReplicated([]string{"n5"}, 1, 3, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if !reflect.DeepEqual(partition.Replicas, []string{"n1", "n2", "n3"}) {
+		t.Fatalf("replicas = %v, want [n1 n2 n3]", partition.Replicas)
+	}
+	if partition.Leader != "n1" {
+		t.Fatalf("leader = %q, want %q", partition.Leader, "n1")
+	}
+	if partition.LeaderEpoch != 4 {
+		t.Fatalf("leader_epoch = %d, want 4", partition.LeaderEpoch)
 	}
 }

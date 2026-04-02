@@ -1,6 +1,20 @@
-# ISR Replication — Post-Review Fixes
+# Camu TODO
 
-## Critical
+## Coordination Bugs (verified, not yet fixed)
+
+- [ ] **CRITICAL: `checkISRLag` data race** — reads `ps.isLeader`, `ps.replicaState`, `ps.epoch` without `ps.mu` (`server.go:1474`). Fix: add `ps.mu.RLock`.
+- [ ] **CRITICAL: `attemptPartitionLeadership` data race** — reads `ps.fetchCancel`/`ps.fetchDone` without `ps.mu` (`server.go:1292`). Fix: copy pattern from `initPartitionAsLeader:664`.
+- [ ] **HIGH: HW regression on failover** — `attemptPartitionLeadership` sets `recoveredHW = max(walEnd, indexNext)` but omits `isrState.HighWatermark` (`server.go:1346`). `initPartitionAsLeader:738` does this correctly.
+- [ ] **HIGH: ISR expansion not persisted** — `UpdateFollower` adds to ISR in memory but never writes to S3 (`replica_state.go:85`). Only ISR shrinkage triggers S3 write.
+- [ ] **HIGH: TOCTOU in `initPartitionAsLeader`** — checks `ps.isLeader` under `RLock`, then proceeds unlocked (`server.go:649`). Fix: re-check under `Lock`.
+- [ ] **HIGH: Phantom leader** — produce fencing uses local cache (`s.myPartitions`) updated on renewal tick. Old leader accepts writes for up to `heartbeat_interval` after CAS loss.
+- [ ] **MEDIUM: `state.json` flush without CAS** — stale leader can overwrite new leader's state
+- [ ] **MEDIUM: ISR writes use unconditional PUT** — no CAS guard, last writer wins under split brain
+- [ ] **MEDIUM: Epoch history `StartOffset`** — uses `walEnd` instead of `recoveredHW` (`server.go:1373`)
+
+## ISR Replication — Post-Review Fixes
+
+### Critical
 
 - [x] Guard unsigned underflow in ISR expansion (`internal/replication/replica_state.go:70`) — add `offset <= rs.leaderOffset` before subtraction
 - [x] Remove dead `time.AfterFunc` in purgatory (`internal/replication/purgatory.go:39-43`) — callback is empty, `time.After` on line 54 handles timeout
@@ -23,7 +37,7 @@
 
 - [x] **Segmented WAL** — `TruncateBefore` rewrites entire WAL file while holding lock (`wal.go:187-261`); use multiple small WAL files, truncation = delete old files
 - [ ] **Pipeline S3 uploads** — `onFlush` blocks on `s3Client.Put` for 50-200ms (`partition_manager.go:652`); decouple accumulation from upload with per-partition upload queue
-- [ ] **Batch index updates** — every flush does GET+PUT to S3 for index.json (`partition_manager.go:673-727`); batch updates across N segments or use append-only format
+- [x] **Batch index updates** — every flush does GET+PUT to S3 for index.json (`partition_manager.go:673-727`); batch updates across N segments or use append-only format
 - [ ] **`sync.Pool` for segment buffers** — `WriteSegment` allocates new `bytes.Buffer` per message frame (`segment.go:42-47`); pool and reuse buffers to reduce GC pressure
 - [ ] **Binary produce protocol** — JSON parsing allocates heavily with string→[]byte copies (`handlers_produce.go:54-70`); add protobuf or custom framing for high-throughput clients
 - [ ] **Server-side request coalescing** — no linger across concurrent HTTP requests; hold response for up to N ms, coalesce into single WAL write + fsync (standard Kafka/Redpanda approach)
@@ -45,20 +59,41 @@ Leaderless, zero-WAL topic type where S3 is the sole storage and durability laye
 
 Replace 307 redirects with internal proxying — any broker accepts any request and forwards to the partition owner internally.
 
-- [ ] **Internal HTTP/2 connection pool** — persistent h2/h2c connections between brokers. Shared for both request proxying and replica fetches. Multiplexed streams eliminate head-of-line blocking across partitions
-- [ ] **Proxy produce/consume to partition owner** — broker looks up owner from assignment table, forwards request, returns response. One round trip instead of two
-- [ ] **Single LB endpoint** — clients hit any broker via one DNS name. No need to know topology. Kubernetes-friendly
-- [ ] **Optional direct mode** — `?redirect=true` for clients that want to bypass proxy and go direct to partition owner
+- [x] **Internal HTTP/2 connection pool** — persistent h2/h2c connections between brokers. Shared for both request proxying and replica fetches. Multiplexed streams eliminate head-of-line blocking across partitions
+- [x] **Proxy produce/consume to partition owner** — broker looks up owner from assignment table, forwards request, returns response. One round trip instead of two
+- [x] **Single LB endpoint** — clients hit any broker via one DNS name. No need to know topology. Kubernetes-friendly
 
 ## Consumer Groups
 
 Client-side consumer groups using S3 leases for coordination. No server-side group coordinator.
 
-- [ ] **Offset commit/fetch API** — `POST /v1/groups/{gid}/offsets`, `GET /v1/groups/{gid}/offsets`. Store at `s3://bucket/offsets/{group_id}/{topic}/{partition}`
+- [x] **Offset commit/fetch API** — `POST /v1/groups/{gid}/commit`, `GET /v1/groups/{gid}/offsets`. Store at `s3://bucket/offsets/{group_id}/{topic}/{partition}`
 - [ ] **Group membership via S3 leases** — consumers heartbeat a lease key at `s3://groups/{gid}/members/{cid}`. Dead when lease expires
 - [ ] **Coordinator election** — first member to CAS a coordinator lease becomes coordinator. Reads live members, computes partition assignment (range/round-robin), writes assignments to member keys
 - [ ] **Rebalance on membership change** — coordinator detects join/leave via lease expiry on sweep, reassigns partitions. Stop-the-world initially, cooperative/incremental later
 - [ ] **Client library** — consumer group logic lives client-side. Server only provides offset storage and lease primitives
+
+## Idempotent Produce (Exactly-Once)
+
+- [x] **`Batch` struct** — per-batch producer metadata (`ProducerID`, `Sequence`)
+- [x] **Idempotency manager** — per-(producer, partition) sequence tracking, S3-based ID allocation, checkpoint/load/rebuild, stale eviction
+- [x] **Segment batch header v2** — 16 bytes producer metadata per batch
+- [x] **WAL batch envelope** — carries `ProducerID`/`Sequence` through WAL and replication wire format
+- [x] **`POST /v1/producers/init`** — S3 atomic counter for globally unique producer IDs
+- [x] **Idempotency gate** — partition-specific endpoint only; duplicate → join replication purgatory → `{"duplicate": true}`; gap → 422
+- [x] **S3 per-partition checkpoint** — uploaded during flush, downloaded on leader promotion
+- [x] **WAL recovery filtered by HW** — only committed batches rebuild idempotency state on failover
+- [x] **Stale producer eviction** — 30min TTL, runs on coordination tick
+- [x] **Jepsen exactly-once checker** — 7 test scenarios (combined faults, high concurrency, pause, S3 degradation, membership, strict quorum, soak)
+- [ ] **Per-partition sequence in segment flush** — segment batches carry `ProducerID`/`Sequence` in header but currently write 0/0; wire actual metadata through flush path for segment-level dedup on read
+- [ ] **Idempotent produce on high-level endpoint** — currently rejected with 400; could support by requiring client-side partition routing or by tracking sequences per-request (not per-partition)
+
+## Future: Protocol & Transport
+
+- [ ] **Fast failure detection** — HTTP/2 PING health checking + connection error classification in fetcher (plan at `docs/superpowers/plans/2026-04-02-fast-failure-detection.md`)
+- [ ] **Internal TCP replication** — push-based, zero-copy WAL forwarding (spec at `docs/superpowers/specs/2026-03-27-internal-tcp-protocol-design.md`)
+- [ ] **Kafka protocol support** — minimal subset (ApiVersions, Metadata, Produce, Fetch) using `franz-go/pkg/kmsg`
+- [ ] **Kafka RecordBatch as canonical format** — replace WAL/segment format for zero-copy produce/fetch/replicate
 
 ## Suggestions
 

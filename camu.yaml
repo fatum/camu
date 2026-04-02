@@ -1,0 +1,30 @@
+server:
+  address: ":8080"
+  internal_address: ":8081"
+  instance_id: ""
+storage:
+  bucket: "camu-data"
+  region: "us-east-1"
+  endpoint: ""
+  credentials:
+    access_key: ""
+    secret_key: ""
+wal:
+  directory: "/tmp/camu_wal"
+  fsync: true
+  chunk_size: 67108864
+segments:
+  max_size: 8388608
+  max_age: "5s"
+  compression: "none"
+  record_batch_target_size: 16384
+  index_interval_bytes: 4096
+cache:
+  directory: "/tmp/camu_cache"
+  max_size: 10737418240
+coordination:
+  lease_ttl: "30s"
+  rebalance_delay: "5s"
+  heartbeat_interval: "10s"
+  isr_expansion_threshold: 1000
+  replication_timeout: "30s"

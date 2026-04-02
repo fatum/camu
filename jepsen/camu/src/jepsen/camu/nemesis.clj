@@ -3,6 +3,7 @@
             [jepsen [nemesis :as nemesis]
                     [generator :as gen]
                     [control :as c]]
+            [jepsen.control.util :as cu]
             [jepsen.nemesis.combined :as nc]
             [jepsen.camu.client :as client]
             [jepsen.camu.db :as db]))
@@ -22,11 +23,25 @@
 (defn start-camu!
   "Starts camu on the current node if it is not already running."
   []
-  (c/exec :bash :-lc
-          (str "pgrep -f '/opt/camu/camu serve --config /etc/camu/camu.yaml' >/dev/null || "
-               "nohup /opt/camu/camu serve --config /etc/camu/camu.yaml "
-               ">> /var/log/camu.log 2>&1 &"))
-  (Thread/sleep 1000))
+  (let [running? (try
+                   (c/exec :bash :-lc
+                           (str "if [ -f " db/camu-pid " ]; then "
+                                "kill -0 $(cat " db/camu-pid ") >/dev/null 2>&1; "
+                                "else exit 1; fi"))
+                   true
+                   (catch Exception _ false))]
+    (when-not running?
+      ;; Remove a stale pidfile before restarting so start-daemon! can write a
+      ;; fresh one. Using the same daemon helper as DB setup avoids the
+      ;; pgrep-against-shell-string false positive the old implementation had.
+      (c/exec :rm :-f db/camu-pid)
+      (cu/start-daemon!
+       {:logfile db/camu-log
+        :pidfile db/camu-pid
+        :chdir   db/camu-data}
+       db/camu-bin
+       "serve" "--config" db/camu-config)
+      (Thread/sleep 1000))))
 
 (defn pause-camu!
   "Sends SIGSTOP to camu on the current node."
@@ -109,7 +124,21 @@
 (defn partition-nemesis
   "A nemesis that partitions the network into random halves."
   []
-  (nemesis/partition-random-halves))
+  (let [inner (nemesis/partition-random-halves)]
+    (reify nemesis/Nemesis
+      (setup! [this test]
+        (nemesis/setup! inner test)
+        this)
+      (invoke! [this test op]
+        ;; Jepsen's built-in partition nemesis expects the op function to be the
+        ;; control action itself (:start/:stop), and it owns :value for the
+        ;; generated grudge/heal result. This harness uses :f=:partition with
+        ;; :value=:start|:stop, so strip :value before delegating.
+        (nemesis/invoke! inner test (-> op
+                                        (assoc :f (:value op))
+                                        (dissoc :value))))
+      (teardown! [this test]
+        (nemesis/teardown! inner test)))))
 
 (defn rejoin-nemesis
   "A nemesis that kills a node, waits for lease expiry, then restarts it."
@@ -214,19 +243,30 @@
   []
   (nemesis/clock-scrambler 10))
 
+(defn- address->node
+  "Extracts the hostname from an address like \"n1:8080\" → \"n1\"."
+  [addr]
+  (when addr
+    (first (clojure.string/split addr #":"))))
+
 (defn find-leader-node
   "Queries the routing endpoint to find which node owns the most partitions
    for the given topic. Returns the node name or nil."
   [nodes topic]
-  (some (fn [node]
-          (when-let [routing (client/get-routing! node topic)]
-            (let [;; routing.partitions is a map/vec of partition info with :leader field
-                  partitions (or (:partitions routing) [])
-                  leaders    (keep :leader partitions)
-                  freqs      (frequencies leaders)]
-              (when (seq freqs)
-                (key (apply max-key val freqs))))))
-        (shuffle nodes)))
+  (let [node-set (set nodes)]
+    (some (fn [node]
+            (when-let [routing (client/get-routing! node topic)]
+              (let [;; routing.partitions is a map keyed by partition ID string,
+                    ;; each value has :address (e.g. "n1:8080").
+                    partitions (or (:partitions routing) {})
+                    leaders    (->> (vals partitions)
+                                    (keep (comp address->node :address)))
+                    freqs      (frequencies leaders)]
+                (when (seq freqs)
+                  (let [candidate (key (apply max-key val freqs))]
+                    (when (node-set candidate)
+                      candidate))))))
+          (shuffle nodes))))
 
 (defn leader-kill-nemesis
   "A nemesis that kills the node owning the most partitions (the busiest leader).

@@ -18,7 +18,7 @@ import (
 
 const (
 	segmentMagic   uint32 = 0x43414D55 // "CAMU"
-	segmentVersion byte   = 1
+	segmentVersion byte   = 3
 
 	CompressionNone   = "none"
 	CompressionSnappy = "snappy"
@@ -52,13 +52,23 @@ var (
 	}
 )
 
-// WriteSegment writes a segment header followed by independently readable
-// message batches. Header format: [4B magic][1B version][1B compression].
+// WriteSegment writes a segment header followed by stored WAL batch envelopes.
+// Header format: [4B magic][1B version][1B compression].
 // Each batch is:
-// [4B stored batch length][4B message count][batch bytes]
-// where batch bytes are either the raw concatenated message frames or a
-// compressed batch payload, depending on the segment compression flag.
+// [4B stored batch length][stored batch bytes]
+// where stored batch bytes are either a raw WAL batch envelope or a compressed
+// WAL batch envelope, depending on the segment compression flag.
 func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSize int64) error {
+	batches, err := buildSegmentBatches(msgs, batchTargetSize)
+	if err != nil {
+		return err
+	}
+	return WriteSegmentBatches(w, batches, compression, batchTargetSize)
+}
+
+// WriteSegmentBatches writes a segment header followed by independently readable
+// message batches, preserving the caller's batch boundaries and producer metadata.
+func WriteSegmentBatches(w io.Writer, batches []Batch, compression string, batchTargetSize int64) error {
 	var compressionFlag byte
 	switch compression {
 	case CompressionNone, "":
@@ -79,11 +89,11 @@ func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSi
 		return fmt.Errorf("write header: %w", err)
 	}
 
-	batches, err := buildSegmentBatches(msgs, batchTargetSize)
+	segmentBatches, err := buildSegmentBatchesFromBatches(batches, batchTargetSize)
 	if err != nil {
 		return err
 	}
-	for i, batch := range batches {
+	for i, batch := range segmentBatches {
 		storedBatch, err := encodeSegmentFrame(batch.payload, compressionFlag)
 		if err != nil {
 			return fmt.Errorf("encode batch %d: %w", i, err)
@@ -91,9 +101,6 @@ func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSi
 
 		if err := binary.Write(w, binary.BigEndian, uint32(len(storedBatch))); err != nil {
 			return fmt.Errorf("write batch length %d: %w", i, err)
-		}
-		if err := binary.Write(w, binary.BigEndian, uint32(batch.count)); err != nil {
-			return fmt.Errorf("write batch count %d: %w", i, err)
 		}
 		if _, err := w.Write(storedBatch); err != nil {
 			return fmt.Errorf("write batch %d: %w", i, err)
@@ -104,10 +111,9 @@ func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSi
 
 type segmentBatch struct {
 	payload []byte
-	count   int
 }
 
-func buildSegmentBatches(msgs []Message, batchTargetSize int64) ([]segmentBatch, error) {
+func buildSegmentBatches(msgs []Message, batchTargetSize int64) ([]Batch, error) {
 	if len(msgs) == 0 {
 		return nil, nil
 	}
@@ -118,40 +124,53 @@ func buildSegmentBatches(msgs []Message, batchTargetSize int64) ([]segmentBatch,
 		batchTargetSize = minSegmentRecordBatchTargetSize
 	}
 
-	batches := make([]segmentBatch, 0, (len(msgs)+31)/32)
-	var payload bytes.Buffer
-	count := 0
+	out := make([]Batch, 0, (len(msgs)+31)/32)
+	batchMsgs := make([]Message, 0, 32)
+	batchSize := 0
 
 	flush := func() {
-		if count == 0 {
+		if len(batchMsgs) == 0 {
 			return
 		}
-		batches = append(batches, segmentBatch{
-			payload: append([]byte(nil), payload.Bytes()...),
-			count:   count,
-		})
-		payload.Reset()
-		count = 0
+		cp := make([]Message, len(batchMsgs))
+		copy(cp, batchMsgs)
+		out = append(out, Batch{Messages: cp})
+		batchMsgs = make([]Message, 0, 32)
+		batchSize = 0
 	}
 
-	for i, msg := range msgs {
-		var frame bytes.Buffer
-		if err := writeMessageFrame(&frame, msg); err != nil {
-			return nil, fmt.Errorf("write message frame %d: %w", i, err)
-		}
-		frameBytes := frame.Bytes()
-
-		if count > 0 && int64(payload.Len()+len(frameBytes)) > batchTargetSize {
+	for _, msg := range msgs {
+		frameSize := encodedMessageFrameSize(msg)
+		if len(batchMsgs) > 0 && int64(batchSize+frameSize) > batchTargetSize {
 			flush()
 		}
-		if _, err := payload.Write(frameBytes); err != nil {
-			return nil, fmt.Errorf("buffer message frame %d: %w", i, err)
-		}
-		count++
+		batchMsgs = append(batchMsgs, msg)
+		batchSize += frameSize
 	}
 	flush()
 
-	return batches, nil
+	return out, nil
+}
+
+func buildSegmentBatchesFromBatches(batches []Batch, _ int64) ([]segmentBatch, error) {
+	if len(batches) == 0 {
+		return nil, nil
+	}
+
+	out := make([]segmentBatch, 0, len(batches))
+	for _, batch := range batches {
+		if len(batch.Messages) == 0 {
+			continue
+		}
+		payload, err := serializeWALBatch(batch)
+		if err != nil {
+			return nil, fmt.Errorf("serialize segment batch: %w", err)
+		}
+		out = append(out, segmentBatch{
+			payload: payload,
+		})
+	}
+	return out, nil
 }
 
 func encodeSegmentFrame(frame []byte, compressionFlag byte) ([]byte, error) {
@@ -197,27 +216,32 @@ func decodeSegmentFrame(frame []byte, compressionFlag byte) ([]byte, error) {
 // [4-byte value len][value bytes][4-byte headers count]
 // [for each header: 4-byte key len, key bytes, 4-byte val len, val bytes]
 func writeMessageFrame(w io.Writer, msg Message) error {
+	frame := make([]byte, 0, encodedMessageFrameSize(msg))
+	frame = appendMessageFrame(frame, msg)
+	_, err := w.Write(frame)
+	return err
+}
+
+func encodedMessageFrameSize(msg Message) int {
+	size := 8 + 8 + 4 + len(msg.Key) + 4 + len(msg.Value) + 4
+	for k, v := range msg.Headers {
+		size += 4 + len(k) + 4 + len(v)
+	}
+	return size
+}
+
+func appendMessageFrame(dst []byte, msg Message) []byte {
 	// offset
-	if err := binary.Write(w, binary.BigEndian, msg.Offset); err != nil {
-		return err
-	}
+	dst = binary.BigEndian.AppendUint64(dst, msg.Offset)
 	// timestamp
-	if err := binary.Write(w, binary.BigEndian, msg.Timestamp); err != nil {
-		return err
-	}
+	dst = binary.BigEndian.AppendUint64(dst, uint64(msg.Timestamp))
 	// key
-	if err := writeBytes(w, msg.Key); err != nil {
-		return err
-	}
+	dst = appendLengthPrefixedBytes(dst, msg.Key)
 	// value
-	if err := writeBytes(w, msg.Value); err != nil {
-		return err
-	}
+	dst = appendLengthPrefixedBytes(dst, msg.Value)
 	// headers count
 	headerCount := uint32(len(msg.Headers))
-	if err := binary.Write(w, binary.BigEndian, headerCount); err != nil {
-		return err
-	}
+	dst = binary.BigEndian.AppendUint32(dst, headerCount)
 	keys := make([]string, 0, len(msg.Headers))
 	for k := range msg.Headers {
 		keys = append(keys, k)
@@ -225,14 +249,15 @@ func writeMessageFrame(w io.Writer, msg Message) error {
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := msg.Headers[k]
-		if err := writeBytes(w, []byte(k)); err != nil {
-			return err
-		}
-		if err := writeBytes(w, []byte(v)); err != nil {
-			return err
-		}
+		dst = appendLengthPrefixedBytes(dst, []byte(k))
+		dst = appendLengthPrefixedBytes(dst, []byte(v))
 	}
-	return nil
+	return dst
+}
+
+func appendLengthPrefixedBytes(dst []byte, b []byte) []byte {
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(b)))
+	return append(dst, b...)
 }
 
 // writeBytes writes a 4-byte length prefix followed by the byte slice.
@@ -268,58 +293,71 @@ func ReadSegmentFromOffsetWithIndex(r io.ReaderAt, size int64, offsetIndex []byt
 	return readSegmentFromOffset(r, size, offsetIndex, baseOffset, startOffset, limit)
 }
 
+// WalkSegmentFromOffsetWithIndex decodes messages from a segment incrementally
+// and calls visit for each message at or above startOffset. Returning false
+// from visit stops the scan early.
+func WalkSegmentFromOffsetWithIndex(r io.ReaderAt, size int64, offsetIndex []byte, baseOffset uint64, startOffset uint64, limit int, visit func(Message) bool) error {
+	_, err := walkSegmentFromOffset(r, size, offsetIndex, baseOffset, startOffset, limit, visit)
+	return err
+}
+
 func readSegmentFromOffset(r io.ReaderAt, size int64, offsetIndex []byte, baseOffset uint64, startOffset uint64, limit int) ([]Message, error) {
+	msgs := make([]Message, 0)
+	_, err := walkSegmentFromOffset(r, size, offsetIndex, baseOffset, startOffset, limit, func(msg Message) bool {
+		msgs = append(msgs, msg)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
+func walkSegmentFromOffset(r io.ReaderAt, size int64, offsetIndex []byte, baseOffset uint64, startOffset uint64, limit int, visit func(Message) bool) (int, error) {
 	sr := io.NewSectionReader(r, 0, size)
 
 	// Validate magic number
 	var magic uint32
 	if err := binary.Read(sr, binary.BigEndian, &magic); err != nil {
-		return nil, fmt.Errorf("read magic: %w", err)
+		return 0, fmt.Errorf("read magic: %w", err)
 	}
 	if magic != segmentMagic {
-		return nil, fmt.Errorf("invalid magic number: got 0x%08X, want 0x%08X", magic, segmentMagic)
+		return 0, fmt.Errorf("invalid magic number: got 0x%08X, want 0x%08X", magic, segmentMagic)
 	}
 
 	// Read version
 	var version [1]byte
 	if _, err := io.ReadFull(sr, version[:]); err != nil {
-		return nil, fmt.Errorf("read version: %w", err)
+		return 0, fmt.Errorf("read version: %w", err)
 	}
 	if version[0] != segmentVersion {
-		return nil, fmt.Errorf("unsupported segment version: %d", version[0])
+		return 0, fmt.Errorf("unsupported segment version: %d", version[0])
 	}
 
 	// Read compression flag
 	var compressionFlag [1]byte
 	if _, err := io.ReadFull(sr, compressionFlag[:]); err != nil {
-		return nil, fmt.Errorf("read compression flag: %w", err)
+		return 0, fmt.Errorf("read compression flag: %w", err)
 	}
 
 	startPos := int64(6) // 4B magic + 1B version + 1B compression
 	if len(offsetIndex) > 0 && startOffset > baseOffset {
 		if pos, ok, err := lookupSegmentOffsetIndex(offsetIndex, baseOffset, startOffset); err != nil {
-			return nil, err
+			return 0, err
 		} else if ok {
 			startPos = int64(pos)
 		}
 	}
 	sr = io.NewSectionReader(r, startPos, size-startPos)
 
-	var msgs []Message
+	visited := 0
 	for {
 		var batchLen uint32
 		if err := binary.Read(sr, binary.BigEndian, &batchLen); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
-			return nil, fmt.Errorf("read batch length: %w", err)
-		}
-		var batchCount uint32
-		if err := binary.Read(sr, binary.BigEndian, &batchCount); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-			return nil, fmt.Errorf("read batch count: %w", err)
+			return visited, fmt.Errorf("read batch length: %w", err)
 		}
 
 		batch := make([]byte, batchLen)
@@ -327,36 +365,38 @@ func readSegmentFromOffset(r io.ReaderAt, size int64, offsetIndex []byte, baseOf
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
-			return nil, fmt.Errorf("read batch payload: %w", err)
+			return visited, fmt.Errorf("read batch payload: %w", err)
 		}
 
 		payload, err := decodeSegmentFrame(batch, compressionFlag[0])
 		if err != nil {
-			return nil, fmt.Errorf("decode batch: %w", err)
+			return visited, fmt.Errorf("decode batch: %w", err)
 		}
 
-		pr := bytes.NewReader(payload)
-		for i := uint32(0); i < batchCount; i++ {
-			msg, err := readMessageFrame(pr)
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
+		reader := bytes.NewReader(payload)
+		_, _, _, err = scanWALBatches(reader, int64(len(payload)), 0, func(b Batch) bool {
+			for _, msg := range b.Messages {
+				if msg.Offset < startOffset {
+					continue
+				}
+				visited++
+				if visit != nil && !visit(msg) {
+					return false
+				}
+				if limit > 0 && visited >= limit {
+					return false
+				}
 			}
-			if err != nil {
-				return nil, fmt.Errorf("read message frame: %w", err)
-			}
-
-			if msg.Offset < startOffset {
-				continue
-			}
-
-			msgs = append(msgs, msg)
-
-			if limit > 0 && len(msgs) >= limit {
-				return msgs, nil
-			}
+			return true
+		})
+		if err != nil {
+			return visited, fmt.Errorf("read WAL batch from segment: %w", err)
+		}
+		if limit > 0 && visited >= limit {
+			return visited, nil
 		}
 	}
-	return msgs, nil
+	return visited, nil
 }
 
 type segmentOffsetIndexEntry struct {
@@ -456,30 +496,30 @@ func BuildSegmentOffsetIndex(segment []byte, baseOffset uint64, intervalBytes in
 			}
 			return nil, fmt.Errorf("read batch length: %w", err)
 		}
-		var batchCount uint32
-		if err := binary.Read(reader, binary.BigEndian, &batchCount); err != nil {
-			return nil, fmt.Errorf("read batch count: %w", err)
-		}
-
 		payload := make([]byte, batchLen)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			return nil, fmt.Errorf("read batch payload: %w", err)
 		}
-		if batchCount == 0 {
-			continue
-		}
 
 		// We need the first message offset in each stored batch to build a
 		// Kafka-style sparse offset index. With the current batch-compressed
-		// format, that requires decoding the batch payload here. This is flush-
-		// time work only, so the extra CPU is acceptable on the write path.
+		// format, that requires decoding the stored WAL batch envelope here.
 		decoded, err := decodeSegmentFrame(payload, compressionFlag[0])
 		if err != nil {
 			return nil, fmt.Errorf("decode batch: %w", err)
 		}
-		firstMsg, err := readMessageFrame(bytes.NewReader(decoded))
+		var firstMeta BatchMeta
+		found := false
+		_, _, _, err = scanWALBatchMetas(bytes.NewReader(decoded), int64(len(decoded)), 0, func(meta BatchMeta) bool {
+			firstMeta = meta
+			found = true
+			return false
+		})
 		if err != nil {
-			return nil, fmt.Errorf("read first message in batch: %w", err)
+			return nil, fmt.Errorf("read first WAL batch meta in segment: %w", err)
+		}
+		if !found || firstMeta.MessageCount == 0 {
+			continue
 		}
 
 		if batchStart < headerSize {
@@ -488,10 +528,10 @@ func BuildSegmentOffsetIndex(segment []byte, baseOffset uint64, intervalBytes in
 		if batchStart > math.MaxUint32 {
 			return nil, fmt.Errorf("batch position %d exceeds uint32", batchStart)
 		}
-		if firstMsg.Offset < baseOffset {
-			return nil, fmt.Errorf("batch offset %d before base offset %d", firstMsg.Offset, baseOffset)
+		if firstMeta.FirstOffset < baseOffset {
+			return nil, fmt.Errorf("batch offset %d before base offset %d", firstMeta.FirstOffset, baseOffset)
 		}
-		rel := firstMsg.Offset - baseOffset
+		rel := firstMeta.FirstOffset - baseOffset
 		if rel > math.MaxUint32 {
 			return nil, fmt.Errorf("relative offset %d exceeds uint32", rel)
 		}
@@ -543,50 +583,139 @@ func lookupSegmentOffsetIndex(index []byte, baseOffset uint64, targetOffset uint
 
 // readMessageFrame reads one message frame from r.
 func readMessageFrame(r io.Reader) (Message, error) {
+	frameBytes, err := io.ReadAll(r)
+	if err != nil {
+		return Message{}, err
+	}
+	return readMessageFrameBytes(frameBytes)
+}
+
+func readMessageFrameOffset(r io.Reader) (uint64, error) {
+	frameBytes, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	return readMessageFrameOffsetBytes(frameBytes)
+}
+
+func readMessageFrameBytes(frame []byte) (Message, error) {
 	var msg Message
+	var ok bool
 
-	// offset
-	if err := binary.Read(r, binary.BigEndian, &msg.Offset); err != nil {
-		return msg, err
+	msg.Offset, frame, ok = readUint64Bytes(frame)
+	if !ok {
+		return msg, io.ErrUnexpectedEOF
 	}
-	// timestamp
-	if err := binary.Read(r, binary.BigEndian, &msg.Timestamp); err != nil {
-		return msg, err
+	ts, rest, ok := readUint64Bytes(frame)
+	if !ok {
+		return msg, io.ErrUnexpectedEOF
 	}
-	// key
-	key, err := readBytes(r)
-	if err != nil {
-		return msg, err
-	}
-	msg.Key = key
+	msg.Timestamp = int64(ts)
+	frame = rest
 
-	// value
-	value, err := readBytes(r)
-	if err != nil {
-		return msg, err
+	msg.Key, frame, ok = readLengthPrefixedBytes(frame)
+	if !ok {
+		return msg, io.ErrUnexpectedEOF
 	}
-	msg.Value = value
+	msg.Value, frame, ok = readLengthPrefixedBytes(frame)
+	if !ok {
+		return msg, io.ErrUnexpectedEOF
+	}
 
-	// headers count
 	var headerCount uint32
-	if err := binary.Read(r, binary.BigEndian, &headerCount); err != nil {
-		return msg, err
+	headerCount, frame, ok = readUint32Bytes(frame)
+	if !ok {
+		return msg, io.ErrUnexpectedEOF
 	}
 	if headerCount > 0 {
 		msg.Headers = make(map[string]string, headerCount)
 		for i := uint32(0); i < headerCount; i++ {
-			hKey, err := readBytes(r)
-			if err != nil {
-				return msg, err
+			var hKey, hVal []byte
+			hKey, frame, ok = readLengthPrefixedBytes(frame)
+			if !ok {
+				return msg, io.ErrUnexpectedEOF
 			}
-			hVal, err := readBytes(r)
-			if err != nil {
-				return msg, err
+			hVal, frame, ok = readLengthPrefixedBytes(frame)
+			if !ok {
+				return msg, io.ErrUnexpectedEOF
 			}
 			msg.Headers[string(hKey)] = string(hVal)
 		}
 	}
+	if len(frame) != 0 {
+		return msg, fmt.Errorf("trailing bytes in message frame: %d", len(frame))
+	}
 	return msg, nil
+}
+
+func readMessageFrameOffsetBytes(frame []byte) (uint64, error) {
+	offset, frame, ok := readUint64Bytes(frame)
+	if !ok {
+		return 0, io.ErrUnexpectedEOF
+	}
+	_, frame, ok = readUint64Bytes(frame)
+	if !ok {
+		return 0, io.ErrUnexpectedEOF
+	}
+	frame, ok = skipLengthPrefixedBytes(frame)
+	if !ok {
+		return 0, io.ErrUnexpectedEOF
+	}
+	frame, ok = skipLengthPrefixedBytes(frame)
+	if !ok {
+		return 0, io.ErrUnexpectedEOF
+	}
+	headerCount, frame, ok := readUint32Bytes(frame)
+	if !ok {
+		return 0, io.ErrUnexpectedEOF
+	}
+	for i := uint32(0); i < headerCount; i++ {
+		frame, ok = skipLengthPrefixedBytes(frame)
+		if !ok {
+			return 0, io.ErrUnexpectedEOF
+		}
+		frame, ok = skipLengthPrefixedBytes(frame)
+		if !ok {
+			return 0, io.ErrUnexpectedEOF
+		}
+	}
+	if len(frame) != 0 {
+		return 0, fmt.Errorf("trailing bytes in message frame: %d", len(frame))
+	}
+	return offset, nil
+}
+
+func readUint32Bytes(b []byte) (uint32, []byte, bool) {
+	if len(b) < 4 {
+		return 0, nil, false
+	}
+	return binary.BigEndian.Uint32(b[:4]), b[4:], true
+}
+
+func readUint64Bytes(b []byte) (uint64, []byte, bool) {
+	if len(b) < 8 {
+		return 0, nil, false
+	}
+	return binary.BigEndian.Uint64(b[:8]), b[8:], true
+}
+
+func readLengthPrefixedBytes(b []byte) ([]byte, []byte, bool) {
+	length, rest, ok := readUint32Bytes(b)
+	if !ok {
+		return nil, nil, false
+	}
+	if uint32(len(rest)) < length {
+		return nil, nil, false
+	}
+	if length == 0 {
+		return nil, rest, true
+	}
+	return rest[:length], rest[length:], true
+}
+
+func skipLengthPrefixedBytes(b []byte) ([]byte, bool) {
+	_, rest, ok := readLengthPrefixedBytes(b)
+	return rest, ok
 }
 
 // readBytes reads a 4-byte length-prefixed byte slice.
@@ -604,4 +733,16 @@ func readBytes(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+func skipBytes(r io.Reader) error {
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return err
+	}
+	if length == 0 {
+		return nil
+	}
+	_, err := io.CopyN(io.Discard, r, int64(length))
+	return err
 }

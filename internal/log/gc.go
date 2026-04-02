@@ -8,8 +8,8 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
-// GarbageCollector removes orphaned segment objects from S3 that are no longer
-// referenced by the partition index.
+// GarbageCollector removes orphaned sidecar objects from S3 whose matching
+// segment file is missing (typically from a crash during flush).
 type GarbageCollector struct {
 	s3Client *storage.S3Client
 }
@@ -19,48 +19,64 @@ func NewGarbageCollector(s3 *storage.S3Client) *GarbageCollector {
 	return &GarbageCollector{s3Client: s3}
 }
 
-// FindOrphans lists all .segment objects under {topic}/{partitionID}/ in S3,
-// loads the partition index, and returns the keys that are not referenced by
-// any index entry.
+// FindOrphans lists all objects under {topic}/{partitionID}/ in S3 and returns
+// sidecar keys (.offset.idx, .meta.json) that have no matching .segment file.
 func (gc *GarbageCollector) FindOrphans(ctx context.Context, topic string, partitionID int) ([]string, error) {
 	prefix := fmt.Sprintf("%s/%d/", topic, partitionID)
-	indexKey := fmt.Sprintf("%s%s", prefix, "index.json")
-
-	// Load index
-	data, err := gc.s3Client.Get(ctx, indexKey)
+	keys, err := gc.s3Client.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("gc FindOrphans: load index %q: %w", indexKey, err)
-	}
-	idx := NewIndex()
-	if err := idx.UnmarshalJSON(data); err != nil {
-		return nil, fmt.Errorf("gc FindOrphans: unmarshal index: %w", err)
+		return nil, fmt.Errorf("gc list: %w", err)
 	}
 
-	// Build set of indexed keys
-	indexed := make(map[string]struct{}, len(idx.segments)*3)
-	for _, r := range idx.segments {
-		indexed[r.Key] = struct{}{}
-		indexed[r.OffsetIndexObjectKey()] = struct{}{}
-		indexed[r.MetaObjectKey()] = struct{}{}
-	}
-
-	// List all objects under the prefix
-	allKeys, err := gc.s3Client.List(ctx, prefix)
-	if err != nil {
-		return nil, fmt.Errorf("gc FindOrphans: list %q: %w", prefix, err)
-	}
-
-	var orphans []string
-	for _, key := range allKeys {
-		if !strings.HasSuffix(key, ".segment") &&
-			!strings.HasSuffix(key, ".offset.idx") &&
-			!strings.HasSuffix(key, ".meta.json") {
-			continue
+	// Build sets of segment and meta keys, plus a lookup set of all keys.
+	segments := make(map[string]struct{})
+	metas := make(map[string]struct{})
+	all := make(map[string]struct{})
+	for _, key := range keys {
+		all[key] = struct{}{}
+		if strings.HasSuffix(key, ".segment") {
+			segments[key] = struct{}{}
+		} else if strings.HasSuffix(key, ".meta.json") {
+			metas[key] = struct{}{}
 		}
-		if _, ok := indexed[key]; !ok {
+	}
+
+	// Orphan = sidecar without matching segment.
+	var orphans []string
+	for _, key := range keys {
+		if strings.HasSuffix(key, ".offset.idx") {
+			segKey := strings.TrimSuffix(key, ".offset.idx") + ".segment"
+			if _, ok := segments[segKey]; !ok {
+				orphans = append(orphans, key)
+			}
+		} else if strings.HasSuffix(key, ".meta.json") {
+			segKey := strings.TrimSuffix(key, ".meta.json") + ".segment"
+			if _, ok := segments[segKey]; !ok {
+				orphans = append(orphans, key)
+			}
+		}
+	}
+
+	// Reverse orphan: .segment without .meta.json (incomplete upload).
+	for segKey := range segments {
+		metaKey := strings.TrimSuffix(segKey, ".segment") + ".meta.json"
+		if _, ok := metas[metaKey]; !ok {
+			orphans = append(orphans, segKey)
+			// Also flag the .offset.idx if it exists.
+			idxKey := strings.TrimSuffix(segKey, ".segment") + ".offset.idx"
+			if _, ok := all[idxKey]; ok {
+				orphans = append(orphans, idxKey)
+			}
+		}
+	}
+
+	// Legacy index.json files.
+	for _, key := range keys {
+		if strings.HasSuffix(key, "/index.json") {
 			orphans = append(orphans, key)
 		}
 	}
+
 	return orphans, nil
 }
 

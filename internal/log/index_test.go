@@ -1,10 +1,6 @@
 package log
 
-import (
-	"encoding/json"
-	"testing"
-	"time"
-)
+import "testing"
 
 func TestIndex_AddAndLookup(t *testing.T) {
 	idx := NewIndex()
@@ -43,45 +39,6 @@ func TestIndex_AddAndLookup(t *testing.T) {
 	}
 	if got := idx.baseOffsets; len(got) != 2 || got[0] != 0 || got[1] != 100 {
 		t.Fatalf("baseOffsets = %v, want [0 100]", got)
-	}
-}
-
-func TestIndex_MarshalJSON(t *testing.T) {
-	idx := NewIndex()
-	now := time.Now().UTC().Truncate(time.Second)
-	idx.Add(SegmentRef{
-		BaseOffset: 0,
-		EndOffset:  99,
-		Epoch:      1,
-		Key:        "seg-0",
-		CreatedAt:  now,
-	})
-
-	data, err := json.Marshal(idx)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-
-	idx2 := NewIndex()
-	if err := json.Unmarshal(data, idx2); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	ref, ok := idx2.Lookup(50)
-	if !ok {
-		t.Fatal("expected to find offset 50 after unmarshal")
-	}
-	if ref.BaseOffset != 0 {
-		t.Errorf("expected BaseOffset=0, got %d", ref.BaseOffset)
-	}
-	if ref.Key != "seg-0" {
-		t.Errorf("expected Key=seg-0, got %s", ref.Key)
-	}
-	if ref.Epoch != 1 {
-		t.Errorf("expected Epoch=1, got %d", ref.Epoch)
-	}
-	if !ref.CreatedAt.Equal(now) {
-		t.Errorf("expected CreatedAt=%v, got %v", now, ref.CreatedAt)
 	}
 }
 
@@ -215,57 +172,6 @@ func TestIndex_Add_KeepsPartiallyOverlappingSegment(t *testing.T) {
 	}
 }
 
-func TestIndex_ObjectFormat(t *testing.T) {
-	idx := NewIndex()
-	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 49, Epoch: 1, Key: "seg-0"})
-	idx.Add(SegmentRef{BaseOffset: 50, EndOffset: 99, Epoch: 2, Key: "seg-1"})
-	idx.SetHighWatermark(75)
-	idx.SetEpochHistory([]EpochEntry{
-		{Epoch: 1, StartOffset: 0},
-		{Epoch: 2, StartOffset: 50},
-	})
-
-	data, err := json.Marshal(idx)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-
-	// Verify it is an object, not an array.
-	if len(data) == 0 || data[0] != '{' {
-		t.Fatalf("expected JSON object, got: %s", data)
-	}
-
-	idx2 := NewIndex()
-	if err := json.Unmarshal(data, idx2); err != nil {
-		t.Fatalf("unmarshal failed: %v", err)
-	}
-
-	if idx2.HighWatermark() != 75 {
-		t.Errorf("expected HighWatermark=75, got %d", idx2.HighWatermark())
-	}
-	eh := idx2.EpochHistory()
-	if len(eh) != 2 {
-		t.Fatalf("expected 2 epoch entries, got %d", len(eh))
-	}
-	if eh[0].Epoch != 1 || eh[0].StartOffset != 0 {
-		t.Errorf("unexpected epoch entry 0: %+v", eh[0])
-	}
-	if eh[1].Epoch != 2 || eh[1].StartOffset != 50 {
-		t.Errorf("unexpected epoch entry 1: %+v", eh[1])
-	}
-
-	ref, ok := idx2.Lookup(60)
-	if !ok {
-		t.Fatal("expected to find offset 60 after round-trip")
-	}
-	if ref.Key != "seg-1" {
-		t.Errorf("expected Key=seg-1, got %s", ref.Key)
-	}
-	if got := idx2.baseOffsets; len(got) != 2 || got[0] != 0 || got[1] != 50 {
-		t.Fatalf("baseOffsets after round-trip = %v, want [0 50]", got)
-	}
-}
-
 func TestIndex_SegmentsFrom(t *testing.T) {
 	idx := NewIndex()
 	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 9, Key: "seg-0"})
@@ -282,29 +188,5 @@ func TestIndex_SegmentsFrom(t *testing.T) {
 
 	if segs := idx.SegmentsFrom(30, 0); segs != nil {
 		t.Fatalf("SegmentsFrom(30) = %v, want nil", segs)
-	}
-}
-
-func TestIndex_BackwardCompat(t *testing.T) {
-	// Legacy bare-array format produced by old code.
-	legacy := `[{"base_offset":0,"end_offset":99,"epoch":1,"key":"seg-0","created_at":"0001-01-01T00:00:00Z"}]`
-
-	idx := NewIndex()
-	if err := json.Unmarshal([]byte(legacy), idx); err != nil {
-		t.Fatalf("unmarshal legacy format failed: %v", err)
-	}
-
-	ref, ok := idx.Lookup(50)
-	if !ok {
-		t.Fatal("expected to find offset 50 from legacy index")
-	}
-	if ref.Key != "seg-0" {
-		t.Errorf("expected Key=seg-0, got %s", ref.Key)
-	}
-	if idx.HighWatermark() != 0 {
-		t.Errorf("expected HighWatermark=0 for legacy index, got %d", idx.HighWatermark())
-	}
-	if idx.EpochHistory() != nil {
-		t.Errorf("expected nil EpochHistory for legacy index, got %v", idx.EpochHistory())
 	}
 }

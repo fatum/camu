@@ -162,6 +162,62 @@ func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, par
 	return allMsgs, nextOffset, nil
 }
 
+// Walk retrieves messages starting at startOffset, up to limit, and calls
+// visit for each decoded message in offset order. Returning false from visit
+// stops the scan early.
+func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, partitionID int, startOffset uint64, limit int, visit func(log.Message) bool) (uint64, error) {
+	if index == nil || limit <= 0 {
+		return startOffset, nil
+	}
+
+	currentOffset := startOffset
+	remaining := limit
+
+	for remaining > 0 {
+		segmentPlan := index.SegmentsFrom(currentOffset, 1)
+		if len(segmentPlan) == 0 {
+			break
+		}
+		segRef := segmentPlan[0]
+
+		data, err := f.fetchSegmentData(ctx, segRef.Key)
+		if err != nil {
+			return currentOffset, err
+		}
+		offsetIdx, err := f.fetchOptionalSegmentData(ctx, segRef.OffsetIndexObjectKey())
+		if err != nil {
+			return currentOffset, err
+		}
+
+		produced := 0
+		err = log.WalkSegmentFromOffsetWithIndex(
+			bytes.NewReader(data),
+			int64(len(data)),
+			offsetIdx,
+			segRef.BaseOffset,
+			currentOffset,
+			remaining,
+			func(msg log.Message) bool {
+				produced++
+				currentOffset = msg.Offset + 1
+				remaining--
+				if visit != nil && !visit(msg) {
+					return false
+				}
+				return remaining > 0
+			},
+		)
+		if err != nil {
+			return currentOffset, fmt.Errorf("read segment: %w", err)
+		}
+		if remaining == 0 || produced == 0 {
+			break
+		}
+	}
+
+	return currentOffset, nil
+}
+
 type segmentFetchResult struct {
 	data      []byte
 	offsetIdx []byte
