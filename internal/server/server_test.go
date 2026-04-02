@@ -276,6 +276,98 @@ func TestInitPartitionAsLeader_SetsLeaderEpoch(t *testing.T) {
 	}
 }
 
+func TestInitPartitionAsLeader_RefreshesIndexFromS3BeforeRecoveringTail(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 3,
+		MinInsyncReplicas: 2,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	// Simulate a follower that started before any segments existed locally,
+	// then later gets promoted after the old leader has already flushed a
+	// committed prefix to S3.
+	var oldSeg bytes.Buffer
+	oldMsgs := []log.Message{
+		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
+		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
+		{Offset: 3, Key: []byte("k3"), Value: []byte("v3")},
+		{Offset: 4, Key: []byte("k4"), Value: []byte("v4")},
+	}
+	if err := log.WriteSegment(&oldSeg, oldMsgs, log.CompressionNone, 16*1024); err != nil {
+		t.Fatalf("WriteSegment() error = %v", err)
+	}
+	oldSegKey := log.FormatSegmentKey("topic", 0, 0, 4, 1)
+	if err := s.s3Client.Put(ctx, oldSegKey, oldSeg.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatalf("s3Client.Put(segment) error = %v", err)
+	}
+	partState := &log.PartitionState{HighWatermark: 5}
+	stateData, err := partState.Marshal()
+	if err != nil {
+		t.Fatalf("PartitionState.Marshal() error = %v", err)
+	}
+	if err := s.s3Client.Put(ctx, log.StateKey("topic", 0), stateData, storage.PutOpts{}); err != nil {
+		t.Fatalf("s3Client.Put(state) error = %v", err)
+	}
+
+	tailMsgs := []log.Message{
+		{Offset: 5, Key: []byte("k5"), Value: []byte("v5")},
+		{Offset: 6, Key: []byte("k6"), Value: []byte("v6")},
+		{Offset: 7, Key: []byte("k7"), Value: []byte("v7")},
+		{Offset: 8, Key: []byte("k8"), Value: []byte("v8")},
+		{Offset: 9, Key: []byte("k9"), Value: []byte("v9")},
+	}
+	if err := ps.wal.AppendBatch(tailMsgs); err != nil {
+		t.Fatalf("wal.AppendBatch() error = %v", err)
+	}
+	ps.nextOffset = 10
+	ps.flushedOffset = 4
+	s.assignmentsMu.Lock()
+	s.myPartitions["topic"] = map[int]localPartitionAssignment{
+		0: {Owned: true, LeaderEpoch: 2},
+	}
+	s.assignmentsMu.Unlock()
+
+	s.initPartitionAsLeader(ctx, "topic", 0, coordination.PartitionAssignment{
+		Replicas:    []string{"n1", "n2", "n3"},
+		Leader:      "n1",
+		LeaderEpoch: 2,
+	})
+
+	if got := ps.index.HighWatermark(); got != 10 {
+		t.Fatalf("index.HighWatermark() = %d, want 10", got)
+	}
+	if got := ps.index.NextOffset(); got != 10 {
+		t.Fatalf("index.NextOffset() = %d, want 10", got)
+	}
+	if _, ok := ps.index.Lookup(0); !ok {
+		t.Fatal("expected flushed S3 prefix to remain in index after promotion")
+	}
+	if _, ok := ps.index.Lookup(9); !ok {
+		t.Fatal("expected recovered WAL tail to be flushed into index after promotion")
+	}
+	if got := ps.flushedOffset; got != 9 {
+		t.Fatalf("ps.flushedOffset = %d, want 9", got)
+	}
+}
+
 func TestGetRoutingMap_FallsBackToLeaderHostWhenRegistryMissing(t *testing.T) {
 	s := newTestServer(t)
 

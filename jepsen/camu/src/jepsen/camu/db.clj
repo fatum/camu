@@ -57,6 +57,38 @@
     (c/exec :mkdir :-p "/etc/camu")
     (c/exec :echo config :> camu-config)))
 
+(defn upload-camu-binary!
+  "Uploads the camu binary and verifies it exists remotely before continuing.
+   Jepsen setup occasionally races here under repeated Dockerized runs."
+  [test]
+  (loop [attempt 1]
+    (c/exec :mkdir :-p "/opt/camu")
+    (let [tmp-bin (str camu-bin ".tmp")]
+      (c/exec :rm :-f tmp-bin camu-bin)
+      (c/upload (:camu-binary test) tmp-bin)
+      (let [present? (try
+                       (c/exec :bash :-lc (str "test -f " tmp-bin " && test -s " tmp-bin))
+                       true
+                       (catch Exception _ false))]
+      (cond
+        present?
+        (do
+          (c/exec :mv :-f tmp-bin camu-bin)
+          (c/exec :chmod :+x camu-bin))
+
+        (< attempt 3)
+        (do
+          (info "Retrying camu binary upload, remote file missing after upload" "attempt" attempt)
+          (c/exec :rm :-f tmp-bin camu-bin)
+          (Thread/sleep 500)
+          (recur (inc attempt)))
+
+        :else
+        (throw (ex-info "uploaded camu binary missing on remote node"
+                        {:type :upload-failed
+                         :path camu-bin
+                         :attempts attempt})))))))
+
 (defn db
   "Camu database for Jepsen."
   []
@@ -66,9 +98,8 @@
       (c/exec :mkdir :-p "/opt/camu"
               (str camu-data "/wal")
               (str camu-data "/cache"))
-      ;; Upload the camu binary
-      (c/upload (:camu-binary test) camu-bin)
-      (c/exec :chmod :+x camu-bin)
+      ;; Upload the camu binary and verify the remote file is present before startup.
+      (upload-camu-binary! test)
       ;; Write config
       (write-config! test node)
       ;; Start camu as a daemon. In long-run modes we can disable per-node log

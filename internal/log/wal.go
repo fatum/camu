@@ -1041,6 +1041,21 @@ func (w *WAL) TruncateBeforeLocked(offset uint64) error {
 	return w.truncateBeforeLocked(offset)
 }
 
+// TruncateFrom deletes or rewrites chunks so only messages with offsets below
+// offset remain.
+func (w *WAL) TruncateFrom(offset uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.truncateFromLocked(offset)
+}
+
+// TruncateFromLocked is like TruncateFrom but assumes the caller already holds
+// the partition-level lock.
+func (w *WAL) TruncateFromLocked(offset uint64) error {
+	return w.truncateFromLocked(offset)
+}
+
 func (w *WAL) truncateBeforeLocked(offset uint64) error {
 	if len(w.chunks) == 0 {
 		return nil
@@ -1103,6 +1118,90 @@ func (w *WAL) truncateBeforeLocked(offset uint64) error {
 				maxOffset:  msgs[len(msgs)-1].Offset,
 				size:       int64(len(data)),
 				active:     first.active,
+			}
+		}
+	}
+
+	w.chunks = kept
+	sort.Slice(w.chunks, func(i, j int) bool {
+		if w.chunks[i].baseOffset == w.chunks[j].baseOffset {
+			if w.chunks[i].active == w.chunks[j].active {
+				return false
+			}
+			return !w.chunks[i].active
+		}
+		return w.chunks[i].baseOffset < w.chunks[j].baseOffset
+	})
+	return nil
+}
+
+func (w *WAL) truncateFromLocked(offset uint64) error {
+	if len(w.chunks) == 0 {
+		return nil
+	}
+
+	if err := w.closeActiveFileLocked(); err != nil {
+		return fmt.Errorf("close WAL active chunk before truncate-from: %w", err)
+	}
+
+	chunks := append([]walChunk(nil), w.chunks...)
+	cutIdx := sort.Search(len(chunks), func(i int) bool { return chunks[i].baseOffset >= offset })
+
+	kept := append([]walChunk(nil), chunks[:cutIdx]...)
+
+	for _, chunk := range chunks[cutIdx:] {
+		path := w.chunkPathLocked(chunk)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove WAL chunk %q: %w", path, err)
+		}
+	}
+
+	if len(kept) > 0 {
+		lastIdx := len(kept) - 1
+		last := kept[lastIdx]
+		if last.maxOffset >= offset {
+			oldPath := w.chunkPathLocked(last)
+			frames, err := readChunkBatchFrames(oldPath, 0)
+			if err != nil {
+				return err
+			}
+			keepFrames := frames[:0]
+			for _, frame := range frames {
+				if frame.Meta.MessageCount == 0 {
+					continue
+				}
+				if frame.Meta.FirstOffset >= offset {
+					break
+				}
+				if frame.Meta.LastOffset >= offset {
+					break
+				}
+				keepFrames = append(keepFrames, frame)
+			}
+			if len(keepFrames) == 0 {
+				if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("remove truncated WAL chunk %q: %w", oldPath, err)
+				}
+				kept = kept[:lastIdx]
+			} else {
+				totalSize := 0
+				for _, frame := range keepFrames {
+					totalSize += len(frame.Data)
+				}
+				data := make([]byte, 0, totalSize)
+				for _, frame := range keepFrames {
+					data = append(data, frame.Data...)
+				}
+				if err := rewriteChunkFile(w.dir, oldPath, data, w.fsync); err != nil {
+					return err
+				}
+				kept[lastIdx] = walChunk{
+					baseOffset: keepFrames[0].Meta.FirstOffset,
+					maxOffset:  keepFrames[len(keepFrames)-1].Meta.LastOffset,
+					size:       int64(len(data)),
+					active:     last.active,
+					flushed:    last.flushed,
+				}
 			}
 		}
 	}

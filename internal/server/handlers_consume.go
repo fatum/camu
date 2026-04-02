@@ -31,6 +31,7 @@ const maxConsumeLimit = 20000
 func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
 	partitionStr := r.PathValue("id")
+	w.Header().Set("X-Camu-Instance-ID", s.instanceID)
 
 	partitionID, err := strconv.Atoi(partitionStr)
 	if err != nil {
@@ -510,6 +511,7 @@ func (s *Server) streamMessagesJSON(ctx context.Context, w http.ResponseWriter, 
 func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
 	partitionStr := r.PathValue("id")
+	w.Header().Set("X-Camu-Instance-ID", s.instanceID)
 
 	partitionID, err := strconv.Atoi(partitionStr)
 	if err != nil {

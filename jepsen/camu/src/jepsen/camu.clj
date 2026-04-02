@@ -94,6 +94,37 @@
             (consume-gen partitions offsets)
             (consume-gen partitions offsets)]))
 
+(defn commit-offsets-gen
+  "Requests a commit for a random partition using the client-local consumed
+   offset tracked by the Jepsen client."
+  [partitions]
+  (fn [_ _]
+    {:type  :invoke
+     :f     :commit-offsets
+     :value {:partition (rand-int partitions)}}))
+
+(defn get-offsets-gen
+  "Fetches the committed offsets for the current Jepsen client consumer ID."
+  []
+  (fn [_ _]
+    {:type  :invoke
+     :f     :get-offsets
+     :value {}}))
+
+(defn offsets-workload-gen
+  "Mixed workload for explicit consumer offset semantics."
+  [partitions counter offsets]
+  (gen/mix [(produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (produce-gen counter)
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)
+            (consume-gen partitions offsets)
+            (commit-offsets-gen partitions)
+            (commit-offsets-gen partitions)
+            (get-offsets-gen)]))
+
 (defn num-partitions
   [opts]
   (get opts :num-partitions default-partitions))
@@ -112,19 +143,20 @@
   [opts counter offsets]
   (let [partitions (num-partitions opts)]
     (case (or (:workload opts) :mixed)
-    :idempotent (gen/mix [(idempotent-produce-gen counter)
-                          (idempotent-produce-gen counter)
-                          (idempotent-produce-gen counter)
-                          (idempotent-produce-gen counter)
-                          (idempotent-produce-gen counter)
-                          (idempotent-produce-gen counter)
-                          (idempotent-produce-gen counter)
-                          (consume-gen partitions offsets)
-                          (consume-gen partitions offsets)
-                          (consume-gen partitions offsets)])
-    :large-requests (large-requests-workload-gen partitions counter offsets)
-    :replica-flushed-reads (replica-flushed-reads-workload-gen partitions counter offsets)
-    (mixed-workload-gen partitions counter offsets))))
+      :idempotent (gen/mix [(idempotent-produce-gen counter)
+                            (idempotent-produce-gen counter)
+                            (idempotent-produce-gen counter)
+                            (idempotent-produce-gen counter)
+                            (idempotent-produce-gen counter)
+                            (idempotent-produce-gen counter)
+                            (idempotent-produce-gen counter)
+                            (consume-gen partitions offsets)
+                            (consume-gen partitions offsets)
+                            (consume-gen partitions offsets)])
+      :offsets (offsets-workload-gen partitions counter offsets)
+      :large-requests (large-requests-workload-gen partitions counter offsets)
+      :replica-flushed-reads (replica-flushed-reads-workload-gen partitions counter offsets)
+      (mixed-workload-gen partitions counter offsets))))
 
 (defn drain-gen
   "Returns a generator that drains all partitions using the given operation.
@@ -146,38 +178,54 @@
   "Returns the appropriate checker composition based on whether the test
    is running in replicated mode."
   [opts]
-  (if (= :idempotent (:workload opts))
-    (checker/compose
-     {:exactly-once       (camu-checker/exactly-once-checker)
-      :offset-monotonicity (camu-checker/offset-monotonicity-checker)
-      :total-order        (camu-checker/total-order-checker)
-      :availability       (camu-checker/availability-checker)
-      :recovery-time      (camu-checker/recovery-time-checker)
-      :stats              (checker/stats)})
-    (if (replicated? opts)
-    ;; Replicated: use key-based durability and epoch-based leader checks
-    (checker/compose
-     {:committed-durability  (camu-checker/committed-durability-checker)
-      :no-ghost-reads        (camu-checker/no-ghost-reads-checker)
-      :single-leader         (camu-checker/single-leader-checker)
-      :hw-monotonicity       (camu-checker/hw-monotonicity-checker)
-      :truncation-safety     (camu-checker/truncation-safety-checker)
-      :offset-monotonicity   (camu-checker/offset-monotonicity-checker)
-      :total-order           (camu-checker/total-order-checker)
-      :replica-convergence   (camu-checker/replica-convergence-checker)
-      :availability          (camu-checker/availability-checker)
-      :recovery-time         (camu-checker/recovery-time-checker)
-      :stats                 (checker/stats)})
-    ;; Unreplicated: original checkers
-    (checker/compose
-     {:no-data-loss        (camu-checker/no-data-loss-checker)
-      :offset-monotonicity (camu-checker/offset-monotonicity-checker)
-      :no-split-brain      (camu-checker/no-split-brain-checker)
-      :total-order         (camu-checker/total-order-checker)
-      :availability        (camu-checker/availability-checker)
-      :lease-fencing       (camu-checker/lease-fencing-checker)
-      :recovery-time       (camu-checker/recovery-time-checker)
-      :stats               (checker/stats)}))))
+  (let [meta-checkers (cond-> {:stats         (checker/stats)
+                               :availability  (camu-checker/availability-checker)
+                               :recovery-time (camu-checker/recovery-time-checker)
+                               :ex            (camu-checker/unhandled-exception-checker)}
+                        (db/capture-node-logs?)
+                        (assoc :server-log
+                               (checker/log-file-pattern
+                                #"(?i)(panic:|fatal error:|segmentation fault|sigsegv|sigabrt|warning: data race)"
+                                "camu.log")))
+        base (merge meta-checkers
+                    {:leader-drain-coverage (camu-checker/drain-coverage-checker :drain)})
+        replicated-base (if (replicated? opts)
+                          (assoc base :replica-drain-coverage
+                                 (camu-checker/drain-coverage-checker :replica-drain))
+                          base)]
+    (if (= :idempotent (:workload opts))
+      (checker/compose
+       (merge replicated-base
+              {:exactly-once        (camu-checker/exactly-once-checker)
+               :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+               :total-order         (camu-checker/total-order-checker)}))
+      (if (= :offsets (:workload opts))
+        (checker/compose
+         (merge replicated-base
+                {:committed-durability (camu-checker/committed-durability-checker)
+                 :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
+                 :total-order          (camu-checker/total-order-checker)
+                 :consumer-offsets     (camu-checker/consumer-offset-checker)}))
+        (if (replicated? opts)
+          ;; Replicated: use key-based durability and epoch-based leader checks
+          (checker/compose
+           (merge replicated-base
+                  {:committed-durability (camu-checker/committed-durability-checker)
+                   :no-ghost-reads       (camu-checker/no-ghost-reads-checker)
+                   :single-leader        (camu-checker/single-leader-checker)
+                   :hw-monotonicity      (camu-checker/hw-monotonicity-checker)
+                   :truncation-safety    (camu-checker/truncation-safety-checker)
+                   :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
+                   :total-order          (camu-checker/total-order-checker)
+                   :replica-convergence  (camu-checker/replica-convergence-checker)}))
+          ;; Unreplicated: original checkers
+          (checker/compose
+           (merge base
+                  {:no-data-loss        (camu-checker/no-data-loss-checker)
+                   :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+                   :no-split-brain      (camu-checker/no-split-brain-checker)
+                   :total-order         (camu-checker/total-order-checker)
+                   :lease-fencing       (camu-checker/lease-fencing-checker)})))))))
 
 (defn camu-test
   "Constructs a Jepsen test map for camu."
@@ -259,10 +307,10 @@
     :default :leader
     :parse-fn keyword
     :validate [#{:leader :replica :any} "must be one of: leader, replica, any"]]
-   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, or idempotent"
+   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, idempotent, or offsets"
     :default :mixed
     :parse-fn keyword
-    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent"]]])
+    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent :offsets} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent, offsets"]]])
 
 (defn -main
   "Entry point for the Jepsen CLI."

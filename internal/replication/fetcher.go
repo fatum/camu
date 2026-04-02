@@ -18,8 +18,9 @@ import (
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
 	AppendReplicatedBatchFrames(ctx context.Context, topic string, pid int, frames []log.BatchFrame) error
-	TruncateWAL(topic string, pid int, beforeOffset uint64) error
-	UpdateFollowerProgress(topic string, pid int, highWatermark, flushedOffset uint64)
+	TruncateWALFrom(topic string, pid int, offset uint64) error
+	PruneWALBefore(topic string, pid int, offset uint64) error
+	UpdateFollowerProgress(topic string, pid int, leaderEpoch, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
@@ -134,15 +135,15 @@ func (f *FollowerFetcher) Run(
 
 		// Handle divergence: truncate before appending anything.
 		if resp.HasTruncate {
-			if err := pm.TruncateWAL(topic, pid, resp.TruncateTo); err != nil {
-				slog.Warn("fetcher: TruncateWAL failed",
+			if err := pm.TruncateWALFrom(topic, pid, resp.TruncateTo); err != nil {
+				slog.Warn("fetcher: TruncateWALFrom failed",
 					"topic", topic, "pid", pid, "truncateTo", resp.TruncateTo, "err", err)
 			}
 			localOffset = resp.TruncateTo
 			if resp.LeaderEpoch > localEpoch {
 				localEpoch = resp.LeaderEpoch
 			}
-			pm.UpdateFollowerProgress(topic, pid, resp.HighWatermark, resp.FlushedOffset)
+			pm.UpdateFollowerProgress(topic, pid, localEpoch, resp.HighWatermark, resp.FlushedOffset)
 			continue
 		}
 
@@ -178,12 +179,12 @@ func (f *FollowerFetcher) Run(
 
 		// Prune below the leader's flushed offset.
 		if resp.FlushedOffset > 0 {
-			if err := pm.TruncateWAL(topic, pid, resp.FlushedOffset); err != nil {
-				slog.Warn("fetcher: prune TruncateWAL failed",
+			if err := pm.PruneWALBefore(topic, pid, resp.FlushedOffset); err != nil {
+				slog.Warn("fetcher: prune PruneWALBefore failed",
 					"topic", topic, "pid", pid, "flushedOffset", resp.FlushedOffset, "err", err)
 			}
 		}
-		pm.UpdateFollowerProgress(topic, pid, resp.HighWatermark, resp.FlushedOffset)
+		pm.UpdateFollowerProgress(topic, pid, localEpoch, resp.HighWatermark, resp.FlushedOffset)
 	}
 }
 

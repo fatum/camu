@@ -7,7 +7,8 @@
             [cheshire.core :as json])
   (:import (java.net ConnectException SocketTimeoutException)
            (java.time Instant)
-           (java.nio.charset StandardCharsets)))
+           (java.nio.charset StandardCharsets)
+           (java.util UUID)))
 
 (def default-topic "jepsen-test")
 (def http-timeout-ms 5000)
@@ -191,12 +192,14 @@
        (let [body (json/parse-string (:body resp) true)
              hw   (when-let [h (get-in resp [:headers "x-high-watermark"])]
                     (Long/parseLong h))
+             node (or (get-in resp [:headers "x-camu-instance-id"]) node)
              msgs (vec (map (fn [m] {:offset    (:offset m)
                                      :partition partition
                                      :key       (:key m)
                                      :value     (:value m)})
                             (:messages body)))]
-         (cond-> {:messages msgs}
+         (cond-> {:messages msgs
+                  :node node}
            hw (assoc :high-watermark hw)))
        (throw (ex-info (str "consume failed: " (:status resp))
                        {:type :consume-failed
@@ -480,7 +483,7 @@
    then verifies the produce path works with a successful probe."
   [nodes topic num-partitions replication-factor timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-    (loop []
+    (loop [last-state nil]
       (let [routing-ready (some (fn [n]
                                   (try
                                     (let [routing (get-routing! n topic)
@@ -519,19 +522,34 @@
                                 (range num-partitions)))]
         (cond
           produce-ready
-          (info "Topic" topic "ready — produce succeeded")
+          (do
+            (info "Topic" topic "ready — produce succeeded")
+            true)
 
           (> (System/currentTimeMillis) deadline)
-          (warn "Timed out waiting for topic readiness")
+          (throw (ex-info "topic readiness timeout"
+                          {:type :topic-not-ready
+                           :topic topic
+                           :num-partitions num-partitions
+                           :replication-factor replication-factor
+                           :last-state last-state}))
 
           :else
           (do (Thread/sleep 3000)
-              (recur)))))))
+              (recur {:routing-ready routing-ready
+                      :s3-ready s3-ready
+                      :produce-ready produce-ready})))))))
 
 (defrecord CamuClient [node topic]
   client/Client
   (open! [this test node']
-    (let [this' (assoc this :node node')]
+    (let [this' (assoc this :node node')
+          num-partitions (get test :num-partitions 4)
+          this' (if (= :offsets (:workload test))
+                  (assoc this'
+                         :consumer-id (str "jepsen-consumer-" (UUID/randomUUID))
+                         :seen-offsets (atom {}))
+                  this')]
       (if (= :idempotent (:workload test))
         ;; Each client thread gets its own producer ID and per-partition sequence counters.
         (let [pid (loop [nodes (shuffle (:nodes test))]
@@ -540,7 +558,6 @@
                       (let [result (try (init-producer! (first nodes))
                                        (catch Exception _ nil))]
                         (or result (recur (rest nodes))))))
-              num-partitions (get test :num-partitions 4)
               ;; One sequence atom per partition.
               seqs (into {} (map (fn [p] [p (atom 0)]) (range num-partitions)))]
           (assoc this' :producer-id pid :sequences seqs :num-partitions num-partitions))
@@ -676,7 +693,13 @@
            (when (seq messages)
              (let [max-offset (apply max (map :offset messages))]
                (swap! offsets-atom update partition #(max (or % 0) (inc max-offset))))))
-         (assoc op :type :ok :value (cond-> {:partition partition :messages messages}
+         (when-let [seen-offsets (:seen-offsets this)]
+           (when (seq messages)
+             (let [max-offset (apply max (map :offset messages))]
+               (swap! seen-offsets update partition #(max (or % 0) (inc max-offset))))))
+         (assoc op :type :ok :value (cond-> {:partition partition
+                                             :messages messages
+                                             :node (:node result)}
                                       hw (assoc :high-watermark hw))))
 
        :drain
@@ -700,15 +723,38 @@
 
        :commit-offsets
        (let [{:keys [consumer-id partition offset]} (:value op)
+             consumer-id (or consumer-id (:consumer-id this))
+             local-seen   (when-let [seen-offsets (:seen-offsets this)]
+                            @seen-offsets)
+             offset      (or offset (get local-seen partition))
+             _           (when (or (nil? consumer-id) (nil? partition))
+                           (throw (ex-info "missing commit-offsets fields"
+                                           {:type :offset-commit-failed
+                                            :status :invalid-request
+                                            :partition partition
+                                            :offset offset})))
              topic  (topic-name this test)
-             result (commit-offsets! node topic consumer-id partition offset)]
-         (assoc op :type :ok :value result))
+             result (if (nil? offset)
+                      ::nothing-to-commit
+                      (commit-offsets! node topic consumer-id partition offset))]
+         (if (= ::nothing-to-commit result)
+           (assoc op :type :info
+                  :value {:consumer-id consumer-id
+                          :partition partition
+                          :offset nil}
+                  :error :nothing-to-commit)
+           (assoc op :type :ok
+                  :value {:consumer-id consumer-id
+                          :partition partition
+                          :offset offset})))
 
        :get-offsets
        (let [{:keys [consumer-id]} (:value op)
+             consumer-id (or consumer-id (:consumer-id this))
              topic  (topic-name this test)
              result (get-offsets! node topic consumer-id)]
-         (assoc op :type :ok :value result)))
+         (assoc op :type :ok :value {:consumer-id consumer-id
+                                     :offsets result})))
 
      (catch ConnectException _
        (assoc op :type :fail :error :connection-refused))

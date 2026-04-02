@@ -16,7 +16,8 @@ import (
 type mockPartitionManager struct {
 	mu             sync.Mutex
 	appended       []log.BatchFrame
-	truncated      []uint64
+	truncatedFrom  []uint64
+	prunedBefore   []uint64
 	highWatermarks []uint64
 	flushedOffsets []uint64
 }
@@ -35,14 +36,21 @@ func (m *mockPartitionManager) AppendReplicatedBatchFrames(_ context.Context, _ 
 	return nil
 }
 
-func (m *mockPartitionManager) TruncateWAL(_ string, _ int, beforeOffset uint64) error {
+func (m *mockPartitionManager) TruncateWALFrom(_ string, _ int, offset uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.truncated = append(m.truncated, beforeOffset)
+	m.truncatedFrom = append(m.truncatedFrom, offset)
 	return nil
 }
 
-func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, highWatermark, flushedOffset uint64) {
+func (m *mockPartitionManager) PruneWALBefore(_ string, _ int, offset uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prunedBefore = append(m.prunedBefore, offset)
+	return nil
+}
+
+func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, _ uint64, highWatermark, flushedOffset uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.highWatermarks = append(m.highWatermarks, highWatermark)
@@ -58,7 +66,13 @@ func (m *mockPartitionManager) appendedFrames() []log.BatchFrame {
 func (m *mockPartitionManager) truncatedOffsets() []uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.truncated
+	return m.truncatedFrom
+}
+
+func (m *mockPartitionManager) prunedOffsets() []uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.prunedBefore
 }
 
 func (m *mockPartitionManager) progress() ([]uint64, []uint64) {

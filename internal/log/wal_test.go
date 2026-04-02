@@ -573,3 +573,61 @@ func TestWAL_TruncateRemovesRetainedFlushedChunks(t *testing.T) {
 		t.Fatalf("ReadFrom() returned %d messages after truncate, want 0", len(msgs))
 	}
 }
+
+func TestWAL_TruncateFromKeepsPrefixAndDropsSuffix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "truncate-suffix.wal")
+
+	w, err := OpenWAL(path, false, 64)
+	if err != nil {
+		t.Fatalf("OpenWAL() error: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.AppendBatch([]Message{
+		{Offset: 0, Value: []byte("v0")},
+		{Offset: 1, Value: []byte("v1")},
+	}); err != nil {
+		t.Fatalf("AppendBatch(batch1) error: %v", err)
+	}
+	if err := w.AppendBatch([]Message{
+		{Offset: 2, Value: []byte("v2")},
+		{Offset: 3, Value: []byte("v3")},
+	}); err != nil {
+		t.Fatalf("AppendBatch(batch2) error: %v", err)
+	}
+	if err := w.AppendBatch([]Message{
+		{Offset: 4, Value: []byte("v4")},
+		{Offset: 5, Value: []byte("v5")},
+	}); err != nil {
+		t.Fatalf("AppendBatch(batch3) error: %v", err)
+	}
+
+	if err := w.TruncateFrom(4); err != nil {
+		t.Fatalf("TruncateFrom() error: %v", err)
+	}
+
+	msgs, err := w.ReadFrom(0, 10)
+	if err != nil {
+		t.Fatalf("ReadFrom() error: %v", err)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("ReadFrom() returned %d messages, want 4", len(msgs))
+	}
+	for i, msg := range msgs {
+		if got, want := msg.Offset, uint64(i); got != want {
+			t.Fatalf("msg[%d].Offset = %d, want %d", i, got, want)
+		}
+	}
+
+	frames, err := w.ReadBatchFramesFrom(0)
+	if err != nil {
+		t.Fatalf("ReadBatchFramesFrom() error: %v", err)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("ReadBatchFramesFrom() returned %d frames, want 2", len(frames))
+	}
+	if got := frames[len(frames)-1].Meta.LastOffset; got != 3 {
+		t.Fatalf("last frame LastOffset = %d, want 3", got)
+	}
+}

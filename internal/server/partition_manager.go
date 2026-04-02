@@ -410,11 +410,17 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 		"next_offset", nextOffset,
 	)
 
+	flushedOffset := uint64(0)
+	if idx.NextOffset() > 0 {
+		flushedOffset = idx.NextOffset() - 1
+	}
+
 	return &partitionState{
 		wal:          wal,
 		index:        idx,
 		nextOffset:   nextOffset,
 		epoch:        epoch,
+		flushedOffset: flushedOffset,
 		producerSeqs: make(map[uint64]*producerPartitionState),
 	}, nil
 }
@@ -709,6 +715,12 @@ func (pm *PartitionManager) RefreshIndex(ctx context.Context, topic string, part
 
 	ps.mu.Lock()
 	ps.index = idx
+	if nextOffset := idx.NextOffset(); nextOffset > 0 {
+		refreshedFlushedOffset := nextOffset - 1
+		if refreshedFlushedOffset > ps.flushedOffset {
+			ps.flushedOffset = refreshedFlushedOffset
+		}
+	}
 	ps.mu.Unlock()
 }
 
@@ -748,9 +760,9 @@ func (pm *PartitionManager) GetPartitionState(topic string, partitionID int) *pa
 	return nil
 }
 
-// UpdateFollowerProgress records the latest leader-advertised readable
-// high-watermark and flushed offset for a follower partition.
-func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int, highWatermark, flushedOffset uint64) {
+// UpdateFollowerProgress records the latest leader-advertised epoch, readable
+// high-watermark, and flushed offset for a follower partition.
+func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int, leaderEpoch, highWatermark, flushedOffset uint64) {
 	pm.mu.RLock()
 	parts, ok := pm.partitions[topic]
 	if !ok {
@@ -765,6 +777,9 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 	pm.mu.RUnlock()
 
 	ps.mu.Lock()
+	if leaderEpoch > ps.epoch {
+		ps.epoch = leaderEpoch
+	}
 	if highWatermark > ps.followerHW {
 		ps.followerHW = highWatermark
 	}
@@ -774,8 +789,26 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 	ps.mu.Unlock()
 }
 
-// TruncateWAL removes WAL entries before the given offset for a partition.
-func (pm *PartitionManager) TruncateWAL(topic string, pid int, beforeOffset uint64) error {
+// TruncateWALFrom removes WAL entries at and above the given offset for a partition.
+func (pm *PartitionManager) TruncateWALFrom(topic string, pid int, offset uint64) error {
+	ps := pm.GetPartitionState(topic, pid)
+	if ps == nil {
+		return fmt.Errorf("partition %s/%d not found", topic, pid)
+	}
+	ps.mu.Lock()
+	err := ps.wal.TruncateFromLocked(offset)
+	if ps.nextOffset > offset {
+		ps.nextOffset = offset
+	}
+	if ps.followerHW > ps.nextOffset {
+		ps.followerHW = ps.nextOffset
+	}
+	ps.mu.Unlock()
+	return err
+}
+
+// PruneWALBefore removes WAL entries before the given offset for a partition.
+func (pm *PartitionManager) PruneWALBefore(topic string, pid int, beforeOffset uint64) error {
 	ps := pm.GetPartitionState(topic, pid)
 	if ps == nil {
 		return fmt.Errorf("partition %s/%d not found", topic, pid)

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 FAULTS="${1:-kill}"
 TIME_LIMIT="${2:-120}"
@@ -20,6 +20,12 @@ echo "Building camu for Linux..."
 cd "$(dirname "$0")/../.."
 GOOS=linux GOARCH=amd64 go build -o jepsen/camu/camu ./cmd/camu/
 cd jepsen/camu
+
+echo "Cleaning previous Docker Compose state..."
+docker compose down -v --remove-orphans 2>/dev/null || true
+docker rm -f camu-setup-minio-1 camu-minio-1 camu-n1-1 camu-n2-1 camu-n3-1 camu-n4-1 camu-n5-1 2>/dev/null || true
+docker network rm camu_jepsen 2>/dev/null || true
+docker volume rm camu_shared-ssh 2>/dev/null || true
 
 echo "Starting infrastructure (minio, nodes)..."
 docker compose up -d minio setup-minio n1 n2 n3 n4 n5

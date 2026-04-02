@@ -659,6 +659,27 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		return
 	}
 
+	// If this partition was a follower, stop the fetch loop before recovery so
+	// we don't race an old-leader append against local leader promotion.
+	ps.mu.Lock()
+	existingCancel := ps.fetchCancel
+	existingDone := ps.fetchDone
+	ps.fetchCancel = nil
+	ps.fetchDone = nil
+	ps.mu.Unlock()
+	if existingCancel != nil {
+		existingCancel()
+		if existingDone != nil {
+			<-existingDone
+		}
+	}
+
+	// Refresh the local index from S3 before recovering as leader. Assignment-
+	// driven promotions do not go through the follower failover path, and the
+	// in-memory index can otherwise miss flushed prefix segments from the old
+	// leader, which causes the promoted leader to rebuild only its WAL tail.
+	s.partitionManager.RefreshIndex(ctx, topic, pid)
+
 	// WAL replay: recover true log end from WAL.
 	// ps.nextOffset may be stale if partition was re-initialized from S3.
 	ps.mu.RLock()
@@ -829,7 +850,7 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	}
 
 	ps.mu.RLock()
-	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader && ps.epoch == pa.LeaderEpoch {
+	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader {
 		ps.mu.RUnlock()
 		return
 	}
@@ -882,10 +903,9 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	ps.mu.Lock()
 	ps.isLeader = false
 	ps.leaderID = pa.Leader
-	ps.epoch = pa.LeaderEpoch
 	ps.replicaState = nil
 	localOffset := ps.nextOffset
-	fetchEpoch := ps.epoch
+	fetchEpoch := localEpoch
 	fetchDone := make(chan struct{})
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel
