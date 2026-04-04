@@ -126,6 +126,11 @@ func (ks *KafkaServer) handleFetch(req *kmsg.FetchRequest) (kmsg.Response, error
 				}
 			}
 			partResp.ErrorCode = errorCode
+			// Kafka Fetch flex versions require a non-null RecordBatches field.
+			// A nil slice encodes as length -1, which clients reject.
+			if partResp.RecordBatches == nil {
+				partResp.RecordBatches = []byte{}
+			}
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
 		}
 
