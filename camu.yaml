@@ -9,10 +9,6 @@ storage:
   credentials:
     access_key: ""
     secret_key: ""
-wal:
-  directory: "/tmp/camu_wal"
-  fsync: true
-  chunk_size: 67108864
 segments:
   max_size: 8388608
   max_age: "5s"

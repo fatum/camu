@@ -113,6 +113,31 @@ func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
 	return nil
 }
 
+// Update overwrites an existing topic configuration.
+func (ts *TopicStore) Update(ctx context.Context, cfg TopicConfig) error {
+	if _, err := ts.Get(ctx, cfg.Name); err != nil {
+		return fmt.Errorf("Update: checking existence of %q: %w", cfg.Name, err)
+	}
+	if cfg.ReplicationFactor == 0 {
+		cfg.ReplicationFactor = 1
+	}
+	if cfg.MinInsyncReplicas == 0 {
+		cfg.MinInsyncReplicas = 1
+	}
+
+	data, err := json.Marshal(cfg.toJSON())
+	if err != nil {
+		return fmt.Errorf("Update: marshal %q: %w", cfg.Name, err)
+	}
+	if err := ts.s3Client.Put(ctx, topicKey(cfg.Name), data, storage.PutOpts{
+		ContentType: "application/json",
+	}); err != nil {
+		return fmt.Errorf("Update: put %q: %w", cfg.Name, err)
+	}
+	ts.cache.Store(cfg.Name, cfg)
+	return nil
+}
+
 // Get retrieves a topic configuration by name. Returns a wrapped storage.ErrNotFound if missing.
 func (ts *TopicStore) Get(ctx context.Context, name string) (TopicConfig, error) {
 	// Check cache first.

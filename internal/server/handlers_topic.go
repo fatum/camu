@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -56,20 +58,12 @@ func topicToResponse(tc meta.TopicConfig) topicResponse {
 	}
 }
 
-func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
-	var req createTopicRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
+func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.TopicConfig, error) {
 	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
-		return
+		return meta.TopicConfig{}, fmt.Errorf("name is required")
 	}
 	if req.Partitions < 1 {
-		writeError(w, http.StatusBadRequest, "partitions must be at least 1")
-		return
+		return meta.TopicConfig{}, fmt.Errorf("partitions must be at least 1")
 	}
 
 	retention := 168 * time.Hour // default 7 days
@@ -77,8 +71,7 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		var err error
 		retention, err = time.ParseDuration(req.Retention)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid retention duration")
-			return
+			return meta.TopicConfig{}, fmt.Errorf("invalid retention duration")
 		}
 	}
 
@@ -91,18 +84,15 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		minISR = 1
 	}
 
-	instances, err := s.registry.ActiveInstances(r.Context())
+	instances, err := s.registry.ActiveInstances(ctx)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list instances")
-		return
+		return meta.TopicConfig{}, fmt.Errorf("failed to list instances")
 	}
 	if rf > len(instances) {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("replication_factor %d exceeds active instances %d", rf, len(instances)))
-		return
+		return meta.TopicConfig{}, fmt.Errorf("replication_factor %d exceeds active instances %d", rf, len(instances))
 	}
 	if minISR > rf {
-		writeError(w, http.StatusBadRequest, "min_insync_replicas cannot exceed replication_factor")
-		return
+		return meta.TopicConfig{}, fmt.Errorf("min_insync_replicas cannot exceed replication_factor")
 	}
 
 	tc := meta.TopicConfig{
@@ -115,27 +105,75 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		UncleanLeaderElection: req.UncleanLeaderElection,
 	}
 
-	if err := s.topicStore.Create(r.Context(), tc); err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		slog.Error("topic_create_failed", "topic", tc.Name, "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		return meta.TopicConfig{}, err
 	}
 
 	// Acquire leases first so we have epochs for partition init.
 	s.AcquireLeasesForTopic(tc)
 
 	epochs := s.getOwnedEpochs(tc.Name)
-	if err := s.partitionManager.InitTopic(r.Context(), tc, epochs); err != nil {
-		slog.Error("topic_init_failed", "topic", tc.Name, "partitions", tc.Partitions, "error", err)
-		writeError(w, http.StatusInternalServerError, "topic created but partition init failed: "+err.Error())
-		return
+	if err := s.partitionManager.InitTopic(ctx, tc, epochs); err != nil {
+		return meta.TopicConfig{}, fmt.Errorf("topic created but partition init failed: %w", err)
+	}
+
+	// In the simple single-broker case, do not wait for the background
+	// coordination loop to promote partitions. Make them locally writable and
+	// readable before returning from topic creation.
+	if tc.ReplicationFactor == 1 {
+		s.assignmentsMu.Lock()
+		if s.myPartitions[tc.Name] == nil {
+			s.myPartitions[tc.Name] = make(map[int]localPartitionAssignment)
+		}
+		s.assignmentsMu.Unlock()
+		for pid := 0; pid < tc.Partitions; pid++ {
+			epoch := epochs[pid]
+			if epoch == 0 {
+				epoch = 1
+			}
+			s.initPartitionAsLeader(ctx, tc.Name, pid, coordination.PartitionAssignment{
+				Replicas:    []string{s.instanceID},
+				Leader:      s.instanceID,
+				LeaderEpoch: epoch,
+			})
+			s.assignmentsMu.Lock()
+			s.myPartitions[tc.Name][pid] = localPartitionAssignment{
+				Owned:       true,
+				LeaderEpoch: epoch,
+			}
+			s.assignmentsMu.Unlock()
+		}
 	}
 
 	slog.Info("topic_created", "topic", tc.Name, "partitions", tc.Partitions)
+	return tc, nil
+}
+
+func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
+	var req createTopicRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	tc, err := s.createTopic(r.Context(), req)
+	if err != nil {
+		switch {
+		case strings.Contains(err.Error(), "already exists"):
+			writeError(w, http.StatusConflict, err.Error())
+		case strings.Contains(err.Error(), "required"),
+			strings.Contains(err.Error(), "partitions must be at least 1"),
+			strings.Contains(err.Error(), "invalid retention duration"),
+			strings.Contains(err.Error(), "replication_factor"),
+			strings.Contains(err.Error(), "min_insync_replicas"):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			slog.Error("topic_create_failed", "topic", req.Name, "error", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, topicToResponse(tc))
 }
 
@@ -167,26 +205,16 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, topicToResponse(tc))
 }
 
-func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("topic")
-	ctx := r.Context()
-
+func (s *Server) deleteTopic(ctx context.Context, name string) error {
 	// Check if topic exists first.
 	_, err := s.topicStore.Get(ctx, name)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "topic not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return err
 	}
 
 	// Delete topic metadata.
 	if err := s.topicStore.Delete(ctx, name); err != nil {
-		slog.Error("topic_delete_failed", "topic", name, "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return err
 	}
 
 	// Clean up all S3 data for this topic.
@@ -222,5 +250,19 @@ func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("topic_deleted", "topic", name)
+	return nil
+}
+
+func (s *Server) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("topic")
+	if err := s.deleteTopic(r.Context(), name); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "topic not found")
+			return
+		}
+		slog.Error("topic_delete_failed", "topic", name, "error", err)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

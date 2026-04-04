@@ -86,14 +86,7 @@ func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, par
 				return nil, 0, fetched[i].err
 			}
 
-			msgs, err := log.ReadSegmentFromOffsetWithIndex(
-				bytes.NewReader(fetched[i].data),
-				int64(len(fetched[i].data)),
-				fetched[i].offsetIdx,
-				segRef.BaseOffset,
-				currentOffset,
-				remaining,
-			)
+			msgs, err := decodeSegmentData(fetched[i].data, fetched[i].offsetIdx, segRef.BaseOffset, currentOffset, remaining)
 			if err != nil {
 				slog.Debug("consume_segment_decode_failed",
 					"topic", topic,
@@ -190,23 +183,43 @@ func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, part
 		}
 
 		produced := 0
-		err = log.WalkSegmentFromOffsetWithIndex(
-			bytes.NewReader(data),
-			int64(len(data)),
-			offsetIdx,
-			segRef.BaseOffset,
-			currentOffset,
-			remaining,
-			func(msg log.Message) bool {
-				produced++
-				currentOffset = msg.Offset + 1
-				remaining--
-				if visit != nil && !visit(msg) {
-					return false
+		var walkErr error
+		if log.IsRecordBatchFormat(data) {
+			var msgs []log.Message
+			msgs, walkErr = log.ReadSegmentBatchesAsMessages(data, currentOffset, remaining)
+			if walkErr == nil {
+				for _, msg := range msgs {
+					produced++
+					currentOffset = msg.Offset + 1
+					remaining--
+					if visit != nil && !visit(msg) {
+						break
+					}
+					if remaining == 0 {
+						break
+					}
 				}
-				return remaining > 0
-			},
-		)
+			}
+		} else {
+			walkErr = log.WalkSegmentFromOffsetWithIndex(
+				bytes.NewReader(data),
+				int64(len(data)),
+				offsetIdx,
+				segRef.BaseOffset,
+				currentOffset,
+				remaining,
+				func(msg log.Message) bool {
+					produced++
+					currentOffset = msg.Offset + 1
+					remaining--
+					if visit != nil && !visit(msg) {
+						return false
+					}
+					return remaining > 0
+				},
+			)
+		}
+		err = walkErr
 		if err != nil {
 			return currentOffset, fmt.Errorf("read segment: %w", err)
 		}
@@ -302,6 +315,23 @@ func (f *Fetcher) fetchOptionalSegmentData(ctx context.Context, key string) ([]b
 		return nil, err
 	}
 	return data, nil
+}
+
+// decodeSegmentData decodes messages from segment data, automatically detecting
+// whether the data is in the new bare RecordBatch format (magic byte 2 at
+// offset 16) or the legacy CAMU framed format.
+func decodeSegmentData(data, offsetIdx []byte, baseOffset, startOffset uint64, limit int) ([]log.Message, error) {
+	if log.IsRecordBatchFormat(data) {
+		return log.ReadSegmentBatchesAsMessages(data, startOffset, limit)
+	}
+	return log.ReadSegmentFromOffsetWithIndex(
+		bytes.NewReader(data),
+		int64(len(data)),
+		offsetIdx,
+		baseOffset,
+		startOffset,
+		limit,
+	)
 }
 
 func firstDecodedOffset(msgs []log.Message) any {

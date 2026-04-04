@@ -17,7 +17,7 @@ type Batch struct {
 	Messages   []Message
 }
 
-// BatchMeta summarizes a WAL batch without materializing its messages.
+// BatchMeta summarizes a stored batch without materializing its messages.
 type BatchMeta struct {
 	ProducerID   uint64
 	Sequence     uint64
@@ -27,8 +27,28 @@ type BatchMeta struct {
 }
 
 // BatchFrame is a raw batch envelope plus its parsed metadata.
-// Data is encoded in the WAL batch wire format.
+// Data stores the raw batch bytes.
 type BatchFrame struct {
 	Data []byte
 	Meta BatchMeta
+}
+
+// IndexEntry is one entry in the per-batch offset index.
+// Each entry describes a single batch in the sealed segment and is used for
+// binary-search lookups by offset.
+type IndexEntry struct {
+	BaseOffset     int64
+	LastOffset     int64
+	Position       int64
+	BatchSize      int32
+	FirstTimestamp int64
+	MaxTimestamp   int64
+}
+
+// TimestampIndexEntry is one entry in the monotonic timestamp index.
+// It maps a batch's earliest timestamp to the batch's base offset and is used
+// for binary-search lookups by timestamp.
+type TimestampIndexEntry struct {
+	Timestamp  int64
+	BaseOffset int64
 }

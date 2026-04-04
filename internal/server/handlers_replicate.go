@@ -1,14 +1,12 @@
 package server
 
 import (
-	"bytes"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
-	"github.com/maksim/camu/internal/replication"
 )
 
 func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
@@ -63,84 +61,68 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	// Implicit ack
 	ps.replicaState.UpdateFollower(replicaID, replicaOffset)
 
-	// Try WAL first (hot path for real-time replication). Preserve raw WAL
-	// batch envelopes so the follower can append them directly without
-	// decoding and re-encoding.
-	frames, err := ps.wal.ReadBatchFramesFromLocked(fromOffset)
-	hw := ps.replicaState.HighWatermark()
 	ps.mu.Unlock()
+	rawBytes, _, err := s.partitionManager.ReadReplicaRawBatches(r.Context(), topic, pid, int64(fromOffset), 1<<20)
 	if err != nil {
-		slog.Error("replica_fetch: WAL read failed",
+		slog.Error("replica_fetch: ReadRawBatches failed",
 			"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
-		writeError(w, 500, "WAL read failed")
+		writeError(w, 500, "fetch failed")
 		return
 	}
-
-	if len(frames) > 0 {
-		first := frames[0].Meta.FirstOffset
-		last := frames[len(frames)-1].Meta.LastOffset
-		slog.Info("replica_fetch: served from WAL",
-			"topic", topic, "pid", pid, "replica", replicaID,
-			"from_offset", fromOffset,
-			"batch_count", len(frames),
-			"first", first, "last", last,
-			"hw", hw)
-	}
-
-	// Fall back to flushed segments if WAL doesn't have the data
-	if len(frames) == 0 {
-		index := s.partitionManager.GetIndex(topic, pid)
-		if index != nil {
-			var msgs []log.Message
-			var nextOff uint64
-			msgs, nextOff, err = s.fetcher.Fetch(r.Context(), index, topic, pid, fromOffset, 1000)
-			if err != nil {
-				slog.Error("replica_fetch: segment fetch failed",
-					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
-				writeError(w, 500, "fetch failed")
-				return
-			}
-			if len(msgs) > 0 {
-				slog.Info("replica_fetch: served from segments",
-					"topic", topic, "pid", pid, "replica", replicaID,
-					"from_offset", fromOffset, "msg_count", len(msgs),
-					"next_offset", nextOff, "index_next", index.NextOffset())
-				frames = make([]log.BatchFrame, 0, 1)
-				var buf bytes.Buffer
-				if err := replication.WriteMessageFrames(&buf, msgs); err != nil {
-					slog.Error("replica_fetch: WriteMessageFrames failed",
-						"topic", topic, "pid", pid, "replica", replicaID,
-						"msg_count", len(msgs), "error", err)
-					writeError(w, 500, "replication encode failed")
-					return
-				}
-				segmentFrames, err := replication.ReadBatchFrames(bytes.NewReader(buf.Bytes()))
-				if err != nil {
-					slog.Error("replica_fetch: ReadBatchFrames failed",
-						"topic", topic, "pid", pid, "replica", replicaID,
-						"msg_count", len(msgs), "error", err)
-					writeError(w, 500, "replication decode failed")
-					return
-				}
-				frames = append(frames, segmentFrames...)
-			}
+	frames := make([]log.BatchFrame, 0)
+	if len(rawBytes) > 0 {
+		batches, bErr := log.ReadSegmentBatches(rawBytes, fromOffset, 0)
+		if bErr != nil {
+			slog.Error("replica_fetch: parse raw batches failed",
+				"topic", topic, "pid", pid, "from_offset", fromOffset, "error", bErr)
+			writeError(w, 500, "fetch failed")
+			return
 		}
+		frames = make([]log.BatchFrame, 0, len(batches))
+		for _, batch := range batches {
+			hdr, hErr := log.ReadRecordBatchHeader(batch)
+			if hErr != nil {
+				continue
+			}
+			frames = append(frames, log.BatchFrame{
+				Meta: log.BatchMeta{
+					FirstOffset: uint64(hdr.FirstOffset),
+					LastOffset:  uint64(hdr.LastOffset()),
+				},
+				Data: batch,
+			})
+		}
+		slog.Info("replica_fetch: served raw batches from segments",
+			"topic", topic, "pid", pid, "replica", replicaID,
+			"from_offset", fromOffset, "batch_count", len(frames))
 	}
 
 	// Long-poll if still no data (waiting for new writes)
 	// WaitForData uses its own internal signalling — don't hold ps.mu.
 	if len(frames) == 0 {
 		if ps.replicaState.WaitForData(500 * time.Millisecond) {
-			ps.mu.RLock()
-			frames, err = ps.wal.ReadBatchFramesFromLocked(fromOffset)
-			ps.mu.RUnlock()
+			rawBytes, _, err = s.partitionManager.ReadReplicaRawBatches(r.Context(), topic, pid, int64(fromOffset), 1<<20)
 			if err != nil {
-				slog.Error("replica_fetch: WAL read after wait failed",
+				slog.Error("replica_fetch: ReadRawBatches after wait failed",
 					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
-			} else if len(frames) > 0 {
-				slog.Info("replica_fetch: served from WAL after long-poll",
-					"topic", topic, "pid", pid, "replica", replicaID,
-					"batch_count", len(frames))
+			} else if len(rawBytes) > 0 {
+				batches, bErr := log.ReadSegmentBatches(rawBytes, fromOffset, 0)
+				if bErr == nil {
+					frames = frames[:0]
+					for _, batch := range batches {
+						hdr, hErr := log.ReadRecordBatchHeader(batch)
+						if hErr != nil {
+							continue
+						}
+						frames = append(frames, log.BatchFrame{
+							Meta: log.BatchMeta{
+								FirstOffset: uint64(hdr.FirstOffset),
+								LastOffset:  uint64(hdr.LastOffset()),
+							},
+							Data: batch,
+						})
+					}
+				}
 			}
 		}
 	}

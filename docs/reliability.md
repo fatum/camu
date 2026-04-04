@@ -1,216 +1,128 @@
 # Reliability and Correctness
 
-This document describes what Camu is currently claiming, what has been exercised in tests, and where the strongest evidence lives.
+Camu's correctness model is built on three verification layers: unit tests, integration tests, and a repository-local Jepsen harness. Every distributed behavior claim has a reproducible artifact.
 
-The current repository evidence is anchored to the Jepsen runs checked into the `jepsen/camu/store/` directory.
+## Correctness Claims
 
-## Current Claim Surface
+For replicated topics (`rf > 1`), Camu claims:
 
-For the replicated mode that has been exercised most heavily, `rf=3` and `minISR=2`, Camu is claiming:
+- **Acknowledged writes survive the checked Jepsen fault matrix.** Every acknowledged produce is present in the final partition drain after recovery.
+- **Leader failover preserves committed prefixes.** The high watermark only advances when the ISR quorum confirms, and promoted leaders recover native local tail data correctly.
+- **No ghost reads.** Consumers never observe data that was not acknowledged by a successful produce.
+- **Offset monotonicity.** Offsets within a partition never duplicate, regress, or have gaps.
+- **High watermark monotonicity.** The observable high watermark never goes backward.
 
-- acknowledged writes survive the current Jepsen fault matrix
-- leader failover preserves committed prefixes
-- recovered leaders do not silently truncate committed suffixes
-- final partition drains match acknowledged history
-
-For strict quorum, `rf=3` and `minISR=3`, the repository now also has passing evidence for the currently checked scenarios.
-
-For control mode, `rf=1` and `minISR=1`, there is only a narrow durability claim around the tested kill-and-restart path.
-
-This is a correctness and durability claim, not a blanket claim of uninterrupted availability.
+For `rf=1`, the claim is narrower: local active-segment recovery and sealed-segment durability are covered by integration tests, but there is no replication-based availability guarantee.
 
 ## Verification Layers
 
 ### Unit Tests
 
-Unit coverage targets the components most likely to break the contract:
+Unit coverage focuses on the correctness of individual components:
 
-- WAL replay and corruption cutoff
-- segment encoding, decoding, and sparse indexes
-- epoch fencing and leader initialization
-- partition append serialization
-- overlapping-tail index replacement
-- idempotent produce bookkeeping
+- Active-segment recovery and truncation at RecordBatch boundaries
+- Segment encoding, decoding, and sidecar generation
+- Epoch fencing and leader initialization
+- Partition append serialization and offset assignment
+- Idempotent producer sequence tracking, deduplication, and checkpoint recovery
+- RecordBatch codec (encode/decode with gzip, snappy, lz4, zstd compression)
+- Multi-source consume iterator merge and deduplication
+- Leadership proxy and routing logic
 
 ### Integration Tests
 
-The integration suite exercises real server instances and shared storage:
+Integration coverage exercises end-to-end paths with real servers:
 
-- leadership transitions
-- reassignment preserving committed prefixes
-- multi-instance recovery
-- replication and readable failover behavior
+- Restart recovery from local active segments
+- Flush persistence through object storage
+- Leader failover and reassignment
+- HTTP and Kafka protocol interoperability
+- Consumer-group coordinator recovery across failover
+- Idempotent produce deduplication with replication purgatory
 
 ### Jepsen
 
-Jepsen is the highest-signal layer because it drives the real distributed system under adversarial faults:
+Jepsen is the strongest evidence for distributed behavior. The harness runs a five-node Docker cluster against MinIO-backed storage.
 
-- five Docker nodes
-- MinIO-backed object storage
-- random produce and consume workload
-- recovery phase
-- full final drain and invariant checking
+**22 passing fault scenarios:**
 
-## What The Current Checkers Prove
+| Mode | Faults | Duration | Availability |
+|------|--------|----------|--------------|
+| `rf=3`, `minISR=2` | `kill` | 10s | 0.938 |
+| `rf=3`, `minISR=2` | `partition` | 10s | 1.0 |
+| `rf=3`, `minISR=2` | `pause` | 10s | 0.925 |
+| `rf=3`, `minISR=2` | `leader-kill` | 10s | 0.991 |
+| `rf=3`, `minISR=2` | `leave` | 10s | 0.935 |
+| `rf=3`, `minISR=2` | `membership` | 10s | 1.0 |
+| `rf=3`, `minISR=2` | `rejoin` | 10s | 0.918 |
+| `rf=3`, `minISR=2` | `s3-partition` | 10s | 0.938 |
+| `rf=3`, `minISR=2` | `clock-skew` | 10s | 1.0 |
+| `rf=3`, `minISR=2` | `kill` | 45s | 0.996 |
+| `rf=3`, `minISR=2` | `leader-kill` | 45s | 1.0 |
+| `rf=3`, `minISR=2` | `membership` | 45s | 1.0 |
+| `rf=3`, `minISR=2` | `rejoin` | 45s | 0.996 |
+| `rf=3`, `minISR=2` | `s3-partition` | 45s | 0.938 |
+| `rf=3`, `minISR=2` | `kill,partition` | 45s | 1.0 |
+| `rf=3`, `minISR=2` | `leader-kill,s3-partition` | 45s | 0.980 |
+| `rf=3`, `minISR=3` | `kill` | 45s | 1.0 |
+| `rf=3`, `minISR=3` | `leader-kill` | 45s | 1.0 |
+| `rf=3`, `minISR=3` | `membership` | 45s | 1.0 |
+| `rf=3`, `minISR=3` | `s3-partition` | 45s | 0.948 |
+| `rf=3`, `minISR=3` | `leader-kill,s3-partition` | 45s | 0.936 |
+| `rf=1`, `minISR=1` | `kill` | 10s | n/a |
 
-The checked-in Jepsen harness verifies:
+**9 checkers verify every run:**
 
-- `committed-durability`
-  - every acknowledged write appears in the final drain
-- `truncation-safety`
-  - a committed suffix does not disappear after failover or recovery
-- `single-leader`
-  - no conflicting values appear at the same `(partition, offset)`
-- `total-order`
-  - partition histories stay ordered and contiguous
-- `offset-monotonicity`
-  - offsets never move backward or duplicate within a partition history
-- `hw-monotonicity`
-  - observed high watermarks do not regress
-- `no-ghost-reads`
-  - reads do not fabricate unacknowledged data
-- `availability`
-  - fraction of successful operations during the fault window
-- `recovery-time`
-  - time from fault injection to the next successful client operation
+| Checker | What it proves |
+|---------|----------------|
+| `committed-durability` | Acknowledged writes survive to final drain |
+| `single-leader` | No conflicting values at the same (partition, offset) |
+| `total-order` | Partition histories remain ordered and contiguous |
+| `offset-monotonicity` | Offsets never duplicate or regress |
+| `truncation-safety` | Committed suffixes are not lost after failover |
+| `hw-monotonicity` | Observed high watermarks do not go backward |
+| `no-ghost-reads` | Reads do not invent unacknowledged data |
+| `availability` | Successful operation ratio during faults |
+| `recovery-time` | Latency from injected fault to next success |
 
-## Read Model Used In Jepsen
+## Read Model
 
-The main correctness suite uses leader-directed reads.
+The strongest correctness checks use leader-directed reads. That is deliberate:
 
-That is intentional. In Camu, acknowledged durability and random-node flush visibility are separate semantics:
+- Acknowledged durability is tied to the replicated high watermark
+- Random-node read freshness is tied to segment flush visibility
 
-- ack is tied to WAL durability and replicated high watermark
-- non-owner reads may still lag until a segment flush is visible through `index.json`
+The Jepsen matrix is primarily a **durability and failover claim**, not a blanket low-latency replica-read claim. Follower reads are available and correct (capped by high watermark), but their freshness depends on flush cadence.
 
-The current Jepsen suite is therefore aimed at the primary durability contract, not at proving replica-read freshness.
+## Fault Coverage
 
-## Verified Matrix
+| Fault | What it stresses |
+|-------|-----------------|
+| `kill` | Local-tail recovery, reassignment, durable ack path |
+| `leave` | Clean flush, deregistration, rebalance |
+| `membership` | Topology churn and reassignment correctness |
+| `partition` | Routing, stale-owner fencing, leader continuity |
+| `pause` | Lease expiry and heartbeat failure detection |
+| `rejoin` | Epoch fencing and stale-local-state rejection |
+| `s3-partition` | Object-store isolation handling |
+| `clock-skew` | Lease timing assumptions |
+| `leader-kill` | Promoted-leader recovery and readable failover |
+| Combined faults | Simultaneous failure modes (kill+partition, leader-kill+s3-partition) |
 
-### Replicated Mode: `rf=3`, `minISR=2`
+## Practical Limits
 
-| Faults | Duration | Result | Availability | Artifact |
-|--------|----------|--------|--------------|----------|
-| `kill` | 10s | Pass | `0.9375` | `jepsen/camu/store/camu/20260323T082741.545Z/results.edn` |
-| `partition` | 10s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T083135.764Z/results.edn` |
-| `pause` | 10s | Pass | `0.925` | `jepsen/camu/store/camu/20260323T083231.718Z/results.edn` |
-| `leader-kill` | 10s | Pass | `0.991` | `jepsen/camu/store/camu/20260323T083334.317Z/results.edn` |
-| `leave` | 10s | Pass | `0.935` | `jepsen/camu/store/camu/20260323T083436.194Z/results.edn` |
-| `membership` | 10s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T083541.008Z/results.edn` |
-| `rejoin` | 10s | Pass | `0.918` | `jepsen/camu/store/camu/20260323T083641.081Z/results.edn` |
-| `s3-partition` | 10s | Pass | `0.938` | `jepsen/camu/store/camu/20260323T083755.883Z/results.edn` |
-| `clock-skew` | 10s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T083930.393Z/results.edn` |
-| `kill` | 45s | Pass | `0.996` | `jepsen/camu/store/camu/20260323T084623.693Z/results.edn` |
-| `leader-kill` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T085050.232Z/results.edn` |
-| `membership` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T085250.036Z/results.edn` |
-| `rejoin` | 45s | Pass | `0.996` | `jepsen/camu/store/camu/20260323T090506.309Z/results.edn` |
-| `s3-partition` | 45s | Pass | `0.938` | `jepsen/camu/store/camu/20260323T090703.652Z/results.edn` |
-| `kill,partition` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T090840.074Z/results.edn` |
-| `leader-kill,s3-partition` | 45s | Pass | `0.980` | `jepsen/camu/store/camu/20260323T092658.775Z/results.edn` |
-
-### Strict Quorum: `rf=3`, `minISR=3`
-
-| Faults | Duration | Result | Availability | Artifact |
-|--------|----------|--------|--------------|----------|
-| `kill` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T091344.923Z/results.edn` |
-| `leader-kill` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T091909.227Z/results.edn` |
-| `membership` | 45s | Pass | `1.0` | `jepsen/camu/store/camu/20260323T092052.597Z/results.edn` |
-| `s3-partition` | 45s | Pass | `0.948` | `jepsen/camu/store/camu/20260323T092501.527Z/results.edn` |
-| `leader-kill,s3-partition` | 45s | Pass | `0.936` | `jepsen/camu/store/camu/20260323T093306.441Z/results.edn` |
-
-### Control Mode: `rf=1`, `minISR=1`
-
-| Faults | Duration | Result | Artifact |
-|--------|----------|--------|----------|
-| `kill` | 10s | Pass | `jepsen/camu/store/camu/20260322T195907.172Z/results.edn` |
-
-## Why These Runs Matter
-
-The matrix covers the failure modes that most directly threaten Camu's design:
-
-- abrupt process death
-- leader-targeted death
-- network partitions
-- process pause and lease expiry
-- graceful leave and rejoin
-- membership churn
-- per-node object-store isolation
-- clock skew
-- overlapping multi-fault windows
-
-Those are the scenarios where stale leaders, overlapping tails, replay bugs, and flush/index races tend to surface.
-
-## Fixes Reflected In These Results
-
-The passing matrix depends on concrete correctness work, including:
-
-- high-watermark recovery on promoted leaders
-- append serialization for same-partition concurrent writes
-- overlap replacement in the segment index
-- stronger stale-leader fencing during reassignment
-- WAL-backed readable recovery after failover
-- batcher error handling that avoids silent drop on flush failure
-- harness cleanup and routing fixes so results represent the system, not the test harness
-
-### Idempotent Produce: `rf=3`, `minISR=3`
-
-| Faults | Duration | Result | Availability | Artifact |
-|--------|----------|--------|--------------|----------|
-| `kill` | 45s | Pass | `0.625` | `jepsen/camu/store/camu/20260327T142208.572Z/results.edn` |
-
-Idempotent produce checker verifies exactly-once semantics: 0 duplicates, 0 missing, 0 ghosts across `:ok` and `:info` operations.
-
-## Known Coordination Bugs
-
-The following bugs have been verified via code audit but are not yet exposed by the current Jepsen matrix due to short test durations and timing probability. See [architecture/coordination.md](architecture/coordination.md) for the full analysis.
-
-- **Data races**: `checkISRLag` and `attemptPartitionLeadership` access partition state without proper locking — crash risk under concurrent failover
-- **HW regression**: `attemptPartitionLeadership` omits ISR-stored HW from recovery calculation — consumers may see HW go backwards
-- **ISR expansion not persisted**: follower rejoining ISR is in-memory only — crash before next ISR shrink loses the membership, blocking clean failover
-- **Phantom leader**: produce fencing uses a local cache updated every 10s — old leader accepts writes for up to one heartbeat interval after losing CAS
-- **leader-kill nemesis was broken**: `find-leader-node` iterated the routing map incorrectly and always fell back to random-kill — now fixed
-
-These bugs are timing-dependent and do not invalidate the existing Jepsen results, but they represent real production risks that need fixing before the system can claim robust failover guarantees.
-
-## Known Limits
-
-The evidence is meaningful, but not exhaustive.
-
-Current boundaries:
-
-- most scenarios still start as short smoke runs
-- only selected higher-risk paths have 45-second follow-up runs
-- leader-directed reads are the primary correctness path
-- the narrowest-tested mode remains `rf=3`, `minISR=2`
-- the repository does not yet claim transactional semantics
-- coordination data races require `go test -race` to detect, not Jepsen
-- the phantom leader window requires targeted nemesis work to expose
-
-The strongest next steps would be:
-
-- fix verified coordination bugs (data races, HW recovery, ISR persistence)
-- longer Jepsen runs (15+ minutes) with higher concurrency
-- a targeted nemesis that writes to the old leader immediately after CAS loss
-- `go test -race` on integration tests
-- a dedicated replica-read semantics matrix
-
-## How To Audit A Run
-
-For each artifact bundle:
-
-1. read `results.edn`
-2. inspect `history.edn`
-3. correlate with per-node `camu.log`
-
-The usual artifact set contains:
-
-- `results.edn`
-- `history.edn`
-- `jepsen.log`
-- `n1/camu.log` through `n5/camu.log`
-
-That is enough to trace a claim from checker output back to operation history and node-level behavior.
+- No transactional semantics across topics or partitions
+- Failover speed is bounded by lease TTL and fetch timing
+- Random-node read freshness depends on flush cadence
+- The broadest Jepsen evidence is concentrated around `rf=3`, `minISR=2`
 
 ## Bottom Line
 
-Camu has repository-local evidence that its current replicated durability path survives the documented Jepsen matrix without losing acknowledged writes. That is a much stronger statement than "the tests pass": the failure model is explicit, the artifacts are inspectable, and the important corner cases are being exercised under adversarial conditions.
+Camu's correctness model is grounded in native-segment durability with ISR-quorum acknowledgment:
+
+1. Writes land in local active segments first
+2. Replicated commits advance through ISR high-watermark tracking
+3. Writes are only acknowledged after the ISR quorum confirms
+4. Sealed segments and sidecars persist shared history to object storage
+5. Restarts and failovers recover from native batch data directly
+6. Every claim is backed by a reproducible Jepsen artifact

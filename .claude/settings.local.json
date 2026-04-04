@@ -55,7 +55,20 @@
       "Bash(tee /tmp/jepsen-strict.log)",
       "Bash(bash scripts/smoke.sh)",
       "Bash(bash scripts/leader-failover-smoke.sh)",
-      "Bash(echo \"Lock chain per idempotent produce \\(low-level, rf>1\\):\")"
+      "Bash(echo \"Lock chain per idempotent produce \\(low-level, rf>1\\):\")",
+      "Bash(bash jepsen/camu/scripts/idempotent-strict-quorum.sh 45)",
+      "Bash(bash jepsen/camu/scripts/fault-matrix-smoke.sh)",
+      "Bash(bash jepsen/camu/scripts/leader-failover-smoke.sh)",
+      "Bash(bash jepsen/camu/scripts/recovery-matrix-smoke.sh)",
+      "Bash(go doc:*)",
+      "Bash(wc -l /Users/maksim/Projects/camu/internal/log/*.go)",
+      "Bash(awk NR>=642 && NR<=750:*)",
+      "Bash(awk NR>=555 && NR<=640:*)",
+      "Bash(awk NR>=932 && NR<=980:*)",
+      "Bash(/Users/maksim/.asdf/installs/golang/1.25.6/bin/golangci-lint --version)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(nvim --headless -c 'lua print\\(vim.inspect\\(require\\(\"lint\"\\).linters_by_ft\\)\\)' -c 'qa')",
+      "Bash(nvim --headless -c 'lua print\\(vim.fn.exepath\\(\"golangci-lint\"\\)\\)' -c 'qa')"
     ]
   }
 }

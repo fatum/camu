@@ -275,6 +275,8 @@ func TestBuildSegmentMetadata(t *testing.T) {
 	ref := SegmentRef{
 		BaseOffset:     123,
 		EndOffset:      145,
+		MinTimestamp:   111,
+		MaxTimestamp:   222,
 		Epoch:          7,
 		Key:            "orders/0/123-7.segment",
 		OffsetIndexKey: "orders/0/123-7.offset.idx",
@@ -305,6 +307,9 @@ func TestBuildSegmentMetadata(t *testing.T) {
 	}
 	if meta.RecordCount != 23 || meta.SizeBytes != 4096 || meta.Compression != CompressionZstd {
 		t.Fatalf("unexpected metadata payload: %+v", meta)
+	}
+	if meta.MinTimestamp != 111 || meta.MaxTimestamp != 222 {
+		t.Fatalf("unexpected metadata timestamps: min=%d max=%d", meta.MinTimestamp, meta.MaxTimestamp)
 	}
 }
 
@@ -413,5 +418,115 @@ func TestBuildSegmentBatches_AppliesMinimumBatchTargetSize(t *testing.T) {
 
 	if len(withFloor) != len(atMinimum) {
 		t.Fatalf("batch count with tiny target = %d, want %d", len(withFloor), len(atMinimum))
+	}
+}
+
+// TestReadSegmentBatches verifies that ReadSegmentBatches correctly parses
+// three back-to-back RecordBatch entries and applies the startOffset filter.
+func TestReadSegmentBatches(t *testing.T) {
+	// Build three separate batches with consecutive offsets.
+	batch0 := EncodeRecordBatch(0, []Message{{Offset: 0, Value: []byte("a")}})
+	batch1 := EncodeRecordBatch(1, []Message{{Offset: 1, Value: []byte("b")}})
+	batch2 := EncodeRecordBatch(2, []Message{{Offset: 2, Value: []byte("c")}})
+
+	data := append(append(batch0, batch1...), batch2...)
+
+	// Read all three batches.
+	all, err := ReadSegmentBatches(data, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSegmentBatches all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 batches, got %d", len(all))
+	}
+
+	// Read starting from offset 1 — should skip batch0.
+	from1, err := ReadSegmentBatches(data, 1, 0)
+	if err != nil {
+		t.Fatalf("ReadSegmentBatches from offset 1: %v", err)
+	}
+	if len(from1) != 2 {
+		t.Fatalf("expected 2 batches from offset 1, got %d", len(from1))
+	}
+
+	// Verify the returned slices overlap the original buffer (zero-copy).
+	h0, _ := ReadRecordBatchHeader(all[0])
+	if h0.FirstOffset != 0 {
+		t.Errorf("batch[0] FirstOffset: want 0, got %d", h0.FirstOffset)
+	}
+	h2, _ := ReadRecordBatchHeader(all[2])
+	if h2.FirstOffset != 2 {
+		t.Errorf("batch[2] FirstOffset: want 2, got %d", h2.FirstOffset)
+	}
+}
+
+// TestReadSegmentBatchesAsMessages verifies the round-trip: encode batches,
+// concatenate, then decode back to messages via ReadSegmentBatchesAsMessages.
+func TestReadSegmentBatchesAsMessages(t *testing.T) {
+	msgs := []Message{
+		{Offset: 10, Timestamp: 1000, Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 11, Timestamp: 2000, Key: []byte("k2"), Value: []byte("v2")},
+		{Offset: 12, Timestamp: 3000, Key: []byte("k3"), Value: []byte("v3")},
+	}
+
+	// Encode each message as its own batch.
+	var data []byte
+	for _, m := range msgs {
+		data = append(data, EncodeRecordBatch(int64(m.Offset), []Message{m})...)
+	}
+
+	// Read all.
+	got, err := ReadSegmentBatchesAsMessages(data, 10, 0)
+	if err != nil {
+		t.Fatalf("ReadSegmentBatchesAsMessages: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(got))
+	}
+	for i, want := range msgs {
+		if got[i].Offset != want.Offset {
+			t.Errorf("msg[%d] offset: want %d, got %d", i, want.Offset, got[i].Offset)
+		}
+		if !bytes.Equal(got[i].Key, want.Key) {
+			t.Errorf("msg[%d] key: want %q, got %q", i, want.Key, got[i].Key)
+		}
+		if !bytes.Equal(got[i].Value, want.Value) {
+			t.Errorf("msg[%d] value: want %q, got %q", i, want.Value, got[i].Value)
+		}
+	}
+
+	// startOffset filter: skip first message.
+	from11, err := ReadSegmentBatchesAsMessages(data, 11, 0)
+	if err != nil {
+		t.Fatalf("ReadSegmentBatchesAsMessages from 11: %v", err)
+	}
+	if len(from11) != 2 {
+		t.Fatalf("expected 2 messages from offset 11, got %d", len(from11))
+	}
+	if from11[0].Offset != 11 {
+		t.Errorf("first message offset: want 11, got %d", from11[0].Offset)
+	}
+}
+
+// TestIsRecordBatchFormat distinguishes new bare RecordBatch segments from old
+// CAMU-framed segments.
+func TestIsRecordBatchFormat(t *testing.T) {
+	// New format: a valid RecordBatch starts with FirstOffset (8B) + Length
+	// (4B) + PartitionLeaderEpoch (4B) + Magic (1B = 2) at byte 16.
+	newFmt := EncodeRecordBatch(0, []Message{{Offset: 0, Value: []byte("x")}})
+	if !IsRecordBatchFormat(newFmt) {
+		t.Error("IsRecordBatchFormat: expected true for RecordBatch data")
+	}
+
+	// Old CAMU format: first 4 bytes are the magic 0x43414D55.
+	var camuBuf bytes.Buffer
+	_ = WriteSegment(&camuBuf, []Message{{Offset: 0, Value: []byte("x")}}, CompressionNone, testSegmentBatchSize)
+	if IsRecordBatchFormat(camuBuf.Bytes()) {
+		t.Error("IsRecordBatchFormat: expected false for CAMU-format segment")
+	}
+
+	// Too short — should return false, not panic.
+	if IsRecordBatchFormat([]byte{0x00, 0x01}) {
+		t.Error("IsRecordBatchFormat: expected false for too-short buffer")
 	}
 }

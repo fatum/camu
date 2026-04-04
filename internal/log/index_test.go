@@ -145,7 +145,7 @@ func TestIndex_Add_KeepsPartiallyOverlappingSegment(t *testing.T) {
 	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 0, Key: "seg-0-0"})
 	idx.Add(SegmentRef{BaseOffset: 12, EndOffset: 13, Key: "seg-12-13"})
 
-	// New leader recovery flushes 13-15 from WAL. This partially overlaps
+	// New leader recovery flushes 13-15 from the local active segment. This partially overlaps
 	// with seg-12-13 but must NOT remove it — offset 12 is only there.
 	idx.Add(SegmentRef{BaseOffset: 13, EndOffset: 15, Key: "seg-13-15"})
 
@@ -188,5 +188,19 @@ func TestIndex_SegmentsFrom(t *testing.T) {
 
 	if segs := idx.SegmentsFrom(30, 0); segs != nil {
 		t.Fatalf("SegmentsFrom(30) = %v, want nil", segs)
+	}
+}
+
+func TestIndex_FirstOffsetForTimestamp(t *testing.T) {
+	idx := NewIndex()
+	idx.Add(SegmentRef{BaseOffset: 0, EndOffset: 9, MinTimestamp: 1000, MaxTimestamp: 1999, Key: "seg-0"})
+	idx.Add(SegmentRef{BaseOffset: 10, EndOffset: 19, MinTimestamp: 2000, MaxTimestamp: 2999, Key: "seg-10"})
+
+	offset, ok := idx.FirstOffsetForTimestamp(2500)
+	if !ok {
+		t.Fatal("expected timestamp lookup to find a segment")
+	}
+	if offset != 10 {
+		t.Fatalf("FirstOffsetForTimestamp(2500) = %d, want 10", offset)
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,169 +11,6 @@ import (
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
 )
-
-func TestWALReplay_RecoversLogEnd(t *testing.T) {
-	pm := newTestPartitionManager(t)
-
-	tc := meta.TopicConfig{
-		Name:              "topic",
-		Partitions:        1,
-		Retention:         time.Hour,
-		CreatedAt:         time.Now(),
-		ReplicationFactor: 1,
-		MinInsyncReplicas: 1,
-	}
-	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
-		t.Fatalf("InitTopic() error = %v", err)
-	}
-
-	ps := pm.GetPartitionState("topic", 0)
-	if ps == nil {
-		t.Fatal("expected partition state")
-	}
-
-	ps.isLeader = true
-
-	msgs := []log.Message{
-		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
-		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	if err := ps.wal.AppendBatch(msgs); err != nil {
-		t.Fatalf("wal.AppendBatch() error = %v", err)
-	}
-
-	walEnd := ps.nextOffset
-	if replayed, err := ps.wal.Replay(); err == nil && len(replayed) > 0 {
-		lastOffset := replayed[len(replayed)-1].Offset
-		if lastOffset+1 > walEnd {
-			walEnd = lastOffset + 1
-		}
-	}
-
-	if walEnd != 3 {
-		t.Fatalf("expected WAL end=3, got %d", walEnd)
-	}
-}
-
-func TestWALReplay_EmptyWAL(t *testing.T) {
-	pm := newTestPartitionManager(t)
-
-	tc := meta.TopicConfig{
-		Name:              "topic",
-		Partitions:        1,
-		Retention:         time.Hour,
-		CreatedAt:         time.Now(),
-		ReplicationFactor: 1,
-		MinInsyncReplicas: 1,
-	}
-	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
-		t.Fatalf("InitTopic() error = %v", err)
-	}
-
-	ps := pm.GetPartitionState("topic", 0)
-	if ps == nil {
-		t.Fatal("expected partition state")
-	}
-
-	walEnd := ps.nextOffset
-	if replayed, err := ps.wal.Replay(); err == nil && len(replayed) > 0 {
-		lastOffset := replayed[len(replayed)-1].Offset
-		if lastOffset+1 > walEnd {
-			walEnd = lastOffset + 1
-		}
-	}
-
-	if walEnd != 0 {
-		t.Fatalf("expected WAL end=0 (empty), got %d", walEnd)
-	}
-}
-
-func TestWALReplay_NextOffsetHigherThanWAL(t *testing.T) {
-	pm := newTestPartitionManager(t)
-
-	tc := meta.TopicConfig{
-		Name:              "topic",
-		Partitions:        1,
-		Retention:         time.Hour,
-		CreatedAt:         time.Now(),
-		ReplicationFactor: 1,
-		MinInsyncReplicas: 1,
-	}
-	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
-		t.Fatalf("InitTopic() error = %v", err)
-	}
-
-	ps := pm.GetPartitionState("topic", 0)
-	if ps == nil {
-		t.Fatal("expected partition state")
-	}
-
-	msgs := []log.Message{
-		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
-	}
-	if err := ps.wal.AppendBatch(msgs); err != nil {
-		t.Fatalf("wal.AppendBatch() error = %v", err)
-	}
-
-	ps.nextOffset = 10
-
-	walEnd := ps.nextOffset
-	if replayed, err := ps.wal.Replay(); err == nil && len(replayed) > 0 {
-		lastOffset := replayed[len(replayed)-1].Offset
-		if lastOffset+1 > walEnd {
-			walEnd = lastOffset + 1
-		}
-	}
-
-	if walEnd != 10 {
-		t.Fatalf("expected WAL end=10 (nextOffset=10 > WAL last+1=1, data likely flushed to S3), got %d", walEnd)
-	}
-}
-
-func TestWALReplay_NextOffsetLowerThanWAL(t *testing.T) {
-	pm := newTestPartitionManager(t)
-
-	tc := meta.TopicConfig{
-		Name:              "topic",
-		Partitions:        1,
-		Retention:         time.Hour,
-		CreatedAt:         time.Now(),
-		ReplicationFactor: 1,
-		MinInsyncReplicas: 1,
-	}
-	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
-		t.Fatalf("InitTopic() error = %v", err)
-	}
-
-	ps := pm.GetPartitionState("topic", 0)
-	if ps == nil {
-		t.Fatal("expected partition state")
-	}
-
-	msgs := []log.Message{
-		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
-		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	if err := ps.wal.AppendBatch(msgs); err != nil {
-		t.Fatalf("wal.AppendBatch() error = %v", err)
-	}
-
-	ps.nextOffset = 1
-
-	walEnd := ps.nextOffset
-	if replayed, err := ps.wal.Replay(); err == nil && len(replayed) > 0 {
-		lastOffset := replayed[len(replayed)-1].Offset
-		if lastOffset+1 > walEnd {
-			walEnd = lastOffset + 1
-		}
-	}
-
-	if walEnd != 3 {
-		t.Fatalf("expected WAL end=3 (WAL has more msgs than nextOffset), got %d", walEnd)
-	}
-}
 
 func TestReplicaState_NewReplicaStateWithHW(t *testing.T) {
 	rs := replication.NewReplicaState("n1", 5, 1, 1000)
@@ -315,28 +153,22 @@ func TestLeadershipChange_PreservesHW(t *testing.T) {
 	ps.isLeader = true
 	ps.epoch = 1
 
-	msgs := []log.Message{
+	if err := s.partitionManager.ensureActiveSegment("topic", 0); err != nil {
+		t.Fatalf("ensureActiveSegment() error = %v", err)
+	}
+	if err := ps.activeSegment.Append(log.EncodeRecordBatch(0, []log.Message{
 		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
 		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
 		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
+	})); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
 	}
-	if err := ps.wal.AppendBatch(msgs); err != nil {
-		t.Fatalf("wal.AppendBatch() error = %v", err)
-	}
-
-	walEnd := ps.nextOffset
-	if replayed, err := ps.wal.Replay(); err == nil && len(replayed) > 0 {
-		lastOffset := replayed[len(replayed)-1].Offset
-		if lastOffset+1 > walEnd {
-			walEnd = lastOffset + 1
-		}
+	logEnd := uint64(ps.activeSegment.NextOffset())
+	if logEnd != 3 {
+		t.Fatalf("expected log end=3, got %d", logEnd)
 	}
 
-	if walEnd != 3 {
-		t.Fatalf("expected WAL end=3, got %d", walEnd)
-	}
-
-	rs := replication.NewReplicaState("n1", walEnd, 1, 1000)
+	rs := replication.NewReplicaState("n1", logEnd, 1, 1000)
 	if rs.HighWatermark() != 3 {
 		t.Fatalf("expected new replicaState HW=3, got %d", rs.HighWatermark())
 	}
@@ -365,16 +197,20 @@ func TestLeadershipChange_RF3PreservesHW(t *testing.T) {
 		t.Fatal("expected partition state")
 	}
 
-	msgs := []log.Message{
-		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
-		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
-		{Offset: 3, Key: []byte("k3"), Value: []byte("v3")},
-		{Offset: 4, Key: []byte("k4"), Value: []byte("v4")},
+	seg, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "topic-0-active"), 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
 	}
-	if err := ps.wal.AppendBatch(msgs); err != nil {
-		t.Fatalf("wal.AppendBatch() error = %v", err)
+	if err := seg.Append(log.EncodeRecordBatch(0, []log.Message{
+		{Offset: 0, Key: []byte("k0"), Value: []byte("v0"), Timestamp: 1},
+		{Offset: 1, Key: []byte("k1"), Value: []byte("v1"), Timestamp: 2},
+		{Offset: 2, Key: []byte("k2"), Value: []byte("v2"), Timestamp: 3},
+		{Offset: 3, Key: []byte("k3"), Value: []byte("v3"), Timestamp: 4},
+		{Offset: 4, Key: []byte("k4"), Value: []byte("v4"), Timestamp: 5},
+	})); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
 	}
+	ps.activeSegment = seg
 
 	// Reproduce assignment-driven failover with stale persisted metadata.
 	ps.nextOffset = 0
@@ -396,7 +232,7 @@ func TestLeadershipChange_RF3PreservesHW(t *testing.T) {
 	})
 
 	if got := ps.nextOffset; got != 5 {
-		t.Fatalf("nextOffset = %d, want 5 after WAL replay", got)
+		t.Fatalf("nextOffset = %d, want 5 after native recovery", got)
 	}
 	if ps.replicaState == nil {
 		t.Fatal("expected replicaState after leader init")
@@ -448,13 +284,18 @@ func TestInitPartitionAsLeader_FlushesRecoveredWALForReads(t *testing.T) {
 	if ps == nil {
 		t.Fatal("expected partition state")
 	}
-	if err := ps.wal.AppendBatch([]log.Message{
-		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
-		{Offset: 2, Key: []byte("k2"), Value: []byte("v2")},
-	}); err != nil {
-		t.Fatalf("wal.AppendBatch() error = %v", err)
+	seg, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "topic-0-active"), 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
 	}
+	if err := seg.Append(log.EncodeRecordBatch(0, []log.Message{
+		{Offset: 0, Key: []byte("k0"), Value: []byte("v0"), Timestamp: 1},
+		{Offset: 1, Key: []byte("k1"), Value: []byte("v1"), Timestamp: 2},
+		{Offset: 2, Key: []byte("k2"), Value: []byte("v2"), Timestamp: 3},
+	})); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
+	}
+	ps.activeSegment = seg
 	ps.nextOffset = 0
 
 	s.initPartitionAsLeader(context.Background(), "topic", 0, coordination.PartitionAssignment{

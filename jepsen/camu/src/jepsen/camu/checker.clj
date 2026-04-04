@@ -311,6 +311,46 @@
          :lost         (count lost)
          :lost-data    (when (seq lost) (take 20 (sort lost)))}))))
 
+(defn read-your-writes-checker
+  "Verifies that each client can read its own writes immediately after producing.
+   For each consume operation, checks that any keys acked in prior produce operations
+   from the same process appear in the consumed messages."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [events  (sort-by :time history)
+            by-proc (group-by :process events)
+            violations
+            (reduce-kv
+             (fn [acc proc ops]
+               (let [sorted       (sort-by :time ops)
+                     acked-keys   (atom #{})
+                     viols
+                     (reduce
+                      (fn [viols op]
+                        (cond
+                          (and (= :produce (:f op)) (= :ok (:type op)))
+                          (do (swap! acked-keys into (map :key (get-in op [:value :messages])))
+                              viols)
+
+                          (and (= :consume (:f op)) (= :ok (:type op)))
+                          (let [consumed-keys (set (map :key (get-in op [:value :messages])))
+                                missing       (set/difference @acked-keys consumed-keys)]
+                            (if (seq missing)
+                              (conj viols {:process proc
+                                           :time    (:time op)
+                                           :missing (vec (sort (take 10 missing)))})
+                              viols))
+
+                          :else viols))
+                      []
+                      sorted)]
+                 (into acc viols)))
+             []
+             by-proc)]
+        {:valid?     (empty? violations)
+         :violations (when (seq violations) (take 20 violations))}))))
+
 (defn no-ghost-reads-checker
   "Verifies the consumer never sees data above the reported high watermark.
    For each :ok :consume op with a high-watermark, checks that no message

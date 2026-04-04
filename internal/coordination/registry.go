@@ -14,6 +14,7 @@ type InstanceInfo struct {
 	InstanceID      string    `json:"instance_id"`
 	Address         string    `json:"address"`
 	InternalAddress string    `json:"internal_address,omitempty"`
+	KafkaAddress    string    `json:"kafka_address,omitempty"`
 	HeartbeatAt     time.Time `json:"heartbeat_at"`
 }
 
@@ -25,16 +26,18 @@ type Registry struct {
 	instanceID      string
 	address         string
 	internalAddress string
+	kafkaAddress    string
 	ttl             time.Duration
 }
 
 // NewRegistry creates a new Registry.
-func NewRegistry(s3 *storage.S3Client, instanceID, address, internalAddress string, ttl time.Duration) *Registry {
+func NewRegistry(s3 *storage.S3Client, instanceID, address, internalAddress, kafkaAddress string, ttl time.Duration) *Registry {
 	return &Registry{
 		s3Client:        s3,
 		instanceID:      instanceID,
 		address:         address,
 		internalAddress: internalAddress,
+		kafkaAddress:    kafkaAddress,
 		ttl:             ttl,
 	}
 }
@@ -50,6 +53,7 @@ func (r *Registry) Register(ctx context.Context) error {
 		InstanceID:      r.instanceID,
 		Address:         r.address,
 		InternalAddress: r.internalAddress,
+		KafkaAddress:    r.kafkaAddress,
 		HeartbeatAt:     time.Now(),
 	}
 	data, err := json.Marshal(info)
@@ -101,6 +105,31 @@ func (r *Registry) GetInstanceInfo(ctx context.Context, instanceID string) (Inst
 		return InstanceInfo{}, fmt.Errorf("registry: unmarshal instance %s: %w", instanceID, err)
 	}
 	return info, nil
+}
+
+// ActiveInstanceInfos returns all active instance registrations.
+func (r *Registry) ActiveInstanceInfos(ctx context.Context) ([]InstanceInfo, error) {
+	keys, err := r.s3Client.List(ctx, "_coordination/instances/")
+	if err != nil {
+		return nil, fmt.Errorf("registry: list: %w", err)
+	}
+
+	now := time.Now()
+	var active []InstanceInfo
+	for _, key := range keys {
+		data, err := r.s3Client.Get(ctx, key)
+		if err != nil {
+			continue
+		}
+		var info InstanceInfo
+		if err := json.Unmarshal(data, &info); err != nil {
+			continue
+		}
+		if now.Sub(info.HeartbeatAt) < r.ttl {
+			active = append(active, info)
+		}
+	}
+	return active, nil
 }
 
 // InstanceID returns the instanceID this registry represents.

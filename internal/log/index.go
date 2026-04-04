@@ -9,6 +9,8 @@ import (
 type SegmentRef struct {
 	BaseOffset     uint64    `json:"base_offset"`
 	EndOffset      uint64    `json:"end_offset"`
+	MinTimestamp   int64     `json:"min_timestamp,omitempty"`
+	MaxTimestamp   int64     `json:"max_timestamp,omitempty"`
 	Epoch          uint64    `json:"epoch"`
 	Key            string    `json:"key"`
 	OffsetIndexKey string    `json:"offset_index_key,omitempty"`
@@ -159,6 +161,14 @@ func (idx *Index) NextOffset() uint64 {
 	return idx.segments[len(idx.segments)-1].EndOffset + 1
 }
 
+// FirstOffset returns the base offset of the first retained segment.
+func (idx *Index) FirstOffset() (uint64, bool) {
+	if len(idx.segments) == 0 {
+		return 0, false
+	}
+	return idx.segments[0].BaseOffset, true
+}
+
 // SetHighWatermark sets the high-watermark offset on the index.
 func (idx *Index) SetHighWatermark(hw uint64) {
 	idx.highWatermark = hw
@@ -167,6 +177,17 @@ func (idx *Index) SetHighWatermark(hw uint64) {
 // HighWatermark returns the high-watermark offset stored in the index.
 func (idx *Index) HighWatermark() uint64 {
 	return idx.highWatermark
+}
+
+// FirstOffsetForTimestamp returns the first segment base offset whose retained
+// timestamp window could contain the requested timestamp.
+func (idx *Index) FirstOffsetForTimestamp(timestamp int64) (uint64, bool) {
+	for _, seg := range idx.segments {
+		if seg.MaxTimestamp == 0 || seg.MaxTimestamp >= timestamp {
+			return seg.BaseOffset, true
+		}
+	}
+	return 0, false
 }
 
 // SetEpochHistory replaces the epoch history entries in the index.

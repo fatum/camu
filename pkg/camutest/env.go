@@ -15,7 +15,6 @@ import (
 // can be reused on restart.
 type instanceConfig struct {
 	cfg      *config.Config
-	walDir   string
 	cacheDir string
 }
 
@@ -61,7 +60,6 @@ func New(t testing.TB, opts ...Option) *Env {
 		if i < len(o.InstanceIDs) && o.InstanceIDs[i] != "" {
 			instanceID = o.InstanceIDs[i]
 		}
-		walDir := t.TempDir()
 		cacheDir := t.TempDir()
 		cfg := &config.Config{
 			Server: config.ServerConfig{
@@ -72,11 +70,6 @@ func New(t testing.TB, opts ...Option) *Env {
 			Storage: config.StorageConfig{
 				Bucket:   "test-bucket",
 				Endpoint: "memory://",
-			},
-			WAL: config.WALConfig{
-				Directory: walDir,
-				Fsync:     false,
-				ChunkSize: 1 << 20,
 			},
 			Segments: config.SegmentsConfig{
 				MaxSize:     8388608,
@@ -109,7 +102,6 @@ func New(t testing.TB, opts ...Option) *Env {
 		env.instances = append(env.instances, srv)
 		env.configs = append(env.configs, instanceConfig{
 			cfg:      cfg,
-			walDir:   walDir,
 			cacheDir: cacheDir,
 		})
 	}
@@ -149,7 +141,7 @@ func (e *Env) Server(idx int) *server.Server {
 }
 
 // KillInstance forcefully stops the server instance at idx without a graceful
-// shutdown (no WAL flush). It uses a zero-timeout context so the HTTP listener
+// shutdown. It uses a zero-timeout context so the HTTP listener
 // is closed immediately.
 func (e *Env) KillInstance(idx int) {
 	e.t.Helper()
@@ -157,7 +149,7 @@ func (e *Env) KillInstance(idx int) {
 		e.t.Fatalf("camutest: KillInstance: index %d out of range (have %d)", idx, len(e.instances))
 	}
 	// Use an already-cancelled context so Shutdown returns immediately without
-	// waiting for in-flight requests or flushing the batcher/WAL.
+	// waiting for in-flight requests or flushing the batcher.
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 	defer cancel()
 	// Ignore errors — the context expiry causes expected deadline-exceeded errors.
@@ -180,8 +172,9 @@ func (e *Env) StopInstance(idx int) {
 	e.instances[idx] = nil
 }
 
-// RestartInstance creates a new server with the same config (and same WAL
-// directory) as the instance at idx and starts it. This causes WAL replay on
+// RestartInstance creates a new server with the same config and local cache
+// directory as the instance at idx and starts it. This causes local native
+// storage recovery on
 // the new instance. The instance slot is updated in-place so subsequent calls
 // to ClientFor/InstanceAddress use the new address.
 func (e *Env) RestartInstance(idx int) {
@@ -192,8 +185,8 @@ func (e *Env) RestartInstance(idx int) {
 
 	ic := e.configs[idx]
 
-	// Build a fresh config reusing the same WAL/cache directories and instance ID
-	// so WAL replay and replication routing behave like a restarted node.
+	// Build a fresh config reusing the same cache directory and instance ID so
+	// local recovery and replication routing behave like a restarted node.
 	cfg := &config.Config{
 		Server: config.ServerConfig{
 			Address:         ":0", // new random port
@@ -203,11 +196,6 @@ func (e *Env) RestartInstance(idx int) {
 		Storage: config.StorageConfig{
 			Bucket:   ic.cfg.Storage.Bucket,
 			Endpoint: ic.cfg.Storage.Endpoint,
-		},
-		WAL: config.WALConfig{
-			Directory: ic.walDir,
-			Fsync:     ic.cfg.WAL.Fsync,
-			ChunkSize: ic.cfg.WAL.ChunkSize,
 		},
 		Segments: ic.cfg.Segments,
 		Cache: config.CacheConfig{
@@ -230,7 +218,6 @@ func (e *Env) RestartInstance(idx int) {
 	// Update stored config to reflect the new instance's config.
 	e.configs[idx] = instanceConfig{
 		cfg:      cfg,
-		walDir:   ic.walDir,
 		cacheDir: ic.cacheDir,
 	}
 }

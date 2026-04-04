@@ -375,13 +375,17 @@ func (c *Client) StreamSSE(topic string, partition int, offset uint64, maxEvents
 	return events, nil
 }
 
-// CommitOffsets commits offsets for a consumer group.
-func (c *Client) CommitOffsets(groupID string, offsets map[int]uint64) error {
-	strOffsets := make(map[string]uint64, len(offsets))
-	for k, v := range offsets {
-		strOffsets[fmt.Sprintf("%d", k)] = v
+// CommitOffsets commits topic-partition offsets for a consumer group.
+func (c *Client) CommitOffsets(groupID string, offsets map[string]map[int]uint64) error {
+	strTopics := make(map[string]map[string]uint64, len(offsets))
+	for topic, partitions := range offsets {
+		strPartitions := make(map[string]uint64, len(partitions))
+		for k, v := range partitions {
+			strPartitions[fmt.Sprintf("%d", k)] = v
+		}
+		strTopics[topic] = strPartitions
 	}
-	body, _ := json.Marshal(map[string]any{"offsets": strOffsets})
+	body, _ := json.Marshal(map[string]any{"topics": strTopics})
 	resp, err := c.httpClient.Post(c.baseURL+"/v1/groups/"+groupID+"/commit", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("CommitOffsets request: %w", err)
@@ -396,8 +400,8 @@ func (c *Client) CommitOffsets(groupID string, offsets map[int]uint64) error {
 	return nil
 }
 
-// GetOffsets retrieves committed offsets for a consumer group.
-func (c *Client) GetOffsets(groupID string) (map[int]uint64, error) {
+// GetOffsets retrieves committed topic-partition offsets for a consumer group.
+func (c *Client) GetOffsets(groupID string) (map[string]map[int]uint64, error) {
 	resp, err := c.httpClient.Get(c.baseURL + "/v1/groups/" + groupID + "/offsets")
 	if err != nil {
 		return nil, fmt.Errorf("GetOffsets request: %w", err)
@@ -411,17 +415,20 @@ func (c *Client) GetOffsets(groupID string) (map[int]uint64, error) {
 	}
 
 	var result struct {
-		Offsets map[string]uint64 `json:"offsets"`
+		Topics map[string]map[string]uint64 `json:"topics"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("GetOffsets decode: %w", err)
 	}
 
-	offsets := make(map[int]uint64, len(result.Offsets))
-	for k, v := range result.Offsets {
-		var pid int
-		fmt.Sscanf(k, "%d", &pid)
-		offsets[pid] = v
+	offsets := make(map[string]map[int]uint64, len(result.Topics))
+	for topic, partitions := range result.Topics {
+		offsets[topic] = make(map[int]uint64, len(partitions))
+		for k, v := range partitions {
+			var pid int
+			fmt.Sscanf(k, "%d", &pid)
+			offsets[topic][pid] = v
+		}
 	}
 	return offsets, nil
 }

@@ -4,13 +4,13 @@
 
 - [ ] **CRITICAL: `checkISRLag` data race** — reads `ps.isLeader`, `ps.replicaState`, `ps.epoch` without `ps.mu` (`server.go:1474`). Fix: add `ps.mu.RLock`.
 - [ ] **CRITICAL: `attemptPartitionLeadership` data race** — reads `ps.fetchCancel`/`ps.fetchDone` without `ps.mu` (`server.go:1292`). Fix: copy pattern from `initPartitionAsLeader:664`.
-- [ ] **HIGH: HW regression on failover** — `attemptPartitionLeadership` sets `recoveredHW = max(walEnd, indexNext)` but omits `isrState.HighWatermark` (`server.go:1346`). `initPartitionAsLeader:738` does this correctly.
+- [ ] **HIGH: HW regression on failover** — `attemptPartitionLeadership` sets recovered HW from local log/index state but omits `isrState.HighWatermark`. `initPartitionAsLeader` does this correctly.
 - [ ] **HIGH: ISR expansion not persisted** — `UpdateFollower` adds to ISR in memory but never writes to S3 (`replica_state.go:85`). Only ISR shrinkage triggers S3 write.
 - [ ] **HIGH: TOCTOU in `initPartitionAsLeader`** — checks `ps.isLeader` under `RLock`, then proceeds unlocked (`server.go:649`). Fix: re-check under `Lock`.
 - [ ] **HIGH: Phantom leader** — produce fencing uses local cache (`s.myPartitions`) updated on renewal tick. Old leader accepts writes for up to `heartbeat_interval` after CAS loss.
 - [ ] **MEDIUM: `state.json` flush without CAS** — stale leader can overwrite new leader's state
 - [ ] **MEDIUM: ISR writes use unconditional PUT** — no CAS guard, last writer wins under split brain
-- [ ] **MEDIUM: Epoch history `StartOffset`** — uses `walEnd` instead of `recoveredHW` (`server.go:1373`)
+- [ ] **MEDIUM: Epoch history `StartOffset`** — uses recovered local log end instead of `recoveredHW`
 
 ## ISR Replication — Post-Review Fixes
 
@@ -27,27 +27,23 @@
 - [x] Extract ISR expansion threshold (1000) to config or named constant (`internal/replication/replica_state.go:71`)
 - [x] Make ISR lag timeout configurable, currently hardcoded 30s (`internal/server/server.go:1080`)
 - [x] Make replication/purgatory timeout configurable, currently hardcoded 30s (`internal/server/handlers_produce.go:166,307`)
-- [ ] Add `entryLen` bounds check in wire protocol, cap at 64MB (`internal/replication/wire.go:54`)
-- [ ] Note: `WAL.ReadFrom` replays entire WAL per fetch — optimization target (`internal/log/wal_reader.go:5-22`)
+- [ ] Add `entryLen` bounds check in replication protocol, cap at 64MB
 
 ## High-Throughput (10MB/s target)
 
-- [ ] **In-memory buffer for flush path** — `onFlush` replays entire WAL from disk (`partition_manager.go:600`); keep unflushed messages in a ring buffer, use WAL only for crash recovery
-- [x] **Grouped fsync (linger.ms)** — currently every `AppendBatch` fsyncs independently (`wal.go:127-131`); accumulate writes and fsync on interval (e.g. 5ms) or size threshold to amortize disk latency
-
-- [x] **Segmented WAL** — `TruncateBefore` rewrites entire WAL file while holding lock (`wal.go:187-261`); use multiple small WAL files, truncation = delete old files
+- [ ] **In-memory buffer for flush path** — keep unsealed native batches in a ring buffer to reduce rereads during flush/recovery
 - [ ] **Pipeline S3 uploads** — `onFlush` blocks on `s3Client.Put` for 50-200ms (`partition_manager.go:652`); decouple accumulation from upload with per-partition upload queue
 - [x] **Batch index updates** — every flush does GET+PUT to S3 for index.json (`partition_manager.go:673-727`); batch updates across N segments or use append-only format
 - [ ] **`sync.Pool` for segment buffers** — `WriteSegment` allocates new `bytes.Buffer` per message frame (`segment.go:42-47`); pool and reuse buffers to reduce GC pressure
 - [ ] **Binary produce protocol** — JSON parsing allocates heavily with string→[]byte copies (`handlers_produce.go:54-70`); add protobuf or custom framing for high-throughput clients
-- [ ] **Server-side request coalescing** — no linger across concurrent HTTP requests; hold response for up to N ms, coalesce into single WAL write + fsync (standard Kafka/Redpanda approach)
+- [ ] **Server-side request coalescing** — no linger across concurrent HTTP requests; hold response for up to N ms, coalesce into fewer active-segment appends/fsyncs
 - [x] **Multi-segment fetch** — when consumer requests more messages than a single segment holds, load multiple segments from S3/disk in one fetch response. Currently requires one request per segment boundary
 
 ## Diskless Topics (WarpStream-style)
 
-Leaderless, zero-WAL topic type where S3 is the sole storage and durability layer. Any broker accepts produces for any partition. Viable for workloads tolerating ~1s latency.
+Leaderless topic type where S3 is the sole durable storage layer. Any broker accepts produces for any partition. Viable for workloads tolerating ~1s latency.
 
-- [ ] **In-memory batch buffer** — accumulate records in memory per partition, no WAL. Flush to S3 on interval (~1s) or size threshold (~1-10MB)
+- [ ] **In-memory batch buffer** — accumulate records in memory per partition. Flush to S3 on interval (~1s) or size threshold (~1-10MB)
 - [ ] **S3-as-sequencer** — on flush, CAS the partition index to allocate offsets (existing `ConditionalPut` + ETags). Works at 1 PUT/s/partition with low contention
 - [ ] **Pluggable sequencer interface** — `AllocateOffsets(topic, partition, count) -> (startOffset, etag, error)`. Start with S3, swap to DynamoDB/etcd when throughput demands it
 - [ ] **Leaderless produce path** — any broker writes to any partition. No leader election, no ISR, no replication (S3 = 11 nines durability)
@@ -78,11 +74,11 @@ Client-side consumer groups using S3 leases for coordination. No server-side gro
 - [x] **`Batch` struct** — per-batch producer metadata (`ProducerID`, `Sequence`)
 - [x] **Idempotency manager** — per-(producer, partition) sequence tracking, S3-based ID allocation, checkpoint/load/rebuild, stale eviction
 - [x] **Segment batch header v2** — 16 bytes producer metadata per batch
-- [x] **WAL batch envelope** — carries `ProducerID`/`Sequence` through WAL and replication wire format
+- [x] **Batch metadata propagation** — carries `ProducerID`/`Sequence` through native batch and replication format
 - [x] **`POST /v1/producers/init`** — S3 atomic counter for globally unique producer IDs
 - [x] **Idempotency gate** — partition-specific endpoint only; duplicate → join replication purgatory → `{"duplicate": true}`; gap → 422
 - [x] **S3 per-partition checkpoint** — uploaded during flush, downloaded on leader promotion
-- [x] **WAL recovery filtered by HW** — only committed batches rebuild idempotency state on failover
+- [x] **Native recovery filtered by HW** — only committed batches rebuild idempotency state on failover
 - [x] **Stale producer eviction** — 30min TTL, runs on coordination tick
 - [x] **Jepsen exactly-once checker** — 7 test scenarios (combined faults, high concurrency, pause, S3 degradation, membership, strict quorum, soak)
 - [ ] **Per-partition sequence in segment flush** — segment batches carry `ProducerID`/`Sequence` in header but currently write 0/0; wire actual metadata through flush path for segment-level dedup on read
@@ -91,13 +87,13 @@ Client-side consumer groups using S3 leases for coordination. No server-side gro
 ## Future: Protocol & Transport
 
 - [ ] **Fast failure detection** — HTTP/2 PING health checking + connection error classification in fetcher (plan at `docs/superpowers/plans/2026-04-02-fast-failure-detection.md`)
-- [ ] **Internal TCP replication** — push-based, zero-copy WAL forwarding (spec at `docs/superpowers/specs/2026-03-27-internal-tcp-protocol-design.md`)
-- [ ] **Kafka protocol support** — minimal subset (ApiVersions, Metadata, Produce, Fetch) using `franz-go/pkg/kmsg`
-- [ ] **Kafka RecordBatch as canonical format** — replace WAL/segment format for zero-copy produce/fetch/replicate
+- [ ] **Internal TCP replication** — push-based, zero-copy RecordBatch forwarding (spec at `docs/superpowers/specs/2026-03-27-internal-tcp-protocol-design.md`)
+- [x] **Kafka protocol support** — broker-compatible subset for produce, fetch, metadata, groups, and admin flows
+- [x] **Kafka RecordBatch as canonical format** — native format for produce/fetch/replicate
 
 ## Suggestions
 
-- [x] Map iteration non-determinism in header serialization (`internal/replication/wire.go:98-106`)
+- [x] Map iteration non-determinism in header serialization
 - [x] Add concurrency protection to `EpochHistory` or document invariant (`internal/replication/epoch_history.go`)
 - [x] Add test for `CheckDivergence` "future epoch" edge case
 - [x] Add comment about `Purgatory.Complete` double-close safety under current locking
