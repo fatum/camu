@@ -20,10 +20,6 @@ storage:
   credentials:
     access_key: "AKID"
     secret_key: "SECRET"
-wal:
-  directory: "/tmp/wal"
-  fsync: false
-  chunk_size: 8192
 segments:
   max_size: 1048576
   max_age: "10s"
@@ -74,15 +70,6 @@ coordination:
 	}
 	if cfg.Storage.Credentials.SecretKey != "SECRET" {
 		t.Errorf("Storage.Credentials.SecretKey = %q, want %q", cfg.Storage.Credentials.SecretKey, "SECRET")
-	}
-	if cfg.WAL.Directory != "/tmp/wal" {
-		t.Errorf("WAL.Directory = %q, want %q", cfg.WAL.Directory, "/tmp/wal")
-	}
-	if cfg.WAL.Fsync != false {
-		t.Errorf("WAL.Fsync = %v, want false", cfg.WAL.Fsync)
-	}
-	if cfg.WAL.ChunkSize != 8192 {
-		t.Errorf("WAL.ChunkSize = %d, want %d", cfg.WAL.ChunkSize, 8192)
 	}
 	if cfg.Segments.MaxSize != 1048576 {
 		t.Errorf("Segments.MaxSize = %d, want %d", cfg.Segments.MaxSize, 1048576)
@@ -141,12 +128,6 @@ storage:
 
 	if cfg.Server.Address != ":8080" {
 		t.Errorf("Server.Address = %q, want %q", cfg.Server.Address, ":8080")
-	}
-	if cfg.WAL.Fsync != true {
-		t.Errorf("WAL.Fsync = %v, want true", cfg.WAL.Fsync)
-	}
-	if cfg.WAL.ChunkSize != 64*1024*1024 {
-		t.Errorf("WAL.ChunkSize = %d, want %d", cfg.WAL.ChunkSize, 64*1024*1024)
 	}
 	if cfg.Segments.RecordBatchTargetSize != 16*1024 {
 		t.Errorf("Segments.RecordBatchTargetSize = %d, want %d", cfg.Segments.RecordBatchTargetSize, 16*1024)

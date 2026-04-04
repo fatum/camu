@@ -1,0 +1,250 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+
+	"github.com/maksim/camu/internal/replication"
+	"github.com/maksim/camu/internal/storage"
+)
+
+// becomeLeader is the unified leader-promotion path driven by a controller push.
+// It replaces the TOCTOU-racy initPartitionAsLeader and the data-race-prone
+// attemptPartitionLeadership with a single, lock-correct implementation that
+// trusts the controller-provided HW and epoch history.
+func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pushAssignmentRequest) error {
+	ps := s.partitionManager.GetPartitionState(topic, pid)
+	if ps == nil {
+		return fmt.Errorf("partition state not found for %s/%d", topic, pid)
+	}
+
+	// 1. Under ps.mu.Lock — check if already leader at this or higher epoch.
+	ps.mu.Lock()
+	if ps.isLeader && ps.epoch >= req.Epoch {
+		ps.mu.Unlock()
+		return nil // already leader at this or higher epoch
+	}
+	// Capture and nil out fetch loop handles so we can cancel outside the lock.
+	existingCancel := ps.fetchCancel
+	existingDone := ps.fetchDone
+	ps.fetchCancel = nil
+	ps.fetchDone = nil
+	ps.mu.Unlock()
+
+	// 2. Cancel existing fetch loop (outside the lock, with captured handles).
+	if existingCancel != nil {
+		existingCancel()
+		if existingDone != nil {
+			<-existingDone
+		}
+	}
+
+	// 3. Refresh index from S3 so we see segments flushed by the old leader.
+	s.partitionManager.RefreshIndex(ctx, topic, pid)
+	if err := s.partitionManager.ensureActiveSegment(topic, pid); err != nil {
+		slog.Warn("becomeLeader: ensure active segment", "topic", topic, "partition", pid, "error", err)
+	}
+
+	// 4. Recover the true local log end from native storage.
+	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
+
+	// 5. Set HW from controller's pushed value, ensuring it doesn't fall
+	// below what is already locally visible.
+	recoveredHW := req.HW
+	ps.mu.RLock()
+	indexNext := ps.index.NextOffset()
+	ps.mu.RUnlock()
+	if logEnd > recoveredHW {
+		recoveredHW = logEnd
+	}
+	if indexNext > recoveredHW {
+		recoveredHW = indexNext
+	}
+
+	// 6. Build epoch history from the push.
+	eh := &replication.EpochHistory{}
+	for _, entry := range req.EpochHistory {
+		eh.Append(replication.EpochEntry{Epoch: entry.Epoch, StartOffset: entry.StartOffset})
+	}
+	// Append this epoch's entry.
+	eh.Append(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd})
+
+	// 7. Final state update under ps.mu.Lock.
+	ps.mu.Lock()
+	ps.epochHistory = eh
+	ps.isLeader = true
+	ps.leaderID = ""
+	ps.epoch = req.Epoch
+	ps.index.SetHighWatermark(recoveredHW)
+	if logEnd > ps.nextOffset {
+		ps.nextOffset = logEnd
+	}
+	ps.mu.Unlock()
+
+	// Persist epoch history locally and to S3.
+	ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
+	if err := eh.SaveToFile(ehPath); err != nil {
+		slog.Warn("becomeLeader: save epoch history locally", "topic", topic, "partition", pid, "error", err)
+	}
+	if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, eh); err != nil {
+		slog.Warn("becomeLeader: save epoch history to S3", "topic", topic, "partition", pid, "error", err)
+	}
+
+	// 8. Create ReplicaState if replication factor > 1.
+	topicCfg, err := s.topicStore.Get(ctx, topic)
+	if err != nil {
+		slog.Error("becomeLeader: get topic config", "topic", topic, "pid", pid, "error", err)
+		return fmt.Errorf("get topic config: %w", err)
+	}
+	if topicCfg.ReplicationFactor > 1 {
+		ps.mu.Lock()
+		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas, s.cfg.Coordination.ISRExpansionThresholdValue())
+		ps.replicaState.SetEpochHistory(ps.epochHistory)
+		for _, r := range req.Replicas {
+			if r != s.instanceID {
+				ps.replicaState.AddFollower(r)
+			}
+		}
+		ps.mu.Unlock()
+
+		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
+		if err := s.isrStore.Write(ctx, topic, replication.ISRState{
+			Partition:     pid,
+			ISR:           []string{s.instanceID},
+			Leader:        s.instanceID,
+			LeaderEpoch:   req.Epoch,
+			HighWatermark: recoveredHW,
+		}, ""); err != nil {
+			slog.Warn("becomeLeader: write ISR", "topic", topic, "partition", pid, "error", err)
+		}
+	}
+
+	// 9. Recover producer idempotency state from checkpoint plus any local tail.
+	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
+	if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
+		ps.mu.Lock()
+		ps.loadProducerCheckpoint(data)
+		ps.mu.Unlock()
+		slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
+	}
+
+	if source, n := s.partitionManager.RebuildProducerStateFromLocalTail(topic, pid); n > 0 {
+		slog.Info("idempotency_local_tail_recovery", "topic", topic, "partition", pid, "source", source, "batches", n)
+	}
+
+	// 10. Recovery flush if local native data has not been sealed yet.
+	ps.mu.RLock()
+	indexNextOffset := ps.index.NextOffset()
+	logNextOffset := ps.nextOffset
+	ps.mu.RUnlock()
+	if recoveredHW > indexNextOffset {
+		if err := s.partitionManager.flushRecoveredTail(topic, pid); err != nil {
+			slog.Warn("becomeLeader: flush recovered tail",
+				"topic", topic,
+				"partition", pid,
+				"epoch", req.Epoch,
+				"recovered_hw", recoveredHW,
+				"index_next_offset", indexNextOffset,
+				"error", err,
+			)
+		}
+	}
+
+	// 11. Update ownership cache.
+	s.assignmentsMu.Lock()
+	if s.myPartitions == nil {
+		s.myPartitions = make(map[string]map[int]localPartitionAssignment)
+	}
+	if s.myPartitions[topic] == nil {
+		s.myPartitions[topic] = make(map[int]localPartitionAssignment)
+	}
+	s.myPartitions[topic][pid] = localPartitionAssignment{
+		Owned:       true,
+		LeaderEpoch: req.Epoch,
+	}
+	s.assignmentsMu.Unlock()
+
+	slog.Info("becomeLeader: promoted",
+		"topic", topic, "partition", pid,
+		"epoch", req.Epoch, "hw", recoveredHW,
+		"next_offset", logNextOffset, "replicas", len(req.Replicas))
+
+	return nil
+}
+
+// reconfigureFollower handles a controller push that tells this node to follow
+// a (possibly new) leader. It cancels any existing fetch loop if the leader or
+// epoch changed, and starts a new one pointing at the pushed leader.
+func (s *Server) reconfigureFollower(ctx context.Context, req pushAssignmentRequest) {
+	ps := s.partitionManager.GetPartitionState(req.Topic, req.Partition)
+	if ps == nil {
+		slog.Warn("reconfigureFollower: partition not found", "topic", req.Topic, "partition", req.Partition)
+		return
+	}
+
+	ps.mu.Lock()
+	// If already following the same leader at the same or higher epoch, nothing to do.
+	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == req.Leader && ps.epoch >= req.Epoch {
+		ps.mu.Unlock()
+		return
+	}
+	existingCancel := ps.fetchCancel
+	existingDone := ps.fetchDone
+	ps.fetchCancel = nil
+	ps.fetchDone = nil
+	localOffset := ps.nextOffset
+	localEpoch := ps.epoch
+	ps.mu.Unlock()
+
+	// Cancel existing fetch loop outside the lock.
+	if existingCancel != nil {
+		existingCancel()
+		if existingDone != nil {
+			<-existingDone
+		}
+	}
+
+	// Resolve leader address.
+	leaderInfo, err := s.registry.GetInstanceInfo(ctx, req.Leader)
+	if err != nil {
+		slog.Warn("reconfigureFollower: resolve leader", "leader", req.Leader, "error", err)
+		return
+	}
+	addr := leaderInfo.InternalAddress
+	if addr == "" {
+		addr = leaderInfo.Address
+	}
+	leaderAddr := routablePeerAddress(req.Leader, addr)
+
+	// Start new fetch loop.
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.leaderID = req.Leader
+	ps.replicaState = nil
+	ps.epoch = req.Epoch
+	fetchDone := make(chan struct{})
+	fetchCtx, cancel := context.WithCancel(context.Background())
+	ps.fetchCancel = cancel
+	ps.fetchDone = fetchDone
+	ps.mu.Unlock()
+
+	slog.Info("reconfigureFollower: starting fetch",
+		"topic", req.Topic, "partition", req.Partition,
+		"leader", req.Leader, "leader_addr", leaderAddr,
+		"local_offset", localOffset, "epoch", localEpoch)
+
+	go func() {
+		defer close(fetchDone)
+		s.followerFetcher.Run(fetchCtx, req.Topic, req.Partition, leaderAddr, localOffset, localEpoch, s.instanceID, s.partitionManager)
+	}()
+}
+
+// containsString reports whether ss contains s.
+func containsString(ss []string, s string) bool {
+	return slices.Contains(ss, s)
+}

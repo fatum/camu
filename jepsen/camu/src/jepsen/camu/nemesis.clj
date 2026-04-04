@@ -1,5 +1,6 @@
 (ns jepsen.camu.nemesis
-  (:require [clojure.tools.logging :refer [info warn]]
+  (:require [clojure.set :as set]
+            [clojure.tools.logging :refer [info warn]]
             [jepsen [nemesis :as nemesis]
                     [generator :as gen]
                     [control :as c]]
@@ -58,7 +59,7 @@
    Waits up to 5s for the process to exit cleanly."
   []
   (signal-camu! "TERM")
-  ;; Wait for graceful shutdown (WAL flush + deregister)
+  ;; Wait for graceful shutdown (flush + deregister)
   (Thread/sleep 5000))
 
 (defn block-s3!
@@ -140,6 +141,77 @@
       (teardown! [this test]
         (nemesis/teardown! inner test)))))
 
+(defn- ring-neighbor-map
+  "Returns a map of node -> allowed neighbor set for a ring topology."
+  [nodes]
+  (let [n (count nodes)]
+    (into {}
+          (map-indexed
+           (fn [idx node]
+             [node #{(nth nodes (mod (dec idx) n))
+                     (nth nodes (mod (inc idx) n))}])
+           nodes))))
+
+(defn- ring-block-map
+  "Returns a map of node -> peers that should be blocked to leave only ring
+   neighbor connectivity."
+  [nodes]
+  (let [all-nodes  (set nodes)
+        neighbors  (ring-neighbor-map nodes)]
+    (into {}
+          (map (fn [node]
+                 [node (sort (seq (disj (set/difference all-nodes (neighbors node))
+                                        node)))])
+               nodes))))
+
+(defn- block-peer!
+  [peer]
+  (c/exec :iptables :-A :OUTPUT :-d peer :-j :DROP
+          (c/lit "|| true")))
+
+(defn- unblock-peer!
+  [peer]
+  (c/exec :iptables :-D :OUTPUT :-d peer :-j :DROP
+          (c/lit "|| true")))
+
+(defn partition-ring-nemesis
+  "A ring-topology network partition. During the fault, each node can only talk
+   to its two ring neighbors; all other node-to-node links are blocked."
+  []
+  (let [blocked (atom {})]
+    (reify nemesis/Nemesis
+      (setup! [this test] this)
+      (invoke! [this test op]
+        (case (:value op)
+          :start
+          (let [nodes     (vec (:nodes test))
+                block-map (ring-block-map nodes)]
+            (reset! blocked block-map)
+            (doseq [[node peers] block-map]
+              (c/on-nodes test [node]
+                          (fn [_ _]
+                            (doseq [peer peers]
+                              (block-peer! peer)))))
+            (assoc op :value [:isolated block-map]))
+          :stop
+          (let [block-map @blocked]
+            (doseq [[node peers] block-map]
+              (c/on-nodes test [node]
+                          (fn [_ _]
+                            (doseq [peer peers]
+                              (unblock-peer! peer)))))
+            (reset! blocked {})
+            (assoc op :value :network-healed))))
+      (teardown! [this test]
+        (let [block-map @blocked]
+          (when (seq block-map)
+            (doseq [[node peers] block-map]
+              (c/on-nodes test [node]
+                          (fn [_ _]
+                            (doseq [peer peers]
+                              (unblock-peer! peer))))))
+          (reset! blocked {}))))))
+
 (defn rejoin-nemesis
   "A nemesis that kills a node, waits for lease expiry, then restarts it."
   []
@@ -160,7 +232,7 @@
 
 (defn leave-nemesis
   "A nemesis that gracefully stops a node (SIGTERM) and restarts it.
-   Unlike kill-nemesis, this allows the node to flush WAL and deregister
+   Unlike kill-nemesis, this allows the node to flush local data and deregister
    from the cluster, so partition reassignment happens immediately.
    :start = graceful stop (leave), :stop = restart (join)."
   []
@@ -308,7 +380,7 @@
 (defn composed-nemesis
   "Returns a nemesis that composes fault types specified in the faults set.
    Supported fault keys: :kill :partition :pause :rejoin :leave :membership
-                         :s3-partition :clock-skew :leader-kill
+                         :s3-partition :clock-skew :leader-kill :partition-ring
 
    For :kill — start = SIGKILL process, stop = restart process
    For :leave — start = graceful SIGTERM (deregister), stop = restart (rejoin)
@@ -324,6 +396,9 @@
 
       (:partition faults)
       (assoc #{:partition} (partition-nemesis))
+
+      (:partition-ring faults)
+      (assoc #{:partition-ring} (partition-ring-nemesis))
 
       (:pause faults)
       (assoc #{:pause} (pause-nemesis))
@@ -352,6 +427,11 @@
    leave/wait/rejoin internally."
   [fault]
   (case fault
+    :partition-ring (gen/cycle
+                     [(gen/sleep 5)
+                      {:type :info :f fault :value :start}
+                      (gen/sleep 10)
+                      {:type :info :f fault :value :stop}])
     :membership (gen/cycle
                  [(gen/sleep 10)
                   {:type :info :f fault :value :start}

@@ -52,12 +52,12 @@ var (
 	}
 )
 
-// WriteSegment writes a segment header followed by stored WAL batch envelopes.
+// WriteSegment writes a segment header followed by stored batch envelopes.
 // Header format: [4B magic][1B version][1B compression].
 // Each batch is:
 // [4B stored batch length][stored batch bytes]
-// where stored batch bytes are either a raw WAL batch envelope or a compressed
-// WAL batch envelope, depending on the segment compression flag.
+// where stored batch bytes are either raw batch bytes or compressed batch
+// bytes, depending on the segment compression flag.
 func WriteSegment(w io.Writer, msgs []Message, compression string, batchTargetSize int64) error {
 	batches, err := buildSegmentBatches(msgs, batchTargetSize)
 	if err != nil {
@@ -162,7 +162,7 @@ func buildSegmentBatchesFromBatches(batches []Batch, _ int64) ([]segmentBatch, e
 		if len(batch.Messages) == 0 {
 			continue
 		}
-		payload, err := serializeWALBatch(batch)
+		payload, err := serializeSegmentBatch(batch)
 		if err != nil {
 			return nil, fmt.Errorf("serialize segment batch: %w", err)
 		}
@@ -374,7 +374,7 @@ func walkSegmentFromOffset(r io.ReaderAt, size int64, offsetIndex []byte, baseOf
 		}
 
 		reader := bytes.NewReader(payload)
-		_, _, _, err = scanWALBatches(reader, int64(len(payload)), 0, func(b Batch) bool {
+		_, _, _, err = scanSegmentBatches(reader, int64(len(payload)), 0, func(b Batch) bool {
 			for _, msg := range b.Messages {
 				if msg.Offset < startOffset {
 					continue
@@ -390,7 +390,7 @@ func walkSegmentFromOffset(r io.ReaderAt, size int64, offsetIndex []byte, baseOf
 			return true
 		})
 		if err != nil {
-			return visited, fmt.Errorf("read WAL batch from segment: %w", err)
+			return visited, fmt.Errorf("read batch from segment: %w", err)
 		}
 		if limit > 0 && visited >= limit {
 			return visited, nil
@@ -407,6 +407,8 @@ type segmentOffsetIndexEntry struct {
 type SegmentMetadata struct {
 	BaseOffset     uint64    `json:"base_offset"`
 	EndOffset      uint64    `json:"end_offset"`
+	MinTimestamp   int64     `json:"min_timestamp,omitempty"`
+	MaxTimestamp   int64     `json:"max_timestamp,omitempty"`
 	Epoch          uint64    `json:"epoch"`
 	SegmentKey     string    `json:"segment_key"`
 	OffsetIndexKey string    `json:"offset_index_key"`
@@ -437,6 +439,8 @@ func BuildSegmentMetadata(ref SegmentRef, recordCount int, sizeBytes int64, comp
 	meta := SegmentMetadata{
 		BaseOffset:     ref.BaseOffset,
 		EndOffset:      ref.EndOffset,
+		MinTimestamp:   ref.MinTimestamp,
+		MaxTimestamp:   ref.MaxTimestamp,
 		Epoch:          ref.Epoch,
 		SegmentKey:     ref.Key,
 		OffsetIndexKey: ref.OffsetIndexObjectKey(),
@@ -503,20 +507,20 @@ func BuildSegmentOffsetIndex(segment []byte, baseOffset uint64, intervalBytes in
 
 		// We need the first message offset in each stored batch to build a
 		// Kafka-style sparse offset index. With the current batch-compressed
-		// format, that requires decoding the stored WAL batch envelope here.
+		// format, that requires decoding the stored batch envelope here.
 		decoded, err := decodeSegmentFrame(payload, compressionFlag[0])
 		if err != nil {
 			return nil, fmt.Errorf("decode batch: %w", err)
 		}
 		var firstMeta BatchMeta
 		found := false
-		_, _, _, err = scanWALBatchMetas(bytes.NewReader(decoded), int64(len(decoded)), 0, func(meta BatchMeta) bool {
+		_, _, _, err = scanSegmentBatchMetas(bytes.NewReader(decoded), int64(len(decoded)), 0, func(meta BatchMeta) bool {
 			firstMeta = meta
 			found = true
 			return false
 		})
 		if err != nil {
-			return nil, fmt.Errorf("read first WAL batch meta in segment: %w", err)
+			return nil, fmt.Errorf("read first batch meta in segment: %w", err)
 		}
 		if !found || firstMeta.MessageCount == 0 {
 			continue
@@ -579,6 +583,170 @@ func lookupSegmentOffsetIndex(index []byte, baseOffset uint64, targetOffset uint
 	}
 	entryPos := (pos - 1) * 8
 	return binary.BigEndian.Uint32(index[entryPos+4 : entryPos+8]), true, nil
+}
+
+// IsRecordBatchFormat returns true when data begins with a Kafka v2 RecordBatch
+// (Magic byte = 2 at offset 16). Old CAMU segments start with the 4-byte magic
+// 0x43414D55 at offset 0, so this reliably distinguishes the two formats.
+func IsRecordBatchFormat(data []byte) bool {
+	return len(data) >= 17 && data[16] == 2
+}
+
+// ReadSegmentBatches reads bare RecordBatch entries from a segment byte slice.
+// The segment format is RecordBatch entries back-to-back with no framing.
+// Each batch is self-framing via its Length field at offset 8.
+// Returns raw batch byte slices that overlap startOffset..startOffset+limit.
+func ReadSegmentBatches(data []byte, startOffset uint64, limit int) ([][]byte, error) {
+	var batches [][]byte
+	pos := 0
+	for pos < len(data) && (limit <= 0 || len(batches) < limit) {
+		if len(data)-pos < RecordBatchHeaderSize {
+			break
+		}
+		h, err := ReadRecordBatchHeader(data[pos:])
+		if err != nil {
+			break
+		}
+		batchSize := int(h.RecordBatchSize())
+		if batchSize < RecordBatchHeaderSize || pos+batchSize > len(data) {
+			break
+		}
+		if uint64(h.LastOffset()) >= startOffset {
+			batches = append(batches, data[pos:pos+batchSize])
+		}
+		pos += batchSize
+	}
+	return batches, nil
+}
+
+// ReadSegmentBatchesAsMessages decodes bare RecordBatch segment data into
+// messages. It is a convenience wrapper around ReadSegmentBatches used by the
+// HTTP consume path and for backward-compat shims.
+func ReadSegmentBatchesAsMessages(data []byte, startOffset uint64, limit int) ([]Message, error) {
+	rawBatches, err := ReadSegmentBatches(data, startOffset, limit)
+	if err != nil {
+		return nil, err
+	}
+	var msgs []Message
+	for _, raw := range rawBatches {
+		decoded, err := DecodeRecordBatch(raw)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range decoded {
+			if m.Offset >= startOffset && (limit <= 0 || len(msgs) < limit) {
+				msgs = append(msgs, m)
+			}
+		}
+	}
+	return msgs, nil
+}
+
+func serializeSegmentBatch(batch Batch) ([]byte, error) {
+	if len(batch.Messages) == 0 {
+		return nil, nil
+	}
+	return EncodeRecordBatchWithMeta(int64(batch.Messages[0].Offset), batch), nil
+}
+
+func scanSegmentBatches(r io.Reader, _ int64, startOffset uint64, visit func(Batch) bool) (int64, uint64, bool, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("read segment batches: %w", err)
+	}
+
+	var (
+		pos        int
+		lastOffset uint64
+	)
+	for pos < len(data) {
+		if len(data)-pos < RecordBatchHeaderSize {
+			return int64(pos), lastOffset, false, nil
+		}
+		hdr, err := ReadRecordBatchHeader(data[pos:])
+		if err != nil {
+			return int64(pos), lastOffset, false, err
+		}
+		batchSize := int(hdr.RecordBatchSize())
+		if batchSize < RecordBatchHeaderSize || pos+batchSize > len(data) {
+			return int64(pos), lastOffset, false, nil
+		}
+		raw := data[pos : pos+batchSize]
+		pos += batchSize
+		if hdr.LastOffset() < int64(startOffset) {
+			lastOffset = uint64(hdr.LastOffset())
+			continue
+		}
+		msgs, err := DecodeRecordBatch(raw)
+		if err != nil {
+			return int64(pos), lastOffset, false, err
+		}
+		batch := Batch{
+			Messages: msgs,
+		}
+		if hdr.ProducerID >= 0 {
+			batch.ProducerID = uint64(hdr.ProducerID)
+		}
+		if hdr.FirstSequence >= 0 {
+			batch.Sequence = uint64(hdr.FirstSequence)
+		}
+		if len(batch.Messages) == 0 {
+			lastOffset = uint64(hdr.LastOffset())
+			continue
+		}
+		lastOffset = uint64(hdr.LastOffset())
+		if visit != nil && !visit(batch) {
+			return int64(pos), lastOffset, true, nil
+		}
+	}
+	return int64(pos), lastOffset, false, nil
+}
+
+func scanSegmentBatchMetas(r io.Reader, _ int64, startOffset uint64, visit func(BatchMeta) bool) (int64, uint64, bool, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("read segment batch metas: %w", err)
+	}
+
+	var (
+		pos        int
+		lastOffset uint64
+	)
+	for pos < len(data) {
+		if len(data)-pos < RecordBatchHeaderSize {
+			return int64(pos), lastOffset, false, nil
+		}
+		hdr, err := ReadRecordBatchHeader(data[pos:])
+		if err != nil {
+			return int64(pos), lastOffset, false, err
+		}
+		batchSize := int(hdr.RecordBatchSize())
+		if batchSize < RecordBatchHeaderSize || pos+batchSize > len(data) {
+			return int64(pos), lastOffset, false, nil
+		}
+		pos += batchSize
+		if hdr.LastOffset() < int64(startOffset) {
+			lastOffset = uint64(hdr.LastOffset())
+			continue
+		}
+
+		meta := BatchMeta{
+			MessageCount: int(hdr.NumRecords),
+			FirstOffset:  uint64(hdr.FirstOffset),
+			LastOffset:   uint64(hdr.LastOffset()),
+		}
+		if hdr.ProducerID >= 0 {
+			meta.ProducerID = uint64(hdr.ProducerID)
+		}
+		if hdr.FirstSequence >= 0 {
+			meta.Sequence = uint64(hdr.FirstSequence)
+		}
+		lastOffset = meta.LastOffset
+		if visit != nil && !visit(meta) {
+			return int64(pos), lastOffset, true, nil
+		}
+	}
+	return int64(pos), lastOffset, false, nil
 }
 
 // readMessageFrame reads one message frame from r.

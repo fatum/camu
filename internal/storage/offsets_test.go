@@ -106,3 +106,32 @@ func TestOffsetStore_ConsumerSpecific(t *testing.T) {
 		t.Errorf("group offsets should be empty, got %v", groupOffsets)
 	}
 }
+
+func TestOffsetStore_GroupTopics(t *testing.T) {
+	s3 := newTestS3(t)
+	store := NewOffsetStore(s3)
+	ctx := context.Background()
+
+	if err := store.CommitGroupTopics(ctx, "group-1", map[string]map[int]uint64{
+		"topic-a": {0: 10, 1: 11},
+		"topic-b": {0: 20},
+	}); err != nil {
+		t.Fatalf("CommitGroupTopics: %v", err)
+	}
+	if err := store.CommitGroupTopics(ctx, "group-1", map[string]map[int]uint64{
+		"topic-a": {1: 99},
+	}); err != nil {
+		t.Fatalf("CommitGroupTopics merge: %v", err)
+	}
+
+	got, err := store.GetGroupTopics(ctx, "group-1")
+	if err != nil {
+		t.Fatalf("GetGroupTopics: %v", err)
+	}
+	if got["topic-a"][0] != 10 || got["topic-a"][1] != 99 {
+		t.Fatalf("topic-a offsets = %v", got["topic-a"])
+	}
+	if got["topic-b"][0] != 20 {
+		t.Fatalf("topic-b offsets = %v", got["topic-b"])
+	}
+}

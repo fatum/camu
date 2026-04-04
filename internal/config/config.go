@@ -12,7 +12,6 @@ import (
 type Config struct {
 	Server       ServerConfig       `yaml:"server"`
 	Storage      StorageConfig      `yaml:"storage"`
-	WAL          WALConfig          `yaml:"wal"`
 	Segments     SegmentsConfig     `yaml:"segments"`
 	Cache        CacheConfig        `yaml:"cache"`
 	Coordination CoordinationConfig `yaml:"coordination"`
@@ -23,6 +22,9 @@ type ServerConfig struct {
 	Address         string `yaml:"address"`
 	InternalAddress string `yaml:"internal_address"`
 	InstanceID      string `yaml:"instance_id"`
+	AuthToken       string `yaml:"auth_token"`    // Public API bearer token (optional)
+	ClusterToken    string `yaml:"cluster_token"` // Internal API shared secret (optional)
+	KafkaPort       int    `yaml:"kafka_port"`    // Kafka protocol port (0 = disabled)
 }
 
 // StorageConfig holds S3-compatible object storage settings.
@@ -38,15 +40,6 @@ type CredentialsConfig struct {
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
 }
-
-// WALConfig holds write-ahead log settings.
-type WALConfig struct {
-	Directory string `yaml:"directory"`
-	Fsync     bool   `yaml:"fsync"`
-	ChunkSize int64  `yaml:"chunk_size"`
-}
-
-const defaultWALChunkSize = 64 * 1024 * 1024
 
 // SegmentsConfig holds segment management settings.
 type SegmentsConfig struct {
@@ -162,11 +155,6 @@ func defaults() *Config {
 		Server: ServerConfig{
 			Address:         ":8080",
 			InternalAddress: ":8081",
-		},
-		WAL: WALConfig{
-			Directory: "/var/lib/camu/wal",
-			Fsync:     true,
-			ChunkSize: defaultWALChunkSize,
 		},
 		Segments: SegmentsConfig{
 			MaxSize:               8388608,

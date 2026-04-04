@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -33,8 +34,6 @@ func newTestPartitionManagerWithSegmentMaxSize(t *testing.T, maxSize int64) *Par
 	}
 
 	cfg := &config.Config{}
-	cfg.WAL.Directory = filepath.Join(t.TempDir(), "wal")
-	cfg.WAL.Fsync = false
 	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
 	cfg.Segments.MaxSize = maxSize
 	cfg.Segments.MaxAge = "1h"
@@ -46,7 +45,7 @@ func newTestPartitionManagerWithSegmentMaxSize(t *testing.T, maxSize int64) *Par
 	return pm
 }
 
-func TestNewPartitionManager_UsesConfiguredWALFsync(t *testing.T) {
+func TestNewPartitionManager_UsesCacheBackedLocalDir(t *testing.T) {
 	s3Client, err := storage.NewS3Client(storage.S3Config{
 		Bucket:   "test",
 		Endpoint: "memory://",
@@ -56,8 +55,6 @@ func TestNewPartitionManager_UsesConfiguredWALFsync(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	cfg.WAL.Directory = filepath.Join(t.TempDir(), "wal")
-	cfg.WAL.Fsync = true
 	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
 	cfg.Segments.MaxSize = 1 << 20
 	cfg.Segments.MaxAge = "1h"
@@ -66,12 +63,12 @@ func TestNewPartitionManager_UsesConfiguredWALFsync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPartitionManager() error = %v", err)
 	}
-	if !pm.walFsync {
-		t.Fatal("expected PartitionManager to propagate WAL.Fsync=true")
+	if pm.localDir == "" {
+		t.Fatal("expected PartitionManager localDir to be initialized")
 	}
 }
 
-func TestPartitionManagerAppendBatch_ConcurrentWritesPreserveWALOrder(t *testing.T) {
+func TestPartitionManagerAppendBatch_ConcurrentWritesPreserveOffsetOrder(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
 	tc := meta.TopicConfig{
@@ -111,17 +108,49 @@ func TestPartitionManagerAppendBatch_ConcurrentWritesPreserveWALOrder(t *testing
 	}
 	wg.Wait()
 
-	msgs, err := ps.wal.Replay()
+	ps.mu.RLock()
+	nextOffset := ps.nextOffset
+	indexHW := ps.index.HighWatermark()
+	ps.mu.RUnlock()
+	if nextOffset != goroutines {
+		t.Fatalf("nextOffset = %d, want %d", nextOffset, goroutines)
+	}
+	if indexHW != goroutines {
+		t.Fatalf("index.HighWatermark() = %d, want %d", indexHW, goroutines)
+	}
+}
+
+func TestRecoverLocalLogEnd_PrefersNativeData(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
 	if err != nil {
-		t.Fatalf("wal.Replay() error = %v", err)
+		t.Fatalf("OpenActiveSegment() error = %v", err)
 	}
-	if len(msgs) != goroutines {
-		t.Fatalf("wal.Replay() returned %d messages, want %d", len(msgs), goroutines)
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	nativeBatch := log.EncodeRecordBatch(0, []log.Message{
+		{Key: []byte("k0"), Value: []byte("v0"), Timestamp: now},
+		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now + 1},
+	})
+	if err := as.Append(nativeBatch); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
 	}
-	for i, msg := range msgs {
-		if msg.Offset != uint64(i) {
-			t.Fatalf("wal message %d has offset %d, want %d", i, msg.Offset, i)
-		}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.nextOffset = 0
+	ps.mu.Unlock()
+
+	if got := pm.recoverLocalLogEnd("topic", 0); got != 2 {
+		t.Fatalf("recoverLocalLogEnd() = %d, want 2 from native data", got)
 	}
 }
 
@@ -161,19 +190,19 @@ func TestPartitionManagerAppendBatch_PersistsHighWatermarkBeforeFlush(t *testing
 		t.Fatalf("index.HighWatermark() = %d, want 1", got)
 	}
 
-	msgs, err := ps.wal.Replay()
+	raw, _, err := pm.ReadRawBatches(context.Background(), "topic", 0, 0, 1<<20)
 	if err != nil {
-		t.Fatalf("wal.Replay() error = %v", err)
+		t.Fatalf("ReadRawBatches() error = %v", err)
 	}
-	if len(msgs) != 0 {
-		t.Fatalf("expected WAL to be truncated after flush, found %d messages", len(msgs))
+	if len(raw) == 0 {
+		t.Fatal("expected native storage to expose appended batch")
 	}
 }
 
 // TestPartitionManagerOnFlush_IndexCASExhaustionKeepsWAL was removed:
 // index.json CAS loop has been replaced by a simple state.json PUT.
 
-func TestPartitionManagerScanAndRebuildProducerState(t *testing.T) {
+func TestPartitionManagerScanAndRebuildProducerStateFromActiveSegment(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
 	tc := meta.TopicConfig{
@@ -193,32 +222,40 @@ func TestPartitionManagerScanAndRebuildProducerState(t *testing.T) {
 		t.Fatal("expected partition state")
 	}
 
-	if err := ps.wal.AppendBatchWithMeta(log.Batch{
+	as, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "topic-0-active"), 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.activeSegment = as
+
+	first := log.EncodeRecordBatchWithMeta(0, log.Batch{
 		ProducerID: 1,
 		Sequence:   0,
 		Messages: []log.Message{
 			{Offset: 0, Key: []byte("k0"), Value: []byte("v0"), Headers: map[string]string{"a": "1"}},
 			{Offset: 1, Key: []byte("k1"), Value: []byte("v1"), Headers: map[string]string{"b": "2"}},
 		},
-	}); err != nil {
-		t.Fatalf("AppendBatchWithMeta(first) error = %v", err)
+	})
+	if err := as.Append(first); err != nil {
+		t.Fatalf("activeSegment.Append(first) error = %v", err)
 	}
-	if err := ps.wal.AppendBatchWithMeta(log.Batch{
+	second := log.EncodeRecordBatchWithMeta(2, log.Batch{
 		ProducerID: 2,
 		Sequence:   5,
 		Messages: []log.Message{
 			{Offset: 2, Key: []byte("k2"), Value: []byte("v2"), Headers: map[string]string{"c": "3"}},
 		},
-	}); err != nil {
-		t.Fatalf("AppendBatchWithMeta(second) error = %v", err)
+	})
+	if err := as.Append(second); err != nil {
+		t.Fatalf("activeSegment.Append(second) error = %v", err)
 	}
 
-	// Only batches at or above flushedOffset are scanned.
-	ps.flushedOffset = 2
+	ps.flushedOffset = 1
+	ps.nextOffset = 3
 
-	n := pm.ScanAndRebuildProducerState("topic", 0)
+	n := pm.ScanAndRebuildProducerStateFromActiveSegment("topic", 0)
 	if n != 1 {
-		t.Fatalf("ScanAndRebuildProducerState() rebuilt %d batches, want 1", n)
+		t.Fatalf("ScanAndRebuildProducerStateFromActiveSegment() rebuilt %d batches, want 1", n)
 	}
 
 	// Verify producer 2's sequence state was rebuilt.
@@ -287,6 +324,487 @@ func TestPartitionStateRebuildProducerSeqsFromBatches_DoesNotImmediateExpire(t *
 		t.Fatalf("state.NextSeq = %d, want 5", got)
 	}
 	if state.LastActiveAt.IsZero() {
-		t.Fatal("expected LastActiveAt to be populated on WAL rebuild")
+		t.Fatal("expected LastActiveAt to be populated on producer-state rebuild")
+	}
+}
+
+func TestAppendRawBatch_BasicOffsetAssignment(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	// Set up activeSegment and mark as leader.
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.mu.Unlock()
+
+	// Build a raw RecordBatch with 3 messages.
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	msgs := []log.Message{
+		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now},
+		{Key: []byte("k2"), Value: []byte("v2"), Timestamp: now + 1},
+		{Key: []byte("k3"), Value: []byte("v3"), Timestamp: now + 2},
+	}
+	rawBatch := log.EncodeRecordBatch(0, msgs)
+
+	// Append first batch.
+	baseOffset, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch)
+	if err != nil {
+		t.Fatalf("AppendRawBatch() error = %v", err)
+	}
+	if baseOffset != 0 {
+		t.Fatalf("expected baseOffset=0, got %d", baseOffset)
+	}
+
+	// Build and append second batch.
+	msgs2 := []log.Message{
+		{Key: []byte("k4"), Value: []byte("v4"), Timestamp: now + 3},
+		{Key: []byte("k5"), Value: []byte("v5"), Timestamp: now + 4},
+	}
+	rawBatch2 := log.EncodeRecordBatch(0, msgs2)
+
+	baseOffset2, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch2)
+	if err != nil {
+		t.Fatalf("AppendRawBatch() second batch error = %v", err)
+	}
+	if baseOffset2 != 3 {
+		t.Fatalf("expected baseOffset=3, got %d", baseOffset2)
+	}
+
+	// Verify nextOffset advanced correctly.
+	ps.mu.RLock()
+	nextOff := ps.nextOffset
+	ps.mu.RUnlock()
+	if nextOff != 5 {
+		t.Fatalf("expected nextOffset=5, got %d", nextOff)
+	}
+
+	// Verify the active segment has the data by reading back the header.
+	entries := as.OffsetIndex()
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 index entries, got %d", len(entries))
+	}
+	if entries[0].BaseOffset != 0 {
+		t.Fatalf("first entry baseOffset: got %d, want 0", entries[0].BaseOffset)
+	}
+	if entries[1].BaseOffset != 3 {
+		t.Fatalf("second entry baseOffset: got %d, want 3", entries[1].BaseOffset)
+	}
+}
+
+func TestAppendRawBatch_NotLeaderReturnsError(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+
+	// Set up activeSegment but do NOT mark as leader.
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = false
+	ps.mu.Unlock()
+
+	rawBatch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})
+	_, err = pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch)
+	if err == nil {
+		t.Fatal("expected error for non-leader append")
+	}
+}
+
+func TestAppendRawBatch_NilActiveSegmentReturnsError(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	ps.mu.Lock()
+	ps.isLeader = true
+	// activeSegment is nil
+	ps.mu.Unlock()
+
+	rawBatch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})
+	_, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch)
+	if err == nil {
+		t.Fatal("expected error for nil active segment")
+	}
+}
+
+func TestReadRawBatches_ActiveSegment(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.mu.Unlock()
+
+	// Append two batches.
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	msgs1 := []log.Message{
+		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now},
+		{Key: []byte("k2"), Value: []byte("v2"), Timestamp: now + 1},
+	}
+	rawBatch1 := log.EncodeRecordBatch(0, msgs1)
+	if _, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch1); err != nil {
+		t.Fatalf("AppendRawBatch(1) error = %v", err)
+	}
+
+	msgs2 := []log.Message{
+		{Key: []byte("k3"), Value: []byte("v3"), Timestamp: now + 2},
+	}
+	rawBatch2 := log.EncodeRecordBatch(0, msgs2)
+	if _, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch2); err != nil {
+		t.Fatalf("AppendRawBatch(2) error = %v", err)
+	}
+
+	// Read all from offset 0.
+	data, hw, err := pm.ReadRawBatches(context.Background(), "topic", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadRawBatches() error = %v", err)
+	}
+	if hw != 3 {
+		t.Fatalf("expected hw=3, got %d", hw)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected non-empty data")
+	}
+
+	// Decode the returned bytes — should contain both batches.
+	decoded, err := log.DecodeRecordBatch(data[:len(rawBatch1)])
+	if err != nil {
+		t.Fatalf("DecodeRecordBatch(batch1) error = %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("expected 2 messages in first batch, got %d", len(decoded))
+	}
+	if string(decoded[0].Key) != "k1" {
+		t.Fatalf("expected key=k1, got %s", decoded[0].Key)
+	}
+
+	// Read from offset 2 — should get only the second batch.
+	data2, hw2, err := pm.ReadRawBatches(context.Background(), "topic", 0, 2, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadRawBatches(offset=2) error = %v", err)
+	}
+	if hw2 != 3 {
+		t.Fatalf("expected hw=3, got %d", hw2)
+	}
+	if len(data2) == 0 {
+		t.Fatal("expected non-empty data for offset=2")
+	}
+
+	decoded2, err := log.DecodeRecordBatch(data2)
+	if err != nil {
+		t.Fatalf("DecodeRecordBatch(batch2) error = %v", err)
+	}
+	if len(decoded2) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(decoded2))
+	}
+	if string(decoded2[0].Key) != "k3" {
+		t.Fatalf("expected key=k3, got %s", decoded2[0].Key)
+	}
+
+	// Read beyond HW should return empty.
+	data3, hw3, err := pm.ReadRawBatches(context.Background(), "topic", 0, 3, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadRawBatches(offset=3) error = %v", err)
+	}
+	if hw3 != 3 {
+		t.Fatalf("expected hw=3, got %d", hw3)
+	}
+	if len(data3) != 0 {
+		t.Fatalf("expected empty data for offset >= hw, got %d bytes", len(data3))
+	}
+}
+
+func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	batch0 := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k0"), Value: []byte("v0"), Timestamp: now}})
+	batch1 := log.EncodeRecordBatch(1, []log.Message{{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now + 1}})
+	if err := as.Append(batch0); err != nil {
+		t.Fatalf("Append(batch0) error = %v", err)
+	}
+	if err := as.Append(batch1); err != nil {
+		t.Fatalf("Append(batch1) error = %v", err)
+	}
+
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.nextOffset = 2
+	ps.replicaState = replication.NewReplicaState("leader", 1, 1, 1000) // readable HW=1, log end=2
+	ps.mu.Unlock()
+
+	data, hw, err := pm.ReadRawBatches(context.Background(), "topic", 0, 1, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadRawBatches() error = %v", err)
+	}
+	if hw != 1 {
+		t.Fatalf("ReadRawBatches() hw = %d, want 1", hw)
+	}
+	if len(data) != 0 {
+		t.Fatalf("ReadRawBatches() returned %d bytes, want 0 beyond readable HW", len(data))
+	}
+
+	replicaData, leo, err := pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 1, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadReplicaRawBatches() error = %v", err)
+	}
+	if leo != 2 {
+		t.Fatalf("ReadReplicaRawBatches() upper bound = %d, want 2", leo)
+	}
+	if len(replicaData) == 0 {
+		t.Fatal("ReadReplicaRawBatches() returned no data, want uncommitted tail batch")
+	}
+	decoded, err := log.DecodeRecordBatch(replicaData)
+	if err != nil {
+		t.Fatalf("DecodeRecordBatch() error = %v", err)
+	}
+	if len(decoded) != 1 || string(decoded[0].Key) != "k1" {
+		t.Fatalf("decoded replica batch = %+v, want one k1 record", decoded)
+	}
+}
+
+func TestReadRawBatches_UnknownTopicReturnsError(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	_, _, err := pm.ReadRawBatches(context.Background(), "nonexistent", 0, 0, 1<<20)
+	if err == nil {
+		t.Fatal("expected error for unknown topic")
+	}
+}
+
+func TestReadRawBatches_MaxBytesLimit(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.mu.Unlock()
+
+	// Append 3 batches.
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	for i := 0; i < 3; i++ {
+		msgs := []log.Message{{Key: []byte(fmt.Sprintf("k%d", i)), Value: []byte("val"), Timestamp: now + int64(i)}}
+		raw := log.EncodeRecordBatch(0, msgs)
+		if _, err := pm.AppendRawBatch(context.Background(), "topic", 0, raw); err != nil {
+			t.Fatalf("AppendRawBatch(%d) error = %v", i, err)
+		}
+	}
+
+	// Use a tiny maxBytes — should still return at least one batch.
+	data, _, err := pm.ReadRawBatches(context.Background(), "topic", 0, 0, 1)
+	if err != nil {
+		t.Fatalf("ReadRawBatches(maxBytes=1) error = %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected at least one batch even with maxBytes=1")
+	}
+
+	// Verify we got exactly one batch (the first one).
+	decoded, err := log.DecodeRecordBatch(data)
+	if err != nil {
+		t.Fatalf("DecodeRecordBatch error = %v", err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("expected 1 message (one batch), got %d", len(decoded))
+	}
+	if string(decoded[0].Key) != "k0" {
+		t.Fatalf("expected key=k0, got %s", decoded[0].Key)
+	}
+}
+
+func newTestTopicConfig(name string) meta.TopicConfig {
+	return meta.TopicConfig{
+		Name:              name,
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+}
+
+func TestAppendReplicatedRawBatches(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("expected partition state")
+	}
+
+	// Wire up an active segment (followers receive replicated data into the active segment).
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = false // follower
+	ps.mu.Unlock()
+
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+
+	// Build two raw RecordBatch blobs with leader-assigned offsets.
+	// batch1: base=10, 2 records → offsets 10,11
+	// batch2: base=12, 1 record  → offset  12
+	batch1 := log.EncodeRecordBatch(10, []log.Message{
+		{Key: []byte("a"), Value: []byte("1"), Timestamp: now},
+		{Key: []byte("b"), Value: []byte("2"), Timestamp: now + 1},
+	})
+	batch2 := log.EncodeRecordBatch(12, []log.Message{
+		{Key: []byte("c"), Value: []byte("3"), Timestamp: now + 2},
+	})
+
+	if err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{batch1, batch2}); err != nil {
+		t.Fatalf("AppendReplicatedRawBatches() error = %v", err)
+	}
+
+	// nextOffset should be 13 (last offset 12 + 1).
+	ps.mu.RLock()
+	gotOffset := ps.nextOffset
+	ps.mu.RUnlock()
+	if gotOffset != 13 {
+		t.Fatalf("nextOffset = %d, want 13", gotOffset)
+	}
+
+	// Verify both batches were written via the offset index.
+	entries := as.OffsetIndex()
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 index entries, got %d", len(entries))
+	}
+	if entries[0].BaseOffset != 10 {
+		t.Errorf("entries[0].BaseOffset = %d, want 10", entries[0].BaseOffset)
+	}
+	if entries[1].BaseOffset != 12 {
+		t.Errorf("entries[1].BaseOffset = %d, want 12", entries[1].BaseOffset)
+	}
+}
+
+func TestAppendReplicatedRawBatches_NoActiveSegment(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	// activeSegment is nil by default — should return an error.
+	batch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})
+	err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{batch})
+	if err == nil {
+		t.Fatal("expected error for nil active segment, got nil")
+	}
+}
+
+func TestAppendReplicatedRawBatches_PartitionNotFound(t *testing.T) {
+	pm := newTestPartitionManager(t)
+	batch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})
+	err := pm.AppendReplicatedRawBatches(context.Background(), "ghost", 0, [][]byte{batch})
+	if err == nil {
+		t.Fatal("expected error for unknown partition, got nil")
 	}
 }

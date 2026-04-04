@@ -22,6 +22,7 @@ type ReplicaState struct {
 	newDataCh             atomic.Value // stores chan struct{}
 	epochHistory          *EpochHistory
 	isrExpansionThreshold int
+	isrChanged            bool
 }
 
 // FollowerState holds the last known state for a single follower replica.
@@ -83,6 +84,7 @@ func (rs *ReplicaState) UpdateFollower(id string, offset uint64) {
 		lag := rs.leaderOffset - offset
 		if lag <= uint64(rs.isrExpansionThreshold) {
 			rs.isrSet[id] = true
+			rs.isrChanged = true
 			slog.Info("isr_expand: follower caught up",
 				"leader", rs.leaderID, "follower", id,
 				"follower_offset", offset, "leader_offset", rs.leaderOffset,
@@ -202,6 +204,18 @@ func (rs *ReplicaState) CheckISRLag(lagTimeout time.Duration) bool {
 		rs.advanceHW()
 	}
 	return changed
+}
+
+// ISRChanged reports whether the ISR set has been modified since the last
+// call to ClearISRChanged (e.g., by follower catch-up expansion).
+func (rs *ReplicaState) ISRChanged() bool {
+	return rs.isrChanged
+}
+
+// ClearISRChanged resets the ISR-changed flag after the caller has persisted
+// the updated ISR state.
+func (rs *ReplicaState) ClearISRChanged() {
+	rs.isrChanged = false
 }
 
 // GetISRMembers returns a snapshot of the current ISR member IDs.

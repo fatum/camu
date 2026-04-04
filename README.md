@@ -4,7 +4,28 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/fatum/camu.svg)](https://pkg.go.dev/github.com/fatum/camu)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
 
-**An S3-native event log with an HTTP API.** Camu keeps durable log state in object storage, uses a local WAL for fast acknowledgements, and coordinates multi-instance ownership through S3 leases instead of a broker quorum.
+**A Jepsen-verified, S3-native event log with HTTP and Kafka wire protocol support.** Camu stores native Kafka RecordBatch data in local active segments, seals immutable segments to object storage, and coordinates multi-instance ownership through S3 conditional writes — no ZooKeeper, no Raft, no external metadata service.
+
+```
+                   +-----------+     +-----------+
+                   | Producer  |     | Producer  |
+                   +-----+-----+     +-----+-----+
+                         |                 |
+                   HTTP / Kafka        HTTP / Kafka
+                         |                 |
+                 +-------v-----------------v-------+
+                 |          Camu Cluster            |
+                 |  +------+  +------+  +------+   |
+                 |  | n1   |  | n2   |  | n3   |   |
+                 |  | lead |<-| foll |<-| foll |   |
+                 |  +--+---+  +------+  +------+   |
+                 +-----|---------------------------+
+                       | seal + flush
+                 +-----v-----+
+                 |  S3 / R2  |
+                 |  MinIO    |
+                 +-----------+
+```
 
 ```bash
 # Create a topic
@@ -23,19 +44,23 @@ curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limi
 
 ## Why Camu
 
-- S3-native storage for segments, indexes, topic metadata, offsets, and coordination state
-- One Go binary, no ZooKeeper, no Raft cluster, no external metadata service
-- HTTP-first API for produce, consume, and SSE streaming
-- Kafka-style replicated topics with `replication_factor` and `min_insync_replicas`
-- Idempotent produce with producer IDs and sequence tracking
-- Repository-local Jepsen evidence for failover, partition, pause, churn, and storage-isolation faults
+| | |
+|---|---|
+| **S3-native** | Segments, indexes, topic metadata, offsets, and coordination state all live in object storage. No local disk is required for durability. |
+| **Single binary** | One Go binary. No ZooKeeper, no Raft cluster, no external metadata service. Deploy as a static binary, a container, or a systemd unit. |
+| **Dual protocol** | HTTP-first API for produce, consume, SSE streaming, and topic management. Full Kafka wire protocol (v0-v12) for drop-in client compatibility. |
+| **ISR replication** | Kafka-style replicated topics with configurable `replication_factor` and `min_insync_replicas`. Writes are only acknowledged after the ISR quorum confirms. |
+| **Exactly-once produce** | Idempotent produce with producer IDs and sequence tracking. Duplicate retries on replicated topics wait for the original batch commit before confirming. |
+| **Jepsen-verified** | 22 passing fault scenarios across kill, leader-kill, pause, partition, rejoin, membership churn, S3 isolation, clock skew, and combined-fault runs. Every claim has a reproducible artifact. |
 
 ## What An Ack Means
 
-- `rf=1`, `minISR=1`: a successful produce is durable in the local WAL on the owning node
-- `rf>1`: a successful produce is durable in the leader WAL and only acknowledged after the configured ISR quorum confirms it
-- Flush to S3 is asynchronous. Cross-instance visibility for non-replica reads follows segment flush timing, not ack timing
-- Reads are capped by the readable high watermark, so consumers do not observe uncommitted replicated writes
+| Mode | Durability guarantee |
+|------|---------------------|
+| `rf=1`, `minISR=1` | A successful produce is durable in the local active segment on the owning node. |
+| `rf>1` | A successful produce is durable on the leader **and** only acknowledged after the configured ISR quorum confirms it. |
+
+Flush to S3 is asynchronous. Cross-instance visibility for non-replica reads follows segment flush timing, not ack timing. Reads are capped by the readable high watermark, so consumers never observe uncommitted replicated writes.
 
 ## Quick Start
 
@@ -55,6 +80,7 @@ cat >/tmp/camu/camu.yaml <<'EOF'
 server:
   address: ":8080"
   internal_address: ":8081"
+  kafka_port: 9092
 storage:
   bucket: "camu-data"
   region: "us-east-1"
@@ -62,10 +88,6 @@ storage:
   credentials:
     access_key: "minioadmin"
     secret_key: "minioadmin"
-wal:
-  directory: "/var/lib/camu/wal"
-  fsync: true
-  chunk_size: 67108864
 segments:
   max_size: 8388608
   max_age: "5s"
@@ -152,6 +174,18 @@ If a request lands on a non-owner, Camu either proxies internally to the leader 
 curl http://localhost:8080/v1/topics/orders/routing
 ```
 
+### Kafka Wire Protocol
+
+Camu implements the Kafka wire protocol for seamless client compatibility. Any Kafka client (librdkafka, franz-go, kafka-python, etc.) can produce to and consume from Camu without modification.
+
+```bash
+# Using kcat
+echo "hello" | kcat -b localhost:9092 -t orders -P
+kcat -b localhost:9092 -t orders -C -e
+```
+
+Supported Kafka APIs: Produce, Fetch, Metadata, ListOffsets, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups, DeleteGroups, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs, IncrementalAlterConfigs, DescribeCluster, ApiVersions, InitProducerID, and ACL operations.
+
 ### Idempotent Produce
 
 Idempotent produce is tracked per `(producer_id, topic, partition)` and is only supported on the partition-specific produce endpoint:
@@ -219,7 +253,7 @@ Operational details:
 - duplicate retries do not append again
 - on replicated topics, duplicate retries wait for the original batch to reach the replicated commit point before returning success
 - the manager stores the last offset of the accepted batch so duplicate retries can join that commit wait
-- idempotency state is checkpointed during flush and rebuilt from WAL metadata on recovery
+- idempotency state is checkpointed during flush and rebuilt from native batch metadata on recovery
 - inactive producer state is eventually evicted, so producer IDs are not meant to live forever
 
 Practical rules:
@@ -285,13 +319,11 @@ Replicated topics use ISR-style follower fetch from the leader over the internal
 |---------|---------|-------|
 | `server.address` | `:8080` | Public HTTP API |
 | `server.internal_address` | `:8081` | Internal h2c listener for replication and leader proxying |
+| `server.kafka_port` | `9092` | Kafka wire protocol listener |
 | `server.instance_id` | auto-generated UUID | Stable IDs are useful for fixed deployments |
 | `storage.bucket` | required | S3 or compatible object store bucket |
 | `storage.region` | empty unless set | Required by many S3 providers |
 | `storage.endpoint` | empty | Set this for MinIO, R2, Backblaze, etc. |
-| `wal.directory` | `/var/lib/camu/wal` | Local durability path |
-| `wal.fsync` | `true` | Ack waits for WAL fsync |
-| `wal.chunk_size` | `64 MiB` | Active chunk rotation threshold |
 | `segments.max_size` | `8 MiB` | Flush-by-size threshold |
 | `segments.max_age` | `5s` | Flush-by-time threshold |
 | `segments.compression` | `none` | `none`, `snappy`, `zstd` |
@@ -306,32 +338,74 @@ Replicated topics use ISR-style follower fetch from the leader over the internal
 | `coordination.isr_expansion_threshold` | `1000` | Follower catch-up threshold before ISR rejoin |
 | `coordination.replication_timeout` | `30s` | Produce wait timeout for replicated topics |
 
-## Reliability
+## Jepsen Verification
 
-The checked-in Jepsen harness currently verifies:
+Camu ships with a repository-local Jepsen harness that runs a five-node Docker cluster against MinIO-backed storage, injects adversarial faults, then drains all partitions and verifies the observed history against acknowledged operations.
 
-- replicated mode: `rf=3`, `minISR=2`
-- strict quorum: `rf=3`, `minISR=3`
-- control mode: `rf=1`, `minISR=1`
+**22 passing fault scenarios** across three replication modes:
 
-The repository documents 21+ passing fault scenarios across kill, leader kill, pause, partition, rejoin, membership churn, S3 isolation, and combined-fault runs. See [docs/reliability.md](docs/reliability.md) for the matrix and [jepsen/camu/README.md](jepsen/camu/README.md) for the harness.
+| Mode | Faults tested |
+|------|---------------|
+| `rf=3`, `minISR=2` | kill, partition, pause, leader-kill, leave, membership, rejoin, s3-partition, clock-skew, kill+partition, leader-kill+s3-partition (10s and 45s durations) |
+| `rf=3`, `minISR=3` | kill, leader-kill, membership, s3-partition, leader-kill+s3-partition |
+| `rf=1`, `minISR=1` | kill |
+
+**9 correctness checkers** verify every run:
+
+| Checker | What it proves |
+|---------|----------------|
+| committed-durability | Acknowledged writes survive to final drain |
+| single-leader | No conflicting values at the same (partition, offset) |
+| total-order | Partition histories remain ordered and contiguous |
+| offset-monotonicity | Offsets never duplicate or regress |
+| truncation-safety | Committed suffixes are not lost after failover |
+| hw-monotonicity | Observed high watermarks do not go backward |
+| no-ghost-reads | Reads do not invent unacknowledged data |
+| availability | Successful operation ratio during faults |
+| recovery-time | Latency from injected fault to next success |
+
+See [docs/reliability.md](docs/reliability.md) for the full matrix and [jepsen/camu/README.md](jepsen/camu/README.md) for the harness.
 
 ## Project Layout
 
 ```text
-cmd/camu/          CLI entry point
-internal/config/   Config loading and validation
-internal/log/      WAL, segments, indexes, cache, retention
-internal/server/   HTTP handlers, partition manager, routing
-internal/replication/ ISR replication and follower fetch
-internal/coordination/ S3 leases, registry, assignment store
-internal/meta/     Topic metadata
-internal/storage/  S3 client and offset persistence
-pkg/camutest/      Multi-instance test helpers
-test/integration/  Real-server integration tests
-test/bench/        Benchmarks
-jepsen/camu/       Jepsen fault-injection harness
-docs/              Architecture, reliability, and design notes
+cmd/camu/                        CLI entry point
+internal/
+  config/                        Config loading and validation
+  log/                           Active segments, sealed segments, indexes, cache, retention
+  server/
+    handlers_produce.go          HTTP produce handlers (high-level + partition-specific)
+    handlers_consume.go          HTTP consume handlers (polling + SSE streaming)
+    handlers_producers.go        Producer ID allocation
+    produce_types.go             Produce request/response DTOs
+    produce_parse.go             Body parsing and decoding utilities
+    produce_append.go            RecordBatch append fast-path, replication wait
+    produce_leadership.go        Leadership proxy/reject helpers
+    consume_types.go             Consume response DTOs
+    consume_iterator.go          Multi-source merge iterator
+    consume_stream.go            Streaming JSON response writer
+    consume_helpers.go           High watermark, message merge, encoding
+    kafka_types.go               Kafka server types, config, interfaces
+    kafka_wire.go                Kafka wire protocol: conn, decode, encode, routing
+    kafka_handlers_admin.go      Kafka admin API handlers (25 APIs)
+    kafka_handlers_data.go       Kafka produce + fetch handlers
+    kafka_codec.go               RecordBatch encode/decode, compression
+    kafka_helpers.go             Partition lookup, error mapping, adapters
+    kafka_groups.go              Kafka consumer group coordinator (S3-backed)
+    server.go                    HTTP server, routing, lifecycle
+    partition_manager.go         Partition state, flush, recovery
+  replication/                   ISR replication and follower fetch
+  coordination/                  S3 leases, registry, assignment store
+  meta/                          Topic metadata
+  storage/                       S3 client and offset persistence
+  consumer/                      SSE streaming support
+  producer/                      Backpressure and producer utilities
+  idempotency/                   Producer sequence tracking and deduplication
+pkg/camutest/                    Multi-instance test helpers
+test/integration/                Real-server integration tests
+test/bench/                      Benchmarks
+jepsen/camu/                     Jepsen fault-injection harness (Clojure)
+docs/                            Architecture, reliability, and design notes
 ```
 
 ## Development
@@ -349,11 +423,10 @@ RF=3 MIN_ISR=3 ./run.sh leader-kill,s3-partition 45
 
 ## More Docs
 
-- [docs/architecture.md](docs/architecture.md)
-- [docs/architecture/coordination.md](docs/architecture/coordination.md)
-- [docs/reliability.md](docs/reliability.md)
-- [docs/multiple-indexes.md](docs/multiple-indexes.md)
-- [jepsen/camu/README.md](jepsen/camu/README.md)
+- [docs/architecture.md](docs/architecture.md) -- System architecture and data path
+- [docs/architecture/coordination.md](docs/architecture/coordination.md) -- Coordination, failover, and consumer groups
+- [docs/reliability.md](docs/reliability.md) -- Correctness claims and verification layers
+- [jepsen/camu/README.md](jepsen/camu/README.md) -- Jepsen harness, fault matrix, and checkers
 
 ## License
 

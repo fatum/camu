@@ -624,9 +624,9 @@
                                         result))))))))
 
        :produce
-       (let [{:keys [key value]} (:value op)
+       (let [{:keys [key value partition]} (:value op)
              topic             (topic-name this test)
-             partition         (route-partition key (get test :num-partitions 4))]
+             partition         (or partition (route-partition key (get test :num-partitions 4)))]
          ;; Use only the partition-specific produce endpoint and try all nodes
          ;; until the current leader accepts the write.
          (loop [nodes (shuffle (:nodes test))

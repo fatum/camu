@@ -50,6 +50,14 @@ func (s *Server) internalRoutes() http.Handler {
 	// non-leader nodes can be handled by the leader's internal server.
 	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
 	mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
+
+	// Controller coordination endpoints.
+	mux.HandleFunc("POST /v1/internal/report-failure", s.handleReportFailure)
+	mux.HandleFunc("POST /v1/internal/report-isr", s.handleReportISR)
+	mux.HandleFunc("POST /v1/internal/report-hw", s.handleReportHW)
+	mux.HandleFunc("GET /v1/internal/assignments", s.handleGetAssignments)
+	mux.HandleFunc("POST /v1/internal/push-assignments", s.handlePushAssignment)
+
 	return s.withMiddleware(mux)
 }
 

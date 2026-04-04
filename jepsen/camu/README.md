@@ -61,7 +61,7 @@ The harness currently supports:
 - `mixed`
   - the baseline workload: mostly small produces with some consumes
 - `large-requests`
-  - the same general shape with larger values to pressure WAL and flush behavior
+  - the same general shape with larger values to pressure active segments and flush behavior
 - `replica-flushed-reads`
   - a produce-heavy workload used for follower-read checks after graceful flushes
 
@@ -79,10 +79,11 @@ Pass `--faults` as a comma-separated list or use `run.sh <faults> <seconds>`.
 
 | Fault | Description | What it stresses |
 |-------|-------------|------------------|
-| `kill` | SIGKILL a random process, then restart it | WAL recovery, reassignment, durable ack path |
+| `kill` | SIGKILL a random process, then restart it | local-tail recovery, reassignment, durable ack path |
 | `leave` | Graceful SIGTERM and later restart | Clean flush, deregistration, rebalance |
 | `membership` | Leave, wait, then rejoin | Topology churn and reassignment correctness |
 | `partition` | Split nodes into network partitions | Routing, stale-owner fencing, leader continuity |
+| `partition-ring` | Allow only ring-neighbor node connectivity during the fault | Multi-hop routing pressure and non-neighbor isolation |
 | `pause` | SIGSTOP/SIGCONT a process | Lease expiry and heartbeat failure detection |
 | `rejoin` | Kill, wait for lease expiry, then restart | Epoch fencing and stale-local-state rejection |
 | `s3-partition` | Block MinIO access on one node | Object-store isolation handling |
@@ -122,6 +123,7 @@ RF=3 MIN_ISR=3 ./run.sh leader-kill,s3-partition 45
 WORKLOAD=large-requests ./run.sh kill 120
 CONCURRENCY=25 ./run.sh kill 120
 CONCURRENCY=25 WORKLOAD=large-requests ./run.sh kill 120
+API=kafka ./run.sh kill 30
 READ_MODE=replica WORKLOAD=replica-flushed-reads ./run.sh leave 10
 ```
 
@@ -138,6 +140,7 @@ The `scripts/` directory contains reusable scenarios:
 
 ```bash
 ./scripts/smoke.sh
+./scripts/kafka-smoke.sh
 ./scripts/strict-quorum-smoke.sh
 ./scripts/leader-failover-smoke.sh
 ./scripts/high-pressure-smoke.sh
@@ -149,6 +152,9 @@ The `scripts/` directory contains reusable scenarios:
 
 Useful shortcuts:
 
+- `kafka-smoke.sh`
+  - Kafka protocol smoke path, separate from the default HTTP client harness
+  - uses one HTTP topic bootstrap and then Kafka metadata readiness only, so the workload history stays Kafka-only
 - `strict-quorum-smoke.sh`
   - baseline `rf=3`, `minISR=3`
 - `leader-failover-smoke.sh`
@@ -164,7 +170,7 @@ The Jepsen harness intentionally uses faster coordination timing and larger flus
 
 | Setting | Jepsen value | Production default | Reason |
 |---------|--------------|-------------------|--------|
-| `segments.max_age` | `1m` | `5s` | keep more data in WAL during faults |
+| `segments.max_age` | `1m` | `5s` | keep more data in local active segments during faults |
 | `segments.max_size` | `100MB` | `8MB` | reduce early flush-by-size |
 | `coordination.lease_ttl` | `6s` | `30s` | faster failover in tests |
 | `coordination.instance_ttl` | `8s` | derived from lease TTL | faster membership expiry |

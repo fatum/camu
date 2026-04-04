@@ -19,11 +19,12 @@
   [test node]
   (let [s3-endpoint (:s3-endpoint test "http://minio:9000")
         http-port   (:http-port test 8080)
-        wal-chunk-size (:wal-chunk-size test 67108864)
+        kafka-port  (:kafka-port test 9092)
         segment-max-size (:segment-max-size test 104857600)
         segment-max-age (:segment-max-age test "1m")
         config      (str "server:\n"
                          "  address: \":" http-port "\"\n"
+                         "  kafka_port: " kafka-port "\n"
                          "  internal_address: \":8081\"\n"
                          "  instance_id: \"" node "\"\n"
                          "\n"
@@ -34,11 +35,6 @@
                          "  credentials:\n"
                          "    access_key: \"minioadmin\"\n"
                          "    secret_key: \"minioadmin\"\n"
-                         "\n"
-                         "wal:\n"
-                         "  directory: \"" camu-data "/wal\"\n"
-                         "  fsync: true\n"
-                         "  chunk_size: " wal-chunk-size "\n"
                          "\n"
                          "segments:\n"
                          "  max_size: " segment-max-size "\n"
@@ -96,7 +92,6 @@
     (setup! [_ test node]
       (info "Setting up camu on" node)
       (c/exec :mkdir :-p "/opt/camu"
-              (str camu-data "/wal")
               (str camu-data "/cache"))
       ;; Upload the camu binary and verify the remote file is present before startup.
       (upload-camu-binary! test)

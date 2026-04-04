@@ -1,241 +1,140 @@
 # Camu Architecture
 
-Camu is an object-storage-backed commit log. It acknowledges writes from a local WAL, flushes immutable segments to S3, and uses S3 conditional writes for leader election, partition assignment, and fencing.
+Camu is an S3-native event log that stores native Kafka `RecordBatch` bytes as its canonical log format and coordinates multi-instance ownership through object storage conditional writes.
 
-## High-Level Shape
+## System Overview
 
-```text
-producer
-  -> public HTTP API (:8080 by default)
-  -> partition router
-  -> ownership / leadership checks
-  -> WAL append + fsync
-  -> replication wait (for replicated topics)
-  -> HTTP response
-
-background flush
-  -> seal WAL chunks
-  -> build segment + sidecars
-  -> verify ownership from S3
-  -> upload to object storage
-  -> CAS-update partition index
-  -> retain or prune flushed WAL chunks
-
-consumer
-  -> segment index lookup
-  -> local cache or S3 fetch
-  -> WAL overlay when readable committed suffix exists locally
-  -> JSON poll or SSE stream response
+```
+  Producers                          Consumers
+  (HTTP / Kafka)                     (HTTP / Kafka / SSE)
+       |                                  ^
+       v                                  |
+  +--------------------------------------------+
+  |              Camu Instance                  |
+  |                                            |
+  |  +-----------+  +----------+  +---------+  |
+  |  | Produce   |  | Consume  |  | Kafka   |  |
+  |  | Handlers  |  | Handlers |  | Server  |  |
+  |  +-----+-----+  +----+-----+  +----+----+  |
+  |        |              |             |       |
+  |  +-----v--------------v-------------v----+  |
+  |  |         Partition Manager              |  |
+  |  |  (active segments, flush, recovery)    |  |
+  |  +-----+------------------+--------------+  |
+  |        |                  |                 |
+  |  +-----v------+    +-----v-----------+     |
+  |  | Replication |    | Coordination    |     |
+  |  | (ISR fetch) |    | (S3 leases)     |     |
+  |  +-----+------+    +-----+-----------+     |
+  +--------|------------------|----------------+
+           |                  |
+     +-----v------------------v-----+
+     |      Object Storage          |
+     |  (S3 / MinIO / R2 / B2)     |
+     +------------------------------+
 ```
 
-## Core Objects
+## Data Path
 
-| Object | Stored where | Purpose |
-|--------|--------------|---------|
-| Topic config | `_meta/topics/{topic}.json` | Partition count, retention, replication settings |
-| Assignment | `_coordination/assignments/{topic}.json` | Owner, replicas, epoch/version |
+### Write Path
+
+1. **Ingest**: Producers send HTTP JSON or Kafka wire protocol requests.
+2. **Encode**: HTTP writes are translated into Kafka `RecordBatch` bytes at the API boundary. Kafka protocol writes pass through as zero-copy raw batches.
+3. **Append**: The partition leader appends batch bytes to a local active segment.
+4. **Replicate**: For replicated topics, followers fetch raw batches from the leader over the internal h2c listener. The leader advances the high watermark when ISR followers confirm progress.
+5. **Acknowledge**: The produce response is sent only after the ISR quorum has confirmed the write.
+6. **Flush**: The batcher seals active segments and uploads immutable segment files plus sidecars to object storage.
+
+### Read Path
+
+1. **Route**: The consume request resolves to a partition and starting offset.
+2. **Merge**: The streaming iterator merges records from sealed segments (S3) and the in-memory active segment, deduplicating by offset.
+3. **Cap**: Reads are capped by the readable high watermark when replication is enabled, ensuring consumers never see uncommitted data.
+4. **Encode**: Kafka fetch returns raw RecordBatch bytes. HTTP consume decodes batches into JSON at read time.
+
+## Server Module Structure
+
+The HTTP and Kafka server layer is organized by concern:
+
+```
+internal/server/
+  Produce pipeline
+  ├── handlers_produce.go      High-level + partition-specific HTTP handlers
+  ├── produce_types.go         Request/response DTOs
+  ├── produce_parse.go         Body parsing (JSON array vs idempotent batch)
+  ├── produce_append.go        RecordBatch append fast-path + replication wait
+  └── produce_leadership.go    Leadership proxy/reject helpers
+
+  Consume pipeline
+  ├── handlers_consume.go      Polling + SSE streaming HTTP handlers
+  ├── consume_types.go         Response DTOs
+  ├── consume_iterator.go      Multi-source merge iterator (sealed + active)
+  ├── consume_stream.go        Streaming JSON writer with offset merge
+  └── consume_helpers.go       High watermark, encoding, message utilities
+
+  Kafka wire protocol
+  ├── kafka_types.go           Server struct, config, interfaces, error codes
+  ├── kafka_wire.go            Connection handling, request routing, codec framing
+  ├── kafka_handlers_admin.go  Admin APIs (Metadata, CreateTopics, ACLs, etc.)
+  ├── kafka_handlers_data.go   Produce + Fetch handlers
+  ├── kafka_codec.go           RecordBatch encode/decode, compression (gzip/snappy/lz4/zstd)
+  ├── kafka_helpers.go         Partition lookup, error mapping, adapters
+  └── kafka_groups.go          Consumer group coordinator (S3-backed CAS)
+```
+
+## Stored Objects
+
+| Object | Location | Purpose |
+|--------|----------|---------|
+| Topic config | `_meta/topics/{topic}.json` | Retention, partitions, replication settings |
+| Assignments | `_coordination/assignments/{topic}.json` | Partition leaders and replicas |
 | Instance heartbeat | `_coordination/instances/{instanceID}.json` | Liveness and routable addresses |
-| Segment | `{topic}/{partition}/{baseOffset}-{epoch}.segment` | Immutable flushed log data |
-| Offset index | `{topic}/{partition}/{baseOffset}-{epoch}.offset.idx` | Sparse seek index inside a segment |
-| Segment metadata | `{topic}/{partition}/{baseOffset}-{epoch}.meta.json` | Record count, size, compression |
-| Partition index | `{topic}/{partition}/index.json` | Ordered list of segment refs and HW |
-| WAL | local disk | Fast ack path and recovery source |
+| Cluster leader lease | `_coordination/leader.json` | Controller ownership |
+| ISR state | `_coordination/isr/{topic}/{partition}.json` | ISR membership and high watermark |
+| Epoch history | `_coordination/epochs/{topic}/{partition}.json` | Divergence detection and fencing |
+| Sealed segment | `segments/{topic}/{partition}/{baseOffset}.log` | Immutable Kafka batch data |
+| Segment sidecar | `segments/{topic}/{partition}/{baseOffset}.index` | Offset and timestamp indexes |
+| Partition state | `_meta/state/{topic}/{partition}.json` | High watermark and epoch history |
+| Producer checkpoint | `{topic}/{partition}/producers.checkpoint` | Idempotent producer recovery |
+| Consumer group state | `_coordination/kafka-groups/{group}.json` | Kafka consumer group coordination |
 
-## Request Paths
+## Local State
 
-### Produce
+Each partition keeps:
 
-1. Parse the request body as a JSON array, or as an idempotent batch on the partition-specific endpoint.
-2. Route messages by key with FNV-32a; keyless messages use round-robin.
-3. Check local partition ownership.
-4. For replicated topics, confirm the node is still the leader for that partition.
-5. Append to the partition WAL and fsync.
-6. If replicated, wait until the partition high watermark reaches the appended offset.
-7. Return assigned offsets.
+- one active segment on local disk
+- in-memory offset and timestamp indexes for the active segment
+- per-partition producer-sequence state for idempotent produce
+- replication state when the topic uses `replication_factor > 1`
 
-Important semantics:
-
-- `rf=1`: ack means local-WAL durability only
-- `rf>1`: ack means leader WAL durability plus ISR quorum confirmation
-- segment flush is not on the critical path for produce
-- backpressure returns `503` with `Retry-After: 1`
-- replication wait timeout returns `408`
-
-### Leader Proxying And `421`
-
-If a request reaches a node that does not own the destination partition, Camu tries to proxy the request over the internal h2c listener to the current leader. If that path is unavailable, it returns `421 Misdirected Request` with a routing map so the client can retry directly.
-
-This keeps high-level produce usable behind a load balancer while still fencing stale owners.
-
-### Consume
-
-1. Parse `offset` and `limit`.
-2. Refresh the segment index from S3 for non-owned partitions.
-3. Cap reads at the readable high watermark when one is available.
-4. Locate candidate segments with a binary search over the partition index.
-5. Fetch segment blobs from local cache or S3.
-6. Use the sparse `.offset.idx` sidecar to seek near the requested offset.
-7. Overlay a readable local WAL suffix when the node has committed but not yet flushed data.
-8. Return JSON or stream SSE events.
-
-The key read-path distinction is:
-
-- any node can serve flushed segment data
-- owners and caught-up replicas can also serve committed WAL-backed suffixes
-- non-owned, non-replica reads are segment-backed only
-
-## WAL Lifecycle
-
-Each partition has its own WAL. Entries are length-prefixed frames with a CRC so crash recovery can stop cleanly at the first partial write.
-
-WAL chunks move through three states:
-
-- active: accepts new writes
-- sealed: waiting to flush
-- flushed-retained: already materialized to S3 but kept locally for follower fetch and readable committed suffixes
-
-WAL truncation is follower-aware. Old flushed chunks are only removed after the system determines replicas no longer need them.
-
-## Flush Path
-
-Flush is triggered when either:
-
-- buffered bytes for a partition exceed `segments.max_size`
-- the partition has been idle for `segments.max_age`
-
-Flush sequence:
-
-1. Re-read partition ownership from S3.
-2. Seal the active WAL chunk.
-3. Replay unflushed WAL entries from sealed chunks.
-4. Serialize a segment with optional batch-level compression.
-5. Build `.offset.idx` and `.meta.json`.
-6. Upload segment and sidecars.
-7. Write the segment into the local disk cache.
-8. CAS-update `index.json`.
-9. Mark source WAL chunks as flushed-retained.
-
-If ownership changed before flush, the partition is revoked locally and the flush is skipped. That is one of the core stale-writer fences.
-
-## Segment Format
-
-Segments are immutable and seekable. Compression is applied per batch, not to the whole segment, so readers can seek to a batch boundary and decode only the needed suffix.
-
-```text
-[4B magic "CAMU"]
-[1B version = 3]
-[1B compression flag]
-repeated:
-  [4B stored_batch_len]
-  [stored_batch bytes — raw or compressed WAL batch envelope]
-```
-
-Each WAL batch envelope contains:
-
-```text
-[4B total_envelope_length]
-[1B envelope_version = 1]
-[8B producer_id]
-[8B sequence]
-[4B message_count]
-repeated per message:
-  [4B frame_length]
-  [frame bytes: 8B offset, 8B timestamp, 4B+key, 4B+value, 4B+headers...]
-  [4B CRC32]
-[4B envelope CRC32]
-```
-
-When compression is `none`, stored batch = raw WAL envelope. When `snappy` or `zstd`, stored batch = compressed WAL envelope.
+The local active segment is the only mutable log file. Recovery truncates partial tail data by scanning RecordBatch boundaries and CRCs.
 
 ## Replication
 
-Replicated topics use an ISR model.
+- Leaders append raw RecordBatch bytes locally
+- Followers fetch raw RecordBatch bytes from the leader over h2c
+- Followers append those bytes without re-encoding (zero-copy replication)
+- The leader advances the high watermark when ISR followers confirm progress
+- Produce responses wait in a purgatory until the high watermark passes the written offset
 
-- leaders accept writes
-- followers fetch leader data over the internal h2c endpoint
-- the partition high watermark advances after enough replicas confirm the append
-- producers wait on that high watermark when `replication_factor > 1`
+## Flush
 
-Two boundaries matter:
+Flush is triggered by `segments.max_size` or `segments.max_age`.
 
-- acknowledged boundary: what the client can rely on after a successful produce
-- flushed boundary: what a cold reader can fetch from S3-only state
+Flush steps:
 
-The architecture deliberately keeps those separate.
+1. Verify ownership from S3 (fences stale leaders)
+2. Seal the active segment
+3. Upload the sealed `.log` and `.index`
+4. Persist partition state and producer checkpoint
+5. Open the next active segment at the current log end
 
 ## Coordination
 
-Camu uses S3 conditional writes instead of a consensus cluster. See [architecture/coordination.md](architecture/coordination.md) for the full coordination deep-dive with architecture diagram, timing analysis, and known bugs.
+Camu uses S3 conditional writes instead of a separate consensus cluster.
 
-### Two Leadership Concepts
+- One cluster controller publishes assignments
+- Partition leaders own produce and replication for their partitions
+- Epoch history fences stale leaders and supports divergence checks
 
-1. **Cluster coordinator** (`_coordination/leader.json`): one node holds a lease to publish partition assignments. Renewed via CAS every `heartbeat_interval=10s`, expires after `lease_ttl=30s`.
-2. **Partition leader** (`_coordination/assignments/{topic}.json`): per-partition ownership, changed via CAS. Independent from the cluster coordinator — a follower can win partition leadership via `attemptPartitionLeadership` without being the cluster coordinator.
-
-### Partition Assignment
-
-Assignments are deterministic round-robin over active instances. The assignment version doubles as the leader epoch used in filenames and stale-writer fencing.
-
-### Fencing
-
-Stale ownership is blocked by:
-
-- local ownership checks on every produce (cached, up to `heartbeat_interval` stale)
-- leader verification before replicated writes
-- S3 ownership re-check before every flush
-- epoch-tagged segment filenames
-- CAS updates on `index.json`
-- WAL recovery that discards old-epoch local state when a newer owner has already taken over
-
-### Failure Detection
-
-Leader failure is detected by the follower fetch loop: >10 consecutive HTTP errors with exponential backoff (~26s for hard crash, ~330s for network hang). The follower then races to acquire partition leadership via CAS on the assignment object.
-
-## Operational Notes
-
-### What `GET /v1/cluster/status` Means
-
-This endpoint currently reports the serving node's local identity and public address. It is a lightweight status endpoint, not a full cluster-membership dump.
-
-### What `GET /v1/ready` Means
-
-Readiness only turns true after the node has completed initial coordination and partition initialization. During shutdown it returns `503` with status `shutting_down`.
-
-### Why Cross-Instance Reads Lag Flush
-
-Camu does not coordinate every read through the leader. That keeps the read path simple, but it means a random node can only serve what is already in the segment index unless it is the owner or a replica with readable local state. In practice, that makes `segments.max_age` and flush cadence directly visible in stale-read behavior.
-
-## Trade-Offs
-
-| Decision | Benefit | Cost |
-|----------|---------|------|
-| S3 as persistent store | Durable, cheap, scale-to-zero storage model | Read visibility and coordination latency depend on object-store timing |
-| Local WAL ack path | Fast durable writes without waiting for flush | `rf=1` can still lose unflushed data on node loss |
-| HTTP/JSON API | Easy integration, curl-debuggable, load-balancer-friendly | Higher overhead than binary protocols |
-| No external consensus system | One fewer cluster to run | Failover speed is bounded by lease timing and S3 round trips |
-| Immutable segments | Simple cache and retention behavior | No compaction or in-place mutation |
-| Deterministic assignment | Predictable and simple | Not load-aware |
-
-## Known Coordination Bugs
-
-See [architecture/coordination.md](architecture/coordination.md) for the full list with file:line references.
-
-**Critical (data races):**
-- `checkISRLag` reads partition state without `ps.mu` — potential nil dereference
-- `attemptPartitionLeadership` reads `ps.fetchCancel` without `ps.mu`
-
-**High (correctness):**
-- `attemptPartitionLeadership` doesn't incorporate ISR HW into recovery — HW can regress
-- ISR expansion (follower joins) is never persisted to S3
-- TOCTOU race in `initPartitionAsLeader` — double initialization possible
-- Phantom leader: produce fencing is local-cache-based, up to 10s stale after CAS loss
-
-**Medium (hardening):**
-- `state.json` flush and ISR writes use unconditional PUT (no CAS)
-- Epoch history `StartOffset` uses `walEnd` instead of `recoveredHW`
-
-These bugs are timing-dependent and rarely manifest in short Jepsen runs, but are real risks under sustained production load.
-
-## Current Evidence
-
-The current architecture is backed by unit tests, integration tests, and the Jepsen harness under [jepsen/camu/README.md](../jepsen/camu/README.md). The verified fault matrix is summarized in [docs/reliability.md](reliability.md).
+See [architecture/coordination.md](architecture/coordination.md) for the coordination-specific view.

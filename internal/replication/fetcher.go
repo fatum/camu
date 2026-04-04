@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,15 +18,14 @@ import (
 
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
-	AppendReplicatedBatchFrames(ctx context.Context, topic string, pid int, frames []log.BatchFrame) error
-	TruncateWALFrom(topic string, pid int, offset uint64) error
-	PruneWALBefore(topic string, pid int, offset uint64) error
+	AppendReplicatedRawBatches(ctx context.Context, topic string, pid int, batches [][]byte) error
+	TruncateLogFrom(topic string, pid int, offset uint64) error
 	UpdateFollowerProgress(topic string, pid int, leaderEpoch, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
-	Frames        []log.BatchFrame
+	RawBatches    [][]byte
 	TruncateTo    uint64
 	HasTruncate   bool
 	HighWatermark uint64
@@ -135,8 +135,8 @@ func (f *FollowerFetcher) Run(
 
 		// Handle divergence: truncate before appending anything.
 		if resp.HasTruncate {
-			if err := pm.TruncateWALFrom(topic, pid, resp.TruncateTo); err != nil {
-				slog.Warn("fetcher: TruncateWALFrom failed",
+			if err := pm.TruncateLogFrom(topic, pid, resp.TruncateTo); err != nil {
+				slog.Warn("fetcher: TruncateLogFrom failed",
 					"topic", topic, "pid", pid, "truncateTo", resp.TruncateTo, "err", err)
 			}
 			localOffset = resp.TruncateTo
@@ -148,25 +148,29 @@ func (f *FollowerFetcher) Run(
 		}
 
 		// Append new batches (preserving producer metadata for idempotency recovery).
-		if len(resp.Frames) > 0 {
+		if len(resp.RawBatches) > 0 {
 			var first, last uint64
-			for _, frame := range resp.Frames {
-				if frame.Meta.MessageCount > 0 {
-					if first == 0 || frame.Meta.FirstOffset < first {
-						first = frame.Meta.FirstOffset
-					}
-					if frame.Meta.LastOffset > last {
-						last = frame.Meta.LastOffset
-					}
+			for _, batch := range resp.RawBatches {
+				hdr, err := log.ReadRecordBatchHeader(batch)
+				if err != nil {
+					continue
+				}
+				base := uint64(hdr.FirstOffset)
+				end := uint64(hdr.LastOffset())
+				if first == 0 || base < first {
+					first = base
+				}
+				if end > last {
+					last = end
 				}
 			}
-			if err := pm.AppendReplicatedBatchFrames(ctx, topic, pid, resp.Frames); err != nil {
-				slog.Warn("fetcher: AppendReplicatedBatchFrames failed",
+			if err := pm.AppendReplicatedRawBatches(ctx, topic, pid, resp.RawBatches); err != nil {
+				slog.Warn("fetcher: AppendReplicatedRawBatches failed",
 					"topic", topic, "pid", pid, "err", err)
 			} else {
-				slog.Debug("fetcher: replicated batches",
+				slog.Debug("fetcher: replicated raw batches",
 					"topic", topic, "pid", pid,
-					"batch_count", len(resp.Frames),
+					"batch_count", len(resp.RawBatches),
 					"offsets", fmt.Sprintf("%d-%d", first, last),
 					"leader_hw", resp.HighWatermark)
 				localOffset = last + 1
@@ -175,14 +179,6 @@ func (f *FollowerFetcher) Run(
 
 		if resp.LeaderEpoch > localEpoch {
 			localEpoch = resp.LeaderEpoch
-		}
-
-		// Prune below the leader's flushed offset.
-		if resp.FlushedOffset > 0 {
-			if err := pm.PruneWALBefore(topic, pid, resp.FlushedOffset); err != nil {
-				slog.Warn("fetcher: prune PruneWALBefore failed",
-					"topic", topic, "pid", pid, "flushedOffset", resp.FlushedOffset, "err", err)
-			}
 		}
 		pm.UpdateFollowerProgress(topic, pid, localEpoch, resp.HighWatermark, resp.FlushedOffset)
 	}
@@ -253,11 +249,17 @@ func (f *FollowerFetcher) fetchFromLeader(
 		}
 	}
 
-	frames, err := ReadBatchFrames(httpResp.Body)
+	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("fetcher: read batch frames: %w", err)
+		return nil, fmt.Errorf("fetcher: read body: %w", err)
 	}
-	fr.Frames = frames
-
+	if len(body) == 0 {
+		return &fr, nil
+	}
+	rawBatches, err := log.ReadSegmentBatches(body, offset, 0)
+	if err != nil {
+		return nil, fmt.Errorf("fetcher: parse raw batches: %w", err)
+	}
+	fr.RawBatches = rawBatches
 	return &fr, nil
 }

@@ -29,7 +29,7 @@ type partitionBuffer struct {
 
 // Batcher tracks per-partition size metadata and triggers flushes when either a
 // size or time threshold is exceeded. It does not store messages — the caller
-// reads from the WAL at flush time.
+// reads from local active segments at flush time.
 type Batcher struct {
 	cfg       BatcherConfig
 	buffers   map[int]*partitionBuffer

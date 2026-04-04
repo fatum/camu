@@ -27,7 +27,7 @@ type PartitionKey struct {
 	Partition int    `json:"partition"`
 }
 
-// BatchInfo describes a single batch for WAL rebuild.
+// BatchInfo describes a single batch for producer-state rebuild.
 type BatchInfo struct {
 	ProducerID uint64
 	Sequence   uint64
@@ -152,7 +152,7 @@ func (m *Manager) CheckAndAdvance(producerID uint64, key PartitionKey, sequence 
 }
 
 // RollbackSequence resets NextSeq back to the given sequence value.
-// Called when a WAL write fails after CheckAndAdvance succeeded.
+// Called when an append fails after CheckAndAdvance succeeded.
 func (m *Manager) RollbackSequence(producerID uint64, key PartitionKey, sequence uint64) {
 	pk := partitionKeyStr(key)
 	m.mu.Lock()
@@ -276,7 +276,7 @@ func (m *Manager) LoadCheckpoint(data []byte) {
 	}
 }
 
-// RebuildFromBatches replays WAL batch metadata to advance sequence counters
+// RebuildFromBatches replays batch metadata to advance sequence counters
 // past whatever the checkpoint contained. Batches whose sequence is below the
 // current NextSeq for their (producer, partition) are silently skipped (already
 // covered by the checkpoint).

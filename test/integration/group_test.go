@@ -16,9 +16,14 @@ func TestGroupOffsets_CommitAndGet(t *testing.T) {
 
 	topic := "cg-offset-test"
 	client.CreateTopic(topic, 4, 24*time.Hour)
+	otherTopic := "cg-offset-test-b"
+	client.CreateTopic(otherTopic, 2, 24*time.Hour)
 
 	// Commit offsets.
-	offsets := map[int]uint64{0: 100, 1: 200, 2: 50, 3: 0}
+	offsets := map[string]map[int]uint64{
+		topic:      {0: 100, 1: 200, 2: 50, 3: 0},
+		otherTopic: {0: 7, 1: 9},
+	}
 	if err := client.CommitOffsets("offset-group", offsets); err != nil {
 		t.Fatalf("CommitOffsets: %v", err)
 	}
@@ -29,9 +34,11 @@ func TestGroupOffsets_CommitAndGet(t *testing.T) {
 		t.Fatalf("GetOffsets: %v", err)
 	}
 
-	for k, want := range offsets {
-		if got[k] != want {
-			t.Errorf("partition %d: got %d, want %d", k, got[k], want)
+	for topicName, topicOffsets := range offsets {
+		for partition, want := range topicOffsets {
+			if got[topicName][partition] != want {
+				t.Errorf("%s partition %d: got %d, want %d", topicName, partition, got[topicName][partition], want)
+			}
 		}
 	}
 }

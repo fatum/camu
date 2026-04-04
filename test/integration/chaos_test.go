@@ -76,7 +76,7 @@ func TestChaos_RandomKillsDuringProduce(t *testing.T) {
 	producedCount := atomic.LoadInt64(&produced)
 	t.Logf("consumed %d messages, produced %d", total, producedCount)
 
-	// Allow for some data loss from unflushed WAL on killed instances
+	// Allow for some data loss from unflushed local active-segment state on killed instances
 	// but the majority should survive
 	if total == 0 && producedCount > 0 {
 		t.Error("consumed 0 messages but produced some — total data loss")

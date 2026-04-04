@@ -1,82 +1,19 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"unsafe"
 
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/producer"
-	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
-
-type produceMessageRequest struct {
-	Key     string            `json:"key"`
-	Value   string            `json:"value"`
-	Headers map[string]string `json:"headers,omitempty"`
-}
-
-// produceBatchRequest is the idempotent produce format:
-// {"producer_id": N, "sequence": M, "messages": [...]}
-type produceBatchRequest struct {
-	ProducerID uint64                  `json:"producer_id"`
-	Sequence   uint64                  `json:"sequence"`
-	Messages   []produceMessageRequest `json:"messages"`
-}
-
-type produceResponse struct {
-	Offsets []offsetInfo `json:"offsets"`
-}
-
-type offsetInfo struct {
-	Partition int    `json:"partition"`
-	Offset    uint64 `json:"offset"`
-}
-
-func newBodyDecoder(r io.Reader) (*json.Decoder, byte, error) {
-	br := bufio.NewReader(r)
-	first, err := peekFirstNonSpaceByte(br)
-	if err != nil {
-		return nil, 0, err
-	}
-	return json.NewDecoder(br), first, nil
-}
-
-func peekFirstNonSpaceByte(r *bufio.Reader) (byte, error) {
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		switch b {
-		case ' ', '\t', '\n', '\r':
-			continue
-		default:
-			if err := r.UnreadByte(); err != nil {
-				return 0, err
-			}
-			return b, nil
-		}
-	}
-}
-
-// immutableStringBytes exposes a string as a read-only byte slice without
-// copying. The returned slice must never be mutated.
-func immutableStringBytes(s string) []byte {
-	if s == "" {
-		return nil
-	}
-	return unsafe.Slice(unsafe.StringData(s), len(s))
-}
 
 func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) {
 	if s.shuttingDown.Load() {
@@ -145,7 +82,7 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Group messages by partition for batch WAL writes (single fsync per partition).
+	// Group messages by partition for batch appends.
 	type indexedMsg struct {
 		idx       int // original position in the request
 		partition int
@@ -172,19 +109,14 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 	if topicCfg.ReplicationFactor <= 1 {
 		for partitionID := range byPartition {
 			if !s.isOwnedPartition(topicName, partitionID) {
-				if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
-					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-					s.proxyToLeader(w, r, leaderAddr)
-					return
-				}
-				routing := s.getRoutingMap(topicName)
-				writeJSON(w, 421, routing)
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 				return
 			}
 		}
 	}
 
-	// Append each partition's batch with a single WAL fsync.
+	// Append each partition's batch in one native write.
 	offsets := make([]offsetInfo, len(msgs))
 	for partitionID, group := range byPartition {
 		batch := make([]log.Message, len(group))
@@ -213,18 +145,13 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
-				if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
-					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-					s.proxyToLeader(w, r, leaderAddr)
-					return
-				}
-				routing := s.getRoutingMap(topicName)
-				writeJSON(w, 421, routing)
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 				return
 			}
 		}
 
-		assignedOffsets, err := s.partitionManager.appendBatchToPS(ps, topicName, partitionID, batch)
+		assignedOffsets, err := s.appendHTTPMessagesAsRecordBatch(r.Context(), ps, topicName, partitionID, batch)
 		if err != nil {
 			if errors.Is(err, producer.ErrBackpressure) {
 				w.Header().Set("Retry-After", "1")
@@ -244,16 +171,12 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
 				"isr_size", ps.replicaState.ISRSize())
 
-			if err := ps.replicaState.Purgatory().Wait(r.Context(), lastOffset, s.replicationTimeout); err != nil {
-				if errors.Is(err, replication.ErrReplicationTimeout) {
-					slog.Warn("produce_replication_timeout",
-						"topic", topicName, "partition", partitionID,
-						"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
-						"isr_size", ps.replicaState.ISRSize())
-					writeError(w, 408, "replication timeout")
-					return
-				}
-				writeError(w, http.StatusInternalServerError, "replication error: "+err.Error())
+			if err := waitForReplicatedOffset(r.Context(), ps, lastOffset, s.replicationTimeout); err != nil {
+				slog.Warn("produce_replication_timeout",
+					"topic", topicName, "partition", partitionID,
+					"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
+					"isr_size", ps.replicaState.ISRSize())
+				writeReplicationError(w, err)
 				return
 			}
 
@@ -317,12 +240,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	// lock acquisition.
 	if tc.ReplicationFactor <= 1 {
 		if !s.isOwnedPartition(topicName, partitionID) {
-			if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
-				s.proxyToLeader(w, r, leaderAddr)
-				return
-			}
-			routing := s.getRoutingMap(topicName)
-			writeJSON(w, 421, routing)
+			s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 			return
 		}
 	}
@@ -384,12 +302,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
 	if tc.ReplicationFactor > 1 {
 		if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
-			if leaderAddr := s.leaderInternalAddr(topicName, partitionID); leaderAddr != "" && r.Header.Get(headerForwardedBy) == "" {
-				s.proxyToLeader(w, r, leaderAddr)
-				return
-			}
-			routing := s.getRoutingMap(topicName)
-			writeJSON(w, 421, routing)
+			s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 			return
 		}
 		if ps.replicaState == nil {
@@ -409,34 +322,11 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 			Sequence: sequence,
 		})
 		if errors.Is(err, idempotency.ErrDuplicateSequence) {
-			// Join the replication purgatory for the original batch —
-			// only return success once the data is committed.
-			if ps != nil {
-				ps.mu.RLock()
-				lastOff, ok := ps.getLastOffset(producerID)
-				hw, hwOK := readableHighWatermark(ps)
-				replicaState := ps.replicaState
-				ps.mu.RUnlock()
-				if ok && hwOK && hw > lastOff {
-					writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
-					return
-				}
-				if ok && replicaState != nil {
-					if waitErr := replicaState.Purgatory().Wait(r.Context(), lastOff, s.replicationTimeout); waitErr != nil {
-						if errors.Is(waitErr, replication.ErrReplicationTimeout) {
-							writeError(w, 408, "replication timeout")
-							return
-						}
-						writeError(w, http.StatusInternalServerError, "replication error: "+waitErr.Error())
-						return
-					}
-				}
-			}
-			writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+			s.handleDuplicateSequence(w, r, ps, producerID)
 			return
 		}
 	} else {
-		assignedOffsets, err = s.partitionManager.appendBatchToPS(ps, topicName, partitionID, batch)
+		assignedOffsets, err = s.appendHTTPMessagesAsRecordBatch(r.Context(), ps, topicName, partitionID, batch)
 	}
 	if err != nil {
 		if errors.Is(err, producer.ErrBackpressure) {
@@ -455,12 +345,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	if ps != nil && ps.replicaState != nil {
 		lastOffset := assignedOffsets[len(assignedOffsets)-1]
-		if err := ps.replicaState.Purgatory().Wait(r.Context(), lastOffset, s.replicationTimeout); err != nil {
-			if errors.Is(err, replication.ErrReplicationTimeout) {
-				writeError(w, 408, "replication timeout")
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "replication error: "+err.Error())
+		if writeReplicationError(w, waitForReplicatedOffset(r.Context(), ps, lastOffset, s.replicationTimeout)) {
 			return
 		}
 	}
@@ -478,4 +363,32 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, produceResponse{Offsets: offsets})
+}
+
+// handleDuplicateSequence handles the ErrDuplicateSequence case for idempotent
+// produce. It waits for the original batch to be replicated before confirming.
+func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request, ps *partitionState, producerID uint64) {
+	if ps == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+		return
+	}
+
+	ps.mu.RLock()
+	lastOff, ok := ps.getLastOffset(producerID)
+	hw, hwOK := readableHighWatermark(ps)
+	replicaState := ps.replicaState
+	ps.mu.RUnlock()
+
+	if ok && hwOK && hw > lastOff {
+		writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+		return
+	}
+	if ok && replicaState != nil {
+		if err := waitForReplicatedOffset(r.Context(), ps, lastOff, s.replicationTimeout); err != nil {
+			writeReplicationError(w, err)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
 }

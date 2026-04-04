@@ -8,6 +8,7 @@
                     [os :as os]
                     [tests :as tests]]
             [jepsen.camu.client :as client]
+            [jepsen.camu.kafka-client :as kafka-client]
             [jepsen.camu.nemesis :as nem]
             [jepsen.camu.checker :as camu-checker]
             [jepsen.camu.db :as db])
@@ -84,15 +85,42 @@
    data. Pair it with read-mode :replica and a graceful leave-style fault."
   [partitions counter offsets]
   (gen/mix [(produce-gen counter)
-            (produce-gen counter)
-            (produce-gen counter)
-            (produce-gen counter)
-            (produce-gen counter)
-            (produce-gen counter)
-            (produce-gen counter)
-            (produce-gen counter)
-            (consume-gen partitions offsets)
-            (consume-gen partitions offsets)]))
+           (produce-gen counter)
+           (produce-gen counter)
+           (produce-gen counter)
+           (produce-gen counter)
+           (produce-gen counter)
+           (produce-gen counter)
+           (produce-gen counter)
+           (consume-gen partitions offsets)
+           (consume-gen partitions offsets)]))
+
+(defn concurrent-writes-gen
+  "Generator that produces messages targeting a single partition to create
+   write contention. All produces go to partition 0."
+  [counter]
+  (fn [_ _]
+    (let [n (swap! counter inc)]
+      {:type  :invoke
+       :f     :produce
+       :value {:key   (str "k-" n)
+               :value (str "v-" n)
+               :partition 0}})))
+
+(defn concurrent-writes-workload-gen
+  "Produce-heavy workload where all clients write to the same partition.
+   Stresses concurrent writes, leader serialization, and offset assignment."
+  [partitions counter offsets]
+  (gen/mix [(concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)
+           (concurrent-writes-gen counter)]))
 
 (defn commit-offsets-gen
   "Requests a commit for a random partition using the client-local consumed
@@ -156,6 +184,7 @@
       :offsets (offsets-workload-gen partitions counter offsets)
       :large-requests (large-requests-workload-gen partitions counter offsets)
       :replica-flushed-reads (replica-flushed-reads-workload-gen partitions counter offsets)
+      :concurrent-writes (concurrent-writes-workload-gen partitions counter offsets)
       (mixed-workload-gen partitions counter offsets))))
 
 (defn drain-gen
@@ -174,6 +203,39 @@
   [opts]
   (> (get opts :replication-factor 1) 1))
 
+(defn api-mode
+  [opts]
+  (or (:api opts) :http))
+
+(defn http-api?
+  [opts]
+  (= :http (api-mode opts)))
+
+(defn kafka-api?
+  [opts]
+  (= :kafka (api-mode opts)))
+
+(defn supported-workload?
+  [opts]
+  (or (http-api? opts)
+      (contains? #{:mixed :large-requests :concurrent-writes :idempotent}
+                 (or (:workload opts) :mixed))))
+
+(defn validate-opts!
+  [opts]
+  (when-not (supported-workload? opts)
+    (throw (ex-info "Kafka Jepsen path currently supports only mixed, large-requests, concurrent-writes, and idempotent workloads"
+                    {:type :unsupported-workload
+                     :api (api-mode opts)
+                     :workload (:workload opts)})))
+  (when (and (kafka-api? opts)
+             (not= :leader (or (:read-mode opts) :leader)))
+    (throw (ex-info "Kafka Jepsen path only supports leader read-mode"
+                    {:type :unsupported-read-mode
+                     :api :kafka
+                     :read-mode (:read-mode opts)})))
+  opts)
+
 (defn checker-suite
   "Returns the appropriate checker composition based on whether the test
    is running in replicated mode."
@@ -189,61 +251,68 @@
                                 "camu.log")))
         base (merge meta-checkers
                     {:leader-drain-coverage (camu-checker/drain-coverage-checker :drain)})
-        replicated-base (if (replicated? opts)
+        replicated-base (if (and (replicated? opts) (http-api? opts))
                           (assoc base :replica-drain-coverage
                                  (camu-checker/drain-coverage-checker :replica-drain))
                           base)]
-    (if (= :idempotent (:workload opts))
-      (checker/compose
-       (merge replicated-base
+    (checker/compose
+     (cond
+       (= :idempotent (:workload opts))
+       (merge base
               {:exactly-once        (camu-checker/exactly-once-checker)
                :offset-monotonicity (camu-checker/offset-monotonicity-checker)
-               :total-order         (camu-checker/total-order-checker)}))
-      (if (= :offsets (:workload opts))
-        (checker/compose
-         (merge replicated-base
-                {:committed-durability (camu-checker/committed-durability-checker)
-                 :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
-                 :total-order          (camu-checker/total-order-checker)
-                 :consumer-offsets     (camu-checker/consumer-offset-checker)}))
-        (if (replicated? opts)
-          ;; Replicated: use key-based durability and epoch-based leader checks
-          (checker/compose
-           (merge replicated-base
-                  {:committed-durability (camu-checker/committed-durability-checker)
-                   :no-ghost-reads       (camu-checker/no-ghost-reads-checker)
-                   :single-leader        (camu-checker/single-leader-checker)
-                   :hw-monotonicity      (camu-checker/hw-monotonicity-checker)
-                   :truncation-safety    (camu-checker/truncation-safety-checker)
-                   :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
-                   :total-order          (camu-checker/total-order-checker)
-                   :replica-convergence  (camu-checker/replica-convergence-checker)}))
-          ;; Unreplicated: original checkers
-          (checker/compose
-           (merge base
-                  {:no-data-loss        (camu-checker/no-data-loss-checker)
-                   :offset-monotonicity (camu-checker/offset-monotonicity-checker)
-                   :no-split-brain      (camu-checker/no-split-brain-checker)
-                   :total-order         (camu-checker/total-order-checker)
-                   :lease-fencing       (camu-checker/lease-fencing-checker)})))))))
+               :total-order         (camu-checker/total-order-checker)})
+
+       (= :offsets (:workload opts))
+       (merge replicated-base
+              {:committed-durability (camu-checker/committed-durability-checker)
+               :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
+               :total-order          (camu-checker/total-order-checker)
+               :consumer-offsets     (camu-checker/consumer-offset-checker)})
+
+       (replicated? opts)
+       (cond-> (merge replicated-base
+                      {:committed-durability (camu-checker/committed-durability-checker)
+                       :truncation-safety    (camu-checker/truncation-safety-checker)
+                       :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
+                       :total-order          (camu-checker/total-order-checker)})
+         (http-api? opts)
+         (assoc :no-ghost-reads (camu-checker/no-ghost-reads-checker)
+                :single-leader (camu-checker/single-leader-checker)
+                :hw-monotonicity (camu-checker/hw-monotonicity-checker)
+                :read-your-writes (camu-checker/read-your-writes-checker)
+                :replica-convergence (camu-checker/replica-convergence-checker)))
+
+       :else
+       (cond-> (merge base
+                      {:no-data-loss        (camu-checker/no-data-loss-checker)
+                       :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+                       :no-split-brain      (camu-checker/no-split-brain-checker)
+                       :total-order         (camu-checker/total-order-checker)})
+         (http-api? opts)
+         (assoc :lease-fencing (camu-checker/lease-fencing-checker)
+                :read-your-writes (camu-checker/read-your-writes-checker)))))))
 
 (defn camu-test
   "Constructs a Jepsen test map for camu."
   [opts]
-  (let [faults         (:faults opts #{:kill})
+  (let [opts            (validate-opts! opts)
+        faults         (:faults opts #{:kill})
         partitions     (num-partitions opts)
         topic           (str "jepsen-test-" (str (UUID/randomUUID)))
         counter         (atom 0)
         consume-offsets (atom {})]
     (merge tests/noop-test
            opts
-           {:name            "camu"
+           {:name            (str "camu-" (name (api-mode opts)))
             :topic           topic
             :num-partitions  partitions
             :read-mode       (or (:read-mode opts) :leader)
             :os              os/noop
             :db              (db/db)
-            :client          (client/client)
+            :client          (if (kafka-api? opts)
+                               (kafka-client/client)
+                               (client/client))
             :consume-offsets consume-offsets
             :nemesis   (nem/composed-nemesis faults)
             :checker   (checker-suite opts)
@@ -270,7 +339,7 @@
                (gen/log "Draining all partitions for verification...")
                (gen/clients (drain-gen partitions))]
               ;; Phase 4: drain ALL partitions from replicas to verify convergence
-              (when (replicated? opts)
+              (when (and (replicated? opts) (http-api? opts))
                 [(gen/log "Draining all partitions from replicas...")
                  (gen/clients (drain-gen partitions :replica-drain))])))})))
 
@@ -283,10 +352,17 @@
    [nil "--http-port PORT" "HTTP port for camu"
     :default 8080
     :parse-fn #(Integer/parseInt %)]
+   [nil "--kafka-port PORT" "Kafka port for camu"
+    :default 9092
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--api NAME" "Client API: http or kafka"
+    :default :http
+    :parse-fn keyword
+    :validate [#{:http :kafka} "must be one of: http, kafka"]]
    [nil "--num-partitions N" "Number of partitions in the Jepsen topic"
     :default default-partitions
     :parse-fn #(Integer/parseInt %)]
-   [nil "--faults FAULTS" "Comma-separated fault types: kill,partition,pause,leader-kill"
+   [nil "--faults FAULTS" "Comma-separated fault types: kill,partition,partition-ring,pause,leader-kill"
     :default #{:kill}
     :parse-fn (fn [s] (set (map keyword (clojure.string/split s #","))))]
    [nil "--replication-factor N" "Topic replication factor"
@@ -295,9 +371,6 @@
    [nil "--min-insync-replicas N" "Minimum in-sync replicas for ack"
     :default 1
     :parse-fn #(Integer/parseInt %)]
-   [nil "--wal-chunk-size BYTES" "WAL chunk size in bytes"
-    :default 67108864
-    :parse-fn #(Long/parseLong %)]
    [nil "--segment-max-size BYTES" "Segment flush size threshold in bytes"
     :default 104857600
     :parse-fn #(Long/parseLong %)]
@@ -307,10 +380,10 @@
     :default :leader
     :parse-fn keyword
     :validate [#{:leader :replica :any} "must be one of: leader, replica, any"]]
-   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, idempotent, or offsets"
+   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, idempotent, offsets, or concurrent-writes"
     :default :mixed
     :parse-fn keyword
-    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent :offsets} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent, offsets"]]])
+    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent :offsets :concurrent-writes} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent, offsets, concurrent-writes"]]])
 
 (defn -main
   "Entry point for the Jepsen CLI."

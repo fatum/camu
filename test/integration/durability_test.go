@@ -9,17 +9,17 @@ import (
 	"github.com/maksim/camu/pkg/camutest"
 )
 
-func TestDurability_WALReplay(t *testing.T) {
+func TestDurability_LocalActiveSegmentRecovery(t *testing.T) {
 	env := camutest.New(t, camutest.WithInstances(1))
 	defer env.Cleanup()
 	client := env.Client()
 
-	if err := client.CreateTopic("wal-test", 1, 24*time.Hour); err != nil {
+	if err := client.CreateTopic("recovery-test", 1, 24*time.Hour); err != nil {
 		t.Fatalf("CreateTopic() error: %v", err)
 	}
 
 	// Produce messages before the crash.
-	if _, err := client.Produce("wal-test", []camutest.ProduceMessage{
+	if _, err := client.Produce("recovery-test", []camutest.ProduceMessage{
 		{Key: "k1", Value: "before-crash-1"},
 		{Key: "k1", Value: "before-crash-2"},
 	}); err != nil {
@@ -29,7 +29,7 @@ func TestDurability_WALReplay(t *testing.T) {
 	// Kill instance without graceful shutdown (skips flush).
 	env.KillInstance(0)
 
-	// Restart instance — WAL should replay and recover the unflushed messages.
+	// Restart instance — the local active segment should recover the unflushed messages.
 	env.RestartInstance(0)
 
 	// Wait for the new instance to be ready.
@@ -40,13 +40,13 @@ func TestDurability_WALReplay(t *testing.T) {
 	// After restart the client must point to the new address.
 	client = env.Client()
 
-	// Messages should be available from WAL replay (served from buffer).
-	resp, err := client.Consume("wal-test", 0, 0, 10)
+	// Messages should be available after local active-segment recovery.
+	resp, err := client.Consume("recovery-test", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Consume() error: %v", err)
 	}
 	if len(resp.Messages) < 2 {
-		t.Errorf("expected at least 2 messages after WAL replay, got %d", len(resp.Messages))
+		t.Errorf("expected at least 2 messages after restart recovery, got %d", len(resp.Messages))
 	}
 }
 

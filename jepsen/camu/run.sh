@@ -6,10 +6,11 @@ TIME_LIMIT="${2:-120}"
 REPLICATION_FACTOR="${RF:-3}"
 MIN_INSYNC_REPLICAS="${MIN_ISR:-2}"
 WORKLOAD="${WORKLOAD:-mixed}"
+API="${API:-http}"
 CONCURRENCY="${CONCURRENCY:-5}"
 READ_MODE="${READ_MODE:-leader}"
 NUM_PARTITIONS="${NUM_PARTITIONS:-4}"
-WAL_CHUNK_SIZE="${WAL_CHUNK_SIZE:-67108864}"
+KAFKA_PORT="${KAFKA_PORT:-9092}"
 SEGMENT_MAX_SIZE="${SEGMENT_MAX_SIZE:-104857600}"
 SEGMENT_MAX_AGE="${SEGMENT_MAX_AGE:-1m}"
 MINIO_USER="${MINIO_USER:-minioadmin}"
@@ -53,7 +54,7 @@ docker compose build control
 echo "Waiting for services to be ready..."
 sleep 10
 
-echo "Running Jepsen tests (faults=$FAULTS, time-limit=$TIME_LIMIT, rf=$REPLICATION_FACTOR, minISR=$MIN_INSYNC_REPLICAS, partitions=$NUM_PARTITIONS, workload=$WORKLOAD, concurrency=$CONCURRENCY, read-mode=$READ_MODE, wal_chunk_size=$WAL_CHUNK_SIZE, segment_max_size=$SEGMENT_MAX_SIZE, segment_max_age=$SEGMENT_MAX_AGE)..."
+echo "Running Jepsen tests (api=$API, faults=$FAULTS, time-limit=$TIME_LIMIT, rf=$REPLICATION_FACTOR, minISR=$MIN_INSYNC_REPLICAS, partitions=$NUM_PARTITIONS, workload=$WORKLOAD, concurrency=$CONCURRENCY, read-mode=$READ_MODE, kafka_port=$KAFKA_PORT, segment_max_size=$SEGMENT_MAX_SIZE, segment_max_age=$SEGMENT_MAX_AGE)..."
 docker compose run --rm \
   -e CAMU_DISABLE_NODE_LOGS \
   -e CAMU_QUIET_CLIENT_LOGS \
@@ -72,10 +73,11 @@ docker compose run --rm \
     --s3-endpoint http://minio:9000 \
     --camu-binary /jepsen/camu/camu \
     --faults $FAULTS \
+    --api $API \
     --workload $WORKLOAD \
     --read-mode $READ_MODE \
+    --kafka-port $KAFKA_PORT \
     --num-partitions $NUM_PARTITIONS \
-    --wal-chunk-size $WAL_CHUNK_SIZE \
     --segment-max-size $SEGMENT_MAX_SIZE \
     --segment-max-age $SEGMENT_MAX_AGE \
     --replication-factor $REPLICATION_FACTOR \
