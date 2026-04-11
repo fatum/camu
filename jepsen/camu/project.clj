@@ -1,7 +1,7 @@
 (defproject jepsen.camu "0.1.0"
   :description "Jepsen tests for Camu commit log"
   :dependencies [[org.clojure/clojure "1.11.1"]
-                 [jepsen "0.3.5"]
+                 [jepsen "0.3.7"]
                  [clj-http "3.12.3"]
                  [cheshire "5.12.0"]
                  [org.slf4j/slf4j-api "2.0.3"]

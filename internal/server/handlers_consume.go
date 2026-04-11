@@ -1,11 +1,17 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/maksim/camu/internal/consumer"
+	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/storage"
 )
 
 func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +45,30 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		if limit > maxConsumeLimit {
 			limit = maxConsumeLimit
 		}
+	}
+
+	tc, err := s.topicStore.Get(r.Context(), topicName)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "topic not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if partitionID < 0 || partitionID >= tc.Partitions {
+		writeError(w, http.StatusBadRequest, "partition ID out of range")
+		return
+	}
+
+	if s.isTopicDiskless(r.Context(), topicName) {
+		out, nextOffset, err := s.consumeDisklessMessages(r.Context(), topicName, partitionID, startOffset, limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, consumeResponse{Messages: out, NextOffset: nextOffset})
+		return
 	}
 
 	// Cap reads at the readable high watermark for replicated partitions.
@@ -138,6 +168,71 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tc, err := s.topicStore.Get(r.Context(), topicName)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "topic not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if partitionID < 0 || partitionID >= tc.Partitions {
+		writeError(w, http.StatusBadRequest, "partition ID out of range")
+		return
+	}
+
+	if s.isTopicDiskless(r.Context(), topicName) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported")
+			return
+		}
+		var startOffset uint64
+		if lastID := r.Header.Get("Last-Event-ID"); lastID != "" {
+			if parsed, err := strconv.ParseUint(lastID, 10, 64); err == nil {
+				startOffset = parsed + 1
+			}
+		} else if v := r.URL.Query().Get("offset"); v != "" {
+			if parsed, err := strconv.ParseUint(v, 10, 64); err == nil {
+				startOffset = parsed
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher.Flush()
+
+		currentOffset := int64(startOffset)
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			data, _, err := s.disklessEngine.Fetch(r.Context(), topicName, partitionID, currentOffset, 100*1024)
+			if err != nil {
+				return
+			}
+			msgs, _ := log.ReadSegmentBatchesAsMessages(data, uint64(currentOffset), 100)
+			if len(msgs) == 0 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
+			}
+			for _, msg := range msgs {
+				if err := consumer.WriteSSEEvent(w, msg); err != nil {
+					return
+				}
+			}
+			flusher.Flush()
+			currentOffset = int64(msgs[len(msgs)-1].Offset) + 1
+		}
+	}
+
 	// Check for SSE flusher support.
 	if _, ok := w.(http.Flusher); !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
@@ -180,6 +275,65 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.(http.Flusher).Flush()
 
 	consumer.StreamSSE(r.Context(), w, s.fetcher, index, topicName, partitionID, startOffset)
+}
+
+const disklessConsumeFetchBytes = 64 * 1024
+
+func (s *Server) consumeDisklessMessages(ctx context.Context, topic string, partitionID int, startOffset uint64, limit int) ([]consumedMessage, uint64, error) {
+	currentOffset := startOffset
+	nextOffset := startOffset
+	var highWatermark uint64
+	var out []consumedMessage
+
+	for len(out) < limit {
+		data, hw, err := s.disklessEngine.Fetch(ctx, topic, partitionID, int64(currentOffset), disklessConsumeFetchBytes)
+		if err != nil {
+			return nil, startOffset, fmt.Errorf("diskless fetch: %w", err)
+		}
+		if hw > 0 {
+			highWatermark = uint64(hw)
+		}
+		if len(data) == 0 {
+			break
+		}
+
+		msgs, err := log.ReadSegmentBatchesAsMessages(data, currentOffset, limit-len(out))
+		if err != nil {
+			return nil, startOffset, fmt.Errorf("decode diskless batches: %w", err)
+		}
+		if len(msgs) == 0 {
+			break
+		}
+
+		for _, msg := range msgs {
+			out = append(out, consumedMessage{
+				Offset:    msg.Offset,
+				Timestamp: msg.Timestamp,
+				Key:       string(msg.Key),
+				Value:     string(msg.Value),
+				Headers:   msg.Headers,
+			})
+		}
+
+		nextOffset = msgs[len(msgs)-1].Offset + 1
+		if nextOffset <= currentOffset {
+			break
+		}
+		currentOffset = nextOffset
+		if currentOffset >= highWatermark {
+			break
+		}
+	}
+
+	if len(out) == 0 {
+		if highWatermark > startOffset {
+			return nil, highWatermark, nil
+		}
+		return nil, startOffset, nil
+	}
+
+	return out, nextOffset, nil
 }

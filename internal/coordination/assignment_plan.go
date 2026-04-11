@@ -54,7 +54,18 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 					if nextLeader, ok := firstActiveReplica(replicas, instances); ok {
 						leader = nextLeader
 						leaderEpoch++
+					} else if n >= replicationFactor {
+						// No active replica in the existing set and we have enough
+						// active instances to satisfy RF — reassign entirely.
+						replicas = replicas[:0]
+						for r := range rf {
+							replicas = append(replicas, instances[(pid+r)%n])
+						}
+						leader = replicas[0]
+						leaderEpoch++
 					}
+					// else: transient state — fewer active instances than RF.
+					// Preserve existing replicas hoping they come back.
 				}
 				result[pid] = PartitionAssignment{
 					Replicas:    replicas,

@@ -15,6 +15,39 @@ type Config struct {
 	Segments     SegmentsConfig     `yaml:"segments"`
 	Cache        CacheConfig        `yaml:"cache"`
 	Coordination CoordinationConfig `yaml:"coordination"`
+	Diskless     DisklessConfig     `yaml:"diskless"`
+}
+
+// DisklessConfig holds settings for diskless topic mode.
+type DisklessConfig struct {
+	LingerMs      int            `yaml:"linger_ms"`       // Max buffer time before flush (default 250)
+	MaxBatchBytes int64          `yaml:"max_batch_bytes"`  // Max buffer size before flush (default 8MiB)
+	MetaStore     string         `yaml:"metastore"`        // "memory" (default) or "dynamodb"
+	DynamoDB      DynamoDBConfig `yaml:"dynamodb"`
+}
+
+// DynamoDBConfig holds DynamoDB settings for the diskless MetaStore.
+type DynamoDBConfig struct {
+	TablePrefix string `yaml:"table_prefix"` // default "camu"
+	Region      string `yaml:"region"`
+	Endpoint    string `yaml:"endpoint"`     // for local DynamoDB
+}
+
+// LingerDuration returns the linger duration, defaulting to 250ms.
+func (d DisklessConfig) LingerDuration() time.Duration {
+	ms := d.LingerMs
+	if ms <= 0 {
+		ms = 250
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// MaxBatchBytesValue returns the max batch bytes, defaulting to 8MiB.
+func (d DisklessConfig) MaxBatchBytesValue() int64 {
+	if d.MaxBatchBytes <= 0 {
+		return 8 * 1024 * 1024
+	}
+	return d.MaxBatchBytes
 }
 
 // ServerConfig holds HTTP server settings.
@@ -78,6 +111,7 @@ type CoordinationConfig struct {
 	InstanceTTL           string `yaml:"instance_ttl"`
 	ISRExpansionThreshold int    `yaml:"isr_expansion_threshold"`
 	ReplicationTimeout    string `yaml:"replication_timeout"`
+	MaintenanceMaxConcurrency int `yaml:"maintenance_max_concurrency"`
 }
 
 const (
@@ -86,6 +120,7 @@ const (
 	defaultRebalanceDelay        = 5 * time.Second
 	defaultISRExpansionThreshold = 1000
 	defaultReplicationTimeout    = 30 * time.Second
+	defaultMaintenanceMaxConcurrency = 4
 )
 
 func parseDurationOrDefault(raw string, fallback time.Duration) (time.Duration, error) {
@@ -129,6 +164,13 @@ func (c CoordinationConfig) ReplicationTimeoutDuration() (time.Duration, error) 
 	return parseDurationOrDefault(c.ReplicationTimeout, defaultReplicationTimeout)
 }
 
+func (c CoordinationConfig) MaintenanceMaxConcurrencyValue() int {
+	if c.MaintenanceMaxConcurrency <= 0 {
+		return defaultMaintenanceMaxConcurrency
+	}
+	return c.MaintenanceMaxConcurrency
+}
+
 // Load reads a YAML config file at path, applies defaults, and validates required fields.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -168,9 +210,10 @@ func defaults() *Config {
 			MaxSize:   10737418240,
 		},
 		Coordination: CoordinationConfig{
-			LeaseTTL:          defaultLeaseTTL.String(),
-			HeartbeatInterval: defaultHeartbeatInterval.String(),
-			RebalanceDelay:    defaultRebalanceDelay.String(),
+			LeaseTTL:                 defaultLeaseTTL.String(),
+			HeartbeatInterval:        defaultHeartbeatInterval.String(),
+			RebalanceDelay:           defaultRebalanceDelay.String(),
+			MaintenanceMaxConcurrency: defaultMaintenanceMaxConcurrency,
 		},
 	}
 }

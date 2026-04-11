@@ -78,8 +78,14 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 
 	router := s.partitionManager.GetRouter(topicName)
 	if router == nil {
-		writeError(w, http.StatusInternalServerError, "topic not initialized")
-		return
+		// Diskless topics are not registered in the partition manager, so
+		// create an ephemeral router for key-based partition routing.
+		if topicCfg.StorageMode == "diskless" {
+			router = producer.NewRouter(topicCfg.Partitions)
+		} else {
+			writeError(w, http.StatusInternalServerError, "topic not initialized")
+			return
+		}
 	}
 
 	// Group messages by partition for batch appends.
@@ -124,30 +130,33 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 			batch[i] = im.msg
 		}
 
-		ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-		if ps == nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
-			return
-		}
-
-		// For replicated topics, reject writes if replicaState not yet initialized.
-		// Don't check min_insync_replicas here — the purgatory will wait until
-		// enough ISR members ack. This avoids a chicken-and-egg problem where
-		// followers can't catch up (join ISR) if no data flows.
-		// verifyProduceLeadership checks both ownership and epoch in a single
-		// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
-		if topicCfg.ReplicationFactor > 1 {
-			if ps.replicaState == nil {
-				slog.Debug("produce_rejected: replicaState not ready",
-					"topic", topicName, "partition", partitionID)
-				w.Header().Set("Retry-After", "1")
-				writeError(w, 503, "partition not ready for replicated writes")
+		var ps *partitionState
+		if topicCfg.StorageMode != "diskless" {
+			ps = s.partitionManager.GetPartitionState(topicName, partitionID)
+			if ps == nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
 				return
 			}
-			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
-				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
-				return
+
+			// For replicated topics, reject writes if replicaState not yet initialized.
+			// Don't check min_insync_replicas here — the purgatory will wait until
+			// enough ISR members ack. This avoids a chicken-and-egg problem where
+			// followers can't catch up (join ISR) if no data flows.
+			// verifyProduceLeadership checks both ownership and epoch in a single
+			// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
+			if topicCfg.ReplicationFactor > 1 {
+				if ps.replicaState == nil {
+					slog.Debug("produce_rejected: replicaState not ready",
+						"topic", topicName, "partition", partitionID)
+					w.Header().Set("Retry-After", "1")
+					writeError(w, 503, "partition not ready for replicated writes")
+					return
+				}
+				if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+					r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
+					return
+				}
 			}
 		}
 
@@ -291,24 +300,27 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
-	if ps == nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
-		return
-	}
-
-	// For replicated topics, reject writes if replicaState not yet initialized.
-	// verifyProduceLeadership checks both ownership and epoch in a single
-	// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
-	if tc.ReplicationFactor > 1 {
-		if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
-			s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
+	var ps *partitionState
+	if tc.StorageMode != "diskless" {
+		ps = s.partitionManager.GetPartitionState(topicName, partitionID)
+		if ps == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
 			return
 		}
-		if ps.replicaState == nil {
-			w.Header().Set("Retry-After", "1")
-			writeError(w, 503, "partition not ready for replicated writes")
-			return
+
+		// For replicated topics, reject writes if replicaState not yet initialized.
+		// verifyProduceLeadership checks both ownership and epoch in a single
+		// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
+		if tc.ReplicationFactor > 1 {
+			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
+				return
+			}
+			if ps.replicaState == nil {
+				w.Header().Set("Retry-After", "1")
+				writeError(w, 503, "partition not ready for replicated writes")
+				return
+			}
 		}
 	}
 

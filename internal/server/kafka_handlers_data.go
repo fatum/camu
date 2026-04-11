@@ -18,7 +18,7 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 		for _, partition := range topic.Partitions {
 			partResp := kmsg.NewProduceResponseTopicPartition()
 			partResp.Partition = partition.Partition
-			partResp.BaseOffset = int64(partition.Partition) * 1000
+			partResp.BaseOffset = -1
 
 			errorCode := ks.partitionError(topic.Topic, int(partition.Partition))
 			if errorCode == 0 {
@@ -126,6 +126,11 @@ func (ks *KafkaServer) handleFetch(req *kmsg.FetchRequest) (kmsg.Response, error
 				}
 			}
 			partResp.ErrorCode = errorCode
+			// Kafka Fetch flex versions require a non-null RecordBatches field.
+			// A nil slice encodes as length -1, which clients reject.
+			if partResp.RecordBatches == nil {
+				partResp.RecordBatches = []byte{}
+			}
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
 		}
 

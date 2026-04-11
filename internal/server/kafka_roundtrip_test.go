@@ -49,7 +49,7 @@ func TestKafkaRecordBatchRoundTrip(t *testing.T) {
 	ps.isLeader = true
 	ps.mu.Unlock()
 
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 
 	// --- Batch 1: 3 messages with keys, values, and headers ---
 	batch1Msgs := []log.Message{

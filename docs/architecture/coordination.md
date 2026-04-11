@@ -46,12 +46,19 @@ Camu uses object storage as its coordination backend. There is no separate conse
 One node holds the controller lease and is responsible for:
 
 - Publishing partition assignments with epoch bumps
-- Driving cluster-wide topic creation and deletion
+- Driving cluster-wide topic creation and enqueuing topic deletion
 - Acting as the Kafka group coordinator broker
-- Garbage-collecting stale ISR entries and expired instances
+- Garbage-collecting stale ISR entries, expired instances, and pending topic deletions
 - Stamping consumer group state with controller epoch for fencing
 
 The controller lease uses S3 conditional writes with a TTL. If the controller fails to renew, another node acquires the lease after expiry.
+
+Topic deletion is resumable. The controller-side GC loop processes
+`_coordination/topic_deletions/{topic}.json` markers by deleting topic S3 data
+first, then clearing any diskless metastore state, and finally removing the
+marker. Controller-only cleanup is now grouped behind a dedicated
+coordination-leader service layer rather than being mixed into partition-local
+maintenance paths.
 
 ### Partition Leader
 
@@ -62,7 +69,24 @@ Each partition leader is responsible for:
 - Tracking ISR follower progress and advancing the high watermark
 - Sealing active segments and uploading to object storage
 - Persisting idempotent producer checkpoints during flush
+- Executing retention through durable partition jobs
 - Fencing itself if the local epoch falls behind the assignment epoch
+
+Retention jobs are expected to survive both restart and reassignment. If an
+owner loses leadership mid-job, the stale owner stops. The new owner
+re-discovers the same durable work and resumes it under the new leader epoch.
+This partition-local maintenance path now runs behind a dedicated
+partition-leader service layer.
+
+### Partition Follower
+
+Follower-specific behavior is now grouped behind a dedicated service layer as
+well. That service owns:
+
+- resolving and proxying to the current partition leader
+- reconfiguring follower fetch loops after controller pushes
+- attempting self-promotion when the leader is detected as down and controller
+  reporting fails
 
 ## Failover Sequence
 

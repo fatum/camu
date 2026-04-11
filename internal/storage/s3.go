@@ -46,6 +46,7 @@ type memObject struct {
 type s3Backend interface {
 	put(ctx context.Context, key string, data []byte, opts PutOpts) error
 	get(ctx context.Context, key string) ([]byte, error)
+	getRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	getWithETag(ctx context.Context, key string) ([]byte, string, error)
 	delete(ctx context.Context, key string) error
 	list(ctx context.Context, prefix string) ([]string, error)
@@ -81,6 +82,11 @@ func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpt
 // Get retrieves data at key. Returns ErrNotFound if missing.
 func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
 	return c.backend.get(ctx, key)
+}
+
+// GetRange retrieves a byte range from key. Returns ErrNotFound if missing.
+func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	return c.backend.getRange(ctx, key, offset, length)
 }
 
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
@@ -134,6 +140,25 @@ func (m *memBackend) get(_ context.Context, key string) ([]byte, error) {
 	}
 	cp := make([]byte, len(obj.data))
 	copy(cp, obj.data)
+	return cp, nil
+}
+
+func (m *memBackend) getRange(_ context.Context, key string, offset, length int64) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	obj, ok := m.objects[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	end := offset + length
+	if end > int64(len(obj.data)) {
+		end = int64(len(obj.data))
+	}
+	if offset >= int64(len(obj.data)) {
+		return nil, nil
+	}
+	cp := make([]byte, end-offset)
+	copy(cp, obj.data[offset:end])
 	return cp, nil
 }
 
@@ -251,6 +276,27 @@ func (b *awsS3Backend) put(ctx context.Context, key string, data []byte, opts Pu
 func (b *awsS3Backend) get(ctx context.Context, key string) ([]byte, error) {
 	data, _, err := b.getWithETag(ctx, key)
 	return data, err
+}
+
+func (b *awsS3Backend) getRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	out, err := b.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(rangeHeader),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("s3 GetRange %q: %w", key, err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, fmt.Errorf("s3 GetRange %q read body: %w", key, err)
+	}
+	return data, nil
 }
 
 func (b *awsS3Backend) getWithETag(ctx context.Context, key string) ([]byte, string, error) {

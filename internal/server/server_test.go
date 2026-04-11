@@ -16,10 +16,12 @@ import (
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -144,6 +146,514 @@ func TestHandleKafkaListOffsets_ByTimestampFromWAL(t *testing.T) {
 	}
 	if resp.Timestamp != 1500 {
 		t.Fatalf("handleKafkaListOffsets() timestamp = %d, want 1500", resp.Timestamp)
+	}
+}
+
+func TestHandleConsumeLowLevel_DisklessHonorsMessageLimit(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	s.markTopicDiskless("diskless-topic")
+
+	largeValue := strings.Repeat("x", 1500)
+	for i := 0; i < 3; i++ {
+		_, err := s.disklessEngine.Produce(context.Background(), "diskless-topic", 0, log.EncodeRecordBatch(0, []log.Message{
+			{Key: []byte("k" + strconv.Itoa(i+1)), Value: []byte(largeValue + "-" + strconv.Itoa(i+1))},
+		}))
+		if err != nil {
+			t.Fatalf("disklessEngine.Produce() error = %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/topics/diskless-topic/partitions/0/messages?offset=0&limit=2", nil)
+	req.SetPathValue("topic", "diskless-topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+
+	s.handleConsumeLowLevel(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp consumeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(resp.Messages))
+	}
+	if resp.Messages[0].Offset != 0 {
+		t.Fatalf("message[0].offset = %d, want 0", resp.Messages[0].Offset)
+	}
+	if resp.Messages[1].Offset != 1 {
+		t.Fatalf("message[1].offset = %d, want 1", resp.Messages[1].Offset)
+	}
+	if resp.NextOffset != 2 {
+		t.Fatalf("next_offset = %d, want 2", resp.NextOffset)
+	}
+}
+
+func TestHandleConsumeLowLevel_DisklessBeyondEndReturnsRequestedOffset(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	s.markTopicDiskless("diskless-topic")
+
+	for i := 0; i < 2; i++ {
+		_, err := s.disklessEngine.Produce(context.Background(), "diskless-topic", 0, log.EncodeRecordBatch(0, []log.Message{
+			{Key: []byte("k" + strconv.Itoa(i+1)), Value: []byte("v" + strconv.Itoa(i+1))},
+		}))
+		if err != nil {
+			t.Fatalf("disklessEngine.Produce() error = %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/topics/diskless-topic/partitions/0/messages?offset=10&limit=2", nil)
+	req.SetPathValue("topic", "diskless-topic")
+	req.SetPathValue("id", "0")
+	rec := httptest.NewRecorder()
+
+	s.handleConsumeLowLevel(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp consumeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Messages) != 0 {
+		t.Fatalf("len(messages) = %d, want 0", len(resp.Messages))
+	}
+	if resp.NextOffset != 10 {
+		t.Fatalf("next_offset = %d, want 10", resp.NextOffset)
+	}
+}
+
+func TestHandleKafkaMetadataIncludesUnknownRequestedTopic(t *testing.T) {
+	s := newTestServer(t)
+
+	req := kmsg.NewPtrMetadataRequest()
+	req.Topics = []kmsg.MetadataRequestTopic{{Topic: strPtr("missing-topic")}}
+
+	resp, err := s.handleKafkaMetadata(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleKafkaMetadata() error = %v", err)
+	}
+	if len(resp.Topics) != 1 {
+		t.Fatalf("handleKafkaMetadata() topics = %d, want 1", len(resp.Topics))
+	}
+	if resp.Topics[0].Topic == nil || *resp.Topics[0].Topic != "missing-topic" {
+		t.Fatalf("handleKafkaMetadata() topic = %v, want missing-topic", resp.Topics[0].Topic)
+	}
+	if resp.Topics[0].ErrorCode != kafkaErrorUnknownTopicPartition {
+		t.Fatalf("handleKafkaMetadata() error = %d, want %d", resp.Topics[0].ErrorCode, kafkaErrorUnknownTopicPartition)
+	}
+}
+
+func TestKafkaCreateTopicRequestRejectsRetentionBytes(t *testing.T) {
+	retentionBytes := "1024"
+	_, code, msg := newTestServer(t).kafkaCreateTopicRequest(kmsg.CreateTopicsRequestTopic{
+		Topic:             "topic",
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+		Configs: []kmsg.CreateTopicsRequestTopicConfig{{
+			Name:  "retention.bytes",
+			Value: &retentionBytes,
+		}},
+	})
+	if code != kafkaErrorInvalidConfig {
+		t.Fatalf("kafkaCreateTopicRequest() code = %d, want %d", code, kafkaErrorInvalidConfig)
+	}
+	if !strings.Contains(msg, "time-based retention only") {
+		t.Fatalf("kafkaCreateTopicRequest() message = %q, want time-based retention guidance", msg)
+	}
+}
+
+func TestApplyKafkaTopicConfigsRejectsRetentionBytes(t *testing.T) {
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+
+	retentionBytes := "1024"
+	_, err := applyKafkaTopicConfigs(tc, map[string]*string{
+		"retention.bytes": &retentionBytes,
+	}, false)
+	if err == nil {
+		t.Fatal("applyKafkaTopicConfigs() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "time-based retention only") {
+		t.Fatalf("applyKafkaTopicConfigs() error = %q, want time-based retention guidance", err)
+	}
+}
+
+func TestKafkaCreateTopicRequestAcceptsDisklessStorageMode(t *testing.T) {
+	storageMode := "diskless"
+	reqBody, code, msg := newTestServer(t).kafkaCreateTopicRequest(kmsg.CreateTopicsRequestTopic{
+		Topic:             "topic",
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+		Configs: []kmsg.CreateTopicsRequestTopicConfig{{
+			Name:  "camu.storage.mode",
+			Value: &storageMode,
+		}},
+	})
+	if code != 0 {
+		t.Fatalf("kafkaCreateTopicRequest() code = %d, want 0; msg=%q", code, msg)
+	}
+	if reqBody.StorageMode != "diskless" {
+		t.Fatalf("kafkaCreateTopicRequest() storage mode = %q, want %q", reqBody.StorageMode, "diskless")
+	}
+}
+
+func TestApplyKafkaTopicConfigsRejectsStorageModeMutation(t *testing.T) {
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+
+	classicMode := "classic"
+	_, err := applyKafkaTopicConfigs(tc, map[string]*string{
+		"camu.storage.mode": &classicMode,
+	}, false)
+	if err == nil {
+		t.Fatal("applyKafkaTopicConfigs() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("applyKafkaTopicConfigs() error = %q, want immutable guidance", err)
+	}
+}
+
+func TestHandleKafkaCreateTopicsRequiresController(t *testing.T) {
+	s := newTestServer(t)
+
+	req := kmsg.NewPtrCreateTopicsRequest()
+	req.Topics = []kmsg.CreateTopicsRequestTopic{{
+		Topic:             "topic",
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	}}
+
+	resp, err := s.handleKafkaCreateTopics(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleKafkaCreateTopics() error = %v", err)
+	}
+	if len(resp.Topics) != 1 {
+		t.Fatalf("handleKafkaCreateTopics() topics = %d, want 1", len(resp.Topics))
+	}
+	if resp.Topics[0].ErrorCode != kafkaErrorNotController {
+		t.Fatalf("handleKafkaCreateTopics() error = %d, want %d", resp.Topics[0].ErrorCode, kafkaErrorNotController)
+	}
+	if _, err := s.topicStore.Get(context.Background(), "topic"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("topicStore.Get() error = %v, want not found", err)
+	}
+}
+
+func TestHandleKafkaDeleteTopicsRequiresController(t *testing.T) {
+	s := newTestServer(t)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	req := kmsg.NewPtrDeleteTopicsRequest()
+	req.SetVersion(5)
+	req.TopicNames = []string{"topic"}
+
+	resp, err := s.handleKafkaDeleteTopics(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleKafkaDeleteTopics() error = %v", err)
+	}
+	if len(resp.Topics) != 1 {
+		t.Fatalf("handleKafkaDeleteTopics() topics = %d, want 1", len(resp.Topics))
+	}
+	if resp.Topics[0].ErrorCode != kafkaErrorNotController {
+		t.Fatalf("handleKafkaDeleteTopics() error = %d, want %d", resp.Topics[0].ErrorCode, kafkaErrorNotController)
+	}
+	if _, err := s.topicStore.Get(context.Background(), "topic"); err != nil {
+		t.Fatalf("topicStore.Get() after non-controller delete error = %v, want topic to remain", err)
+	}
+}
+
+func TestHandleKafkaDeleteTopicsEnqueuesDisklessCleanup(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.leaderLease = coordination.LeaderLease{
+		InstanceID: s.instanceID,
+		ExpiresAt:  time.Now().Add(time.Minute),
+	}
+
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	_, err := s.disklessMeta.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
+		Topic:     "diskless-topic",
+		Partition: 0,
+		Count:     5,
+	}})
+	if err != nil {
+		t.Fatalf("AllocateOffsets() error = %v", err)
+	}
+	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
+		FileKey: "seg-001.dat",
+		Batches: []diskless.BatchRef{{
+			Topic:      "diskless-topic",
+			Partition:  0,
+			BaseOffset: 0,
+			EndOffset:  5,
+			ByteOffset: 0,
+			ByteLength: 500,
+		}},
+	}); err != nil {
+		t.Fatalf("RegisterSegment() error = %v", err)
+	}
+
+	head, err := s.disklessMeta.GetPartitionHead(ctx, "diskless-topic", 0)
+	if err != nil {
+		t.Fatalf("GetPartitionHead(before) error = %v", err)
+	}
+	if head != 5 {
+		t.Fatalf("GetPartitionHead(before) = %d, want 5", head)
+	}
+	refs, err := s.disklessMeta.QuerySegments(ctx, "diskless-topic", 0, 0, 10000)
+	if err != nil {
+		t.Fatalf("QuerySegments(before) error = %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("QuerySegments(before) = %d refs, want 1", len(refs))
+	}
+
+	req := kmsg.NewPtrDeleteTopicsRequest()
+	req.SetVersion(5)
+	req.TopicNames = []string{"diskless-topic"}
+	resp, err := s.handleKafkaDeleteTopics(ctx, req)
+	if err != nil {
+		t.Fatalf("handleKafkaDeleteTopics() error = %v", err)
+	}
+	if len(resp.Topics) != 1 {
+		t.Fatalf("handleKafkaDeleteTopics() topics = %d, want 1", len(resp.Topics))
+	}
+	if resp.Topics[0].ErrorCode != 0 {
+		t.Fatalf("handleKafkaDeleteTopics() error = %d, want 0", resp.Topics[0].ErrorCode)
+	}
+
+	if _, err := s.topicStore.Get(ctx, "diskless-topic"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("topicStore.Get(after) error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.getTopicDeletion(ctx, "diskless-topic"); err != nil {
+		t.Fatalf("getTopicDeletion() error = %v, want marker to remain", err)
+	}
+	head, err = s.disklessMeta.GetPartitionHead(ctx, "diskless-topic", 0)
+	if err != nil {
+		t.Fatalf("GetPartitionHead(after) error = %v", err)
+	}
+	if head != 5 {
+		t.Fatalf("GetPartitionHead(after enqueue) = %d, want 5", head)
+	}
+	refs, err = s.disklessMeta.QuerySegments(ctx, "diskless-topic", 0, 0, 10000)
+	if err != nil {
+		t.Fatalf("QuerySegments(after) error = %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("QuerySegments(after enqueue) = %d refs, want 1", len(refs))
+	}
+}
+
+func TestHandleKafkaListOffsets_DisklessTimestampLookupReturnsInvalidRequest(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	_, err := s.handleKafkaListOffsets(context.Background(), "diskless-topic", 0, 1234)
+	if !errors.Is(err, errKafkaInvalidRequest) {
+		t.Fatalf("handleKafkaListOffsets() error = %v, want %v", err, errKafkaInvalidRequest)
+	}
+}
+
+func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	s.markTopicDiskless("diskless-topic")
+
+	oldBatch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("old")}})
+	freshBatch := log.EncodeRecordBatch(1, []log.Message{{Offset: 1, Value: []byte("fresh")}})
+
+	oldFileKey := "_diskless/test-node/old.data"
+	freshFileKey := "_diskless/test-node/fresh.data"
+	if err := s.s3Client.Put(context.Background(), oldFileKey, oldBatch, storage.PutOpts{}); err != nil {
+		t.Fatalf("s3Client.Put old batch error = %v", err)
+	}
+	if err := s.s3Client.Put(context.Background(), freshFileKey, freshBatch, storage.PutOpts{}); err != nil {
+		t.Fatalf("s3Client.Put fresh batch error = %v", err)
+	}
+
+	_, err := s.disklessMeta.AllocateOffsets(context.Background(), []diskless.OffsetAllocation{
+		{Topic: "diskless-topic", Partition: 0, Count: 2},
+	})
+	if err != nil {
+		t.Fatalf("AllocateOffsets() error = %v", err)
+	}
+
+	if err := s.disklessMeta.RegisterSegment(context.Background(), diskless.SegmentRecord{
+		FileKey:   oldFileKey,
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		Batches: []diskless.BatchRef{{
+			Topic:      "diskless-topic",
+			Partition:  0,
+			BaseOffset: 0,
+			EndOffset:  1,
+			ByteOffset: 0,
+			ByteLength: int64(len(oldBatch)),
+		}},
+	}); err != nil {
+		t.Fatalf("RegisterSegment(old) error = %v", err)
+	}
+	if err := s.disklessMeta.RegisterSegment(context.Background(), diskless.SegmentRecord{
+		FileKey:   freshFileKey,
+		CreatedAt: time.Now(),
+		Batches: []diskless.BatchRef{{
+			Topic:      "diskless-topic",
+			Partition:  0,
+			BaseOffset: 1,
+			EndOffset:  2,
+			ByteOffset: 0,
+			ByteLength: int64(len(freshBatch)),
+		}},
+	}); err != nil {
+		t.Fatalf("RegisterSegment(fresh) error = %v", err)
+	}
+
+	topics, err := s.topicStore.List(context.Background())
+	if err != nil {
+		t.Fatalf("topicStore.List() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(context.Background(), "diskless-topic", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 9},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["diskless-topic"] = map[int]localPartitionAssignment{
+		0: {Owned: true, LeaderEpoch: 9},
+	}
+	s.assignmentsMu.Unlock()
+	s.runPartitionMaintenance(context.Background(), topics)
+
+	if _, err := s.s3Client.Get(context.Background(), oldFileKey); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected expired diskless file to be deleted by owner maintenance, got %v", err)
+	}
+	refsBefore, err := s.disklessMeta.QuerySegments(context.Background(), "diskless-topic", 0, 0, 1000)
+	if err != nil {
+		t.Fatalf("QuerySegments(after maintenance) error = %v", err)
+	}
+	if len(refsBefore) == 0 || refsBefore[0].FileKey != freshFileKey {
+		t.Fatalf("QuerySegments(after maintenance) = %+v, want only fresh ref to remain visible", refsBefore)
+	}
+
+	if _, err := s.s3Client.Get(context.Background(), oldFileKey); err == nil {
+		t.Fatal("expected expired diskless file to be deleted")
+	}
+	if _, err := s.s3Client.Get(context.Background(), freshFileKey); err != nil {
+		t.Fatalf("expected fresh diskless file to remain: %v", err)
+	}
+
+	resp, err := s.handleKafkaListOffsets(context.Background(), "diskless-topic", 0, -2)
+	if err != nil {
+		t.Fatalf("handleKafkaListOffsets() error = %v", err)
+	}
+	if resp.Offset != 1 {
+		t.Fatalf("handleKafkaListOffsets() earliest offset = %d, want 1", resp.Offset)
 	}
 }
 
@@ -473,7 +983,6 @@ func TestInitPartitionAsLeader_RefreshesIndexFromS3BeforeRecoveringTail(t *testi
 	// Simulate a follower that started before any segments existed locally,
 	// then later gets promoted after the old leader has already flushed a
 	// committed prefix to S3.
-	var oldSeg bytes.Buffer
 	oldMsgs := []log.Message{
 		{Offset: 0, Key: []byte("k0"), Value: []byte("v0")},
 		{Offset: 1, Key: []byte("k1"), Value: []byte("v1")},
@@ -481,11 +990,9 @@ func TestInitPartitionAsLeader_RefreshesIndexFromS3BeforeRecoveringTail(t *testi
 		{Offset: 3, Key: []byte("k3"), Value: []byte("v3")},
 		{Offset: 4, Key: []byte("k4"), Value: []byte("v4")},
 	}
-	if err := log.WriteSegment(&oldSeg, oldMsgs, log.CompressionNone, 16*1024); err != nil {
-		t.Fatalf("WriteSegment() error = %v", err)
-	}
+	oldSegData := log.EncodeRecordBatch(int64(oldMsgs[0].Offset), oldMsgs)
 	oldSegKey := log.FormatSegmentKey("topic", 0, 0, 4, 1)
-	if err := s.s3Client.Put(ctx, oldSegKey, oldSeg.Bytes(), storage.PutOpts{}); err != nil {
+	if err := s.s3Client.Put(ctx, oldSegKey, oldSegData, storage.PutOpts{}); err != nil {
 		t.Fatalf("s3Client.Put(segment) error = %v", err)
 	}
 	partState := &log.PartitionState{HighWatermark: 5}
@@ -793,12 +1300,9 @@ func TestHandleConsumeLowLevel_MergesOverlappingSegmentAndActiveData(t *testing.
 			Value:  []byte("seg-v" + strconv.Itoa(i)),
 		}
 	}
-	var segBuf bytes.Buffer
-	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
-		t.Fatalf("WriteSegment() error = %v", err)
-	}
+	segData := log.EncodeRecordBatch(int64(segmentMsgs[0].Offset), segmentMsgs)
 	segKey := "topic/0/0-1.segment"
-	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
+	if err := s.partitionManager.GetDiskCache().Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
 	}
 	ps.index.Add(log.SegmentRef{
@@ -905,12 +1409,9 @@ func TestHandleConsumeLowLevel_MergesActiveDataBeforeApplyingLimit(t *testing.T)
 			Value:  []byte("seg-v" + strconv.Itoa(i)),
 		}
 	}
-	var segBuf bytes.Buffer
-	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
-		t.Fatalf("WriteSegment() error = %v", err)
-	}
+	segData := log.EncodeRecordBatch(int64(segmentMsgs[0].Offset), segmentMsgs)
 	segKey := "topic/0/0-1.segment"
-	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
+	if err := s.partitionManager.GetDiskCache().Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
 	}
 	ps.index.Add(log.SegmentRef{
@@ -963,11 +1464,11 @@ func TestHandleConsumeLowLevel_MergesActiveDataBeforeApplyingLimit(t *testing.T)
 		if msg.Offset != uint64(i) {
 			t.Fatalf("message[%d].offset = %d, want %d", i, msg.Offset, i)
 		}
-			if msg.Key != "active-k"+strconv.Itoa(i) {
-				t.Fatalf("message[%d].key = %q, want %q", i, msg.Key, "active-k"+strconv.Itoa(i))
-			}
+		if msg.Key != "active-k"+strconv.Itoa(i) {
+			t.Fatalf("message[%d].key = %q, want %q", i, msg.Key, "active-k"+strconv.Itoa(i))
 		}
 	}
+}
 
 func TestHandleConsumeLowLevel_ReturnsReadableFollowerActiveSuffix(t *testing.T) {
 	s := newTestServer(t)
@@ -1004,15 +1505,12 @@ func TestHandleConsumeLowLevel_ReturnsReadableFollowerActiveSuffix(t *testing.T)
 			Value:  []byte("seg-v" + strconv.Itoa(i)),
 		}
 	}
-	var segBuf bytes.Buffer
-	if err := log.WriteSegment(&segBuf, segmentMsgs, log.CompressionNone, 16*1024); err != nil {
-		t.Fatalf("WriteSegment() error = %v", err)
-	}
+	segData := log.EncodeRecordBatch(int64(segmentMsgs[0].Offset), segmentMsgs)
 	segKey := log.FormatSegmentKey("topic", 0, 0, 16, 1)
-	if err := s.partitionManager.GetDiskCache().Put(segKey, segBuf.Bytes()); err != nil {
+	if err := s.partitionManager.GetDiskCache().Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
 	}
-	if err := s.s3Client.Put(context.Background(), segKey, segBuf.Bytes(), storage.PutOpts{}); err != nil {
+	if err := s.s3Client.Put(context.Background(), segKey, segData, storage.PutOpts{}); err != nil {
 		t.Fatalf("s3Client.Put() error = %v", err)
 	}
 	ps.index.Add(log.SegmentRef{
@@ -1344,6 +1842,41 @@ func TestProduceHighLevelRejectsSingleObjectBody(t *testing.T) {
 	}
 }
 
+func TestCommitConsumerOffsetsRejectsInvalidBody(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics/topic/offsets/consumer-a", bytes.NewBufferString("{"))
+	req.SetPathValue("topic", "topic")
+	req.SetPathValue("consumer_id", "consumer-a")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid request body") {
+		t.Fatalf("body = %q, want invalid request body", rec.Body.String())
+	}
+}
+
+func TestCommitGroupOffsetsRejectsInvalidBody(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.publicRoutes()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/groups/group-a/commit", bytes.NewBufferString("{"))
+	req.SetPathValue("group_id", "group-a")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid request body") {
+		t.Fatalf("body = %q, want invalid request body", rec.Body.String())
+	}
+}
+
 func TestProduceLowLevelRejectsSingleObjectBody(t *testing.T) {
 	s := newTestServer(t)
 	handler := s.publicRoutes()
@@ -1496,7 +2029,7 @@ func TestGCStaleISR(t *testing.T) {
 	}
 }
 
-func TestHandleDeleteTopic_CleansUpAllS3Data(t *testing.T) {
+func TestHandleDeleteTopicEnqueuesAsyncCleanup(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 
@@ -1546,23 +2079,14 @@ func TestHandleDeleteTopic_CleansUpAllS3Data(t *testing.T) {
 	if _, err := s.topicStore.Get(ctx, "doomed"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for deleted topic, got %v", err)
 	}
+	if _, err := s.getTopicDeletion(ctx, "doomed"); err != nil {
+		t.Fatalf("expected deletion marker for doomed topic, got %v", err)
+	}
 
-	// Verify all partition data is gone.
+	// Verify partition data is still present until GC finalizes cleanup.
 	keys, _ := s.s3Client.List(ctx, "doomed/")
-	if len(keys) != 0 {
-		t.Fatalf("expected 0 objects under doomed/, got %d: %v", len(keys), keys)
-	}
-
-	// Verify assignment is gone.
-	keys, _ = s.s3Client.List(ctx, "_coordination/assignments/doomed")
-	if len(keys) != 0 {
-		t.Fatalf("expected 0 assignment files, got %d: %v", len(keys), keys)
-	}
-
-	// Verify epoch files are gone.
-	keys, _ = s.s3Client.List(ctx, "_coordination/epochs/doomed/")
-	if len(keys) != 0 {
-		t.Fatalf("expected 0 epoch files, got %d: %v", len(keys), keys)
+	if len(keys) == 0 {
+		t.Fatal("expected doomed/ objects to remain until GC")
 	}
 }
 

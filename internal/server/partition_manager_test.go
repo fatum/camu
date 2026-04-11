@@ -136,7 +136,7 @@ func TestRecoverLocalLogEnd_PrefersNativeData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenActiveSegment() error = %v", err)
 	}
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 	nativeBatch := log.EncodeRecordBatch(0, []log.Message{
 		{Key: []byte("k0"), Value: []byte("v0"), Timestamp: now},
 		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now + 1},
@@ -360,7 +360,7 @@ func TestAppendRawBatch_BasicOffsetAssignment(t *testing.T) {
 	ps.mu.Unlock()
 
 	// Build a raw RecordBatch with 3 messages.
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 	msgs := []log.Message{
 		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now},
 		{Key: []byte("k2"), Value: []byte("v2"), Timestamp: now + 1},
@@ -507,7 +507,7 @@ func TestReadRawBatches_ActiveSegment(t *testing.T) {
 	ps.mu.Unlock()
 
 	// Append two batches.
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 	msgs1 := []log.Message{
 		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now},
 		{Key: []byte("k2"), Value: []byte("v2"), Timestamp: now + 1},
@@ -602,7 +602,7 @@ func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
 		t.Fatalf("OpenActiveSegment() error = %v", err)
 	}
 
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 	batch0 := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k0"), Value: []byte("v0"), Timestamp: now}})
 	batch1 := log.EncodeRecordBatch(1, []log.Message{{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now + 1}})
 	if err := as.Append(batch0); err != nil {
@@ -684,7 +684,7 @@ func TestReadRawBatches_MaxBytesLimit(t *testing.T) {
 	ps.mu.Unlock()
 
 	// Append 3 batches.
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 	for i := 0; i < 3; i++ {
 		msgs := []log.Message{{Key: []byte(fmt.Sprintf("k%d", i)), Value: []byte("val"), Timestamp: now + int64(i)}}
 		raw := log.EncodeRecordBatch(0, msgs)
@@ -748,7 +748,7 @@ func TestAppendReplicatedRawBatches(t *testing.T) {
 	ps.isLeader = false // follower
 	ps.mu.Unlock()
 
-	now := time.Now().UnixNano() / int64(time.Millisecond)
+	now := time.Now().UnixMilli()
 
 	// Build two raw RecordBatch blobs with leader-assigned offsets.
 	// batch1: base=10, 2 records → offsets 10,11

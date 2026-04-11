@@ -77,7 +77,11 @@ func (ks *KafkaServer) HandleRequest(_ context.Context, req kmsg.Request) (kmsg.
 }
 
 func (ks *KafkaServer) HandleConn(conn net.Conn, _ net.Listener) {
-	defer conn.Close()
+	ks.trackConn(conn)
+	defer func() {
+		ks.untrackConn(conn)
+		conn.Close()
+	}()
 
 	var reqBuf []byte
 
@@ -155,10 +159,35 @@ func (ks *KafkaServer) Close() error {
 	ln := ks.listener
 	ks.listener = nil
 	ks.listenerMu.Unlock()
+
+	// Close all active connections so clients discover the server is gone
+	// immediately instead of hanging on stale TCP sockets.
+	ks.connsMu.Lock()
+	for conn := range ks.conns {
+		conn.Close()
+	}
+	ks.conns = nil
+	ks.connsMu.Unlock()
+
 	if ln == nil {
 		return nil
 	}
 	return ln.Close()
+}
+
+func (ks *KafkaServer) trackConn(conn net.Conn) {
+	ks.connsMu.Lock()
+	if ks.conns == nil {
+		ks.conns = make(map[net.Conn]struct{})
+	}
+	ks.conns[conn] = struct{}{}
+	ks.connsMu.Unlock()
+}
+
+func (ks *KafkaServer) untrackConn(conn net.Conn) {
+	ks.connsMu.Lock()
+	delete(ks.conns, conn)
+	ks.connsMu.Unlock()
 }
 
 func decodeKafkaRequest(buf []byte) (int32, kmsg.Request, error) {

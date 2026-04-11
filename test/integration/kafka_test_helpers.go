@@ -22,10 +22,14 @@ import (
 )
 
 const kafkaErrorNotCoordinatorForTest int16 = 16
+const kafkaErrorNotControllerForTest int16 = 41
 const kafkaErrorNonEmptyGroupForTest int16 = 68
 const kafkaErrorGroupIDNotFoundForTest int16 = 69
 
-func newKafkaTestEnv(t *testing.T, topic string) (*camutest.Env, *camutest.Client, *kgo.Client) {
+// newKafkaEnv creates a single-node environment with Kafka enabled but does not
+// create any topics. Tests that need Kafka admin semantics should create topics
+// over Kafka explicitly instead of using HTTP fixture setup.
+func newKafkaEnv(t *testing.T) (*camutest.Env, *camutest.Client, string) {
 	t.Helper()
 
 	kafkaPort := freeTCPPort(t)
@@ -37,12 +41,17 @@ func newKafkaTestEnv(t *testing.T, topic string) (*camutest.Env, *camutest.Clien
 	)
 
 	httpClient := env.Client()
-	if err := httpClient.CreateTopic(topic, 1, 24*time.Hour); err != nil {
-		env.Cleanup()
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	seedBroker := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	return env, httpClient, seedBroker
+}
+
+// newKafkaTopicBootstrappedEnv provisions a classic topic via Kafka CreateTopics
+// before exercising Kafka requests.
+func newKafkaTopicBootstrappedEnv(t *testing.T, topic string) (*camutest.Env, *camutest.Client, *kgo.Client, string) {
+	t.Helper()
+
+	env, httpClient, seedBroker := newKafkaFixtureEnv(t, topic)
+
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(seedBroker),
 		kgo.MaxVersions(kversion.V1_0_0()),
@@ -57,7 +66,117 @@ func newKafkaTestEnv(t *testing.T, topic string) (*camutest.Env, *camutest.Clien
 		t.Fatalf("kgo.NewClient() error: %v", err)
 	}
 
-	return env, httpClient, client
+	return env, httpClient, client, seedBroker
+}
+
+func newKafkaReadyEnv(t *testing.T) (*camutest.Env, *camutest.Client, string) {
+	t.Helper()
+
+	env, httpClient, seedBroker := newKafkaEnv(t)
+	waitForKafkaAddr(t, seedBroker)
+	return env, httpClient, seedBroker
+}
+
+func newKafkaFixtureEnv(t *testing.T, topic string) (*camutest.Env, *camutest.Client, string) {
+	t.Helper()
+
+	env, httpClient, seedBroker := newKafkaEnv(t)
+	createKafkaFixtureTopic(t, seedBroker, topic, 1)
+	return env, httpClient, seedBroker
+}
+
+func newDisklessKafkaEnv(t *testing.T, topic string) (*camutest.Env, *camutest.Client, string) {
+	t.Helper()
+
+	env, httpClient, seedBroker := newKafkaEnv(t)
+	createDisklessKafkaFixtureTopic(t, seedBroker, topic, 1)
+	assertKafkaTopicStorageMode(t, seedBroker, topic, "diskless")
+	return env, httpClient, seedBroker
+}
+
+// createKafkaFixtureTopic provisions a classic topic over Kafka CreateTopics for
+// tests that are exercising Kafka protocol behavior.
+func createKafkaFixtureTopic(t *testing.T, addr, topic string, partitions int) {
+	t.Helper()
+	createKafkaFixtureTopicWithConfigs(t, addr, topic, partitions, nil)
+}
+
+func createDisklessKafkaFixtureTopic(t *testing.T, addr, topic string, partitions int) {
+	t.Helper()
+
+	disklessMode := "diskless"
+	createKafkaFixtureTopicWithConfigs(t, addr, topic, partitions, []kmsg.CreateTopicsRequestTopicConfig{{
+		Name:  "camu.storage.mode",
+		Value: &disklessMode,
+	}})
+}
+
+func createKafkaFixtureTopicWithConfigs(t *testing.T, addr, topic string, partitions int, configs []kmsg.CreateTopicsRequestTopicConfig) {
+	t.Helper()
+
+	waitForKafkaAddr(t, addr)
+
+	req := kmsg.NewPtrCreateTopicsRequest()
+	req.SetVersion(5)
+	req.Topics = []kmsg.CreateTopicsRequestTopic{{
+		Topic:             topic,
+		NumPartitions:     int32(partitions),
+		ReplicationFactor: 1,
+		Configs:           configs,
+	}}
+	respAny, err := sendKafkaRequest(addr, req)
+	if err != nil {
+		t.Fatalf("CreateTopics Request() error: %v", err)
+	}
+	resp := respAny.(*kmsg.CreateTopicsResponse)
+	if len(resp.Topics) != 1 {
+		t.Fatalf("CreateTopics topics = %d, want 1", len(resp.Topics))
+	}
+	if resp.Topics[0].ErrorCode != 0 {
+		t.Fatalf("CreateTopics error code = %d, want 0", resp.Topics[0].ErrorCode)
+	}
+}
+
+func assertKafkaTopicStorageMode(t *testing.T, addr, topic, want string) {
+	t.Helper()
+
+	got := fetchKafkaTopicConfigValues(t, addr, topic, "camu.storage.mode")["camu.storage.mode"]
+	if got != want {
+		t.Fatalf("camu.storage.mode = %q, want %q", got, want)
+	}
+}
+
+func createKafkaReplicatedFixtureTopic(t *testing.T, seedAddr string, addrByBrokerID map[int32]string, topic string, partitions, replicationFactor int, configs []kmsg.CreateTopicsRequestTopicConfig) {
+	t.Helper()
+
+	controllerAddr, _ := waitForKafkaControllerAndFollowerAddrs(t, seedAddr, addrByBrokerID)
+	createKafkaFixtureTopicWithReplicationAndConfigs(t, controllerAddr, topic, partitions, replicationFactor, configs)
+}
+
+func createKafkaFixtureTopicWithReplicationAndConfigs(t *testing.T, addr, topic string, partitions, replicationFactor int, configs []kmsg.CreateTopicsRequestTopicConfig) {
+	t.Helper()
+
+	waitForKafkaAddr(t, addr)
+
+	req := kmsg.NewPtrCreateTopicsRequest()
+	req.SetVersion(5)
+	req.Topics = []kmsg.CreateTopicsRequestTopic{{
+		Topic:             topic,
+		NumPartitions:     int32(partitions),
+		ReplicationFactor: int16(replicationFactor),
+		Configs:           configs,
+	}}
+	respAny, err := sendKafkaRequest(addr, req)
+	if err != nil {
+		t.Fatalf("CreateTopics Request() error: %v", err)
+	}
+	resp := respAny.(*kmsg.CreateTopicsResponse)
+	if len(resp.Topics) != 1 {
+		t.Fatalf("CreateTopics topics = %d, want 1", len(resp.Topics))
+	}
+	if resp.Topics[0].ErrorCode != 0 {
+		t.Fatalf("CreateTopics error code = %d, want 0", resp.Topics[0].ErrorCode)
+	}
 }
 
 func collectKafkaValues(t *testing.T, ctx context.Context, client *kgo.Client, want int) [][]byte {
@@ -221,8 +340,84 @@ func waitForKafkaAddr(t *testing.T, addr string) {
 	t.Fatalf("kafka listener %s did not become reachable before timeout", addr)
 }
 
+func waitForKafkaControllerAndFollowerAddrs(t *testing.T, seedAddr string, addrByBrokerID map[int32]string) (string, string) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		req := kmsg.NewPtrDescribeClusterRequest()
+		req.SetVersion(0)
+		respAny, err := sendKafkaRequest(seedAddr, req)
+		if err == nil {
+			resp := respAny.(*kmsg.DescribeClusterResponse)
+			if len(resp.Brokers) >= 2 {
+				controllerAddr := addrByBrokerID[resp.ControllerID]
+				followerAddr := ""
+				for brokerID, addr := range addrByBrokerID {
+					if brokerID != resp.ControllerID {
+						followerAddr = addr
+						break
+					}
+				}
+				if controllerAddr != "" && followerAddr != "" {
+					return controllerAddr, followerAddr
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatal("did not determine controller and follower Kafka addresses before timeout")
+	return "", ""
+}
+
+func fetchKafkaTopicMetadata(t *testing.T, addr, topic string) kmsg.MetadataResponseTopic {
+	t.Helper()
+
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(1)
+	req.Topics = []kmsg.MetadataRequestTopic{{Topic: strPtr(topic)}}
+	respAny, err := sendKafkaRequest(addr, req)
+	if err != nil {
+		t.Fatalf("Metadata Request() error: %v", err)
+	}
+	resp := respAny.(*kmsg.MetadataResponse)
+	if len(resp.Topics) != 1 {
+		t.Fatalf("metadata topics = %d, want 1", len(resp.Topics))
+	}
+	return resp.Topics[0]
+}
+
+func fetchKafkaTopicConfigValues(t *testing.T, addr, topic string, names ...string) map[string]string {
+	t.Helper()
+
+	req := kmsg.NewPtrDescribeConfigsRequest()
+	req.SetVersion(1)
+	req.Resources = []kmsg.DescribeConfigsRequestResource{{
+		ResourceType: kmsg.ConfigResourceTypeTopic,
+		ResourceName: topic,
+		ConfigNames:  names,
+	}}
+	respAny, err := sendKafkaRequest(addr, req)
+	if err != nil {
+		t.Fatalf("DescribeConfigs Request() error: %v", err)
+	}
+	resp := respAny.(*kmsg.DescribeConfigsResponse)
+	if len(resp.Resources) != 1 {
+		t.Fatalf("DescribeConfigs resources = %d, want 1", len(resp.Resources))
+	}
+	if resp.Resources[0].ErrorCode != 0 {
+		t.Fatalf("DescribeConfigs error code = %d, want 0", resp.Resources[0].ErrorCode)
+	}
+	values := make(map[string]string, len(resp.Resources[0].Configs))
+	for _, cfg := range resp.Resources[0].Configs {
+		values[cfg.Name] = stringValue(cfg.Value)
+	}
+	return values
+}
+
 func produceWithKgoUntilSuccess(ctx context.Context, client *kgo.Client, topic, value string) error {
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(40 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		results := client.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte(value)})
@@ -359,4 +554,16 @@ func kafkaRecordBatchForTest(records []testKafkaRecord) []byte {
 	raw = batch.AppendTo(nil)
 	batch.CRC = int32(crc32.Checksum(raw[21:], kafkaCRC32CTableForTest))
 	return batch.AppendTo(nil)
+}
+
+func newConsumerMemberAssignment(t *testing.T, topic string, partition int32) []byte {
+	t.Helper()
+
+	assignment := kmsg.NewConsumerMemberAssignment()
+	assignment.Version = 0
+	assignment.Topics = []kmsg.ConsumerMemberAssignmentTopic{{
+		Topic:      topic,
+		Partitions: []int32{partition},
+	}}
+	return assignment.AppendTo(nil)
 }

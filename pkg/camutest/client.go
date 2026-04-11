@@ -12,9 +12,10 @@ import (
 
 // TopicInfo holds topic metadata returned by the API.
 type TopicInfo struct {
-	Name       string `json:"name"`
-	Partitions int    `json:"partitions"`
-	Retention  string `json:"retention"`
+	Name        string `json:"name"`
+	Partitions  int    `json:"partitions"`
+	Retention   string `json:"retention"`
+	StorageMode string `json:"storage_mode,omitempty"`
 }
 
 // ClusterStatusResponse holds the cluster status response.
@@ -40,6 +41,11 @@ func NewClient(baseURL string) *Client {
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 	}
+}
+
+// BaseURL returns the base URL of the client.
+func (c *Client) BaseURL() string {
+	return c.baseURL
 }
 
 type apiError struct {

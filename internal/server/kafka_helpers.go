@@ -74,6 +74,8 @@ func mapKafkaError(err error) int16 {
 		return kafkaErrorLeaderNotAvailable
 	case errors.Is(err, errKafkaNotLeader):
 		return kafkaErrorNotLeader
+	case errors.Is(err, errKafkaInvalidRequest):
+		return kafkaErrorInvalidRequest
 	case errors.Is(err, idempotency.ErrSequenceGap):
 		return kafkaErrorOutOfOrderSequence
 	case errors.Is(err, idempotency.ErrUnknownProducer):

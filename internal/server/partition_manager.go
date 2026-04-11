@@ -169,7 +169,7 @@ type producerCheckpointEntry struct {
 
 // partitionState holds per-partition runtime state.
 type partitionState struct {
-	mu            sync.RWMutex // unified per-partition lock for all read/write access
+	mu            sync.RWMutex       // unified per-partition lock for all read/write access
 	activeSegment *log.ActiveSegment // zero-copy RecordBatch storage (nil until wired)
 	index         *log.Index
 	nextOffset    uint64
@@ -298,14 +298,14 @@ func (ps *partitionState) evictStaleProducers(ttl time.Duration) int {
 
 // PartitionManager manages per-partition native log state, indexes, and batching.
 type PartitionManager struct {
-	mu           sync.RWMutex
-	s3Client     *storage.S3Client
-	diskCache    *log.DiskCache
-	partitions   map[string]map[int]*partitionState // topic -> partitionID -> state
-	routers      map[string]*producer.Router
-	batcher      *producer.Batcher
-	localDir     string
-	segmentsCfg  config.SegmentsConfig
+	mu          sync.RWMutex
+	s3Client    *storage.S3Client
+	diskCache   *log.DiskCache
+	partitions  map[string]map[int]*partitionState // topic -> partitionID -> state
+	routers     map[string]*producer.Router
+	batcher     *producer.Batcher
+	localDir    string
+	segmentsCfg config.SegmentsConfig
 
 	// leaseChecker validates partition ownership before flushing to S3.
 	leaseChecker func(topic string, partitionID int) bool
@@ -343,14 +343,14 @@ func NewPartitionManager(cfg *config.Config, s3Client *storage.S3Client) (*Parti
 	}
 
 	pm := &PartitionManager{
-		s3Client:     s3Client,
-		diskCache:    diskCache,
-		partitions:   make(map[string]map[int]*partitionState),
-		routers:      make(map[string]*producer.Router),
-		localDir:     localDir,
-		segmentsCfg:  cfg.Segments,
-		globalIDMap:  make(map[int]topicPartition),
-		reverseMap:   make(map[topicPartition]int),
+		s3Client:    s3Client,
+		diskCache:   diskCache,
+		partitions:  make(map[string]map[int]*partitionState),
+		routers:     make(map[string]*producer.Router),
+		localDir:    localDir,
+		segmentsCfg: cfg.Segments,
+		globalIDMap: make(map[int]topicPartition),
+		reverseMap:  make(map[topicPartition]int),
 	}
 
 	maxAge, err := cfg.Segments.MaxAgeDuration()
@@ -625,7 +625,7 @@ func (pm *PartitionManager) appendNativeBatchToPS(ps *partitionState, topic stri
 		return nil, err
 	}
 
-	now := time.Now().UnixNano()
+	now := time.Now().UnixMilli()
 	for i := range batch.Messages {
 		if batch.Messages[i].Timestamp == 0 {
 			batch.Messages[i].Timestamp = now
@@ -892,6 +892,58 @@ func (pm *PartitionManager) GetDiskCache() *log.DiskCache {
 	return pm.diskCache
 }
 
+// RemoveSealedSegmentObjects removes sealed-segment refs for the given object
+// keys from the local partition index and evicts matching disk-cache entries.
+func (pm *PartitionManager) RemoveSealedSegmentObjects(topic string, partitionID int, keys ...string) {
+	ps := pm.GetPartitionState(topic, partitionID)
+	if ps != nil {
+		ps.mu.Lock()
+		if ps.index != nil {
+			ps.index.RemoveObjectKeys(keys...)
+		}
+		ps.mu.Unlock()
+	}
+	if pm.diskCache != nil {
+		for _, key := range keys {
+			if key == "" {
+				continue
+			}
+			pm.diskCache.Delete(key)
+		}
+	}
+}
+
+// InstallSealedSegment swaps old sealed-segment refs out of the local index,
+// adds ref, and updates the disk cache with the merged artifact.
+func (pm *PartitionManager) InstallSealedSegment(topic string, partitionID int, ref log.SegmentRef, segData, sidecarData, metaData []byte, removeKeys ...string) {
+	ps := pm.GetPartitionState(topic, partitionID)
+	if ps != nil {
+		ps.mu.Lock()
+		if ps.index != nil {
+			ps.index.RemoveObjectKeys(removeKeys...)
+			ps.index.Add(ref)
+		}
+		ps.mu.Unlock()
+	}
+	if pm.diskCache != nil {
+		for _, key := range removeKeys {
+			if key == "" {
+				continue
+			}
+			pm.diskCache.Delete(key)
+		}
+		if len(segData) > 0 {
+			_ = pm.diskCache.Put(ref.Key, segData)
+		}
+		if len(sidecarData) > 0 {
+			_ = pm.diskCache.Put(ref.OffsetIndexObjectKey(), sidecarData)
+		}
+		if len(metaData) > 0 {
+			_ = pm.diskCache.Put(ref.MetaObjectKey(), metaData)
+		}
+	}
+}
+
 // GetIndex returns the partition index.
 func (pm *PartitionManager) GetIndex(topic string, partitionID int) *log.Index {
 	pm.mu.RLock()
@@ -921,6 +973,48 @@ func (pm *PartitionManager) GetPartitionState(topic string, partitionID int) *pa
 		return parts[partitionID]
 	}
 	return nil
+}
+
+func (pm *PartitionManager) RemoveTopic(topic string) {
+	pm.mu.Lock()
+	parts := pm.partitions[topic]
+	delete(pm.partitions, topic)
+	delete(pm.routers, topic)
+	pm.mu.Unlock()
+
+	var doneChans []chan struct{}
+	for _, ps := range parts {
+		if ps.fetchCancel != nil {
+			ps.fetchCancel()
+			if ps.fetchDone != nil {
+				doneChans = append(doneChans, ps.fetchDone)
+			}
+		}
+	}
+	for _, ch := range doneChans {
+		<-ch
+	}
+	for _, ps := range parts {
+		ps.mu.Lock()
+		if ps.activeSegment != nil {
+			_ = ps.activeSegment.Close()
+			ps.activeSegment = nil
+		}
+		ps.index = nil
+		ps.mu.Unlock()
+	}
+
+	pm.globalIDMu.Lock()
+	for tp, id := range pm.reverseMap {
+		if tp.topic != topic {
+			continue
+		}
+		delete(pm.reverseMap, tp)
+		delete(pm.globalIDMap, id)
+	}
+	pm.globalIDMu.Unlock()
+
+	_ = os.RemoveAll(filepath.Join(pm.localDir, topic))
 }
 
 // UpdateFollowerProgress records the latest leader-advertised epoch, readable
@@ -1166,9 +1260,20 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 				break
 			}
 
+			// Use the sidecar offset index to seek directly to the
+			// approximate position instead of scanning from byte 0.
+			startPos := 0
+			if sidecarData, err := pm.readSealedSegmentSidecar(ctx, ref); err == nil {
+				if entries, _, err := log.ReadSidecar(sidecarData); err == nil {
+					if pos, ok := log.LookupSidecarPosition(entries, currentOffset); ok {
+						startPos = int(pos)
+					}
+				}
+			}
+
 			// Sealed segment data IS raw RecordBatch bytes back-to-back.
 			// Slice out batches directly — no decoding or re-encoding needed.
-			rawBatches, err := log.ReadSegmentBatches(segData, uint64(currentOffset), 0)
+			rawBatches, err := log.ReadSegmentBatchesFromPosition(segData, startPos, uint64(currentOffset), 0)
 			if err != nil {
 				slog.Warn("ReadRawBatches: failed to parse sealed segment batches",
 					"topic", topic, "partition", pid,
@@ -1262,6 +1367,33 @@ func (pm *PartitionManager) readSealedSegmentData(ctx context.Context, ref log.S
 	}
 
 	return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+}
+
+// readSealedSegmentSidecar reads the CIDX sidecar for a sealed segment from
+// disk cache or S3. Returns an error if unavailable (callers should fall back
+// to scanning from byte 0).
+func (pm *PartitionManager) readSealedSegmentSidecar(ctx context.Context, ref log.SegmentRef) ([]byte, error) {
+	key := ref.OffsetIndexObjectKey()
+	if key == "" {
+		return nil, fmt.Errorf("no sidecar key for segment %s", ref.Key)
+	}
+	if pm.diskCache != nil {
+		data, err := pm.diskCache.Get(key)
+		if err == nil && len(data) > 0 {
+			return data, nil
+		}
+	}
+	if pm.s3Client != nil {
+		data, err := pm.s3Client.Get(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("s3 get %s: %w", key, err)
+		}
+		if pm.diskCache != nil {
+			_ = pm.diskCache.Put(key, data)
+		}
+		return data, nil
+	}
+	return nil, fmt.Errorf("no storage backend available for sidecar %s", key)
 }
 
 // readSealedSegmentOffsetIndex reads a sealed segment's offset index from disk cache or S3.

@@ -273,3 +273,163 @@ func TestKafkaGroupCoordinatorHeartbeatExpiresStaleMembers(t *testing.T) {
 	require.False(t, ok)
 	require.Equal(t, firstResp.MemberID, group.LeaderID)
 }
+
+func TestKafkaGroupCoordinatorSyncGroupRejectsFollowerAssignments(t *testing.T) {
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	require.NoError(t, err)
+
+	gc := newKafkaGroupCoordinator(s3Client, "n1")
+	joinReq := newTestKafkaJoinGroupRequest("group-sync-follower")
+
+	leaderResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+
+	secondResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+
+	leaderAssignment := newTestKafkaMemberAssignment("test-topic", 0)
+	followerAssignment := newTestKafkaMemberAssignment("test-topic", 1)
+
+	syncReq := kmsg.NewPtrSyncGroupRequest()
+	syncReq.Group = "group-sync-follower"
+	syncReq.Generation = secondResp.Generation
+	syncReq.MemberID = secondResp.MemberID
+	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{
+		{MemberID: leaderResp.MemberID, MemberAssignment: leaderAssignment},
+		{MemberID: secondResp.MemberID, MemberAssignment: followerAssignment},
+	}
+
+	syncResp, err := gc.syncGroup(context.Background(), syncReq)
+	require.NoError(t, err)
+	require.Equal(t, kafkaErrorRebalanceInProgress, syncResp.ErrorCode)
+
+	group, err := gc.readGroup(context.Background(), "group-sync-follower")
+	require.NoError(t, err)
+	require.Empty(t, group.Assignments)
+}
+
+func TestKafkaGroupCoordinatorSyncGroupRejectsIncompleteAssignments(t *testing.T) {
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	require.NoError(t, err)
+
+	gc := newKafkaGroupCoordinator(s3Client, "n1")
+	joinReq := newTestKafkaJoinGroupRequest("group-sync-incomplete")
+
+	leaderResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+
+	secondResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+
+	syncReq := kmsg.NewPtrSyncGroupRequest()
+	syncReq.Group = "group-sync-incomplete"
+	syncReq.Generation = secondResp.Generation
+	syncReq.MemberID = leaderResp.MemberID
+	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{
+		{MemberID: leaderResp.MemberID, MemberAssignment: newTestKafkaMemberAssignment("test-topic", 0)},
+	}
+
+	syncResp, err := gc.syncGroup(context.Background(), syncReq)
+	require.NoError(t, err)
+	require.Equal(t, kafkaErrorRebalanceInProgress, syncResp.ErrorCode)
+
+	group, err := gc.readGroup(context.Background(), "group-sync-incomplete")
+	require.NoError(t, err)
+	require.Empty(t, group.Assignments)
+}
+
+func TestKafkaGroupCoordinatorLeaveGroupRebalancesOnMemberRemoval(t *testing.T) {
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	require.NoError(t, err)
+
+	gc := newKafkaGroupCoordinator(s3Client, "n1")
+	joinReq := newTestKafkaJoinGroupRequest("group-leave-rebalance")
+
+	leaderResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), leaderResp.Generation)
+
+	secondResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+	require.Equal(t, int32(2), secondResp.Generation)
+
+	assignment := newTestKafkaMemberAssignment("test-topic", 0)
+	syncReq := kmsg.NewPtrSyncGroupRequest()
+	syncReq.Group = "group-leave-rebalance"
+	syncReq.Generation = secondResp.Generation
+	syncReq.MemberID = leaderResp.MemberID
+	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{
+		{MemberID: leaderResp.MemberID, MemberAssignment: assignment},
+		{MemberID: secondResp.MemberID, MemberAssignment: assignment},
+	}
+
+	syncResp, err := gc.syncGroup(context.Background(), syncReq)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), syncResp.ErrorCode)
+
+	leaveReq := kmsg.NewPtrLeaveGroupRequest()
+	leaveReq.Group = "group-leave-rebalance"
+	leaveReq.MemberID = secondResp.MemberID
+
+	leaveResp, err := gc.leaveGroup(context.Background(), leaveReq)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), leaveResp.ErrorCode)
+
+	group, err := gc.readGroup(context.Background(), "group-leave-rebalance")
+	require.NoError(t, err)
+	require.Equal(t, int32(3), group.Generation)
+	require.Len(t, group.Members, 1)
+	require.Empty(t, group.Assignments)
+	require.Equal(t, leaderResp.MemberID, group.LeaderID)
+}
+
+func TestKafkaGroupCoordinatorJoinRejectsUnknownMemberID(t *testing.T) {
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	require.NoError(t, err)
+
+	gc := newKafkaGroupCoordinator(s3Client, "n1")
+	joinReq := newTestKafkaJoinGroupRequest("group-unknown-member")
+
+	firstResp, err := gc.joinGroup(context.Background(), joinReq)
+	require.NoError(t, err)
+	require.Equal(t, int16(0), firstResp.ErrorCode)
+
+	rejoinReq := newTestKafkaJoinGroupRequest("group-unknown-member")
+	rejoinReq.MemberID = "stale-member-id"
+
+	rejoinResp, err := gc.joinGroup(context.Background(), rejoinReq)
+	require.NoError(t, err)
+	require.Equal(t, kafkaErrorUnknownMemberID, rejoinResp.ErrorCode)
+	require.Equal(t, int32(-1), rejoinResp.Generation)
+
+	group, err := gc.readGroup(context.Background(), "group-unknown-member")
+	require.NoError(t, err)
+	require.Len(t, group.Members, 1)
+	_, ok := group.Members["stale-member-id"]
+	require.False(t, ok)
+}
+
+func newTestKafkaJoinGroupRequest(group string) *kmsg.JoinGroupRequest {
+	joinReq := kmsg.NewPtrJoinGroupRequest()
+	joinReq.Group = group
+	joinReq.ProtocolType = "consumer"
+	joinReq.SessionTimeoutMillis = 10000
+	meta := kmsg.NewConsumerMemberMetadata()
+	meta.Version = 0
+	meta.Topics = []string{"test-topic"}
+	joinReq.Protocols = []kmsg.JoinGroupRequestProtocol{{
+		Name:     "range",
+		Metadata: meta.AppendTo(nil),
+	}}
+	return joinReq
+}
+
+func newTestKafkaMemberAssignment(topic string, partition int32) []byte {
+	assignment := kmsg.NewConsumerMemberAssignment()
+	assignment.Version = 0
+	assignment.Topics = []kmsg.ConsumerMemberAssignmentTopic{{
+		Topic:      topic,
+		Partitions: []int32{partition},
+	}}
+	return assignment.AppendTo(nil)
+}

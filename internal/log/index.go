@@ -135,6 +135,45 @@ func (idx *Index) RemoveBefore(offset uint64) []SegmentRef {
 	return removed
 }
 
+// RemoveObjectKeys removes and returns segments matching any of the provided
+// object keys.
+func (idx *Index) RemoveObjectKeys(keys ...string) []SegmentRef {
+	if len(keys) == 0 {
+		return nil
+	}
+	match := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		match[key] = struct{}{}
+	}
+	if len(match) == 0 {
+		return nil
+	}
+
+	var removed []SegmentRef
+	keep := idx.segments[:0]
+	for _, ref := range idx.segments {
+		if _, ok := match[ref.Key]; ok {
+			removed = append(removed, ref)
+			continue
+		}
+		if _, ok := match[ref.OffsetIndexObjectKey()]; ok {
+			removed = append(removed, ref)
+			continue
+		}
+		if _, ok := match[ref.MetaObjectKey()]; ok {
+			removed = append(removed, ref)
+			continue
+		}
+		keep = append(keep, ref)
+	}
+	idx.segments = keep
+	idx.rebuildOffsets()
+	return removed
+}
+
 // RemoveExpired removes and returns all segments where CreatedAt + retention
 // is before now. Used by the background retention cleanup goroutine (Task 18).
 func (idx *Index) RemoveExpired(retention time.Duration) []SegmentRef {

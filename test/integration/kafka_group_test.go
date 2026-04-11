@@ -17,13 +17,11 @@ import (
 )
 
 func TestKafkaOffsetCommitFetchWithFranzGoRequests(t *testing.T) {
-	env, httpClient, client := newKafkaTestEnv(t, "kafka-offsets")
+	env, _, client, addr := newKafkaTopicBootstrappedEnv(t, "kafka-offsets")
 	defer env.Cleanup()
 	defer client.Close()
 
-	if err := httpClient.CreateTopic("kafka-offsets-b", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
+	createKafkaFixtureTopic(t, addr, "kafka-offsets-b", 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -238,12 +236,9 @@ func TestKafkaGroupOffsetsOnNonCoordinatorReturnNotCoordinator(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("group-offsets-non-coordinator", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+	createKafkaFixtureTopic(t, addr1, "group-offsets-non-coordinator", 1)
 	groupID := "group-offsets-non-coordinator"
 
 	findReq := kmsg.NewPtrFindCoordinatorRequest()
@@ -309,11 +304,8 @@ func TestKafkaListAndDescribeGroups(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("kafka-group-introspection", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "kafka-group-introspection", 1)
 
 	joinReq := kmsg.NewPtrJoinGroupRequest()
 	joinReq.Group = "group-introspection"
@@ -384,6 +376,358 @@ func TestKafkaListAndDescribeGroups(t *testing.T) {
 	}
 }
 
+func TestKafkaListGroupsFiltersByStateAndType(t *testing.T) {
+	kafkaPort := freeTCPPort(t)
+	env := camutest.New(t,
+		camutest.WithInstances(1),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			cfg.Server.KafkaPort = kafkaPort
+		}),
+	)
+	defer env.Cleanup()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "kafka-group-filters", 1)
+
+	joinReq := kmsg.NewPtrJoinGroupRequest()
+	joinReq.Group = "group-filters"
+	joinReq.ProtocolType = "consumer"
+	joinReq.SessionTimeoutMillis = 10000
+	meta := kmsg.NewConsumerMemberMetadata()
+	meta.Version = 0
+	meta.Topics = []string{"kafka-group-filters"}
+	joinReq.Protocols = []kmsg.JoinGroupRequestProtocol{{
+		Name:     "range",
+		Metadata: meta.AppendTo(nil),
+	}}
+	joinRespAny, err := sendKafkaRequest(addr, joinReq)
+	if err != nil {
+		t.Fatalf("JoinGroup Request() error: %v", err)
+	}
+	joinResp := joinRespAny.(*kmsg.JoinGroupResponse)
+	if joinResp.ErrorCode != 0 {
+		t.Fatalf("JoinGroup error code = %d, want 0", joinResp.ErrorCode)
+	}
+
+	baseReq := kmsg.NewPtrListGroupsRequest()
+	baseReq.SetVersion(5)
+	baseRespAny, err := sendKafkaRequest(addr, baseReq)
+	if err != nil {
+		t.Fatalf("ListGroups baseline Request() error: %v", err)
+	}
+	baseResp := baseRespAny.(*kmsg.ListGroupsResponse)
+
+	var groupState string
+	found := false
+	for _, group := range baseResp.Groups {
+		if group.Group == "group-filters" {
+			found = true
+			groupState = group.GroupState
+			if group.ProtocolType != "consumer" {
+				t.Fatalf("baseline ListGroups protocol type = %q, want consumer", group.ProtocolType)
+			}
+			if group.GroupType != "consumer" {
+				t.Fatalf("baseline ListGroups group type = %q, want consumer", group.GroupType)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("baseline ListGroups did not include group-filters")
+	}
+	if groupState == "" {
+		t.Fatal("baseline ListGroups returned empty group state")
+	}
+
+	matchReq := kmsg.NewPtrListGroupsRequest()
+	matchReq.SetVersion(5)
+	matchReq.StatesFilter = []string{groupState}
+	matchReq.TypesFilter = []string{"consumer"}
+	matchRespAny, err := sendKafkaRequest(addr, matchReq)
+	if err != nil {
+		t.Fatalf("ListGroups filtered match Request() error: %v", err)
+	}
+	matchResp := matchRespAny.(*kmsg.ListGroupsResponse)
+	if len(matchResp.Groups) != 1 {
+		t.Fatalf("ListGroups filtered match groups = %d, want 1", len(matchResp.Groups))
+	}
+	if matchResp.Groups[0].Group != "group-filters" {
+		t.Fatalf("ListGroups filtered match group = %q, want group-filters", matchResp.Groups[0].Group)
+	}
+
+	missStateReq := kmsg.NewPtrListGroupsRequest()
+	missStateReq.SetVersion(5)
+	missStateReq.StatesFilter = []string{"DefinitelyNotARealState"}
+	missStateRespAny, err := sendKafkaRequest(addr, missStateReq)
+	if err != nil {
+		t.Fatalf("ListGroups filtered miss-state Request() error: %v", err)
+	}
+	missStateResp := missStateRespAny.(*kmsg.ListGroupsResponse)
+	if len(missStateResp.Groups) != 0 {
+		t.Fatalf("ListGroups filtered miss-state groups = %+v, want none", missStateResp.Groups)
+	}
+
+	missTypeReq := kmsg.NewPtrListGroupsRequest()
+	missTypeReq.SetVersion(5)
+	missTypeReq.TypesFilter = []string{"connect"}
+	missTypeRespAny, err := sendKafkaRequest(addr, missTypeReq)
+	if err != nil {
+		t.Fatalf("ListGroups filtered miss-type Request() error: %v", err)
+	}
+	missTypeResp := missTypeRespAny.(*kmsg.ListGroupsResponse)
+	if len(missTypeResp.Groups) != 0 {
+		t.Fatalf("ListGroups filtered miss-type groups = %+v, want none", missTypeResp.Groups)
+	}
+}
+
+func TestKafkaDescribeGroupsReflectsRebalanceStateTransitions(t *testing.T) {
+	kafkaPort := freeTCPPort(t)
+	env := camutest.New(t,
+		camutest.WithInstances(1),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			cfg.Server.KafkaPort = kafkaPort
+		}),
+	)
+	defer env.Cleanup()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "kafka-group-state-transitions", 1)
+
+	joinReq := kmsg.NewPtrJoinGroupRequest()
+	joinReq.SetVersion(1)
+	joinReq.Group = "group-state-transitions"
+	joinReq.ProtocolType = "consumer"
+	joinReq.SessionTimeoutMillis = 10000
+	meta := kmsg.NewConsumerMemberMetadata()
+	meta.Version = 0
+	meta.Topics = []string{"kafka-group-state-transitions"}
+	joinReq.Protocols = []kmsg.JoinGroupRequestProtocol{{
+		Name:     "range",
+		Metadata: meta.AppendTo(nil),
+	}}
+	joinRespAny, err := sendKafkaRequest(addr, joinReq)
+	if err != nil {
+		t.Fatalf("JoinGroup Request() error: %v", err)
+	}
+	joinResp := joinRespAny.(*kmsg.JoinGroupResponse)
+	if joinResp.ErrorCode != 0 {
+		t.Fatalf("JoinGroup error code = %d, want 0", joinResp.ErrorCode)
+	}
+
+	describeReq := kmsg.NewPtrDescribeGroupsRequest()
+	describeReq.SetVersion(4)
+	describeReq.Groups = []string{"group-state-transitions"}
+	describeRespAny, err := sendKafkaRequest(addr, describeReq)
+	if err != nil {
+		t.Fatalf("DescribeGroups before sync Request() error: %v", err)
+	}
+	describeResp := describeRespAny.(*kmsg.DescribeGroupsResponse)
+	if len(describeResp.Groups) != 1 {
+		t.Fatalf("DescribeGroups before sync groups = %d, want 1", len(describeResp.Groups))
+	}
+	group := describeResp.Groups[0]
+	if group.State != "PreparingRebalance" {
+		t.Fatalf("DescribeGroups state before sync = %q, want PreparingRebalance", group.State)
+	}
+	if len(group.Members) != 1 {
+		t.Fatalf("DescribeGroups members before sync = %d, want 1", len(group.Members))
+	}
+	if len(group.Members[0].MemberAssignment) != 0 {
+		t.Fatalf("DescribeGroups assignment before sync = %v, want empty", group.Members[0].MemberAssignment)
+	}
+
+	assignment := newConsumerMemberAssignment(t, "kafka-group-state-transitions", 0)
+	syncReq := kmsg.NewPtrSyncGroupRequest()
+	syncReq.SetVersion(1)
+	syncReq.Group = "group-state-transitions"
+	syncReq.Generation = joinResp.Generation
+	syncReq.MemberID = joinResp.MemberID
+	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{{
+		MemberID:         joinResp.MemberID,
+		MemberAssignment: assignment,
+	}}
+	syncRespAny, err := sendKafkaRequest(addr, syncReq)
+	if err != nil {
+		t.Fatalf("SyncGroup Request() error: %v", err)
+	}
+	syncResp := syncRespAny.(*kmsg.SyncGroupResponse)
+	if syncResp.ErrorCode != 0 {
+		t.Fatalf("SyncGroup error code = %d, want 0", syncResp.ErrorCode)
+	}
+
+	describeRespAny, err = sendKafkaRequest(addr, describeReq)
+	if err != nil {
+		t.Fatalf("DescribeGroups after sync Request() error: %v", err)
+	}
+	describeResp = describeRespAny.(*kmsg.DescribeGroupsResponse)
+	if len(describeResp.Groups) != 1 {
+		t.Fatalf("DescribeGroups after sync groups = %d, want 1", len(describeResp.Groups))
+	}
+	group = describeResp.Groups[0]
+	if group.State != "Stable" {
+		t.Fatalf("DescribeGroups state after sync = %q, want Stable", group.State)
+	}
+	if len(group.Members) != 1 {
+		t.Fatalf("DescribeGroups members after sync = %d, want 1", len(group.Members))
+	}
+	if string(group.Members[0].MemberAssignment) != string(assignment) {
+		t.Fatalf("DescribeGroups assignment after sync mismatch")
+	}
+}
+
+func TestKafkaDescribeGroupsReflectsTwoMemberRebalance(t *testing.T) {
+	kafkaPort := freeTCPPort(t)
+	env := camutest.New(t,
+		camutest.WithInstances(1),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			cfg.Server.KafkaPort = kafkaPort
+		}),
+	)
+	defer env.Cleanup()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "kafka-group-two-member-state", 2)
+
+	newJoinReq := func(memberID string) *kmsg.JoinGroupRequest {
+		req := kmsg.NewPtrJoinGroupRequest()
+		req.SetVersion(1)
+		req.Group = "group-two-member-state"
+		req.MemberID = memberID
+		req.ProtocolType = "consumer"
+		req.SessionTimeoutMillis = 10000
+		meta := kmsg.NewConsumerMemberMetadata()
+		meta.Version = 0
+		meta.Topics = []string{"kafka-group-two-member-state"}
+		req.Protocols = []kmsg.JoinGroupRequestProtocol{{
+			Name:     "range",
+			Metadata: meta.AppendTo(nil),
+		}}
+		return req
+	}
+
+	joinRespAny, err := sendKafkaRequest(addr, newJoinReq(""))
+	if err != nil {
+		t.Fatalf("JoinGroup leader Request() error: %v", err)
+	}
+	leaderJoin := joinRespAny.(*kmsg.JoinGroupResponse)
+	if leaderJoin.ErrorCode != 0 {
+		t.Fatalf("leader JoinGroup error code = %d, want 0", leaderJoin.ErrorCode)
+	}
+
+	syncReq := kmsg.NewPtrSyncGroupRequest()
+	syncReq.SetVersion(1)
+	syncReq.Group = "group-two-member-state"
+	syncReq.Generation = leaderJoin.Generation
+	syncReq.MemberID = leaderJoin.MemberID
+	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{{
+		MemberID:         leaderJoin.MemberID,
+		MemberAssignment: newConsumerMemberAssignment(t, "kafka-group-two-member-state", 0),
+	}}
+	syncRespAny, err := sendKafkaRequest(addr, syncReq)
+	if err != nil {
+		t.Fatalf("SyncGroup leader Request() error: %v", err)
+	}
+	syncResp := syncRespAny.(*kmsg.SyncGroupResponse)
+	if syncResp.ErrorCode != 0 {
+		t.Fatalf("leader SyncGroup error code = %d, want 0", syncResp.ErrorCode)
+	}
+
+	joinRespAny, err = sendKafkaRequest(addr, newJoinReq(""))
+	if err != nil {
+		t.Fatalf("JoinGroup second member Request() error: %v", err)
+	}
+	secondJoin := joinRespAny.(*kmsg.JoinGroupResponse)
+	if secondJoin.ErrorCode != 0 {
+		t.Fatalf("second JoinGroup error code = %d, want 0", secondJoin.ErrorCode)
+	}
+	if secondJoin.Generation <= leaderJoin.Generation {
+		t.Fatalf("second JoinGroup generation = %d, want > %d", secondJoin.Generation, leaderJoin.Generation)
+	}
+
+	describeReq := kmsg.NewPtrDescribeGroupsRequest()
+	describeReq.SetVersion(4)
+	describeReq.Groups = []string{"group-two-member-state"}
+	describeRespAny, err := sendKafkaRequest(addr, describeReq)
+	if err != nil {
+		t.Fatalf("DescribeGroups during rebalance Request() error: %v", err)
+	}
+	describeResp := describeRespAny.(*kmsg.DescribeGroupsResponse)
+	if len(describeResp.Groups) != 1 {
+		t.Fatalf("DescribeGroups during rebalance groups = %d, want 1", len(describeResp.Groups))
+	}
+	group := describeResp.Groups[0]
+	if group.State != "PreparingRebalance" {
+		t.Fatalf("DescribeGroups during rebalance state = %q, want PreparingRebalance", group.State)
+	}
+	if len(group.Members) != 2 {
+		t.Fatalf("DescribeGroups during rebalance members = %d, want 2", len(group.Members))
+	}
+	for _, member := range group.Members {
+		if len(member.MemberAssignment) != 0 {
+			t.Fatalf("DescribeGroups during rebalance assignment for %q = %v, want empty", member.MemberID, member.MemberAssignment)
+		}
+	}
+
+	leaderAssignment := newConsumerMemberAssignment(t, "kafka-group-two-member-state", 0)
+	secondAssignment := newConsumerMemberAssignment(t, "kafka-group-two-member-state", 1)
+	syncReq = kmsg.NewPtrSyncGroupRequest()
+	syncReq.SetVersion(1)
+	syncReq.Group = "group-two-member-state"
+	syncReq.Generation = secondJoin.Generation
+	syncReq.MemberID = secondJoin.LeaderID
+	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{
+		{MemberID: leaderJoin.MemberID, MemberAssignment: leaderAssignment},
+		{MemberID: secondJoin.MemberID, MemberAssignment: secondAssignment},
+	}
+	syncRespAny, err = sendKafkaRequest(addr, syncReq)
+	if err != nil {
+		t.Fatalf("SyncGroup leader rebalance Request() error: %v", err)
+	}
+	syncResp = syncRespAny.(*kmsg.SyncGroupResponse)
+	if syncResp.ErrorCode != 0 {
+		t.Fatalf("rebalance leader SyncGroup error code = %d, want 0", syncResp.ErrorCode)
+	}
+
+	syncReq = kmsg.NewPtrSyncGroupRequest()
+	syncReq.SetVersion(1)
+	syncReq.Group = "group-two-member-state"
+	syncReq.Generation = secondJoin.Generation
+	syncReq.MemberID = secondJoin.MemberID
+	syncRespAny, err = sendKafkaRequest(addr, syncReq)
+	if err != nil {
+		t.Fatalf("SyncGroup follower rebalance Request() error: %v", err)
+	}
+	syncResp = syncRespAny.(*kmsg.SyncGroupResponse)
+	if syncResp.ErrorCode != 0 {
+		t.Fatalf("rebalance follower SyncGroup error code = %d, want 0", syncResp.ErrorCode)
+	}
+
+	describeRespAny, err = sendKafkaRequest(addr, describeReq)
+	if err != nil {
+		t.Fatalf("DescribeGroups after rebalance Request() error: %v", err)
+	}
+	describeResp = describeRespAny.(*kmsg.DescribeGroupsResponse)
+	if len(describeResp.Groups) != 1 {
+		t.Fatalf("DescribeGroups after rebalance groups = %d, want 1", len(describeResp.Groups))
+	}
+	group = describeResp.Groups[0]
+	if group.State != "Stable" {
+		t.Fatalf("DescribeGroups after rebalance state = %q, want Stable", group.State)
+	}
+	if len(group.Members) != 2 {
+		t.Fatalf("DescribeGroups after rebalance members = %d, want 2", len(group.Members))
+	}
+	assignments := map[string][]byte{}
+	for _, member := range group.Members {
+		assignments[member.MemberID] = member.MemberAssignment
+	}
+	if string(assignments[leaderJoin.MemberID]) != string(leaderAssignment) {
+		t.Fatalf("leader assignment after rebalance mismatch")
+	}
+	if string(assignments[secondJoin.MemberID]) != string(secondAssignment) {
+		t.Fatalf("second member assignment after rebalance mismatch")
+	}
+}
+
 func TestKafkaDeleteGroups(t *testing.T) {
 	kafkaPort := freeTCPPort(t)
 	env := camutest.New(t,
@@ -394,10 +738,8 @@ func TestKafkaDeleteGroups(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("kafka-delete-groups", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
 	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "kafka-delete-groups", 1)
 
 	joinReq := kmsg.NewPtrJoinGroupRequest()
 	joinReq.Group = "group-delete"
@@ -545,15 +887,9 @@ func TestKafkaOffsetDeleteRemovesCommittedOffsets(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	httpClient := env.Client()
-	if err := httpClient.CreateTopic("offset-delete-a", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-	if err := httpClient.CreateTopic("offset-delete-b", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "offset-delete-a", 1)
+	createKafkaFixtureTopic(t, addr, "offset-delete-b", 1)
 
 	joinReq := kmsg.NewPtrJoinGroupRequest()
 	joinReq.Group = "group-offset-delete"
@@ -662,10 +998,8 @@ func TestKafkaControllerEpochStampedInGroupStateAndOffsets(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("group-epoch-stamp", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
 	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	createKafkaFixtureTopic(t, addr, "group-epoch-stamp", 1)
 
 	joinReq := kmsg.NewPtrJoinGroupRequest()
 	joinReq.Group = "group-epoch-stamp"
@@ -755,12 +1089,9 @@ func TestKafkaGroupCoordinatorFailoverPreservesOffsets(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("group-failover-offsets", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+	createKafkaFixtureTopic(t, addr1, "group-failover-offsets", 1)
 	groupID := "group-failover-offsets"
 
 	findReq := kmsg.NewPtrFindCoordinatorRequest()
@@ -875,12 +1206,9 @@ func TestKafkaGroupCoordinatorFailoverAllowsRejoin(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("group-failover-rejoin", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+	createKafkaFixtureTopic(t, addr1, "group-failover-rejoin", 1)
 	groupID := "group-failover-rejoin"
 
 	findReq := kmsg.NewPtrFindCoordinatorRequest()
@@ -968,12 +1296,9 @@ func TestKafkaGroupCoordinatorFailoverAllowsHeartbeatForExistingMember(t *testin
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("group-failover-heartbeat", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+	createKafkaFixtureTopic(t, addr1, "group-failover-heartbeat", 1)
 	groupID := "group-failover-heartbeat"
 
 	findReq := kmsg.NewPtrFindCoordinatorRequest()
@@ -1065,12 +1390,9 @@ func TestKafkaGroupCoordinatorFailoverPreservesSyncAssignment(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	if err := env.Client().CreateTopic("group-failover-sync", 1, 24*time.Hour); err != nil {
-		t.Fatalf("CreateTopic() error: %v", err)
-	}
-
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+	createKafkaFixtureTopic(t, addr1, "group-failover-sync", 1)
 	groupID := "group-failover-sync"
 
 	findReq := kmsg.NewPtrFindCoordinatorRequest()

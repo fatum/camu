@@ -22,6 +22,7 @@ type createTopicRequest struct {
 	ReplicationFactor     int    `json:"replication_factor"`
 	MinInsyncReplicas     int    `json:"min_insync_replicas"`
 	UncleanLeaderElection bool   `json:"unclean_leader_election"`
+	StorageMode           string `json:"storage_mode"`
 }
 
 type topicResponse struct {
@@ -31,6 +32,7 @@ type topicResponse struct {
 	ReplicationFactor     int    `json:"replication_factor"`
 	MinInsyncReplicas     int    `json:"min_insync_replicas"`
 	UncleanLeaderElection bool   `json:"unclean_leader_election"`
+	StorageMode           string `json:"storage_mode,omitempty"`
 }
 
 type errorResponse struct {
@@ -55,12 +57,18 @@ func topicToResponse(tc meta.TopicConfig) topicResponse {
 		ReplicationFactor:     tc.ReplicationFactor,
 		MinInsyncReplicas:     tc.MinInsyncReplicas,
 		UncleanLeaderElection: tc.UncleanLeaderElection,
+		StorageMode:           tc.StorageMode,
 	}
 }
 
 func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.TopicConfig, error) {
 	if req.Name == "" {
 		return meta.TopicConfig{}, fmt.Errorf("name is required")
+	}
+	if _, err := s.getTopicDeletion(ctx, req.Name); err == nil {
+		return meta.TopicConfig{}, fmt.Errorf("topic %q deletion in progress", req.Name)
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return meta.TopicConfig{}, err
 	}
 	if req.Partitions < 1 {
 		return meta.TopicConfig{}, fmt.Errorf("partitions must be at least 1")
@@ -95,6 +103,14 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 		return meta.TopicConfig{}, fmt.Errorf("min_insync_replicas cannot exceed replication_factor")
 	}
 
+	storageMode := req.StorageMode
+	if storageMode == "" {
+		storageMode = meta.StorageModeClassic
+	}
+	if storageMode != meta.StorageModeClassic && storageMode != meta.StorageModeDiskless {
+		return meta.TopicConfig{}, fmt.Errorf("invalid storage_mode, must be classic or diskless")
+	}
+
 	tc := meta.TopicConfig{
 		Name:                  req.Name,
 		Partitions:            req.Partitions,
@@ -103,45 +119,69 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 		ReplicationFactor:     rf,
 		MinInsyncReplicas:     minISR,
 		UncleanLeaderElection: req.UncleanLeaderElection,
+		StorageMode:           storageMode,
 	}
 
 	if err := s.topicStore.Create(ctx, tc); err != nil {
 		return meta.TopicConfig{}, err
 	}
 
-	// Acquire leases first so we have epochs for partition init.
-	s.AcquireLeasesForTopic(tc)
-
-	epochs := s.getOwnedEpochs(tc.Name)
-	if err := s.partitionManager.InitTopic(ctx, tc, epochs); err != nil {
-		return meta.TopicConfig{}, fmt.Errorf("topic created but partition init failed: %w", err)
-	}
-
-	// In the simple single-broker case, do not wait for the background
-	// coordination loop to promote partitions. Make them locally writable and
-	// readable before returning from topic creation.
-	if tc.ReplicationFactor == 1 {
+	if tc.StorageMode == meta.StorageModeDiskless {
+		// Diskless topics skip partition manager init but still need local
+		// ownership so produce/consume routing works immediately.
 		s.assignmentsMu.Lock()
 		if s.myPartitions[tc.Name] == nil {
 			s.myPartitions[tc.Name] = make(map[int]localPartitionAssignment)
 		}
-		s.assignmentsMu.Unlock()
 		for pid := 0; pid < tc.Partitions; pid++ {
-			epoch := epochs[pid]
-			if epoch == 0 {
-				epoch = 1
-			}
-			s.initPartitionAsLeader(ctx, tc.Name, pid, coordination.PartitionAssignment{
-				Replicas:    []string{s.instanceID},
-				Leader:      s.instanceID,
-				LeaderEpoch: epoch,
-			})
-			s.assignmentsMu.Lock()
 			s.myPartitions[tc.Name][pid] = localPartitionAssignment{
 				Owned:       true,
-				LeaderEpoch: epoch,
+				LeaderEpoch: 1,
+			}
+		}
+		if s.disklessTopics == nil {
+			s.disklessTopics = make(map[string]bool)
+		}
+		s.disklessTopics[tc.Name] = true
+		s.assignmentsMu.Unlock()
+
+		// Publish assignments so Kafka protocol and routing map work immediately.
+		s.publishAssignmentsForTopics(ctx, []meta.TopicConfig{tc})
+	} else {
+		// Acquire leases first so we have epochs for partition init.
+		s.AcquireLeasesForTopic(tc)
+
+		epochs := s.getOwnedEpochs(tc.Name)
+		if err := s.partitionManager.InitTopic(ctx, tc, epochs); err != nil {
+			return meta.TopicConfig{}, fmt.Errorf("topic created but partition init failed: %w", err)
+		}
+
+		// In the simple single-broker case, do not wait for the background
+		// coordination loop to promote partitions. Make them locally writable and
+		// readable before returning from topic creation.
+		if tc.ReplicationFactor == 1 {
+			s.assignmentsMu.Lock()
+			if s.myPartitions[tc.Name] == nil {
+				s.myPartitions[tc.Name] = make(map[int]localPartitionAssignment)
 			}
 			s.assignmentsMu.Unlock()
+			for pid := 0; pid < tc.Partitions; pid++ {
+				epoch := epochs[pid]
+				if epoch == 0 {
+					epoch = 1
+				}
+				s.initPartitionAsLeader(ctx, tc.Name, pid, coordination.PartitionAssignment{
+					Replicas:    []string{s.instanceID},
+					Leader:      s.instanceID,
+					LeaderEpoch: epoch,
+				})
+				s.assignmentsMu.Lock()
+				s.myPartitions[tc.Name][pid] = localPartitionAssignment{
+					Owned:       true,
+					LeaderEpoch: epoch,
+				}
+				s.assignmentsMu.Unlock()
+			}
 		}
 	}
 
@@ -161,11 +201,14 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(err.Error(), "already exists"):
 			writeError(w, http.StatusConflict, err.Error())
+		case strings.Contains(err.Error(), "deletion in progress"):
+			writeError(w, http.StatusConflict, err.Error())
 		case strings.Contains(err.Error(), "required"),
 			strings.Contains(err.Error(), "partitions must be at least 1"),
 			strings.Contains(err.Error(), "invalid retention duration"),
 			strings.Contains(err.Error(), "replication_factor"),
-			strings.Contains(err.Error(), "min_insync_replicas"):
+			strings.Contains(err.Error(), "min_insync_replicas"),
+			strings.Contains(err.Error(), "storage_mode"):
 			writeError(w, http.StatusBadRequest, err.Error())
 		default:
 			slog.Error("topic_create_failed", "topic", req.Name, "error", err)
@@ -206,50 +249,25 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteTopic(ctx context.Context, name string) error {
-	// Check if topic exists first.
-	_, err := s.topicStore.Get(ctx, name)
+	if _, err := s.getTopicDeletion(ctx, name); err == nil {
+		if err := s.topicStore.Delete(ctx, name); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
+		s.dropTopicRuntime(name)
+		return nil
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return err
+	}
+
+	tc, err := s.topicStore.Get(ctx, name)
 	if err != nil {
 		return err
 	}
 
-	// Delete topic metadata.
-	if err := s.topicStore.Delete(ctx, name); err != nil {
+	if err := s.enqueueTopicDeletion(ctx, tc); err != nil {
 		return err
 	}
-
-	// Clean up all S3 data for this topic.
-	// Failures here are logged but do not fail the request — GC will catch leftovers.
-
-	// Delete all partition data (segments, sidecars, state.json, producers.checkpoint).
-	if keys, err := s.s3Client.List(ctx, name+"/"); err != nil {
-		slog.Warn("topic_delete_list_data_failed", "topic", name, "error", err)
-	} else {
-		for _, key := range keys {
-			if err := s.s3Client.Delete(ctx, key); err != nil {
-				slog.Warn("topic_delete_object_failed", "topic", name, "key", key, "error", err)
-			}
-		}
-	}
-
-	// Delete coordination assignment.
-	assignmentKey := fmt.Sprintf("_coordination/assignments/%s.json", name)
-	if err := s.s3Client.Delete(ctx, assignmentKey); err != nil {
-		slog.Warn("topic_delete_assignment_failed", "topic", name, "error", err)
-	}
-
-	// Delete epoch histories.
-	epochPrefix := fmt.Sprintf("_coordination/epochs/%s/", name)
-	if keys, err := s.s3Client.List(ctx, epochPrefix); err != nil {
-		slog.Warn("topic_delete_list_epochs_failed", "topic", name, "error", err)
-	} else {
-		for _, key := range keys {
-			if err := s.s3Client.Delete(ctx, key); err != nil {
-				slog.Warn("topic_delete_epoch_failed", "topic", name, "key", key, "error", err)
-			}
-		}
-	}
-
-	slog.Info("topic_deleted", "topic", name)
+	slog.Info("topic_delete_enqueued", "topic", name)
 	return nil
 }
 

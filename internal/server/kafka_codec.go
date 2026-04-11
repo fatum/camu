@@ -18,6 +18,10 @@ import (
 	"github.com/maksim/camu/internal/log"
 )
 
+// Package-level zstd decoder reused across calls. DecodeAll is safe for
+// concurrent use so no synchronization is needed.
+var zstdDecoder, _ = zstd.NewReader(nil)
+
 // extractRawRecordBatches slices raw Kafka protocol bytes into individual
 // RecordBatch byte slices without decoding individual records.
 func extractRawRecordBatches(records []byte) ([][]byte, error) {
@@ -144,12 +148,7 @@ func decodeKafkaBatchRecords(codec int16, data []byte) ([]byte, error) {
 		}
 		return decoded, nil
 	case 4:
-		decoder, err := zstd.NewReader(nil)
-		if err != nil {
-			return nil, fmt.Errorf("zstd record batch: %w", err)
-		}
-		defer decoder.Close()
-		decoded, err := decoder.DecodeAll(data, nil)
+		decoded, err := zstdDecoder.DecodeAll(data, nil)
 		if err != nil {
 			return nil, fmt.Errorf("zstd record batch: %w", err)
 		}
