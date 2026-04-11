@@ -34,6 +34,7 @@ coordination:
   heartbeat_interval: "5s"
   rebalance_delay: "15s"
   instance_ttl: "12s"
+  maintenance_max_concurrency: 7
 `
 	f, err := os.CreateTemp("", "camu-config-*.yaml")
 	if err != nil {
@@ -104,6 +105,9 @@ coordination:
 	if cfg.Coordination.InstanceTTL != "12s" {
 		t.Errorf("Coordination.InstanceTTL = %q, want %q", cfg.Coordination.InstanceTTL, "12s")
 	}
+	if cfg.Coordination.MaintenanceMaxConcurrency != 7 {
+		t.Errorf("Coordination.MaintenanceMaxConcurrency = %d, want %d", cfg.Coordination.MaintenanceMaxConcurrency, 7)
+	}
 }
 
 func TestLoadDefaults(t *testing.T) {
@@ -137,6 +141,9 @@ storage:
 	}
 	if cfg.Segments.MaxSize != 8388608 {
 		t.Errorf("Segments.MaxSize = %d, want %d", cfg.Segments.MaxSize, 8388608)
+	}
+	if cfg.Coordination.MaintenanceMaxConcurrency != 4 {
+		t.Errorf("Coordination.MaintenanceMaxConcurrency = %d, want %d", cfg.Coordination.MaintenanceMaxConcurrency, 4)
 	}
 	instanceTTL, err := cfg.Coordination.InstanceTTLDuration()
 	if err != nil {

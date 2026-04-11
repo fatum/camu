@@ -20,6 +20,7 @@ var (
 	errKafkaUnknownTopicPartition = errors.New("kafka unknown topic or partition")
 	errKafkaNotLeader             = errors.New("kafka not leader")
 	errKafkaLeaderNotAvailable    = errors.New("kafka leader not available")
+	errKafkaInvalidRequest        = errors.New("kafka invalid request")
 )
 
 const (
@@ -43,6 +44,8 @@ type KafkaServer struct {
 	log        *slog.Logger
 	listenerMu sync.Mutex
 	listener   net.Listener
+	connsMu    sync.Mutex
+	conns      map[net.Conn]struct{}
 }
 
 type KafkaServerCfg struct {

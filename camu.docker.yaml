@@ -1,0 +1,21 @@
+server:
+  address: ":8080"
+  internal_address: ":8081"
+  kafka_port: 9092
+
+storage:
+  bucket: camu-data
+  region: us-east-1
+  endpoint: http://minio:9000
+  credentials:
+    access_key: minioadmin
+    secret_key: minioadmin
+
+segments:
+  max_size: 8388608
+  max_age: 5s
+  compression: snappy
+
+cache:
+  directory: /var/lib/camu/cache
+  max_size: 1073741824

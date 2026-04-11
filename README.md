@@ -48,7 +48,7 @@ curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limi
 |---|---|
 | **S3-native** | Segments, indexes, topic metadata, offsets, and coordination state all live in object storage. No local disk is required for durability. |
 | **Single binary** | One Go binary. No ZooKeeper, no Raft cluster, no external metadata service. Deploy as a static binary, a container, or a systemd unit. |
-| **Dual protocol** | HTTP-first API for produce, consume, SSE streaming, and topic management. Full Kafka wire protocol (v0-v12) for drop-in client compatibility. |
+| **Dual protocol** | HTTP-first API for produce, consume, SSE streaming, and topic management. Kafka wire-protocol support for the implemented API subset, with advertised version ranges via `ApiVersions`. |
 | **ISR replication** | Kafka-style replicated topics with configurable `replication_factor` and `min_insync_replicas`. Writes are only acknowledged after the ISR quorum confirms. |
 | **Exactly-once produce** | Idempotent produce with producer IDs and sequence tracking. Duplicate retries on replicated topics wait for the original batch commit before confirming. |
 | **Jepsen-verified** | 22 passing fault scenarios across kill, leader-kill, pause, partition, rejoin, membership churn, S3 isolation, clock skew, and combined-fault runs. Every claim has a reproducible artifact. |
@@ -61,6 +61,17 @@ curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limi
 | `rf>1` | A successful produce is durable on the leader **and** only acknowledged after the configured ISR quorum confirms it. |
 
 Flush to S3 is asynchronous. Cross-instance visibility for non-replica reads follows segment flush timing, not ack timing. Reads are capped by the readable high watermark, so consumers never observe uncommitted replicated writes.
+
+Time-based retention cleanup is also asynchronous and resumable in both modes.
+Partition leaders execute retention through durable partition jobs. For classic
+topics, they delete segment data and index objects first, invalidate local
+sealed-segment cache/index state, and only then remove the metadata sidecar.
+For diskless topics, they delete S3 data first and only then remove diskless
+metastore refs. Diskless retention is therefore conservative at the file level
+when a backing file is still shared by newer data.
+Partition-leader maintenance is bounded per node by
+`coordination.maintenance_max_concurrency`, so retention and merge work stay
+parallel but controlled.
 
 ## Quick Start
 
@@ -101,6 +112,7 @@ coordination:
   lease_ttl: "30s"
   heartbeat_interval: "10s"
   rebalance_delay: "5s"
+  maintenance_max_concurrency: 4
 EOF
 
 docker run -d --name camu --net=host \
@@ -148,6 +160,17 @@ curl http://localhost:8080/v1/topics/orders
 curl -X DELETE http://localhost:8080/v1/topics/orders
 ```
 
+Topic creation supports both `classic` and `diskless` modes. Over HTTP, set
+`"storage_mode":"diskless"` to create a diskless topic. Over Kafka
+`CreateTopics`, use `camu.storage.mode=diskless`.
+
+Topic deletion is asynchronous and resumable. A delete hides the topic
+immediately from HTTP and Kafka metadata, then background GC removes S3 data
+and, for diskless topics, clears diskless metastore state before removing the
+deletion marker. Topic deletion remains coordination-leader-led rather than
+partition-runtime-led so it can resume after restart even when no topic runtime
+is active anymore.
+
 ### Produce
 
 High-level produce routes by key. The same key always maps to the same partition; messages without a key use round-robin routing.
@@ -184,7 +207,25 @@ echo "hello" | kcat -b localhost:9092 -t orders -P
 kcat -b localhost:9092 -t orders -C -e
 ```
 
-Supported Kafka APIs: Produce, Fetch, Metadata, ListOffsets, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup, DescribeGroups, ListGroups, DeleteGroups, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, AlterConfigs, IncrementalAlterConfigs, DescribeCluster, ApiVersions, InitProducerID, and ACL operations.
+Supported Kafka APIs: Produce, Fetch, Metadata, ListOffsets, OffsetCommit,
+OffsetFetch, FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
+DescribeGroups, ListGroups, DeleteGroups, CreateTopics, DeleteTopics,
+CreatePartitions, DescribeConfigs, AlterConfigs, IncrementalAlterConfigs,
+DescribeCluster, ApiVersions, InitProducerID, and ACL operations.
+
+Kafka admin notes:
+
+- `CreateTopics` supports `camu.storage.mode=diskless` at create time
+- `camu.storage.mode` is immutable after creation
+- retention is time-based via `retention.ms`
+- `retention.bytes` is explicitly unsupported
+- `CreatePartitions` is expand-only; partition count cannot be decreased
+- time-based retention in both `classic` and `diskless` is partition-leader-executed through durable partition jobs and a dedicated partition-leader maintenance service
+- classic sealed-segment merge now runs through the same partition-job model with a conservative automatic discovery policy for adjacent retained segments
+- follower-side leader proxying and failover handling are now grouped behind a dedicated partition-follower service layer
+
+The canonical current support status lives in
+[docs/api-support-matrix.md](docs/api-support-matrix.md).
 
 ### Idempotent Produce
 
@@ -387,12 +428,18 @@ internal/
     consume_helpers.go           High watermark, message merge, encoding
     kafka_types.go               Kafka server types, config, interfaces
     kafka_wire.go                Kafka wire protocol: conn, decode, encode, routing
-    kafka_handlers_admin.go      Kafka admin API handlers (25 APIs)
     kafka_handlers_data.go       Kafka produce + fetch handlers
+    kafka_metadata_discovery.go  Kafka Metadata, ListOffsets, FindCoordinator
+    kafka_topic_admin.go         Kafka topic admin + topic config handling
+    kafka_acl_admin.go           Kafka ACL admin handlers and filter validation
+    kafka_offsets.go             Kafka OffsetCommit, OffsetFetch, OffsetDelete
+    kafka_group_handlers.go      Kafka group/coordinator handler wrappers
+    kafka_groups.go              Kafka consumer group coordinator state machine
     kafka_codec.go               RecordBatch encode/decode, compression
     kafka_helpers.go             Partition lookup, error mapping, adapters
-    kafka_groups.go              Kafka consumer group coordinator (S3-backed)
-    server.go                    HTTP server, routing, lifecycle
+    topic_deletion.go            Async/resumable topic deletion workflow
+    coordination_gc.go           Background coordination GC and cleanup
+    server.go                    HTTP server, bootstrap, lifecycle
     partition_manager.go         Partition state, flush, recovery
   replication/                   ISR replication and follower fetch
   coordination/                  S3 leases, registry, assignment store

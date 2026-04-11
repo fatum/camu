@@ -113,6 +113,63 @@ func TestKafkaApiVersions(t *testing.T) {
 	assert.True(t, hasInitProducerID, "should support InitProducerID")
 }
 
+func TestKafkaApiVersionsAdvertisesExpectedVersionRanges(t *testing.T) {
+	ks := NewKafkaServer(&KafkaServerCfg{
+		PartitionGetter: &mockPartitionGetter{},
+		TopicLister:     &mockTopicLister{},
+	})
+
+	respAny, err := ks.HandleRequest(context.Background(), &kmsg.ApiVersionsRequest{})
+	require.NoError(t, err)
+
+	resp := respAny.(*kmsg.ApiVersionsResponse)
+	got := make(map[int16]kmsg.ApiVersionsResponseApiKey, len(resp.ApiKeys))
+	for _, key := range resp.ApiKeys {
+		got[key.ApiKey] = key
+	}
+
+	want := map[int16]struct {
+		min int16
+		max int16
+	}{
+		0:  {min: 0, max: 9},
+		1:  {min: 0, max: 12},
+		2:  {min: 0, max: 10},
+		3:  {min: 0, max: 12},
+		8:  {min: 0, max: 8},
+		9:  {min: 0, max: 7},
+		10: {min: 0, max: 4},
+		11: {min: 0, max: 9},
+		12: {min: 0, max: 4},
+		13: {min: 0, max: 4},
+		14: {min: 0, max: 5},
+		15: {min: 0, max: 5},
+		16: {min: 0, max: 5},
+		18: {min: 0, max: 3},
+		19: {min: 0, max: 7},
+		20: {min: 0, max: 6},
+		22: {min: 0, max: 5},
+		29: {min: 0, max: 3},
+		30: {min: 0, max: 3},
+		31: {min: 0, max: 3},
+		32: {min: 0, max: 4},
+		33: {min: 0, max: 2},
+		37: {min: 0, max: 3},
+		42: {min: 0, max: 2},
+		44: {min: 0, max: 1},
+		47: {min: 0, max: 0},
+		60: {min: 0, max: 2},
+	}
+
+	require.Len(t, got, len(want))
+	for apiKey, expect := range want {
+		key, ok := got[apiKey]
+		require.True(t, ok, "missing api key %d", apiKey)
+		assert.Equal(t, expect.min, key.MinVersion, "api key %d min version", apiKey)
+		assert.Equal(t, expect.max, key.MaxVersion, "api key %d max version", apiKey)
+	}
+}
+
 func TestKafkaACLs(t *testing.T) {
 	var createReq *kmsg.CreateACLsRequest
 	var describeReq *kmsg.DescribeACLsRequest
@@ -358,6 +415,21 @@ func TestKafkaInitProducerID(t *testing.T) {
 	assert.Equal(t, int16(0), resp.ErrorCode)
 	assert.Equal(t, int64(123), resp.ProducerID)
 	assert.Equal(t, int16(0), resp.ProducerEpoch)
+}
+
+func TestKafkaInitProducerIDRejectsTransactionalID(t *testing.T) {
+	ks := NewKafkaServer(&KafkaServerCfg{})
+
+	req := kmsg.NewPtrInitProducerIDRequest()
+	req.SetVersion(4)
+	req.TransactionalID = kmsg.StringPtr("txn-1")
+	respAny, err := ks.HandleRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	resp := respAny.(*kmsg.InitProducerIDResponse)
+	assert.Equal(t, kafkaErrorInvalidRequest, resp.ErrorCode)
+	assert.Equal(t, int64(-1), resp.ProducerID)
+	assert.Equal(t, int16(-1), resp.ProducerEpoch)
 }
 
 func TestKafkaListOffsets(t *testing.T) {

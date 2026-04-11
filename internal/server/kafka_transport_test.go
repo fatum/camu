@@ -63,6 +63,40 @@ func TestKafkaMetadata(t *testing.T) {
 	assert.Len(t, topicResp.Partitions, 3)
 }
 
+func TestKafkaMetadataIncludesUnknownRequestedTopic(t *testing.T) {
+	ks := NewKafkaServer(&KafkaServerCfg{
+		PartitionGetter: &mockPartitionGetter{
+			partitions: map[string]map[int]*PartitionInfo{
+				"test-topic": {
+					0: {Leader: 1, Replicas: []int32{1}, ISR: []int32{1}},
+				},
+			},
+		},
+		TopicLister: &mockTopicLister{
+			topics: map[string]*TopicConfig{
+				"test-topic": {Name: "test-topic", Partitions: 1},
+			},
+		},
+		BrokerID:   1,
+		BrokerAddr: "localhost:9092",
+	})
+
+	req := &kmsg.MetadataRequest{
+		Topics: []kmsg.MetadataRequestTopic{
+			{Topic: strPtr("missing-topic")},
+		},
+	}
+
+	resp, err := ks.HandleRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	apiResp := resp.(*kmsg.MetadataResponse)
+	require.Len(t, apiResp.Topics, 1)
+	require.NotNil(t, apiResp.Topics[0].Topic)
+	assert.Equal(t, "missing-topic", *apiResp.Topics[0].Topic)
+	assert.Equal(t, kafkaErrorUnknownTopicPartition, apiResp.Topics[0].ErrorCode)
+}
+
 func TestKafkaProduce(t *testing.T) {
 	var produced []struct {
 		topic     string
@@ -183,6 +217,39 @@ func TestKafkaFetch(t *testing.T) {
 	assert.Equal(t, []byte("test-records"), partResp.RecordBatches)
 	assert.Equal(t, int64(123), partResp.HighWatermark)
 	assert.Equal(t, int64(123), partResp.LastStableOffset)
+}
+
+func TestKafkaListOffsetsMapsInvalidRequestError(t *testing.T) {
+	ks := NewKafkaServer(&KafkaServerCfg{
+		PartitionGetter: &mockPartitionGetter{
+			partitions: map[string]map[int]*PartitionInfo{
+				"test-topic": {
+					0: {Leader: 1, Replicas: []int32{1}, ISR: []int32{1}},
+				},
+			},
+		},
+		BrokerID: 1,
+		ListOffsetsFunc: func(ctx context.Context, topic string, partition int, timestamp int64) (KafkaOffsetResponse, error) {
+			return KafkaOffsetResponse{}, errKafkaInvalidRequest
+		},
+	})
+
+	req := kmsg.NewPtrListOffsetsRequest()
+	req.Topics = []kmsg.ListOffsetsRequestTopic{{
+		Topic: "test-topic",
+		Partitions: []kmsg.ListOffsetsRequestTopicPartition{{
+			Partition: 0,
+			Timestamp: 1234,
+		}},
+	}}
+
+	resp, err := ks.HandleRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	apiResp := resp.(*kmsg.ListOffsetsResponse)
+	require.Len(t, apiResp.Topics, 1)
+	require.Len(t, apiResp.Topics[0].Partitions, 1)
+	assert.Equal(t, kafkaErrorInvalidRequest, apiResp.Topics[0].Partitions[0].ErrorCode)
 }
 
 func TestDecodeKafkaProduceBatches_Compressed(t *testing.T) {
@@ -411,6 +478,438 @@ func TestKafkaHandleConn_ClosesOnHandleError(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("HandleConn did not exit after handle error")
+	}
+}
+
+func TestKafkaHandleConn_ClosesOnUnsupportedAPIKey(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	frame := []byte{
+		0, 0, 0, 8,
+		3, 231, // api key 999
+		0, 0, // version 0
+		0, 0, 0, 1, // correlation id 1
+	}
+	_, err := clientConn.Write(frame)
+	require.NoError(t, err)
+
+	buf := make([]byte, 1)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = clientConn.Read(buf)
+	require.Error(t, err)
+	require.ErrorIs(t, err, io.EOF)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after unsupported API key")
+	}
+}
+
+func TestDecodeKafkaRequestRejectsUnsupportedAPIKey(t *testing.T) {
+	_, _, err := decodeKafkaRequest([]byte{
+		3, 231, // api key 999
+		0, 0, // version 0
+		0, 0, 0, 1, // correlation id 1
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported API key")
+}
+
+func TestWriteKafkaResponseClampsToResponseMaxVersion(t *testing.T) {
+	req := kmsg.NewPtrApiVersionsRequest()
+	req.SetVersion(99)
+	resp := kmsg.NewPtrApiVersionsResponse()
+	resp.ApiKeys = []kmsg.ApiVersionsResponseApiKey{{ApiKey: 18, MinVersion: 0, MaxVersion: 3}}
+
+	var buf bytes.Buffer
+	err := writeKafkaResponse(&buf, 7, req, resp)
+	require.NoError(t, err)
+	assert.Equal(t, resp.MaxVersion(), resp.GetVersion())
+
+	frame := buf.Bytes()
+	require.GreaterOrEqual(t, len(frame), 8)
+	reader := kbin.Reader{Src: frame[4:]}
+	assert.Equal(t, int32(7), reader.Int32())
+}
+
+func TestDecodeKafkaRequestAcceptsHighKnownVersion(t *testing.T) {
+	req := kmsg.NewPtrApiVersionsRequest()
+	req.SetVersion(99)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+
+	correlationID, decoded, err := decodeKafkaRequest(frame[4:])
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), correlationID)
+	assert.Equal(t, int16(99), decoded.GetVersion())
+}
+
+func TestDecodeKafkaRequestAcceptsNegativeMetadataVersion(t *testing.T) {
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(-1)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+
+	correlationID, decoded, err := decodeKafkaRequest(frame[4:])
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), correlationID)
+	assert.Equal(t, int16(-1), decoded.GetVersion())
+}
+
+func TestDecodeKafkaRequestAcceptsFutureMetadataVersion(t *testing.T) {
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(99)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+
+	correlationID, decoded, err := decodeKafkaRequest(frame[4:])
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), correlationID)
+	assert.Equal(t, int16(99), decoded.GetVersion())
+}
+
+func TestDecodeKafkaRequestRejectsTruncatedFlexibleRequest(t *testing.T) {
+	req := kmsg.NewPtrApiVersionsRequest()
+	req.SetVersion(3)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+	require.Greater(t, len(frame), 6)
+
+	_, _, err := decodeKafkaRequest(frame[4 : len(frame)-1])
+	require.Error(t, err)
+}
+
+func TestWriteKafkaResponse_WritesTaggedHeaderForFlexibleRequest(t *testing.T) {
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(9)
+	resp := kmsg.NewPtrMetadataResponse()
+	resp.Topics = nil
+
+	var buf bytes.Buffer
+	err := writeKafkaResponse(&buf, 7, req, resp)
+	require.NoError(t, err)
+
+	frame := buf.Bytes()
+	require.GreaterOrEqual(t, len(frame), 9)
+	expectedPayloadLen := 4 + 1 + len(resp.AppendTo(nil))
+	assert.Equal(t, int32(expectedPayloadLen), int32(len(frame)-4))
+
+	reader := kbin.Reader{Src: frame[4:]}
+	assert.Equal(t, int32(7), reader.Int32())
+	assert.Equal(t, int8(0), reader.Int8(), "flexible response header must include empty tagged-fields byte")
+}
+
+func TestWriteKafkaResponse_OmitsTaggedHeaderForNonFlexibleRequest(t *testing.T) {
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(0)
+	resp := kmsg.NewPtrMetadataResponse()
+	resp.Topics = nil
+
+	var buf bytes.Buffer
+	err := writeKafkaResponse(&buf, 7, req, resp)
+	require.NoError(t, err)
+
+	frame := buf.Bytes()
+	expectedPayloadLen := 4 + len(resp.AppendTo(nil))
+	assert.Equal(t, int32(expectedPayloadLen), int32(len(frame)-4))
+}
+
+func TestKafkaHandleConn_ClosesOnInvalidFrameLength(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	_, err := clientConn.Write([]byte{0, 0, 0, 0})
+	require.NoError(t, err)
+
+	buf := make([]byte, 1)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = clientConn.Read(buf)
+	require.Error(t, err)
+	require.ErrorIs(t, err, io.EOF)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after invalid frame length")
+	}
+}
+
+func TestKafkaHandleConn_ClosesOnOversizedFrameLength(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	tooLarge := maxKafkaRequestSize + 1
+	frame := []byte{
+		byte(tooLarge >> 24),
+		byte(tooLarge >> 16),
+		byte(tooLarge >> 8),
+		byte(tooLarge),
+	}
+	_, err := clientConn.Write(frame)
+	require.NoError(t, err)
+
+	buf := make([]byte, 1)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = clientConn.Read(buf)
+	require.Error(t, err)
+	require.ErrorIs(t, err, io.EOF)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after oversized frame length")
+	}
+}
+
+func TestKafkaHandleConn_RejectsTruncatedFlexibleRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	req := kmsg.NewPtrApiVersionsRequest()
+	req.SetVersion(3)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+	truncated := frame[:len(frame)-1]
+
+	_, err := clientConn.Write(truncated)
+	require.NoError(t, err)
+	_ = clientConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after truncated flexible request")
+	}
+}
+
+func TestKafkaHandleConn_ServesMultipleRequestsOnSameConnection(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	req1 := kmsg.NewPtrApiVersionsRequest()
+	req1.SetVersion(0)
+	frame1 := kmsg.NewRequestFormatter().AppendRequest(nil, req1, 1)
+	_, err := clientConn.Write(frame1)
+	require.NoError(t, err)
+
+	readKafkaFrame := func(t *testing.T, conn net.Conn) []byte {
+		t.Helper()
+		lenBuf := make([]byte, 4)
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, err := io.ReadFull(conn, lenBuf)
+		require.NoError(t, err)
+		length := int(lenBuf[0])<<24 | int(lenBuf[1])<<16 | int(lenBuf[2])<<8 | int(lenBuf[3])
+		body := make([]byte, length)
+		_, err = io.ReadFull(conn, body)
+		require.NoError(t, err)
+		return body
+	}
+
+	body1 := readKafkaFrame(t, clientConn)
+	reader1 := kbin.Reader{Src: body1}
+	assert.Equal(t, int32(1), reader1.Int32())
+
+	req2 := kmsg.NewPtrApiVersionsRequest()
+	req2.SetVersion(0)
+	frame2 := kmsg.NewRequestFormatter().AppendRequest(nil, req2, 2)
+	_, err = clientConn.Write(frame2)
+	require.NoError(t, err)
+
+	body2 := readKafkaFrame(t, clientConn)
+	reader2 := kbin.Reader{Src: body2}
+	assert.Equal(t, int32(2), reader2.Int32())
+
+	select {
+	case <-done:
+		t.Fatal("HandleConn exited after serving valid reused-connection requests")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestKafkaHandleConn_ClosesOnMalformedSecondRequestOnReusedConnection(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	req := kmsg.NewPtrApiVersionsRequest()
+	req.SetVersion(0)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+	_, err := clientConn.Write(frame)
+	require.NoError(t, err)
+
+	respLenBuf := make([]byte, 4)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = io.ReadFull(clientConn, respLenBuf)
+	require.NoError(t, err)
+	respLen := uint32(respLenBuf[0])<<24 | uint32(respLenBuf[1])<<16 | uint32(respLenBuf[2])<<8 | uint32(respLenBuf[3])
+	respBody := make([]byte, respLen)
+	_, err = io.ReadFull(clientConn, respBody)
+	require.NoError(t, err)
+
+	_, err = clientConn.Write([]byte{0, 0, 0, 0})
+	require.NoError(t, err)
+
+	buf := make([]byte, 1)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = clientConn.Read(buf)
+	require.Error(t, err)
+	require.ErrorIs(t, err, io.EOF)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after malformed second request")
+	}
+}
+
+func TestKafkaHandleConn_RespondsToHighKnownVersion(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	req := kmsg.NewPtrApiVersionsRequest()
+	req.SetVersion(99)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+	_, err := clientConn.Write(frame)
+	require.NoError(t, err)
+
+	respLenBuf := make([]byte, 4)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = io.ReadFull(clientConn, respLenBuf)
+	require.NoError(t, err)
+	respLen := uint32(respLenBuf[0])<<24 | uint32(respLenBuf[1])<<16 | uint32(respLenBuf[2])<<8 | uint32(respLenBuf[3])
+	assert.Greater(t, respLen, uint32(0))
+
+	select {
+	case <-done:
+		t.Fatal("HandleConn exited after high known version request")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after client close")
+	}
+}
+
+func TestKafkaHandleConn_RespondsToNegativeMetadataVersion(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(-1)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+	_, err := clientConn.Write(frame)
+	require.NoError(t, err)
+
+	respLenBuf := make([]byte, 4)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = io.ReadFull(clientConn, respLenBuf)
+	require.NoError(t, err)
+	respLen := uint32(respLenBuf[0])<<24 | uint32(respLenBuf[1])<<16 | uint32(respLenBuf[2])<<8 | uint32(respLenBuf[3])
+	assert.Greater(t, respLen, uint32(0))
+
+	select {
+	case <-done:
+		t.Fatal("HandleConn exited after negative metadata version request")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after client close")
+	}
+}
+
+func TestKafkaHandleConn_RespondsToFutureMetadataVersion(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	ks := NewKafkaServer(&KafkaServerCfg{})
+	done := make(chan struct{})
+	go func() {
+		ks.HandleConn(serverConn, nil)
+		close(done)
+	}()
+
+	req := kmsg.NewPtrMetadataRequest()
+	req.SetVersion(99)
+	frame := kmsg.NewRequestFormatter().AppendRequest(nil, req, 1)
+	_, err := clientConn.Write(frame)
+	require.NoError(t, err)
+
+	respLenBuf := make([]byte, 4)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = io.ReadFull(clientConn, respLenBuf)
+	require.NoError(t, err)
+	respLen := uint32(respLenBuf[0])<<24 | uint32(respLenBuf[1])<<16 | uint32(respLenBuf[2])<<8 | uint32(respLenBuf[3])
+	assert.Greater(t, respLen, uint32(0))
+
+	select {
+	case <-done:
+		t.Fatal("HandleConn exited after future metadata version request")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not exit after client close")
 	}
 }
 

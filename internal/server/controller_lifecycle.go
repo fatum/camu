@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -107,18 +108,34 @@ func (s *Server) reconcileControllerState(ctx context.Context) {
 		}
 
 		for pid, pa := range ta.Partitions {
-			// Don't overwrite state that was loaded from the checkpoint.
-			if existing := cs.GetPartition(tc.Name, pid); existing != nil {
-				continue
+			existing := cs.GetPartition(tc.Name, pid)
+			if existing != nil && existing.Epoch >= pa.LeaderEpoch && existing.Leader == pa.Leader {
+				continue // checkpoint is up-to-date
 			}
+
 			isr := make([]string, len(pa.Replicas))
 			copy(isr, pa.Replicas)
-			cs.SetPartition(tc.Name, pid, &coordination.PartitionMeta{
+			meta := &coordination.PartitionMeta{
 				Leader:   pa.Leader,
 				Epoch:    pa.LeaderEpoch,
 				Replicas: pa.Replicas,
 				ISR:      isr,
-			})
+			}
+
+			// Recover HW from the partition's state.json on S3.
+			if stateData, err := s.s3Client.Get(ctx, log.StateKey(tc.Name, pid)); err == nil {
+				var ps log.PartitionState
+				if err := ps.Unmarshal(stateData); err == nil {
+					meta.HW = ps.HighWatermark
+					epochs := make([]coordination.EpochEntry, len(ps.EpochHistory))
+					for i, e := range ps.EpochHistory {
+						epochs[i] = coordination.EpochEntry{Epoch: e.Epoch, StartOffset: e.StartOffset}
+					}
+					meta.EpochHistory = epochs
+				}
+			}
+
+			cs.SetPartition(tc.Name, pid, meta)
 		}
 	}
 }

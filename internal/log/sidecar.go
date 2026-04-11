@@ -130,3 +130,71 @@ func ReadSidecar(data []byte) ([]IndexEntry, []TimestampIndexEntry, error) {
 
 	return entries, tsEntries, nil
 }
+
+// LookupSidecarPosition binary searches the sidecar index entries for the
+// largest entry whose BaseOffset <= targetOffset and returns its byte position
+// in the segment. Returns (0, false) if the index is empty or targetOffset is
+// before the first entry.
+func LookupSidecarPosition(entries []IndexEntry, targetOffset int64) (int64, bool) {
+	if len(entries) == 0 {
+		return 0, false
+	}
+	lo, hi := 0, len(entries)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if entries[mid].BaseOffset <= targetOffset {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if hi < 0 {
+		return 0, false
+	}
+	return entries[hi].Position, true
+}
+
+// LookupTimestampOffset binary searches the timestamp index entries for the
+// largest entry whose Timestamp <= targetTimestamp and returns its BaseOffset.
+// Returns (0, false) if the index is empty or targetTimestamp is before all entries.
+func LookupTimestampOffset(tsEntries []TimestampIndexEntry, targetTimestamp int64) (int64, bool) {
+	if len(tsEntries) == 0 {
+		return 0, false
+	}
+	lo, hi := 0, len(tsEntries)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if tsEntries[mid].Timestamp <= targetTimestamp {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if hi < 0 {
+		return 0, false
+	}
+	return tsEntries[hi].BaseOffset, true
+}
+
+// LookupSidecarEntry binary searches the index entries for the largest entry
+// whose BaseOffset <= targetOffset and returns the full entry. This provides
+// the byte Position and BatchSize needed to read a specific batch from the
+// segment without scanning from the start.
+func LookupSidecarEntry(entries []IndexEntry, targetOffset int64) (IndexEntry, bool) {
+	if len(entries) == 0 {
+		return IndexEntry{}, false
+	}
+	lo, hi := 0, len(entries)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if entries[mid].BaseOffset <= targetOffset {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if hi < 0 {
+		return IndexEntry{}, false
+	}
+	return entries[hi], true
+}

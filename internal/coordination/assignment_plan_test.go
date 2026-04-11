@@ -48,6 +48,43 @@ func TestRebalancer_Empty(t *testing.T) {
 	}
 }
 
+func TestAssignReplicated_DeadReplicaSetReassigned(t *testing.T) {
+	// When all replicas in the existing assignment are dead (not in active instances),
+	// the partition should be reassigned to active instances.
+	current := map[int]PartitionAssignment{
+		0: {Replicas: []string{"dead-1"}, Leader: "dead-1", LeaderEpoch: 1},
+		1: {Replicas: []string{"dead-1"}, Leader: "dead-1", LeaderEpoch: 1},
+	}
+	result := AssignReplicated([]string{"alive-1"}, 2, 1, current)
+
+	for pid, pa := range result {
+		if pa.Leader != "alive-1" {
+			t.Fatalf("partition %d: leader = %q, want alive-1", pid, pa.Leader)
+		}
+		if len(pa.Replicas) != 1 || pa.Replicas[0] != "alive-1" {
+			t.Fatalf("partition %d: replicas = %v, want [alive-1]", pid, pa.Replicas)
+		}
+		if pa.LeaderEpoch != 2 {
+			t.Fatalf("partition %d: epoch = %d, want 2", pid, pa.LeaderEpoch)
+		}
+	}
+}
+
+func TestAssignReplicated_PartialDeadReplicas(t *testing.T) {
+	// When some replicas are dead but one is alive, leader should move to the alive one.
+	current := map[int]PartitionAssignment{
+		0: {Replicas: []string{"dead-1", "alive-1"}, Leader: "dead-1", LeaderEpoch: 1},
+	}
+	result := AssignReplicated([]string{"alive-1"}, 1, 2, current)
+	pa := result[0]
+	if pa.Leader != "alive-1" {
+		t.Fatalf("leader = %q, want alive-1", pa.Leader)
+	}
+	if pa.LeaderEpoch != 2 {
+		t.Fatalf("epoch = %d, want 2", pa.LeaderEpoch)
+	}
+}
+
 func TestRebalancer_Deterministic(t *testing.T) {
 	a := AssignReplicated([]string{"n3", "n1", "n2"}, 4, 3, nil)
 	b := AssignReplicated([]string{"n2", "n3", "n1"}, 4, 3, nil)

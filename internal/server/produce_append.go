@@ -20,13 +20,26 @@ import (
 func (s *Server) appendHTTPMessagesAsRecordBatch(ctx context.Context, ps *partitionState, topic string, partitionID int, msgs []log.Message) ([]uint64, error) {
 	stamped := make([]log.Message, len(msgs))
 	copy(stamped, msgs)
-	now := time.Now().UnixNano()
+	now := time.Now().UnixMilli()
 	for i := range stamped {
 		if stamped[i].Timestamp == 0 {
 			stamped[i].Timestamp = now
 		}
 	}
 	rawBatch := log.EncodeRecordBatch(0, stamped)
+
+	if s.isTopicDiskless(ctx, topic) {
+		result, err := s.disklessEngine.Produce(ctx, topic, partitionID, rawBatch)
+		if err != nil {
+			return nil, err
+		}
+		offsets := make([]uint64, len(stamped))
+		for i := range offsets {
+			offsets[i] = uint64(result.BaseOffset) + uint64(i)
+		}
+		return offsets, nil
+	}
+
 	baseOffset, err := s.partitionManager.AppendRawBatch(ctx, topic, partitionID, rawBatch)
 	if err == nil {
 		offsets := make([]uint64, len(stamped))

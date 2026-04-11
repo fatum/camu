@@ -70,6 +70,48 @@ func TestTopicCreateDuplicate(t *testing.T) {
 	}
 }
 
+func TestTopicReadResponsesExposeStorageMode(t *testing.T) {
+	env := camutest.New(t, camutest.WithInstances(1))
+	defer env.Cleanup()
+	client := env.Client()
+
+	if err := client.CreateTopic("classic-topic", 2, 24*time.Hour); err != nil {
+		t.Fatalf("CreateTopic(classic-topic) error: %v", err)
+	}
+	createDisklessTopic(t, client, "diskless-topic", 3)
+
+	classicTopic, err := client.GetTopic("classic-topic")
+	if err != nil {
+		t.Fatalf("GetTopic(classic-topic) error: %v", err)
+	}
+	if classicTopic.StorageMode != "classic" {
+		t.Fatalf("classic topic storage_mode = %q, want %q", classicTopic.StorageMode, "classic")
+	}
+
+	disklessTopic, err := client.GetTopic("diskless-topic")
+	if err != nil {
+		t.Fatalf("GetTopic(diskless-topic) error: %v", err)
+	}
+	if disklessTopic.StorageMode != "diskless" {
+		t.Fatalf("diskless topic storage_mode = %q, want %q", disklessTopic.StorageMode, "diskless")
+	}
+
+	topics, err := client.ListTopics()
+	if err != nil {
+		t.Fatalf("ListTopics() error: %v", err)
+	}
+	modes := map[string]string{}
+	for _, topic := range topics {
+		modes[topic.Name] = topic.StorageMode
+	}
+	if modes["classic-topic"] != "classic" {
+		t.Fatalf("listed classic topic storage_mode = %q, want %q", modes["classic-topic"], "classic")
+	}
+	if modes["diskless-topic"] != "diskless" {
+		t.Fatalf("listed diskless topic storage_mode = %q, want %q", modes["diskless-topic"], "diskless")
+	}
+}
+
 func TestClusterStatus(t *testing.T) {
 	env := camutest.New(t, camutest.WithInstances(1))
 	defer env.Cleanup()

@@ -13,6 +13,11 @@ import (
 
 const topicPrefix = "_meta/topics/"
 
+const (
+	StorageModeClassic  = "classic"
+	StorageModeDiskless = "diskless"
+)
+
 // topicConfigJSON is the on-disk representation of a TopicConfig.
 // Retention is stored as a nanosecond integer so it round-trips correctly.
 type topicConfigJSON struct {
@@ -23,6 +28,7 @@ type topicConfigJSON struct {
 	ReplicationFactor     int       `json:"replication_factor"`
 	MinInsyncReplicas     int       `json:"min_insync_replicas"`
 	UncleanLeaderElection bool      `json:"unclean_leader_election"`
+	StorageMode           string    `json:"storage_mode,omitempty"`
 }
 
 // TopicConfig holds the configuration for a single topic.
@@ -34,6 +40,7 @@ type TopicConfig struct {
 	ReplicationFactor     int
 	MinInsyncReplicas     int
 	UncleanLeaderElection bool
+	StorageMode           string
 }
 
 func (tc TopicConfig) toJSON() topicConfigJSON {
@@ -45,6 +52,7 @@ func (tc TopicConfig) toJSON() topicConfigJSON {
 		ReplicationFactor:     tc.ReplicationFactor,
 		MinInsyncReplicas:     tc.MinInsyncReplicas,
 		UncleanLeaderElection: tc.UncleanLeaderElection,
+		StorageMode:           tc.StorageMode,
 	}
 }
 
@@ -57,6 +65,7 @@ func fromJSON(j topicConfigJSON) TopicConfig {
 		ReplicationFactor:     j.ReplicationFactor,
 		MinInsyncReplicas:     j.MinInsyncReplicas,
 		UncleanLeaderElection: j.UncleanLeaderElection,
+		StorageMode:           j.StorageMode,
 	}
 	if cfg.ReplicationFactor == 0 {
 		cfg.ReplicationFactor = 1
@@ -198,6 +207,18 @@ func (ts *TopicStore) List(ctx context.Context) ([]TopicConfig, error) {
 	})
 
 	return topics, nil
+}
+
+// ListCached returns all topic configurations from the in-memory cache without
+// hitting S3. Returns nil if the cache has never been populated (call List first).
+// Useful for hot-path handlers like Kafka Metadata that are called frequently.
+func (ts *TopicStore) ListCached() []TopicConfig {
+	var topics []TopicConfig
+	ts.cache.Range(func(_, v any) bool {
+		topics = append(topics, v.(TopicConfig))
+		return true
+	})
+	return topics
 }
 
 // Delete removes a topic configuration from S3.

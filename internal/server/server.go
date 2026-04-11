@@ -2,18 +2,14 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"slices"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +22,7 @@ import (
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/consumer"
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
@@ -70,9 +67,13 @@ type Server struct {
 	kafkaServer *KafkaServer
 	groupCoord  *kafkaGroupCoordinator
 
-	// assignmentsMu protects myPartitions.
-	assignmentsMu sync.RWMutex
-	myPartitions  map[string]map[int]localPartitionAssignment // topic -> partitionID -> local assignment view
+	disklessEngine *diskless.Engine
+	disklessMeta   diskless.MetaStore
+
+	// assignmentsMu protects myPartitions and disklessTopics.
+	assignmentsMu  sync.RWMutex
+	myPartitions   map[string]map[int]localPartitionAssignment // topic -> partitionID -> local assignment view
+	disklessTopics map[string]bool                             // cached: topic is diskless
 
 	// leaseStop signals the background coordination goroutine to stop.
 	leaseStop chan struct{}
@@ -92,6 +93,26 @@ type Server struct {
 
 	// coordinationGCTick counts renewal ticks; GC runs every 10th tick.
 	coordinationGCTick uint64
+}
+
+// DisklessMeta returns the diskless MetaStore used by the server.
+func (s *Server) DisklessMeta() diskless.MetaStore {
+	return s.disklessMeta
+}
+
+func (s *Server) isTopicDiskless(_ context.Context, topic string) bool {
+	s.assignmentsMu.RLock()
+	defer s.assignmentsMu.RUnlock()
+	return s.disklessTopics[topic]
+}
+
+func (s *Server) markTopicDiskless(topic string) {
+	s.assignmentsMu.Lock()
+	defer s.assignmentsMu.Unlock()
+	if s.disklessTopics == nil {
+		s.disklessTopics = make(map[string]bool)
+	}
+	s.disklessTopics[topic] = true
 }
 
 type localPartitionAssignment struct {
@@ -187,19 +208,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	s.internalClient = replication.NewH2CClient(replicationTimeout)
 	s.assignmentPusher = NewAssignmentPusher(s.internalClient)
-	s.followerFetcher = replication.NewFollowerFetcher(s.internalClient, func(topic string, pid int) {
-		slog.Warn("leader down detected, reporting to controller",
-			"topic", topic, "pid", pid)
-		if err := s.reportFailureToController(topic, pid); err != nil {
-			slog.Error("report failure to controller failed, falling back to self-election",
-				"topic", topic, "pid", pid, "err", err)
-			// Fallback: try the old path if controller is unreachable
-			if err := s.attemptPartitionLeadership(topic, pid); err != nil {
-				slog.Error("fallback self-election also failed",
-					"topic", topic, "pid", pid, "err", err)
-			}
-		}
-	})
+	s.followerFetcher = replication.NewFollowerFetcher(s.internalClient, s.partitionFollower().handleLeaderDown)
 
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
@@ -259,6 +268,27 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	if err := s.initExistingTopics(); err != nil {
 		return fmt.Errorf("init existing topics: %w", err)
 	}
+	switch s.cfg.Diskless.MetaStore {
+	case "dynamodb":
+		dms, err := diskless.NewDynamoMetaStore(context.Background(), diskless.DynamoMetaStoreConfig{
+			TablePrefix: s.cfg.Diskless.DynamoDB.TablePrefix,
+			Region:      s.cfg.Diskless.DynamoDB.Region,
+			Endpoint:    s.cfg.Diskless.DynamoDB.Endpoint,
+		})
+		if err != nil {
+			return fmt.Errorf("create dynamodb metastore: %w", err)
+		}
+		if err := dms.EnsureTables(context.Background()); err != nil {
+			return fmt.Errorf("ensure dynamodb tables: %w", err)
+		}
+		s.disklessMeta = dms
+	default:
+		s.disklessMeta = diskless.NewMemoryMetaStore()
+	}
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{
+		LingerMs:      s.cfg.Diskless.LingerMs,
+		MaxBatchBytes: s.cfg.Diskless.MaxBatchBytesValue(),
+	})
 	s.initialCoordination()
 	s.ready.Store(true)
 	s.startLeaseRenewal()
@@ -340,6 +370,10 @@ func (s *Server) handleKafkaAppend(topic string, partition int, msgs []log.Messa
 		return nil, fmt.Errorf("server is shutting down")
 	}
 
+	if s.isTopicDiskless(context.Background(), topic) {
+		return nil, fmt.Errorf("%w: use raw batch path for diskless topics", errKafkaNotLeader)
+	}
+
 	pm := s.partitionManager
 	pm.mu.RLock()
 	tp, ok := pm.partitions[topic]
@@ -365,6 +399,10 @@ func (s *Server) handleKafkaAppend(topic string, partition int, msgs []log.Messa
 func (s *Server) handleKafkaAppendBatch(topic string, partition int, batch log.Batch) ([]uint64, error) {
 	if s.shuttingDown.Load() {
 		return nil, fmt.Errorf("server is shutting down")
+	}
+
+	if s.isTopicDiskless(context.Background(), topic) {
+		return nil, fmt.Errorf("%w: use raw batch path for diskless topics", errKafkaNotLeader)
 	}
 
 	pm := s.partitionManager
@@ -394,6 +432,14 @@ func (s *Server) handleKafkaAppendBatch(topic string, partition int, batch log.B
 func (s *Server) handleKafkaAppendRawBatch(ctx context.Context, topic string, partition int, batch []byte) (int64, error) {
 	if s.shuttingDown.Load() {
 		return 0, fmt.Errorf("server is shutting down")
+	}
+
+	if s.isTopicDiskless(ctx, topic) {
+		result, err := s.disklessEngine.Produce(ctx, topic, partition, batch)
+		if err != nil {
+			return 0, err
+		}
+		return result.BaseOffset, nil
 	}
 
 	pm := s.partitionManager
@@ -439,6 +485,18 @@ func (s *Server) handleKafkaInitProducerID(ctx context.Context, req *kmsg.InitPr
 // For the current simple integration, the handler returns Kafka record batches
 // synthesized from retained internal messages plus the partition offset view.
 func (s *Server) handleKafkaFetch(topic string, partition int, startOffset uint64, maxBytes int32) (KafkaFetchResult, error) {
+	if s.isTopicDiskless(context.Background(), topic) {
+		data, hw, err := s.disklessEngine.Fetch(context.Background(), topic, partition, int64(startOffset), int(maxBytes))
+		if err != nil {
+			return KafkaFetchResult{}, err
+		}
+		return KafkaFetchResult{
+			RecordBatches:    data,
+			HighWatermark:    hw,
+			LastStableOffset: hw,
+		}, nil
+	}
+
 	pm := s.partitionManager
 	pm.mu.RLock()
 	tp, ok := pm.partitions[topic]
@@ -510,6 +568,9 @@ func (s *Server) handleKafkaFetch(topic string, partition int, startOffset uint6
 }
 
 func (s *Server) handleKafkaFetchRawBatches(ctx context.Context, topic string, partition int, startOffset int64, maxBytes int) ([]byte, int64, error) {
+	if s.isTopicDiskless(ctx, topic) {
+		return s.disklessEngine.Fetch(ctx, topic, partition, startOffset, maxBytes)
+	}
 	return s.partitionManager.ReadRawBatches(ctx, topic, partition, startOffset, maxBytes)
 }
 
@@ -518,1359 +579,6 @@ func kafkaFetchHighWatermark(highWatermark uint64, ok bool, nextOffset uint64) i
 		return int64(highWatermark)
 	}
 	return int64(nextOffset)
-}
-
-func (s *Server) handleKafkaMetadata(ctx context.Context, req *kmsg.MetadataRequest) (*kmsg.MetadataResponse, error) {
-	resp := kmsg.NewPtrMetadataResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	instanceInfos, err := s.registry.ActiveInstanceInfos(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	sort.Slice(instanceInfos, func(i, j int) bool {
-		return instanceInfos[i].InstanceID < instanceInfos[j].InstanceID
-	})
-	brokerIDs := make(map[string]int32, len(instanceInfos))
-	for _, info := range instanceInfos {
-		if info.KafkaAddress == "" {
-			continue
-		}
-		brokerID := kafkaBrokerID(info.InstanceID)
-		brokerIDs[info.InstanceID] = brokerID
-		host, port := splitKafkaBrokerAddr(info.KafkaAddress)
-		resp.Brokers = append(resp.Brokers, kmsg.MetadataResponseBroker{
-			NodeID: brokerID,
-			Host:   host,
-			Port:   port,
-		})
-	}
-
-	requested := requestedMetadataTopics(req)
-	topics, err := s.topicStore.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, topic := range topics {
-		if len(requested) > 0 && !requested[topic.Name] {
-			continue
-		}
-
-		assignments, err := s.assignmentStore.Read(ctx, topic.Name)
-		if err != nil {
-			continue
-		}
-
-		topicResp := kmsg.NewMetadataResponseTopic()
-		topicResp.Topic = kmsg.StringPtr(topic.Name)
-		for partitionID := 0; partitionID < topic.Partitions; partitionID++ {
-			assignment, ok := assignments.Partitions[partitionID]
-			if !ok {
-				continue
-			}
-
-			partResp := kmsg.NewMetadataResponseTopicPartition()
-			partResp.Partition = int32(partitionID)
-			partResp.Leader = brokerIDs[assignment.Leader]
-			for _, replica := range assignment.Replicas {
-				if brokerID, ok := brokerIDs[replica]; ok {
-					partResp.Replicas = append(partResp.Replicas, brokerID)
-				}
-			}
-
-			isrState, err := s.isrStore.Read(ctx, topic.Name, partitionID)
-			if err == nil {
-				for _, isrReplica := range isrState.ISR {
-					if brokerID, ok := brokerIDs[isrReplica]; ok {
-						partResp.ISR = append(partResp.ISR, brokerID)
-					}
-				}
-			}
-			if len(partResp.ISR) == 0 {
-				partResp.ISR = append(partResp.ISR, partResp.Replicas...)
-			}
-			topicResp.Partitions = append(topicResp.Partitions, partResp)
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-
-	return resp, nil
-}
-
-func (s *Server) handleKafkaFindCoordinator(_ context.Context, req *kmsg.FindCoordinatorRequest) (*kmsg.FindCoordinatorResponse, error) {
-	resp := kmsg.NewPtrFindCoordinatorResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	if req.GetVersion() >= 4 {
-		keys := req.CoordinatorKeys
-		if len(keys) == 0 && req.CoordinatorKey != "" {
-			keys = []string{req.CoordinatorKey}
-		}
-		for _, key := range keys {
-			brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
-			if err != nil {
-				return nil, err
-			}
-			resp.Coordinators = append(resp.Coordinators, kmsg.FindCoordinatorResponseCoordinator{
-				Key:    key,
-				NodeID: brokerID,
-				Host:   host,
-				Port:   port,
-			})
-		}
-		return resp, nil
-	}
-
-	brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	resp.NodeID = brokerID
-	resp.Host = host
-	resp.Port = port
-	return resp, nil
-}
-
-func (s *Server) handleKafkaCreateTopics(ctx context.Context, req *kmsg.CreateTopicsRequest) (*kmsg.CreateTopicsResponse, error) {
-	resp := kmsg.NewPtrCreateTopicsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	if !s.amLeader() {
-		for _, topic := range req.Topics {
-			topicResp := kmsg.NewCreateTopicsResponseTopic()
-			topicResp.Topic = topic.Topic
-			topicResp.ErrorCode = kafkaErrorNotController
-			resp.Topics = append(resp.Topics, topicResp)
-		}
-		return resp, nil
-	}
-
-	seen := make(map[string]bool, len(req.Topics))
-	for _, topic := range req.Topics {
-		topicResp := kmsg.NewCreateTopicsResponseTopic()
-		topicResp.Topic = topic.Topic
-		topicResp.NumPartitions = topic.NumPartitions
-		topicResp.ReplicationFactor = topic.ReplicationFactor
-
-		reqBody, errCode, errMsg := s.kafkaCreateTopicRequest(topic)
-		if errCode == 0 && seen[topic.Topic] {
-			errCode = kafkaErrorInvalidRequest
-			errMsg = "duplicate topic in request"
-		}
-		seen[topic.Topic] = true
-
-		if errCode == 0 && !req.ValidateOnly {
-			tc, err := s.createTopic(ctx, reqBody)
-			switch {
-			case err == nil:
-				topicResp.NumPartitions = int32(tc.Partitions)
-				topicResp.ReplicationFactor = int16(tc.ReplicationFactor)
-			case strings.Contains(err.Error(), "already exists"):
-				errCode = kafkaErrorTopicAlreadyExists
-				errMsg = err.Error()
-			case strings.Contains(err.Error(), "replication_factor"):
-				errCode = kafkaErrorInvalidReplication
-				errMsg = err.Error()
-			case strings.Contains(err.Error(), "min_insync_replicas"):
-				errCode = kafkaErrorInvalidConfig
-				errMsg = err.Error()
-			default:
-				return nil, err
-			}
-		}
-
-		if errCode != 0 {
-			topicResp.ErrorCode = errCode
-			topicResp.ErrorMessage = kmsg.StringPtr(errMsg)
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDeleteTopics(ctx context.Context, req *kmsg.DeleteTopicsRequest) (*kmsg.DeleteTopicsResponse, error) {
-	resp := kmsg.NewPtrDeleteTopicsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	var topicNames []string
-	if req.GetVersion() <= 5 {
-		topicNames = append(topicNames, req.TopicNames...)
-	} else {
-		for _, topic := range req.Topics {
-			if topic.Topic != nil {
-				topicNames = append(topicNames, *topic.Topic)
-				continue
-			}
-			topicResp := kmsg.NewDeleteTopicsResponseTopic()
-			topicResp.ErrorCode = kafkaErrorInvalidRequest
-			msg := "topic IDs are not supported"
-			topicResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Topics = append(resp.Topics, topicResp)
-		}
-	}
-
-	for _, topicName := range topicNames {
-		topicResp := kmsg.NewDeleteTopicsResponseTopic()
-		topicResp.Topic = kmsg.StringPtr(topicName)
-		if !s.amLeader() {
-			topicResp.ErrorCode = kafkaErrorNotController
-			resp.Topics = append(resp.Topics, topicResp)
-			continue
-		}
-		if err := s.deleteTopic(ctx, topicName); err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				topicResp.ErrorCode = kafkaErrorUnknownTopicPartition
-			} else {
-				return nil, err
-			}
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaCreatePartitions(ctx context.Context, req *kmsg.CreatePartitionsRequest) (*kmsg.CreatePartitionsResponse, error) {
-	resp := kmsg.NewPtrCreatePartitionsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	seen := make(map[string]bool, len(req.Topics))
-	for _, topic := range req.Topics {
-		topicResp := kmsg.NewCreatePartitionsResponseTopic()
-		topicResp.Topic = topic.Topic
-
-		if !s.amLeader() {
-			topicResp.ErrorCode = kafkaErrorNotController
-			resp.Topics = append(resp.Topics, topicResp)
-			continue
-		}
-		if seen[topic.Topic] {
-			topicResp.ErrorCode = kafkaErrorInvalidRequest
-			msg := "duplicate topic in request"
-			topicResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Topics = append(resp.Topics, topicResp)
-			continue
-		}
-		seen[topic.Topic] = true
-
-		if len(topic.Assignment) > 0 {
-			topicResp.ErrorCode = kafkaErrorInvalidReplicaAssign
-			msg := "manual partition assignment is not supported"
-			topicResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Topics = append(resp.Topics, topicResp)
-			continue
-		}
-
-		tc, err := s.topicStore.Get(ctx, topic.Topic)
-		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				topicResp.ErrorCode = kafkaErrorUnknownTopicPartition
-				resp.Topics = append(resp.Topics, topicResp)
-				continue
-			}
-			return nil, err
-		}
-		if int(topic.Count) <= tc.Partitions {
-			topicResp.ErrorCode = kafkaErrorInvalidPartitions
-			msg := "partition count must increase"
-			topicResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Topics = append(resp.Topics, topicResp)
-			continue
-		}
-		if req.ValidateOnly {
-			resp.Topics = append(resp.Topics, topicResp)
-			continue
-		}
-
-		tc.Partitions = int(topic.Count)
-		if err := s.topicStore.Update(ctx, tc); err != nil {
-			return nil, err
-		}
-		s.publishAssignmentsForTopics(ctx, []meta.TopicConfig{tc})
-		s.applyAssignmentsForTopic(ctx, tc.Name, tc.Partitions)
-		if err := s.partitionManager.AddTopicPartitions(ctx, tc, s.getOwnedEpochs(tc.Name)); err != nil {
-			return nil, err
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDescribeConfigs(ctx context.Context, req *kmsg.DescribeConfigsRequest) (*kmsg.DescribeConfigsResponse, error) {
-	resp := kmsg.NewPtrDescribeConfigsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	for _, resource := range req.Resources {
-		resourceResp := kmsg.NewDescribeConfigsResponseResource()
-		resourceResp.ResourceType = resource.ResourceType
-		resourceResp.ResourceName = resource.ResourceName
-
-		switch resource.ResourceType {
-		case kmsg.ConfigResourceTypeTopic:
-			tc, err := s.topicStore.Get(ctx, resource.ResourceName)
-			if err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
-					resourceResp.ErrorCode = kafkaErrorUnknownTopicPartition
-					resp.Resources = append(resp.Resources, resourceResp)
-					continue
-				}
-				return nil, err
-			}
-			configs := kafkaTopicDescribeConfigs(tc)
-			resourceResp.Configs = filterDescribeConfigs(configs, resource.ConfigNames)
-		default:
-			resourceResp.ErrorCode = kafkaErrorInvalidRequest
-			msg := "only topic configs are supported"
-			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
-		}
-
-		resp.Resources = append(resp.Resources, resourceResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaAlterConfigs(ctx context.Context, req *kmsg.AlterConfigsRequest) (*kmsg.AlterConfigsResponse, error) {
-	resp := kmsg.NewPtrAlterConfigsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	for _, resource := range req.Resources {
-		resourceResp := kmsg.NewAlterConfigsResponseResource()
-		resourceResp.ResourceType = resource.ResourceType
-		resourceResp.ResourceName = resource.ResourceName
-
-		if !s.amLeader() {
-			resourceResp.ErrorCode = kafkaErrorNotController
-			resp.Resources = append(resp.Resources, resourceResp)
-			continue
-		}
-		if resource.ResourceType != kmsg.ConfigResourceTypeTopic {
-			resourceResp.ErrorCode = kafkaErrorInvalidRequest
-			msg := "only topic config mutation is supported"
-			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Resources = append(resp.Resources, resourceResp)
-			continue
-		}
-
-		tc, err := s.topicStore.Get(ctx, resource.ResourceName)
-		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				resourceResp.ErrorCode = kafkaErrorUnknownTopicPartition
-				resp.Resources = append(resp.Resources, resourceResp)
-				continue
-			}
-			return nil, err
-		}
-		next, err := applyKafkaTopicConfigs(tc, kafkaAlterConfigsToMap(resource.Configs), true)
-		if err != nil {
-			resourceResp.ErrorCode = kafkaErrorInvalidConfig
-			msg := err.Error()
-			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Resources = append(resp.Resources, resourceResp)
-			continue
-		}
-		if !req.ValidateOnly {
-			if err := s.topicStore.Update(ctx, next); err != nil {
-				return nil, err
-			}
-		}
-		resp.Resources = append(resp.Resources, resourceResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaIncrementalAlterConfigs(ctx context.Context, req *kmsg.IncrementalAlterConfigsRequest) (*kmsg.IncrementalAlterConfigsResponse, error) {
-	resp := kmsg.NewPtrIncrementalAlterConfigsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	for _, resource := range req.Resources {
-		resourceResp := kmsg.NewIncrementalAlterConfigsResponseResource()
-		resourceResp.ResourceType = resource.ResourceType
-		resourceResp.ResourceName = resource.ResourceName
-
-		if !s.amLeader() {
-			resourceResp.ErrorCode = kafkaErrorNotController
-			resp.Resources = append(resp.Resources, resourceResp)
-			continue
-		}
-		if resource.ResourceType != kmsg.ConfigResourceTypeTopic {
-			resourceResp.ErrorCode = kafkaErrorInvalidRequest
-			msg := "only topic config mutation is supported"
-			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Resources = append(resp.Resources, resourceResp)
-			continue
-		}
-
-		tc, err := s.topicStore.Get(ctx, resource.ResourceName)
-		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				resourceResp.ErrorCode = kafkaErrorUnknownTopicPartition
-				resp.Resources = append(resp.Resources, resourceResp)
-				continue
-			}
-			return nil, err
-		}
-		next, err := applyKafkaTopicIncrementalConfigs(tc, resource.Configs)
-		if err != nil {
-			resourceResp.ErrorCode = kafkaErrorInvalidConfig
-			msg := err.Error()
-			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Resources = append(resp.Resources, resourceResp)
-			continue
-		}
-		if !req.ValidateOnly {
-			if err := s.topicStore.Update(ctx, next); err != nil {
-				return nil, err
-			}
-		}
-		resp.Resources = append(resp.Resources, resourceResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDescribeCluster(ctx context.Context, req *kmsg.DescribeClusterRequest) (*kmsg.DescribeClusterResponse, error) {
-	resp := kmsg.NewPtrDescribeClusterResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-	resp.ClusterID = s.kafkaClusterID()
-	resp.EndpointType = req.EndpointType
-
-	instanceInfos, err := s.registry.ActiveInstanceInfos(ctx)
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(instanceInfos, func(i, j int) bool {
-		return instanceInfos[i].InstanceID < instanceInfos[j].InstanceID
-	})
-	for _, info := range instanceInfos {
-		if info.KafkaAddress == "" {
-			continue
-		}
-		host, port := splitKafkaBrokerAddr(info.KafkaAddress)
-		resp.Brokers = append(resp.Brokers, kmsg.DescribeClusterResponseBroker{
-			NodeID: kafkaBrokerID(info.InstanceID),
-			Host:   host,
-			Port:   port,
-		})
-	}
-
-	lease, err := s.leaderElection.GetLeader(ctx)
-	if err == nil && lease.InstanceID != "" {
-		resp.ControllerID = kafkaBrokerID(lease.InstanceID)
-	} else {
-		resp.ControllerID = kafkaBrokerID(s.instanceID)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaCreateACLs(ctx context.Context, req *kmsg.CreateACLsRequest) (*kmsg.CreateACLsResponse, error) {
-	resp := kmsg.NewPtrCreateACLsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	records := make([]storage.ACLRecord, 0, len(req.Creations))
-	for _, creation := range req.Creations {
-		result := kmsg.NewCreateACLsResponseResult()
-		record, err := kafkaACLRecordFromCreation(creation)
-		if err != nil {
-			result.ErrorCode = kafkaErrorInvalidRequest
-			msg := err.Error()
-			result.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Results = append(resp.Results, result)
-			continue
-		}
-		if !s.amLeader() {
-			result.ErrorCode = kafkaErrorNotController
-			resp.Results = append(resp.Results, result)
-			continue
-		}
-		records = append(records, record)
-		resp.Results = append(resp.Results, result)
-	}
-
-	if len(records) > 0 {
-		if err := s.aclStore.Create(ctx, records); err != nil {
-			return nil, err
-		}
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDescribeACLs(ctx context.Context, req *kmsg.DescribeACLsRequest) (*kmsg.DescribeACLsResponse, error) {
-	resp := kmsg.NewPtrDescribeACLsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	filter, err := kafkaACLFilterFromDescribeRequest(req)
-	if err != nil {
-		resp.ErrorCode = kafkaErrorInvalidRequest
-		msg := err.Error()
-		resp.ErrorMessage = kmsg.StringPtr(msg)
-		return resp, nil
-	}
-
-	acls, err := s.aclStore.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	grouped := make(map[string]*kmsg.DescribeACLsResponseResource)
-	keys := make([]string, 0)
-	for _, acl := range acls {
-		if !filter.Matches(acl) {
-			continue
-		}
-		key := kafkaACLResourceKey(acl)
-		resource, ok := grouped[key]
-		if !ok {
-			resource = &kmsg.DescribeACLsResponseResource{
-				ResourceType:        acl.ResourceType,
-				ResourceName:        acl.ResourceName,
-				ResourcePatternType: acl.ResourcePatternType,
-			}
-			grouped[key] = resource
-			keys = append(keys, key)
-		}
-		resource.ACLs = append(resource.ACLs, kmsg.DescribeACLsResponseResourceACL{
-			Principal:      acl.Principal,
-			Host:           acl.Host,
-			Operation:      acl.Operation,
-			PermissionType: acl.PermissionType,
-		})
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		resp.Resources = append(resp.Resources, *grouped[key])
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDeleteACLs(ctx context.Context, req *kmsg.DeleteACLsRequest) (*kmsg.DeleteACLsResponse, error) {
-	resp := kmsg.NewPtrDeleteACLsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	if !s.amLeader() {
-		for range req.Filters {
-			result := kmsg.NewDeleteACLsResponseResult()
-			result.ErrorCode = kafkaErrorNotController
-			resp.Results = append(resp.Results, result)
-		}
-		return resp, nil
-	}
-
-	filters := make([]storage.ACLFilter, 0, len(req.Filters))
-	for _, filterReq := range req.Filters {
-		filter, err := kafkaACLFilterFromDeleteFilter(filterReq)
-		if err != nil {
-			result := kmsg.NewDeleteACLsResponseResult()
-			result.ErrorCode = kafkaErrorInvalidRequest
-			msg := err.Error()
-			result.ErrorMessage = kmsg.StringPtr(msg)
-			resp.Results = append(resp.Results, result)
-			continue
-		}
-		filters = append(filters, filter)
-		resp.Results = append(resp.Results, kmsg.NewDeleteACLsResponseResult())
-	}
-
-	if len(filters) == 0 {
-		return resp, nil
-	}
-
-	matched, err := s.aclStore.DeleteMatching(ctx, filters)
-	if err != nil {
-		return nil, err
-	}
-
-	matchIdx := 0
-	for i := range resp.Results {
-		if resp.Results[i].ErrorCode != 0 {
-			continue
-		}
-		for _, acl := range matched[matchIdx] {
-			resp.Results[i].MatchingACLs = append(resp.Results[i].MatchingACLs, kmsg.DeleteACLsResponseResultMatchingACL{
-				ResourceType:        acl.ResourceType,
-				ResourceName:        acl.ResourceName,
-				ResourcePatternType: acl.ResourcePatternType,
-				Principal:           acl.Principal,
-				Host:                acl.Host,
-				Operation:           acl.Operation,
-				PermissionType:      acl.PermissionType,
-			})
-		}
-		matchIdx++
-	}
-	return resp, nil
-}
-
-func (s *Server) kafkaCreateTopicRequest(topic kmsg.CreateTopicsRequestTopic) (createTopicRequest, int16, string) {
-	reqBody := createTopicRequest{
-		Name:              topic.Topic,
-		Partitions:        int(topic.NumPartitions),
-		ReplicationFactor: int(topic.ReplicationFactor),
-	}
-	if reqBody.Name == "" {
-		return reqBody, kafkaErrorInvalidRequest, "topic name is required"
-	}
-	if len(topic.ReplicaAssignment) > 0 {
-		return reqBody, kafkaErrorInvalidReplicaAssign, "manual replica assignment is not supported"
-	}
-	if reqBody.Partitions == -1 {
-		reqBody.Partitions = 1
-	}
-	if reqBody.ReplicationFactor == -1 {
-		reqBody.ReplicationFactor = 1
-	}
-	if reqBody.Partitions < 1 {
-		return reqBody, kafkaErrorInvalidPartitions, "partitions must be at least 1"
-	}
-	if reqBody.ReplicationFactor < 1 {
-		return reqBody, kafkaErrorInvalidReplication, "replication factor must be at least 1"
-	}
-
-	for _, cfg := range topic.Configs {
-		if cfg.Value == nil {
-			continue
-		}
-		switch cfg.Name {
-		case "retention.ms":
-			ms, err := strconv.ParseInt(*cfg.Value, 10, 64)
-			if err != nil || ms < 0 {
-				return reqBody, kafkaErrorInvalidConfig, "invalid retention.ms"
-			}
-			reqBody.Retention = fmt.Sprintf("%dms", ms)
-		case "min.insync.replicas":
-			minISR, err := strconv.Atoi(*cfg.Value)
-			if err != nil || minISR < 1 {
-				return reqBody, kafkaErrorInvalidConfig, "invalid min.insync.replicas"
-			}
-			reqBody.MinInsyncReplicas = minISR
-		case "unclean.leader.election.enable":
-			v, err := strconv.ParseBool(*cfg.Value)
-			if err != nil {
-				return reqBody, kafkaErrorInvalidConfig, "invalid unclean.leader.election.enable"
-			}
-			reqBody.UncleanLeaderElection = v
-		case "cleanup.policy":
-			if *cfg.Value != "delete" {
-				return reqBody, kafkaErrorInvalidConfig, "only cleanup.policy=delete is supported"
-			}
-		default:
-			return reqBody, kafkaErrorInvalidConfig, fmt.Sprintf("unsupported topic config %q", cfg.Name)
-		}
-	}
-
-	return reqBody, 0, ""
-}
-
-func kafkaTopicDescribeConfigs(tc meta.TopicConfig) []kmsg.DescribeConfigsResponseResourceConfig {
-	retentionMs := fmt.Sprintf("%d", tc.Retention/time.Millisecond)
-	minISR := fmt.Sprintf("%d", tc.MinInsyncReplicas)
-	cleanupPolicy := "delete"
-	unclean := strconv.FormatBool(tc.UncleanLeaderElection)
-
-	return []kmsg.DescribeConfigsResponseResourceConfig{
-		{Name: "cleanup.policy", Value: kmsg.StringPtr(cleanupPolicy), IsDefault: true},
-		{Name: "min.insync.replicas", Value: kmsg.StringPtr(minISR), IsDefault: false},
-		{Name: "retention.ms", Value: kmsg.StringPtr(retentionMs), IsDefault: false},
-		{Name: "unclean.leader.election.enable", Value: kmsg.StringPtr(unclean), IsDefault: !tc.UncleanLeaderElection},
-	}
-}
-
-func kafkaAlterConfigsToMap(configs []kmsg.AlterConfigsRequestResourceConfig) map[string]*string {
-	out := make(map[string]*string, len(configs))
-	for _, cfg := range configs {
-		out[cfg.Name] = cfg.Value
-	}
-	return out
-}
-
-func applyKafkaTopicIncrementalConfigs(tc meta.TopicConfig, configs []kmsg.IncrementalAlterConfigsRequestResourceConfig) (meta.TopicConfig, error) {
-	values := map[string]*string{}
-	for _, cfg := range configs {
-		switch cfg.Op {
-		case kmsg.IncrementalAlterConfigOpSet:
-			values[cfg.Name] = cfg.Value
-		case kmsg.IncrementalAlterConfigOpDelete:
-			values[cfg.Name] = nil
-		default:
-			return tc, fmt.Errorf("unsupported incremental alter op for %q", cfg.Name)
-		}
-	}
-	return applyKafkaTopicConfigs(tc, values, false)
-}
-
-func applyKafkaTopicConfigs(tc meta.TopicConfig, values map[string]*string, resetMissing bool) (meta.TopicConfig, error) {
-	next := tc
-
-	if resetMissing {
-		next.Retention = 7 * 24 * time.Hour
-		next.MinInsyncReplicas = 1
-		next.UncleanLeaderElection = false
-	}
-
-	for name, value := range values {
-		switch name {
-		case "cleanup.policy":
-			if value == nil {
-				continue
-			}
-			if *value != "delete" {
-				return tc, fmt.Errorf("only cleanup.policy=delete is supported")
-			}
-		case "retention.ms":
-			if value == nil {
-				next.Retention = 7 * 24 * time.Hour
-				continue
-			}
-			ms, err := strconv.ParseInt(*value, 10, 64)
-			if err != nil || ms < 0 {
-				return tc, fmt.Errorf("invalid retention.ms")
-			}
-			next.Retention = time.Duration(ms) * time.Millisecond
-		case "min.insync.replicas":
-			if value == nil {
-				next.MinInsyncReplicas = 1
-				continue
-			}
-			v, err := strconv.Atoi(*value)
-			if err != nil || v < 1 || v > next.ReplicationFactor {
-				return tc, fmt.Errorf("invalid min.insync.replicas")
-			}
-			next.MinInsyncReplicas = v
-		case "unclean.leader.election.enable":
-			if value == nil {
-				next.UncleanLeaderElection = false
-				continue
-			}
-			v, err := strconv.ParseBool(*value)
-			if err != nil {
-				return tc, fmt.Errorf("invalid unclean.leader.election.enable")
-			}
-			next.UncleanLeaderElection = v
-		default:
-			return tc, fmt.Errorf("unsupported topic config %q", name)
-		}
-	}
-
-	return next, nil
-}
-
-func filterDescribeConfigs(configs []kmsg.DescribeConfigsResponseResourceConfig, names []string) []kmsg.DescribeConfigsResponseResourceConfig {
-	if len(names) == 0 {
-		return configs
-	}
-	allowed := make(map[string]bool, len(names))
-	for _, name := range names {
-		allowed[name] = true
-	}
-	filtered := make([]kmsg.DescribeConfigsResponseResourceConfig, 0, len(configs))
-	for _, cfg := range configs {
-		if allowed[cfg.Name] {
-			filtered = append(filtered, cfg)
-		}
-	}
-	return filtered
-}
-
-func (s *Server) kafkaClusterID() string {
-	if s.cfg.Storage.Bucket != "" {
-		return "camu-" + s.cfg.Storage.Bucket
-	}
-	return "camu"
-}
-
-func kafkaACLRecordFromCreation(creation kmsg.CreateACLsRequestCreation) (storage.ACLRecord, error) {
-	record := storage.ACLRecord{
-		ResourceType:        creation.ResourceType,
-		ResourceName:        creation.ResourceName,
-		ResourcePatternType: creation.ResourcePatternType,
-		Principal:           creation.Principal,
-		Host:                creation.Host,
-		Operation:           creation.Operation,
-		PermissionType:      creation.PermissionType,
-	}
-	if creation.ResourceType == kmsg.ACLResourceTypeUnknown || creation.ResourceType == kmsg.ACLResourceTypeAny {
-		return record, fmt.Errorf("invalid acl resource type")
-	}
-	if creation.ResourceName == "" {
-		return record, fmt.Errorf("acl resource name is required")
-	}
-	if creation.ResourcePatternType != kmsg.ACLResourcePatternTypeLiteral && creation.ResourcePatternType != kmsg.ACLResourcePatternTypePrefixed {
-		return record, fmt.Errorf("unsupported acl resource pattern type")
-	}
-	if creation.Principal == "" {
-		return record, fmt.Errorf("acl principal is required")
-	}
-	if creation.Host == "" {
-		return record, fmt.Errorf("acl host is required")
-	}
-	if creation.Operation == kmsg.ACLOperationUnknown || creation.Operation == kmsg.ACLOperationAny {
-		return record, fmt.Errorf("invalid acl operation")
-	}
-	if creation.PermissionType != kmsg.ACLPermissionTypeAllow && creation.PermissionType != kmsg.ACLPermissionTypeDeny {
-		return record, fmt.Errorf("invalid acl permission type")
-	}
-	return record, nil
-}
-
-func kafkaACLFilterFromDescribeRequest(req *kmsg.DescribeACLsRequest) (storage.ACLFilter, error) {
-	return kafkaACLFilter{
-		resourceType:        req.ResourceType,
-		resourceName:        req.ResourceName,
-		resourcePatternType: req.ResourcePatternType,
-		principal:           req.Principal,
-		host:                req.Host,
-		operation:           req.Operation,
-		permissionType:      req.PermissionType,
-	}.build()
-}
-
-func kafkaACLFilterFromDeleteFilter(req kmsg.DeleteACLsRequestFilter) (storage.ACLFilter, error) {
-	return kafkaACLFilter{
-		resourceType:        req.ResourceType,
-		resourceName:        req.ResourceName,
-		resourcePatternType: req.ResourcePatternType,
-		principal:           req.Principal,
-		host:                req.Host,
-		operation:           req.Operation,
-		permissionType:      req.PermissionType,
-	}.build()
-}
-
-type kafkaACLFilter struct {
-	resourceType        kmsg.ACLResourceType
-	resourceName        *string
-	resourcePatternType kmsg.ACLResourcePatternType
-	principal           *string
-	host                *string
-	operation           kmsg.ACLOperation
-	permissionType      kmsg.ACLPermissionType
-}
-
-func (f kafkaACLFilter) build() (storage.ACLFilter, error) {
-	filter := storage.ACLFilter{
-		ResourceType:        f.resourceType,
-		ResourceName:        f.resourceName,
-		ResourcePatternType: f.resourcePatternType,
-		Principal:           f.principal,
-		Host:                f.host,
-		Operation:           f.operation,
-		PermissionType:      f.permissionType,
-	}
-	if f.resourceType == kmsg.ACLResourceTypeUnknown {
-		return filter, fmt.Errorf("invalid acl resource type")
-	}
-	switch f.resourcePatternType {
-	case kmsg.ACLResourcePatternTypeAny, kmsg.ACLResourcePatternTypeMatch, kmsg.ACLResourcePatternTypeLiteral, kmsg.ACLResourcePatternTypePrefixed:
-	default:
-		return filter, fmt.Errorf("invalid acl resource pattern type")
-	}
-	if f.operation == kmsg.ACLOperationUnknown {
-		return filter, fmt.Errorf("invalid acl operation")
-	}
-	if f.permissionType == kmsg.ACLPermissionTypeUnknown {
-		return filter, fmt.Errorf("invalid acl permission type")
-	}
-	return filter, nil
-}
-
-func kafkaACLResourceKey(acl storage.ACLRecord) string {
-	return fmt.Sprintf("%d:%s:%d", acl.ResourceType, acl.ResourceName, acl.ResourcePatternType)
-}
-
-func (s *Server) kafkaControllerBroker(ctx context.Context) (int32, string, int32, error) {
-	lease, err := s.leaderElection.GetLeader(ctx)
-	if err == nil && lease.InstanceID != "" && time.Now().Before(lease.ExpiresAt) {
-		info, infoErr := s.registry.GetInstanceInfo(ctx, lease.InstanceID)
-		if infoErr == nil && info.KafkaAddress != "" {
-			host, port := splitKafkaBrokerAddr(info.KafkaAddress)
-			return kafkaBrokerID(info.InstanceID), host, port, nil
-		}
-	}
-
-	host, port := splitKafkaBrokerAddr(kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort))
-	return kafkaBrokerID(s.instanceID), host, port, nil
-}
-
-func (s *Server) handleKafkaJoinGroup(_ context.Context, req *kmsg.JoinGroupRequest) (*kmsg.JoinGroupResponse, error) {
-	if !s.isLocalKafkaCoordinator(context.Background(), req.Group) {
-		resp := kmsg.NewPtrJoinGroupResponse()
-		resp.ErrorCode = kafkaErrorNotCoordinator
-		resp.Generation = -1
-		setKafkaResponseVersion(resp, req.GetVersion())
-		return resp, nil
-	}
-	resp, err := s.groupCoord.joinGroup(context.Background(), req)
-	if err != nil {
-		return nil, err
-	}
-	setKafkaResponseVersion(resp, req.GetVersion())
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDescribeGroups(_ context.Context, req *kmsg.DescribeGroupsRequest) (*kmsg.DescribeGroupsResponse, error) {
-	resp := kmsg.NewPtrDescribeGroupsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	for _, groupID := range req.Groups {
-		if !s.isLocalKafkaCoordinator(context.Background(), groupID) {
-			groupResp := kmsg.NewDescribeGroupsResponseGroup()
-			groupResp.Group = groupID
-			groupResp.ErrorCode = kafkaErrorNotCoordinator
-			resp.Groups = append(resp.Groups, groupResp)
-			continue
-		}
-
-		groupResp, err := s.groupCoord.describeGroup(context.Background(), groupID)
-		if err != nil {
-			return nil, err
-		}
-		resp.Groups = append(resp.Groups, groupResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaListGroups(_ context.Context, req *kmsg.ListGroupsRequest) (*kmsg.ListGroupsResponse, error) {
-	resp, err := s.groupCoord.listGroups(context.Background(), req.StatesFilter, req.TypesFilter)
-	if err != nil {
-		return nil, err
-	}
-	setKafkaResponseVersion(resp, req.GetVersion())
-	return resp, nil
-}
-
-func (s *Server) handleKafkaDeleteGroups(_ context.Context, req *kmsg.DeleteGroupsRequest) (*kmsg.DeleteGroupsResponse, error) {
-	resp := kmsg.NewPtrDeleteGroupsResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	for _, groupID := range req.Groups {
-		groupResp := kmsg.NewDeleteGroupsResponseGroup()
-		groupResp.Group = groupID
-		if !s.isLocalKafkaCoordinator(context.Background(), groupID) {
-			groupResp.ErrorCode = kafkaErrorNotCoordinator
-			resp.Groups = append(resp.Groups, groupResp)
-			continue
-		}
-
-		errorCode, err := s.groupCoord.deleteGroup(context.Background(), groupID)
-		if err != nil {
-			return nil, err
-		}
-		if errorCode == 0 {
-			if err := s.offsetStore.DeleteGroup(context.Background(), groupID); err != nil {
-				return nil, err
-			}
-		}
-		groupResp.ErrorCode = errorCode
-		resp.Groups = append(resp.Groups, groupResp)
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaOffsetDelete(ctx context.Context, req *kmsg.OffsetDeleteRequest) (*kmsg.OffsetDeleteResponse, error) {
-	resp := kmsg.NewPtrOffsetDeleteResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-
-	if !s.isLocalKafkaCoordinator(ctx, req.Group) {
-		resp.ErrorCode = kafkaErrorNotCoordinator
-		for _, topic := range req.Topics {
-			topicResp := kmsg.NewOffsetDeleteResponseTopic()
-			topicResp.Topic = topic.Topic
-			for _, partition := range topic.Partitions {
-				partResp := kmsg.NewOffsetDeleteResponseTopicPartition()
-				partResp.Partition = partition.Partition
-				partResp.ErrorCode = kafkaErrorNotCoordinator
-				topicResp.Partitions = append(topicResp.Partitions, partResp)
-			}
-			resp.Topics = append(resp.Topics, topicResp)
-		}
-		return resp, nil
-	}
-
-	if _, err := s.s3Client.Get(ctx, kafkaGroupKey(req.Group)); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			resp.ErrorCode = kafkaErrorGroupIDNotFound
-			return resp, nil
-		}
-		return nil, err
-	}
-
-	deletes := make(map[string][]int, len(req.Topics))
-	for _, topic := range req.Topics {
-		topicResp := kmsg.NewOffsetDeleteResponseTopic()
-		topicResp.Topic = topic.Topic
-		for _, partition := range topic.Partitions {
-			partResp := kmsg.NewOffsetDeleteResponseTopicPartition()
-			partResp.Partition = partition.Partition
-			partResp.ErrorCode = s.kafkaPartitionExists(ctx, topic.Topic, int(partition.Partition))
-			if partResp.ErrorCode == 0 {
-				deletes[topic.Topic] = append(deletes[topic.Topic], int(partition.Partition))
-			}
-			topicResp.Partitions = append(topicResp.Partitions, partResp)
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-
-	if len(deletes) > 0 {
-		if err := s.offsetStore.DeleteGroupTopics(ctx, req.Group, deletes, s.currentControllerEpoch()); err != nil {
-			return nil, err
-		}
-	}
-	return resp, nil
-}
-
-func (s *Server) handleKafkaSyncGroup(_ context.Context, req *kmsg.SyncGroupRequest) (*kmsg.SyncGroupResponse, error) {
-	if !s.isLocalKafkaCoordinator(context.Background(), req.Group) {
-		resp := kmsg.NewPtrSyncGroupResponse()
-		resp.ErrorCode = kafkaErrorNotCoordinator
-		setKafkaResponseVersion(resp, req.GetVersion())
-		return resp, nil
-	}
-	resp, err := s.groupCoord.syncGroup(context.Background(), req)
-	if err != nil {
-		return nil, err
-	}
-	setKafkaResponseVersion(resp, req.GetVersion())
-	return resp, nil
-}
-
-func (s *Server) handleKafkaHeartbeat(_ context.Context, req *kmsg.HeartbeatRequest) (*kmsg.HeartbeatResponse, error) {
-	if !s.isLocalKafkaCoordinator(context.Background(), req.Group) {
-		resp := kmsg.NewPtrHeartbeatResponse()
-		resp.ErrorCode = kafkaErrorNotCoordinator
-		setKafkaResponseVersion(resp, req.GetVersion())
-		return resp, nil
-	}
-	resp, err := s.groupCoord.heartbeat(context.Background(), req)
-	if err != nil {
-		return nil, err
-	}
-	setKafkaResponseVersion(resp, req.GetVersion())
-	return resp, nil
-}
-
-func (s *Server) handleKafkaLeaveGroup(_ context.Context, req *kmsg.LeaveGroupRequest) (*kmsg.LeaveGroupResponse, error) {
-	if !s.isLocalKafkaCoordinator(context.Background(), req.Group) {
-		resp := kmsg.NewPtrLeaveGroupResponse()
-		resp.ErrorCode = kafkaErrorNotCoordinator
-		setKafkaResponseVersion(resp, req.GetVersion())
-		return resp, nil
-	}
-	resp, err := s.groupCoord.leaveGroup(context.Background(), req)
-	if err != nil {
-		return nil, err
-	}
-	setKafkaResponseVersion(resp, req.GetVersion())
-	return resp, nil
-}
-
-func (s *Server) isLocalKafkaCoordinator(ctx context.Context, groupKey string) bool {
-	brokerID, _, _, err := s.kafkaControllerBroker(ctx)
-	if err != nil {
-		return true
-	}
-	return brokerID == kafkaBrokerID(s.instanceID)
-}
-
-func (s *Server) currentControllerEpoch() string {
-	if s.leaderLease.ETag != "" {
-		return s.leaderLease.ETag
-	}
-	lease, err := s.leaderElection.GetLeader(context.Background())
-	if err != nil {
-		return ""
-	}
-	return lease.ETag
-}
-
-func (s *Server) handleKafkaListOffsets(ctx context.Context, topic string, partition int, timestamp int64) (KafkaOffsetResponse, error) {
-	topicCfg, err := s.topicStore.Get(ctx, topic)
-	if err != nil {
-		return KafkaOffsetResponse{}, fmt.Errorf("%w: topic %q", errKafkaUnknownTopicPartition, topic)
-	}
-	if partition < 0 || partition >= topicCfg.Partitions {
-		return KafkaOffsetResponse{}, fmt.Errorf("%w: partition %d for topic %q", errKafkaUnknownTopicPartition, partition, topic)
-	}
-
-	ps := s.partitionManager.GetPartitionState(topic, partition)
-	if ps == nil {
-		return KafkaOffsetResponse{}, fmt.Errorf("%w: partition %d for topic %q", errKafkaUnknownTopicPartition, partition, topic)
-	}
-	if topicCfg.ReplicationFactor > 1 && ps.replicaState == nil {
-		return KafkaOffsetResponse{}, fmt.Errorf("%w: partition %d", errKafkaLeaderNotAvailable, partition)
-	}
-
-	logStartOffset := uint64(0)
-	if firstOffset, ok := ps.index.FirstOffset(); ok {
-		logStartOffset = firstOffset
-	}
-	ps.mu.RLock()
-	if seg := ps.activeSegment; seg != nil {
-		offsetIdx := seg.OffsetIndex()
-		if len(offsetIdx) > 0 && (logStartOffset == 0 || uint64(offsetIdx[0].BaseOffset) < logStartOffset) {
-			logStartOffset = uint64(offsetIdx[0].BaseOffset)
-		}
-	}
-	nextOffset := ps.nextOffset
-	ps.mu.RUnlock()
-
-	switch timestamp {
-	case -4, -2:
-		return KafkaOffsetResponse{
-			Offset:      int64(logStartOffset),
-			Timestamp:   -1,
-			LeaderEpoch: int32(ps.epoch),
-		}, nil
-	case -1:
-		return KafkaOffsetResponse{
-			Offset:      int64(nextOffset),
-			Timestamp:   -1,
-			LeaderEpoch: int32(ps.epoch),
-		}, nil
-	default:
-		startOffset, ok := ps.index.FirstOffsetForTimestamp(timestamp)
-		if !ok {
-			startOffset = logStartOffset
-		}
-		if offset, found, err := s.findKafkaOffsetByTimestamp(ctx, topic, partition, ps, startOffset, timestamp); err != nil {
-			return KafkaOffsetResponse{}, err
-		} else if found {
-			return KafkaOffsetResponse{
-				Offset:      int64(offset),
-				Timestamp:   timestamp,
-				LeaderEpoch: int32(ps.epoch),
-			}, nil
-		}
-		return KafkaOffsetResponse{
-			Offset:      -1,
-			Timestamp:   -1,
-			LeaderEpoch: int32(ps.epoch),
-		}, nil
-	}
-}
-
-func (s *Server) findKafkaOffsetByTimestamp(ctx context.Context, topic string, partition int, ps *partitionState, startOffset uint64, targetTimestamp int64) (uint64, bool, error) {
-	index := ps.index
-	if index != nil {
-		var (
-			foundOffset uint64
-			found       bool
-		)
-		_, err := s.fetcher.Walk(ctx, index, topic, partition, startOffset, int(^uint(0)>>1), func(msg log.Message) bool {
-			if normalizeTimestampForKafkaMillis(msg.Timestamp) >= targetTimestamp {
-				foundOffset = msg.Offset
-				found = true
-				return false
-			}
-			return true
-		})
-		if err != nil {
-			return 0, false, err
-		}
-		if found {
-			return foundOffset, true, nil
-		}
-	}
-
-	ps.mu.RLock()
-	activeSeg := ps.activeSegment
-	hw, hwOK := readableHighWatermark(ps)
-	ps.mu.RUnlock()
-	if activeSeg != nil {
-		offsetIdx := activeSeg.OffsetIndex()
-		for _, entry := range offsetIdx {
-			if uint64(entry.LastOffset) < startOffset {
-				continue
-			}
-			if hwOK && uint64(entry.BaseOffset) >= hw {
-				break
-			}
-			if entry.BatchSize <= 0 || entry.Position < 0 {
-				continue
-			}
-			buf := make([]byte, entry.BatchSize)
-			n, err := activeSeg.ReadAt(buf, entry.Position)
-			if err != nil && n < int(entry.BatchSize) {
-				return 0, false, err
-			}
-			msgs, err := log.DecodeRecordBatch(buf[:n])
-			if err != nil {
-				return 0, false, err
-			}
-			for _, msg := range msgs {
-				if msg.Offset < startOffset {
-					continue
-				}
-				if hwOK && msg.Offset >= hw {
-					return 0, false, nil
-				}
-				if normalizeTimestampForKafkaMillis(msg.Timestamp) >= targetTimestamp {
-					return msg.Offset, true, nil
-				}
-			}
-		}
-	}
-	return 0, false, nil
-}
-
-func normalizeTimestampForKafkaMillis(ts int64) int64 {
-	if ts == 0 {
-		return 0
-	}
-	if ts > 1_000_000_000_000_000 {
-		return ts / int64(time.Millisecond)
-	}
-	return ts
-}
-
-func (s *Server) handleKafkaOffsetCommit(ctx context.Context, req *kmsg.OffsetCommitRequest) (*kmsg.OffsetCommitResponse, error) {
-	resp := kmsg.NewPtrOffsetCommitResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-	if !s.isLocalKafkaCoordinator(ctx, req.Group) {
-		for _, topic := range req.Topics {
-			topicResp := kmsg.NewOffsetCommitResponseTopic()
-			topicResp.Topic = topic.Topic
-			for _, partition := range topic.Partitions {
-				partResp := kmsg.NewOffsetCommitResponseTopicPartition()
-				partResp.Partition = partition.Partition
-				partResp.ErrorCode = kafkaErrorNotCoordinator
-				topicResp.Partitions = append(topicResp.Partitions, partResp)
-			}
-			resp.Topics = append(resp.Topics, topicResp)
-		}
-		return resp, nil
-	}
-
-	offsetsByTopic := make(map[string]map[int]uint64, len(req.Topics))
-	for _, topic := range req.Topics {
-		topicResp := kmsg.NewOffsetCommitResponseTopic()
-		topicResp.Topic = topic.Topic
-		for _, partition := range topic.Partitions {
-			partResp := kmsg.NewOffsetCommitResponseTopicPartition()
-			partResp.Partition = partition.Partition
-
-			errorCode := s.kafkaPartitionExists(ctx, topic.Topic, int(partition.Partition))
-			if errorCode == 0 {
-				if offsetsByTopic[topic.Topic] == nil {
-					offsetsByTopic[topic.Topic] = make(map[int]uint64)
-				}
-				offsetsByTopic[topic.Topic][int(partition.Partition)] = uint64(partition.Offset)
-			}
-			partResp.ErrorCode = errorCode
-			topicResp.Partitions = append(topicResp.Partitions, partResp)
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-
-	if len(offsetsByTopic) > 0 {
-		if err := s.offsetStore.CommitGroupTopicsWithEpoch(ctx, req.Group, offsetsByTopic, s.currentControllerEpoch()); err != nil {
-			for ti := range resp.Topics {
-				for pi := range resp.Topics[ti].Partitions {
-					if resp.Topics[ti].Partitions[pi].ErrorCode == 0 {
-						resp.Topics[ti].Partitions[pi].ErrorCode = kafkaErrorUnknownServer
-					}
-				}
-			}
-		}
-	}
-
-	return resp, nil
-}
-
-func (s *Server) handleKafkaOffsetFetch(ctx context.Context, req *kmsg.OffsetFetchRequest) (*kmsg.OffsetFetchResponse, error) {
-	resp := kmsg.NewPtrOffsetFetchResponse()
-	setKafkaResponseVersion(resp, req.GetVersion())
-	if !s.isLocalKafkaCoordinator(ctx, req.Group) {
-		requestedTopics := req.Topics
-		for _, topic := range requestedTopics {
-			topicResp := kmsg.NewOffsetFetchResponseTopic()
-			topicResp.Topic = topic.Topic
-			for _, partition := range topic.Partitions {
-				partResp := kmsg.NewOffsetFetchResponseTopicPartition()
-				partResp.Partition = partition
-				partResp.Offset = -1
-				partResp.LeaderEpoch = -1
-				partResp.ErrorCode = kafkaErrorNotCoordinator
-				topicResp.Partitions = append(topicResp.Partitions, partResp)
-			}
-			resp.Topics = append(resp.Topics, topicResp)
-		}
-		return resp, nil
-	}
-
-	topics, err := s.offsetStore.GetGroupTopics(ctx, req.Group)
-	if err != nil {
-		return nil, err
-	}
-
-	requestedTopics := req.Topics
-	if len(requestedTopics) == 0 {
-		requestedTopics = make([]kmsg.OffsetFetchRequestTopic, 0, len(topics))
-		for topic, partitions := range topics {
-			topicReq := kmsg.NewOffsetFetchRequestTopic()
-			topicReq.Topic = topic
-			for partition := range partitions {
-				topicReq.Partitions = append(topicReq.Partitions, int32(partition))
-			}
-			requestedTopics = append(requestedTopics, topicReq)
-		}
-	}
-
-	for _, topic := range requestedTopics {
-		topicResp := kmsg.NewOffsetFetchResponseTopic()
-		topicResp.Topic = topic.Topic
-		for _, partition := range topic.Partitions {
-			partResp := kmsg.NewOffsetFetchResponseTopicPartition()
-			partResp.Partition = partition
-			partResp.Offset = -1
-			partResp.LeaderEpoch = -1
-
-			errorCode := s.kafkaPartitionExists(ctx, topic.Topic, int(partition))
-			if errorCode == 0 {
-				if topicOffsets := topics[topic.Topic]; topicOffsets != nil {
-					if offset, ok := topicOffsets[int(partition)]; ok {
-						partResp.Offset = int64(offset)
-					}
-				}
-			}
-			partResp.ErrorCode = errorCode
-			topicResp.Partitions = append(topicResp.Partitions, partResp)
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-
-	return resp, nil
-}
-
-func (s *Server) kafkaPartitionError(ctx context.Context, topic string, partition int) int16 {
-	topicCfg, err := s.topicStore.Get(ctx, topic)
-	if err != nil {
-		return kafkaErrorUnknownTopicPartition
-	}
-	if partition < 0 || partition >= topicCfg.Partitions {
-		return kafkaErrorUnknownTopicPartition
-	}
-
-	assignments, err := s.assignmentStore.Read(ctx, topic)
-	if err != nil {
-		return kafkaErrorUnknownTopicPartition
-	}
-	assignment, ok := assignments.Partitions[partition]
-	if !ok {
-		return kafkaErrorUnknownTopicPartition
-	}
-	if assignment.Leader != s.instanceID {
-		return kafkaErrorNotLeader
-	}
-	return 0
-}
-
-func (s *Server) kafkaPartitionExists(ctx context.Context, topic string, partition int) int16 {
-	topicCfg, err := s.topicStore.Get(ctx, topic)
-	if err != nil {
-		return kafkaErrorUnknownTopicPartition
-	}
-	if partition < 0 || partition >= topicCfg.Partitions {
-		return kafkaErrorUnknownTopicPartition
-	}
-	return 0
 }
 
 // Shutdown gracefully shuts down the HTTP server and partition manager.
@@ -1894,7 +602,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	// 3. Cancel all follower fetch loops.
+	// 3. Close diskless engine (flush pending writes).
+	if s.disklessEngine != nil {
+		s.disklessEngine.Close()
+	}
+
+	// 4. Cancel all follower fetch loops.
 	s.partitionManager.CancelAllFetchLoops()
 
 	// 4. Flush batcher / close local segments.
@@ -2048,6 +761,10 @@ func (s *Server) initExistingTopics() error {
 		return fmt.Errorf("list topics: %w", err)
 	}
 	for _, tc := range topics {
+		if tc.StorageMode == meta.StorageModeDiskless {
+			s.markTopicDiskless(tc.Name)
+			continue
+		}
 		epochs := s.getOwnedEpochs(tc.Name)
 		if err := s.partitionManager.InitTopic(ctx, tc, epochs); err != nil {
 			slog.Error("failed to init topic", "topic", tc.Name, "error", err)
@@ -2109,6 +826,7 @@ func (s *Server) initialCoordination() {
 
 	// All instances apply assignments (acquire leases for assigned partitions).
 	s.applyAssignmentsForTopics(ctx, topics)
+	s.runPartitionMaintenance(ctx, topics)
 }
 
 // AcquireLeasesForTopic is called from handleCreateTopic when a new topic is
@@ -2219,6 +937,12 @@ func partitionAssignmentsChanged(existing, next map[int]coordination.PartitionAs
 // initialized in the local partition manager (e.g. topics created on other nodes).
 func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.TopicConfig) {
 	for _, tc := range topics {
+		if tc.StorageMode == meta.StorageModeDiskless {
+			// Diskless topics skip partition manager init but still need
+			// assignment-based ownership so routing works.
+			s.applyDisklessAssignments(ctx, tc)
+			continue
+		}
 		// Ensure topic is initialized locally before applying assignments.
 		if s.partitionManager.GetRouter(tc.Name) == nil {
 			epochs := s.getOwnedEpochs(tc.Name)
@@ -2228,6 +952,42 @@ func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.To
 		}
 		s.applyAssignmentsForTopic(ctx, tc.Name, tc.Partitions)
 	}
+}
+
+// applyDisklessAssignments reads assignments for a diskless topic and updates
+// the local ownership cache without initializing partition managers.
+func (s *Server) applyDisklessAssignments(ctx context.Context, tc meta.TopicConfig) {
+	assigned, err := s.readAssignments(ctx, tc.Name)
+	if err != nil {
+		// Fallback: assume we own all partitions (single-node case).
+		s.assignmentsMu.Lock()
+		if s.myPartitions[tc.Name] == nil {
+			s.myPartitions[tc.Name] = make(map[int]localPartitionAssignment)
+		}
+		for pid := 0; pid < tc.Partitions; pid++ {
+			if _, exists := s.myPartitions[tc.Name][pid]; !exists {
+				s.myPartitions[tc.Name][pid] = localPartitionAssignment{
+					Owned:       true,
+					LeaderEpoch: 1,
+				}
+			}
+		}
+		s.assignmentsMu.Unlock()
+		return
+	}
+
+	owned := make(map[int]localPartitionAssignment)
+	for pid, pa := range assigned.Partitions {
+		if pa.Leader == s.instanceID {
+			owned[pid] = localPartitionAssignment{
+				Owned:       true,
+				LeaderEpoch: pa.LeaderEpoch,
+			}
+		}
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = owned
+	s.assignmentsMu.Unlock()
 }
 
 // applyAssignmentsForTopic reads assignments for a single topic and updates
@@ -2663,6 +1423,11 @@ func (s *Server) renewLeases() {
 	// Check ISR lag for leader partitions and update S3 if changed.
 	s.checkISRLag(ctx)
 
+	// Partition leaders run partition-scoped maintenance on a slow cadence.
+	if s.coordinationGCTick%10 == 0 {
+		s.runPartitionMaintenance(ctx, topics)
+	}
+
 	// Leader: periodically GC stale coordination files in S3.
 	s.coordinationGCTick++
 	if s.amLeader() && s.coordinationGCTick%10 == 0 {
@@ -2823,55 +1588,14 @@ func (s *Server) getRoutingMap(topic string) routingResponse {
 // leaderInternalAddr resolves the internal (h2c) address for the leader of the
 // given topic/partition. Returns "" if the leader cannot be determined.
 func (s *Server) leaderInternalAddr(topic string, pid int) string {
-	ctx := context.Background()
-	assigned, err := s.assignmentStore.Read(ctx, topic)
-	if err != nil {
-		return ""
-	}
-	pa, ok := assigned.Partitions[pid]
-	if !ok {
-		return ""
-	}
-	leaderID := pa.Leader
-	if leaderID == "" || leaderID == s.instanceID {
-		return ""
-	}
-	info, err := s.registry.GetInstanceInfo(ctx, leaderID)
-	if err != nil {
-		return ""
-	}
-	addr := info.InternalAddress
-	if addr == "" {
-		addr = info.Address
-	}
-	return addr
+	return s.partitionFollower().leaderInternalAddr(topic, pid)
 }
 
 // proxyToLeader forwards the request to the leader node over the h2c internal
 // transport. The leader's public-facing produce handler processes the request
 // and the response is streamed back to the original client.
 func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, leaderAddr string) {
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = "http"
-			req.URL.Host = leaderAddr
-			req.Host = leaderAddr
-			req.Header.Set(headerForwardedBy, s.instanceID)
-		},
-		ModifyResponse: func(resp *http.Response) error {
-			// Propagate the leader's instance ID so clients and checkers
-			// see the true leader, not the proxy node.
-			if id := resp.Header.Get("X-Camu-Instance-ID"); id != "" {
-				resp.Header.Set("X-Camu-Instance-ID", id)
-			}
-			return nil
-		},
-		Transport: s.internalClient.Transport,
-	}
-	// Clear headers set by middleware — the proxy response replaces them.
-	w.Header().Del("X-Camu-Instance-ID")
-	w.Header().Del("Content-Type")
-	proxy.ServeHTTP(w, r)
+	s.partitionFollower().proxyToLeader(w, r, leaderAddr)
 }
 
 // attemptPartitionLeadership is called when a follower detects the leader is
@@ -2879,259 +1603,7 @@ func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, leaderAdd
 // store and, on success, transitions the local partition state from follower
 // to leader.
 func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
-	ctx := context.Background()
-
-	// 1. Read ISR from S3.
-	isrState, isrErr := s.isrStore.Read(ctx, topic, pid)
-	if isrErr != nil {
-		slog.Warn("attemptLeadership: no ISR state", "topic", topic, "pid", pid)
-	}
-
-	// 2. Am I in ISR? (if ISR state exists)
-	if isrErr == nil {
-		inISR := false
-		for _, id := range isrState.ISR {
-			if id == s.instanceID {
-				inISR = true
-				break
-			}
-		}
-		if !inISR {
-			topicCfg, _ := s.topicStore.Get(ctx, topic)
-			if !topicCfg.UncleanLeaderElection {
-				return fmt.Errorf("not in ISR and unclean election disabled")
-			}
-			slog.Warn("attemptLeadership: unclean election", "topic", topic, "pid", pid)
-		}
-	}
-
-	// 3. CAS on assignment store.
-	assignments, err := s.assignmentStore.Read(ctx, topic)
-	if err != nil {
-		return fmt.Errorf("read assignments: %w", err)
-	}
-	pa := assignments.Partitions[pid]
-
-	// Don't attempt if we're already the leader.
-	if pa.Leader == s.instanceID {
-		return nil
-	}
-
-	newEpoch := pa.LeaderEpoch + 1
-	slog.Info("attempt_leadership_begin",
-		"topic", topic,
-		"partition", pid,
-		"current_leader", pa.Leader,
-		"current_epoch", pa.LeaderEpoch,
-		"candidate", s.instanceID,
-		"isr", func() []string {
-			if isrErr != nil {
-				return nil
-			}
-			return isrState.ISR
-		}(),
-		"isr_hw", func() uint64 {
-			if isrErr != nil {
-				return 0
-			}
-			return isrState.HighWatermark
-		}(),
-	)
-	pa.Leader = s.instanceID
-	pa.LeaderEpoch = newEpoch
-	assignments.Partitions[pid] = pa
-	assignments.Version++
-
-	if err := s.assignmentStore.Write(ctx, topic, assignments, assignments.ETag); err != nil {
-		if errors.Is(err, storage.ErrConflict) {
-			return fmt.Errorf("lost leadership race (CAS conflict)")
-		}
-		return fmt.Errorf("write assignments: %w", err)
-	}
-
-	// 4. Won! Transition from follower to leader.
-	slog.Info("won partition leadership", "topic", topic, "pid", pid, "epoch", newEpoch)
-
-	ps := s.partitionManager.GetPartitionState(topic, pid)
-	if ps == nil {
-		return fmt.Errorf("partition state not found")
-	}
-
-	// 4a. Cancel fetch loop and wait for it to finish so any in-flight
-	// append completes before local recovery proceeds.
-	ps.mu.Lock()
-	existingCancel := ps.fetchCancel
-	existingDone := ps.fetchDone
-	ps.fetchCancel = nil
-	ps.fetchDone = nil
-	ps.mu.Unlock()
-	if existingCancel != nil {
-		existingCancel()
-		if existingDone != nil {
-			<-existingDone
-		}
-	}
-
-	// 4b. Refresh index from S3 so we see segments flushed by the old leader.
-	// The follower's in-memory index may be stale.
-	s.partitionManager.RefreshIndex(ctx, topic, pid)
-	if err := s.partitionManager.ensureActiveSegment(topic, pid); err != nil {
-		slog.Warn("attemptPartitionLeadership: ensure active segment before recovery", "topic", topic, "pid", pid, "error", err)
-	}
-
-	// 4c. Recover true local log end from native segment state.
-	ps.mu.RLock()
-	prevEpoch := ps.epoch
-	prevNextOffset := ps.nextOffset
-	indexHW := ps.index.HighWatermark()
-	flushedOffset := ps.flushedOffset
-	ps.mu.RUnlock()
-	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
-
-	slog.Info("failover_recovery_state",
-		"topic", topic,
-		"partition", pid,
-		"new_epoch", newEpoch,
-		"previous_epoch", prevEpoch,
-		"previous_next_offset", prevNextOffset,
-		"log_end", logEnd,
-		"index_hw", indexHW,
-		"flushed_offset", flushedOffset,
-		"isr_hw", func() uint64 {
-			if isrErr != nil {
-				return 0
-			}
-			return isrState.HighWatermark
-		}(),
-	)
-
-	// 4c. Set HW to max of local log end, S3 index state, and persisted ISR HW.
-	// The new leader was an ISR member — everything in its local tail and in S3
-	// segments (visible via the refreshed index) is safe to serve.
-	// logEnd alone can undercount committed data that is already in S3 segments.
-	recoveredHW := logEnd
-	ps.mu.RLock()
-	indexNext := ps.index.NextOffset()
-	currentIndexHW := ps.index.HighWatermark()
-	ps.mu.RUnlock()
-	if indexNext > recoveredHW {
-		recoveredHW = indexNext
-	}
-	if isrErr == nil && isrState.HighWatermark > recoveredHW {
-		recoveredHW = isrState.HighWatermark
-	}
-	slog.Info("failover: recovered HW",
-		"topic", topic, "pid", pid,
-		"hw", recoveredHW, "log_end", logEnd,
-		"index_next", indexNext, "index_hw", currentIndexHW)
-
-	// 4d. Epoch history — load from S3 (authoritative), fall back to local.
-	ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
-	ps.mu.RLock()
-	eh := ps.epochHistory
-	ps.mu.RUnlock()
-	if eh == nil {
-		eh, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
-		if eh == nil || len(eh.Entries) == 0 {
-			eh, _ = replication.LoadEpochHistory(ehPath)
-			if eh == nil {
-				eh = &replication.EpochHistory{}
-			}
-		}
-	}
-	eh.Append(replication.EpochEntry{Epoch: newEpoch, StartOffset: logEnd})
-	ps.mu.Lock()
-	ps.epochHistory = eh
-	ps.isLeader = true
-	ps.leaderID = ""
-	ps.epoch = newEpoch
-	ps.index.SetHighWatermark(recoveredHW)
-	ps.mu.Unlock()
-	if err := s.partitionManager.ensureActiveSegment(topic, pid); err != nil {
-		slog.Warn("attemptPartitionLeadership: ensure active segment", "topic", topic, "pid", pid, "error", err)
-	}
-	if err := eh.SaveToFile(ehPath); err != nil {
-		slog.Warn("attemptPartitionLeadership: save epoch history locally", "topic", topic, "pid", pid, "error", err)
-	}
-	if err := s.isrStore.WriteEpochHistory(ctx, topic, pid, eh); err != nil {
-		slog.Warn("attemptPartitionLeadership: save epoch history to S3", "topic", topic, "pid", pid, "error", err)
-	}
-
-	// 4d. Initialize as leader.
-	topicCfg, err := s.topicStore.Get(ctx, topic)
-	if err != nil {
-		slog.Error("attemptPartitionLeadership: get topic config", "topic", topic, "pid", pid, "error", err)
-		return err
-	}
-	if topicCfg.ReplicationFactor > 1 {
-		ps.mu.Lock()
-		ps.replicaState = replication.NewReplicaState(s.instanceID, recoveredHW, topicCfg.MinInsyncReplicas, s.cfg.Coordination.ISRExpansionThresholdValue())
-		ps.replicaState.SetEpochHistory(ps.epochHistory)
-		for _, r := range pa.Replicas {
-			if r != s.instanceID {
-				ps.replicaState.AddFollower(r)
-			}
-		}
-		ps.mu.Unlock()
-	}
-
-	// 4e. Write ISR = [self] to S3.
-	if err := s.isrStore.Write(ctx, topic, replication.ISRState{
-		Partition:     pid,
-		ISR:           []string{s.instanceID},
-		Leader:        s.instanceID,
-		LeaderEpoch:   newEpoch,
-		HighWatermark: recoveredHW,
-	}, ""); err != nil {
-		slog.Warn("attemptPartitionLeadership: write ISR", "topic", topic, "pid", pid, "error", err)
-	}
-
-	// Recover producer idempotency state from S3 checkpoint + local committed tail.
-	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
-	if data, err := s.s3Client.Get(ctx, checkpointKey); err == nil && len(data) > 0 {
-		ps.mu.Lock()
-		ps.loadProducerCheckpoint(data)
-		ps.mu.Unlock()
-		slog.Info("idempotency_checkpoint_loaded", "topic", topic, "partition", pid, "size", len(data))
-	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		slog.Warn("idempotency_checkpoint_load_failed", "topic", topic, "partition", pid, "error", err)
-	}
-
-	if source, n := s.partitionManager.RebuildProducerStateFromLocalTail(topic, pid); n > 0 {
-		slog.Info("idempotency_local_tail_recovery", "topic", topic, "partition", pid, "source", source, "batches", n)
-	}
-
-	// If promotion recovered committed data from local native storage beyond the current
-	// flushed/indexed prefix, persist it immediately so S3 and the local index
-	// reflect the promoted leader's committed state.
-	ps.mu.RLock()
-	indexNextOffset := ps.index.NextOffset()
-	ps.mu.RUnlock()
-	if recoveredHW > indexNextOffset {
-		if err := s.partitionManager.flushRecoveredTail(topic, pid); err != nil {
-			slog.Warn("attemptPartitionLeadership: flush recovered tail",
-				"topic", topic,
-				"partition", pid,
-				"epoch", newEpoch,
-				"recovered_hw", recoveredHW,
-				"index_next_offset", indexNextOffset,
-				"error", err,
-			)
-		}
-	}
-
-	// 4f. Update ownership cache.
-	s.assignmentsMu.Lock()
-	if s.myPartitions[topic] == nil {
-		s.myPartitions[topic] = make(map[int]localPartitionAssignment)
-	}
-	s.myPartitions[topic][pid] = localPartitionAssignment{
-		Owned:       true,
-		LeaderEpoch: newEpoch,
-	}
-	s.assignmentsMu.Unlock()
-
-	return nil
+	return s.partitionFollower().attemptPartitionLeadership(topic, pid)
 }
 
 // checkISRLag iterates over all leader partitions and removes followers from
@@ -3162,77 +1634,6 @@ func (s *Server) checkISRLag(ctx context.Context) {
 						slog.Warn("checkISRExpansion: write ISR", "topic", topic, "pid", pid, "error", err)
 					}
 				}
-			}
-		}
-	}
-}
-
-// coordinationGC removes stale coordination files from S3.
-// Only called by the leader on a slow cadence (every 10th renewal tick).
-func (s *Server) coordinationGC(ctx context.Context, topics []meta.TopicConfig) {
-	s.gcStaleInstances(ctx)
-	s.gcStaleISR(ctx, topics)
-}
-
-// gcStaleInstances deletes instance registration files whose heartbeat
-// has expired beyond the registry TTL.
-func (s *Server) gcStaleInstances(ctx context.Context) {
-	keys, err := s.s3Client.List(ctx, "_coordination/instances/")
-	if err != nil {
-		slog.Warn("coordinationGC: list instances", "error", err)
-		return
-	}
-	now := time.Now()
-	for _, key := range keys {
-		data, err := s.s3Client.Get(ctx, key)
-		if err != nil {
-			continue
-		}
-		var info coordination.InstanceInfo
-		if err := json.Unmarshal(data, &info); err != nil {
-			continue
-		}
-		// Use the same TTL the registry uses to filter active instances (leaseTTL * 3).
-		if now.Sub(info.HeartbeatAt) > s.leaseTTL*3 {
-			if err := s.s3Client.Delete(ctx, key); err != nil {
-				slog.Warn("coordinationGC: delete stale instance", "key", key, "error", err)
-			} else {
-				slog.Info("coordinationGC: removed stale instance", "instance", info.InstanceID)
-			}
-		}
-	}
-}
-
-// gcStaleISR deletes ISR state files for topics or partitions that no longer exist.
-func (s *Server) gcStaleISR(ctx context.Context, topics []meta.TopicConfig) {
-	topicSet := make(map[string]int) // topic name -> partition count
-	for _, t := range topics {
-		topicSet[t.Name] = t.Partitions
-	}
-
-	keys, err := s.s3Client.List(ctx, "_coordination/isr/")
-	if err != nil {
-		slog.Warn("coordinationGC: list ISR", "error", err)
-		return
-	}
-	for _, key := range keys {
-		// Keys look like: _coordination/isr/{topic}/{pid}.json
-		rest := key[len("_coordination/isr/"):]
-		slashIdx := strings.Index(rest, "/")
-		if slashIdx < 0 {
-			continue
-		}
-		topic := rest[:slashIdx]
-		var pid int
-		if n, _ := fmt.Sscanf(rest[slashIdx+1:], "%d.json", &pid); n != 1 {
-			continue
-		}
-		partCount, topicExists := topicSet[topic]
-		if !topicExists || pid >= partCount {
-			if err := s.s3Client.Delete(ctx, key); err != nil {
-				slog.Warn("coordinationGC: delete stale ISR", "key", key, "error", err)
-			} else {
-				slog.Info("coordinationGC: removed stale ISR", "topic", topic, "partition", pid)
 			}
 		}
 	}

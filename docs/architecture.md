@@ -73,13 +73,28 @@ internal/server/
   └── consume_helpers.go       High watermark, encoding, message utilities
 
   Kafka wire protocol
-  ├── kafka_types.go           Server struct, config, interfaces, error codes
-  ├── kafka_wire.go            Connection handling, request routing, codec framing
-  ├── kafka_handlers_admin.go  Admin APIs (Metadata, CreateTopics, ACLs, etc.)
-  ├── kafka_handlers_data.go   Produce + Fetch handlers
-  ├── kafka_codec.go           RecordBatch encode/decode, compression (gzip/snappy/lz4/zstd)
-  ├── kafka_helpers.go         Partition lookup, error mapping, adapters
-  └── kafka_groups.go          Consumer group coordinator (S3-backed CAS)
+  ├── kafka_types.go               Server struct, config, interfaces, error codes
+  ├── kafka_wire.go                Connection handling, request routing, codec framing
+  ├── kafka_handlers_data.go       Produce + Fetch handlers
+  ├── kafka_metadata_discovery.go  Metadata, ListOffsets, FindCoordinator
+  ├── kafka_topic_admin.go         Topic admin and topic-config handling
+  ├── kafka_acl_admin.go           ACL admin handlers and filter validation
+  ├── kafka_offsets.go             OffsetCommit, OffsetFetch, OffsetDelete
+  ├── kafka_group_handlers.go      Group handler wrappers
+  ├── kafka_groups.go              Consumer group coordinator (S3-backed CAS)
+  ├── kafka_codec.go               RecordBatch encode/decode, compression (gzip/snappy/lz4/zstd)
+  └── kafka_helpers.go             Partition lookup, error mapping, adapters
+
+  Background cleanup
+  ├── topic_deletion.go            Coordination-leader topic deletion workflow
+  ├── coordination_leader_service.go Controller-only cleanup/orchestration service
+  ├── partition_leader_service.go  Partition-leader maintenance service
+  ├── partition_follower_service.go Follower proxying and failover service
+  ├── partition_jobs.go            Durable partition maintenance job model
+  ├── partition_job_executor.go    Compatibility wrappers for owner maintenance entrypoints
+  ├── partition_job_retention.go   Partition-leader retention jobs
+  ├── partition_job_merge.go       Classic sealed-segment merge builder, discovery, and executor
+  └── coordination_gc.go           Coordination GC, ISR cleanup, topic delete
 ```
 
 ## Stored Objects
@@ -97,6 +112,8 @@ internal/server/
 | Partition state | `_meta/state/{topic}/{partition}.json` | High watermark and epoch history |
 | Producer checkpoint | `{topic}/{partition}/producers.checkpoint` | Idempotent producer recovery |
 | Consumer group state | `_coordination/kafka-groups/{group}.json` | Kafka consumer group coordination |
+| Topic deletion marker | `_coordination/topic_deletions/{topic}.json` | Async/resumable topic deletion state |
+| Partition job | `_coordination/partition_jobs/{topic}/{partition}/{job}.json` | Durable partition-leader maintenance work |
 
 ## Local State
 
@@ -129,12 +146,49 @@ Flush steps:
 4. Persist partition state and producer checkpoint
 5. Open the next active segment at the current log end
 
+## Topic Deletion
+
+Topic deletion is asynchronous and resumable:
+
+1. Persist a deletion marker under `_coordination/topic_deletions/`
+2. Remove topic metadata immediately so the topic disappears from HTTP and Kafka APIs
+3. Background GC deletes topic S3 data
+4. For diskless topics, background GC then clears diskless metastore state
+5. The deletion marker is removed last
+
+This ordering prevents diskless metastore refs from being removed before the
+backing S3 data path is actually gone.
+
+## Retention Cleanup
+
+Time-based retention cleanup is also asynchronous and resumable.
+
+Retention is now partition-leader-executed:
+
+1. The partition-leader maintenance service discovers expired retention work for partitions it owns
+2. It persists a partition job under `_coordination/partition_jobs/`
+3. For classic segments, it deletes the segment object and index sidecar
+4. For classic segments, it invalidates local sealed-segment cache and in-memory index refs
+5. For classic segments, it deletes the segment metadata sidecar
+6. For diskless files, it deletes the S3 data file first and then removes diskless metastore refs
+7. It removes the partition job
+
+Diskless retention remains conservative at the file level. If a backing file
+still contains newer live refs, the file is not deleted yet, which means its
+expired refs are also retained until the whole file becomes eligible.
+
+Partition-leader maintenance is bounded per node by
+`coordination.maintenance_max_concurrency`, so retention and merge work remain
+parallel without fanning out unbounded across owned partitions.
+
 ## Coordination
 
 Camu uses S3 conditional writes instead of a separate consensus cluster.
 
 - One cluster controller publishes assignments
 - Partition leaders own produce and replication for their partitions
+- Partition leaders now execute partition-local maintenance through a dedicated service layer
+- Partition followers now handle proxying and fetch/failover transitions through a dedicated service layer
 - Epoch history fences stale leaders and supports divergence checks
 
 See [architecture/coordination.md](architecture/coordination.md) for the coordination-specific view.

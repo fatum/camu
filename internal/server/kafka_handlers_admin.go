@@ -336,6 +336,7 @@ func (ks *KafkaServer) handleMetadata(req *kmsg.MetadataRequest) (kmsg.Response,
 	}
 
 	requested := requestedMetadataTopics(req)
+	seenTopics := make(map[string]struct{}, len(requested))
 	for _, topic := range topics {
 		if len(requested) > 0 && !requested[topic.Name] {
 			continue
@@ -356,6 +357,17 @@ func (ks *KafkaServer) handleMetadata(req *kmsg.MetadataRequest) (kmsg.Response,
 			partResp.ISR = append(partResp.ISR, info.ISR...)
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
 		}
+		resp.Topics = append(resp.Topics, topicResp)
+		seenTopics[topic.Name] = struct{}{}
+	}
+
+	for topicName := range requested {
+		if _, ok := seenTopics[topicName]; ok {
+			continue
+		}
+		topicResp := kmsg.NewMetadataResponseTopic()
+		topicResp.Topic = kmsg.StringPtr(topicName)
+		topicResp.ErrorCode = kafkaErrorUnknownTopicPartition
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 

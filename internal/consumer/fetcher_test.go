@@ -1,7 +1,6 @@
 package consumer
 
 import (
-	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -15,7 +14,7 @@ func makeTestMessages(count int) []log.Message {
 	for i := range msgs {
 		msgs[i] = log.Message{
 			Offset:    uint64(i),
-			Timestamp: time.Now().UnixNano(),
+			Timestamp: time.Now().UnixMilli(),
 			Key:       []byte("key"),
 			Value:     []byte("value-" + string(rune('0'+i))),
 		}
@@ -25,20 +24,11 @@ func makeTestMessages(count int) []log.Message {
 
 func writeTestSegment(t *testing.T, msgs []log.Message) []byte {
 	t.Helper()
-	var buf bytes.Buffer
-	if err := log.WriteSegment(&buf, msgs, log.CompressionNone, 16*1024); err != nil {
-		t.Fatalf("WriteSegment: %v", err)
+	var segData []byte
+	for _, msg := range msgs {
+		segData = append(segData, log.EncodeRecordBatch(int64(msg.Offset), []log.Message{msg})...)
 	}
-	return buf.Bytes()
-}
-
-func writeTestSegmentIndex(t *testing.T, segData []byte, baseOffset uint64) []byte {
-	t.Helper()
-	idx, err := log.BuildSegmentOffsetIndex(segData, baseOffset, 1)
-	if err != nil {
-		t.Fatalf("BuildSegmentOffsetIndex: %v", err)
-	}
-	return idx
+	return segData
 }
 
 func TestFetcher_ReadFromCache(t *testing.T) {
@@ -76,9 +66,6 @@ func TestFetcher_ReadFromCache(t *testing.T) {
 	// Put segment in disk cache (not in S3).
 	if err := diskCache.Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put: %v", err)
-	}
-	if err := diskCache.Put(log.SegmentOffsetIndexKey(segKey), writeTestSegmentIndex(t, segData, 0)); err != nil {
-		t.Fatalf("diskCache.Put(offset index): %v", err)
 	}
 
 	fetcher := NewFetcher(s3Client, diskCache)
@@ -125,9 +112,6 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 	if err := s3Client.Put(context.Background(), segKey, segData, storage.PutOpts{}); err != nil {
 		t.Fatalf("s3Client.Put: %v", err)
 	}
-	if err := s3Client.Put(context.Background(), log.SegmentOffsetIndexKey(segKey), writeTestSegmentIndex(t, segData, 0), storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(offset index): %v", err)
-	}
 
 	// Build index.
 	idx := log.NewIndex()
@@ -157,9 +141,6 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 	if !diskCache.Has(segKey) {
 		t.Error("expected segment to be cached after S3 fetch")
 	}
-	if !diskCache.Has(log.SegmentOffsetIndexKey(segKey)) {
-		t.Error("expected segment offset index to be cached after S3 fetch")
-	}
 
 	// Second fetch — should come from cache (we can verify by deleting from S3).
 	if err := s3Client.Delete(context.Background(), segKey); err != nil {
@@ -178,7 +159,7 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 	}
 }
 
-func TestFetcher_UsesExplicitOffsetIndexKey(t *testing.T) {
+func TestFetcher_FetchFromMiddleOfSegment(t *testing.T) {
 	s3Client, err := storage.NewS3Client(storage.S3Config{
 		Bucket:   "test",
 		Endpoint: "memory://",
@@ -194,27 +175,22 @@ func TestFetcher_UsesExplicitOffsetIndexKey(t *testing.T) {
 	}
 
 	msgs := []log.Message{
-		{Offset: 10, Timestamp: time.Now().UnixNano(), Key: []byte("k10"), Value: []byte("v10")},
-		{Offset: 11, Timestamp: time.Now().UnixNano(), Key: []byte("k11"), Value: []byte("v11")},
-		{Offset: 12, Timestamp: time.Now().UnixNano(), Key: []byte("k12"), Value: []byte("v12")},
+		{Offset: 10, Timestamp: time.Now().UnixMilli(), Key: []byte("k10"), Value: []byte("v10")},
+		{Offset: 11, Timestamp: time.Now().UnixMilli(), Key: []byte("k11"), Value: []byte("v11")},
+		{Offset: 12, Timestamp: time.Now().UnixMilli(), Key: []byte("k12"), Value: []byte("v12")},
 	}
 	segKey := "test-topic/0/10-0.segment"
-	offsetIdxKey := "test-topic/0/assets/10-0.offset.idx"
 	segData := writeTestSegment(t, msgs)
 	if err := s3Client.Put(context.Background(), segKey, segData, storage.PutOpts{}); err != nil {
 		t.Fatalf("s3Client.Put(segment): %v", err)
 	}
-	if err := s3Client.Put(context.Background(), offsetIdxKey, writeTestSegmentIndex(t, segData, 10), storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(offset index): %v", err)
-	}
 
 	idx := log.NewIndex()
 	idx.Add(log.SegmentRef{
-		BaseOffset:     10,
-		EndOffset:      12,
-		Key:            segKey,
-		OffsetIndexKey: offsetIdxKey,
-		CreatedAt:      time.Now(),
+		BaseOffset: 10,
+		EndOffset:  12,
+		Key:        segKey,
+		CreatedAt:  time.Now(),
 	})
 
 	fetcher := NewFetcher(s3Client, diskCache)
@@ -227,9 +203,6 @@ func TestFetcher_UsesExplicitOffsetIndexKey(t *testing.T) {
 	}
 	if nextOffset != 12 {
 		t.Fatalf("nextOffset = %d, want 12", nextOffset)
-	}
-	if !diskCache.Has(offsetIdxKey) {
-		t.Fatal("expected explicit offset index sidecar to be cached")
 	}
 }
 
@@ -279,12 +252,12 @@ func TestFetcher_ReadAcrossMultipleSegments(t *testing.T) {
 	}
 
 	seg0Msgs := []log.Message{
-		{Offset: 0, Timestamp: time.Now().UnixNano(), Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Timestamp: time.Now().UnixNano(), Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 0, Timestamp: time.Now().UnixMilli(), Key: []byte("k0"), Value: []byte("v0")},
+		{Offset: 1, Timestamp: time.Now().UnixMilli(), Key: []byte("k1"), Value: []byte("v1")},
 	}
 	seg1Msgs := []log.Message{
-		{Offset: 2, Timestamp: time.Now().UnixNano(), Key: []byte("k2"), Value: []byte("v2")},
-		{Offset: 3, Timestamp: time.Now().UnixNano(), Key: []byte("k3"), Value: []byte("v3")},
+		{Offset: 2, Timestamp: time.Now().UnixMilli(), Key: []byte("k2"), Value: []byte("v2")},
+		{Offset: 3, Timestamp: time.Now().UnixMilli(), Key: []byte("k3"), Value: []byte("v3")},
 	}
 
 	seg0Key := "test-topic/0/0-0.segment"
@@ -349,12 +322,12 @@ func TestFetcher_ReadAcrossMixedCacheAndS3Segments(t *testing.T) {
 	seg0Key := "test-topic/0/0-0.segment"
 	seg1Key := "test-topic/0/2-0.segment"
 	seg0Data := writeTestSegment(t, []log.Message{
-		{Offset: 0, Timestamp: time.Now().UnixNano(), Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Timestamp: time.Now().UnixNano(), Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 0, Timestamp: time.Now().UnixMilli(), Key: []byte("k0"), Value: []byte("v0")},
+		{Offset: 1, Timestamp: time.Now().UnixMilli(), Key: []byte("k1"), Value: []byte("v1")},
 	})
 	seg1Data := writeTestSegment(t, []log.Message{
-		{Offset: 2, Timestamp: time.Now().UnixNano(), Key: []byte("k2"), Value: []byte("v2")},
-		{Offset: 3, Timestamp: time.Now().UnixNano(), Key: []byte("k3"), Value: []byte("v3")},
+		{Offset: 2, Timestamp: time.Now().UnixMilli(), Key: []byte("k2"), Value: []byte("v2")},
+		{Offset: 3, Timestamp: time.Now().UnixMilli(), Key: []byte("k3"), Value: []byte("v3")},
 	})
 
 	if err := diskCache.Put(seg0Key, seg0Data); err != nil {
@@ -402,8 +375,8 @@ func TestFetcher_ReturnsPartialResultsWhenLaterSegmentFetchFails(t *testing.T) {
 	seg0Key := "test-topic/0/0-0.segment"
 	seg1Key := "test-topic/0/2-0.segment"
 	if err := s3Client.Put(context.Background(), seg0Key, writeTestSegment(t, []log.Message{
-		{Offset: 0, Timestamp: time.Now().UnixNano(), Key: []byte("k0"), Value: []byte("v0")},
-		{Offset: 1, Timestamp: time.Now().UnixNano(), Key: []byte("k1"), Value: []byte("v1")},
+		{Offset: 0, Timestamp: time.Now().UnixMilli(), Key: []byte("k0"), Value: []byte("v0")},
+		{Offset: 1, Timestamp: time.Now().UnixMilli(), Key: []byte("k1"), Value: []byte("v1")},
 	}), storage.PutOpts{}); err != nil {
 		t.Fatalf("s3Client.Put(seg0): %v", err)
 	}

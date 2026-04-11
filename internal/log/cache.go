@@ -143,3 +143,20 @@ func (c *DiskCache) Has(key string) bool {
 	c.mu.Unlock()
 	return ok
 }
+
+// Delete removes key from the cache if it is present.
+func (c *DiskCache) Delete(key string) {
+	c.mu.Lock()
+	elem, ok := c.index[key]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+	entry := elem.Value.(*cacheEntry)
+	delete(c.index, key)
+	c.order.Remove(elem)
+	c.current -= entry.size
+	c.mu.Unlock()
+
+	_ = os.Remove(filepath.Join(c.dir, entry.filename))
+}

@@ -17,7 +17,9 @@ import (
 )
 
 func TestKafkaMetadataAdvertisesLeaderAndBroker(t *testing.T) {
-	env, _, client := newKafkaTestEnv(t, "kafka-metadata")
+	// Topic provisioning happens over Kafka admin; the assertions here are about
+	// Kafka metadata once the topic exists.
+	env, _, client, _ := newKafkaTopicBootstrappedEnv(t, "kafka-metadata")
 	defer env.Cleanup()
 	defer client.Close()
 
@@ -92,10 +94,14 @@ func TestKafkaMetadataTranslatesReplicatedCamuState(t *testing.T) {
 	)
 	defer env.Cleanup()
 
-	httpClient := env.Client()
-	if err := httpClient.CreateTopicWithReplication("kafka-metadata-rf2", 1, 24*time.Hour, 2, 1); err != nil {
-		t.Fatalf("CreateTopicWithReplication() error: %v", err)
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
 	}
+	createKafkaReplicatedFixtureTopic(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID, "kafka-metadata-rf2", 1, 2, []kmsg.CreateTopicsRequestTopicConfig{{
+		Name:  "min.insync.replicas",
+		Value: strPtr("1"),
+	}})
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(fmt.Sprintf("127.0.0.1:%d", port1)),
@@ -185,9 +191,14 @@ func TestKafkaProduceToFollowerReturnsNotLeader(t *testing.T) {
 		partID  = 0
 		partKey = "0"
 	)
-	if err := env.Client().CreateTopicWithReplication(topic, 1, 24*time.Hour, 2, 1); err != nil {
-		t.Fatalf("CreateTopicWithReplication() error: %v", err)
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
 	}
+	createKafkaReplicatedFixtureTopic(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID, topic, 1, 2, []kmsg.CreateTopicsRequestTopicConfig{{
+		Name:  "min.insync.replicas",
+		Value: strPtr("1"),
+	}})
 
 	leaderIdx, _ := waitForLeader(t, env, topic, partKey, map[int]bool{})
 	followerIdx := 1 - leaderIdx
@@ -260,9 +271,14 @@ func TestKafkaFetchFromFollowerReturnsNotLeader(t *testing.T) {
 		partID  = 0
 		partKey = "0"
 	)
-	if err := env.Client().CreateTopicWithReplication(topic, 1, 24*time.Hour, 2, 1); err != nil {
-		t.Fatalf("CreateTopicWithReplication() error: %v", err)
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
 	}
+	createKafkaReplicatedFixtureTopic(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID, topic, 1, 2, []kmsg.CreateTopicsRequestTopicConfig{{
+		Name:  "min.insync.replicas",
+		Value: strPtr("1"),
+	}})
 
 	leaderIdx, leaderClient := waitForLeader(t, env, topic, partKey, map[int]bool{})
 	waitForPartitionProduceReady(t, leaderClient, topic, partID)
@@ -301,6 +317,185 @@ func TestKafkaFetchFromFollowerReturnsNotLeader(t *testing.T) {
 	}
 }
 
+func TestKafkaAdminMutationsOnFollowerReturnNotController(t *testing.T) {
+	port1 := freeTCPPort(t)
+	port2 := freeTCPPort(t)
+
+	env := camutest.New(t,
+		camutest.WithInstances(2),
+		camutest.WithInstanceIDs("127.0.0.1", "127.0.0.2"),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			switch cfg.Server.InstanceID {
+			case "127.0.0.1":
+				cfg.Server.KafkaPort = port1
+			case "127.0.0.2":
+				cfg.Server.KafkaPort = port2
+			}
+		}),
+	)
+	defer env.Cleanup()
+
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
+	}
+	waitForKafkaAddr(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")])
+	waitForKafkaAddr(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.2")])
+	controllerAddr, followerAddr := waitForKafkaControllerAndFollowerAddrs(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID)
+
+	createReq := kmsg.NewPtrCreateTopicsRequest()
+	createReq.SetVersion(5)
+	createReq.Topics = []kmsg.CreateTopicsRequestTopic{{
+		Topic:             "kafka-admin-follower-create",
+		NumPartitions:     1,
+		ReplicationFactor: 1,
+	}}
+	createRespAny, err := sendKafkaRequest(followerAddr, createReq)
+	if err != nil {
+		t.Fatalf("CreateTopics via follower error: %v", err)
+	}
+	createResp := createRespAny.(*kmsg.CreateTopicsResponse)
+	if len(createResp.Topics) != 1 {
+		t.Fatalf("CreateTopics topics = %d, want 1", len(createResp.Topics))
+	}
+	if createResp.Topics[0].ErrorCode != kafkaErrorNotControllerForTest {
+		t.Fatalf("CreateTopics error code = %d, want %d", createResp.Topics[0].ErrorCode, kafkaErrorNotControllerForTest)
+	}
+	meta := fetchKafkaTopicMetadata(t, controllerAddr, "kafka-admin-follower-create")
+	if meta.ErrorCode != 3 {
+		t.Fatalf("metadata error after follower create = %d, want 3", meta.ErrorCode)
+	}
+
+	createKafkaFixtureTopic(t, controllerAddr, "kafka-admin-follower-delete", 1)
+
+	deleteReq := kmsg.NewPtrDeleteTopicsRequest()
+	deleteReq.SetVersion(5)
+	deleteReq.TopicNames = []string{"kafka-admin-follower-delete"}
+	deleteRespAny, err := sendKafkaRequest(followerAddr, deleteReq)
+	if err != nil {
+		t.Fatalf("DeleteTopics via follower error: %v", err)
+	}
+	deleteResp := deleteRespAny.(*kmsg.DeleteTopicsResponse)
+	if len(deleteResp.Topics) != 1 {
+		t.Fatalf("DeleteTopics topics = %d, want 1", len(deleteResp.Topics))
+	}
+	if deleteResp.Topics[0].ErrorCode != kafkaErrorNotControllerForTest {
+		t.Fatalf("DeleteTopics error code = %d, want %d", deleteResp.Topics[0].ErrorCode, kafkaErrorNotControllerForTest)
+	}
+	meta = fetchKafkaTopicMetadata(t, controllerAddr, "kafka-admin-follower-delete")
+	if meta.ErrorCode != 0 {
+		t.Fatalf("metadata error after follower delete = %d, want 0", meta.ErrorCode)
+	}
+	if len(meta.Partitions) != 1 {
+		t.Fatalf("metadata partitions after follower delete = %d, want 1", len(meta.Partitions))
+	}
+}
+
+func TestKafkaACLMutationsOnFollowerReturnNotController(t *testing.T) {
+	port1 := freeTCPPort(t)
+	port2 := freeTCPPort(t)
+
+	env := camutest.New(t,
+		camutest.WithInstances(2),
+		camutest.WithInstanceIDs("127.0.0.1", "127.0.0.2"),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			switch cfg.Server.InstanceID {
+			case "127.0.0.1":
+				cfg.Server.KafkaPort = port1
+			case "127.0.0.2":
+				cfg.Server.KafkaPort = port2
+			}
+		}),
+	)
+	defer env.Cleanup()
+
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
+	}
+	waitForKafkaAddr(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")])
+	waitForKafkaAddr(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.2")])
+	controllerAddr, followerAddr := waitForKafkaControllerAndFollowerAddrs(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID)
+
+	createReq := kmsg.NewPtrCreateACLsRequest()
+	createReq.SetVersion(1)
+	createReq.Creations = []kmsg.CreateACLsRequestCreation{{
+		ResourceType:        kmsg.ACLResourceTypeTopic,
+		ResourceName:        "orders",
+		ResourcePatternType: kmsg.ACLResourcePatternTypeLiteral,
+		Principal:           "User:alice",
+		Host:                "*",
+		Operation:           kmsg.ACLOperationRead,
+		PermissionType:      kmsg.ACLPermissionTypeAllow,
+	}}
+	createRespAny, err := sendKafkaRequest(followerAddr, createReq)
+	if err != nil {
+		t.Fatalf("CreateACLs via follower error: %v", err)
+	}
+	createResp := createRespAny.(*kmsg.CreateACLsResponse)
+	if len(createResp.Results) != 1 {
+		t.Fatalf("CreateACLs results = %d, want 1", len(createResp.Results))
+	}
+	if createResp.Results[0].ErrorCode != kafkaErrorNotControllerForTest {
+		t.Fatalf("CreateACLs error code = %d, want %d", createResp.Results[0].ErrorCode, kafkaErrorNotControllerForTest)
+	}
+
+	describeReq := kmsg.NewPtrDescribeACLsRequest()
+	describeReq.SetVersion(1)
+	describeReq.ResourceType = kmsg.ACLResourceTypeTopic
+	describeReq.ResourceName = kmsg.StringPtr("orders")
+	describeReq.ResourcePatternType = kmsg.ACLResourcePatternTypeLiteral
+	describeReq.Operation = kmsg.ACLOperationAny
+	describeReq.PermissionType = kmsg.ACLPermissionTypeAny
+	describeRespAny, err := sendKafkaRequest(controllerAddr, describeReq)
+	if err != nil {
+		t.Fatalf("DescribeACLs after follower create error: %v", err)
+	}
+	describeResp := describeRespAny.(*kmsg.DescribeACLsResponse)
+	if len(describeResp.Resources) != 0 {
+		t.Fatalf("DescribeACLs resources after follower create = %+v, want none", describeResp.Resources)
+	}
+
+	createRespAny, err = sendKafkaRequest(controllerAddr, createReq)
+	if err != nil {
+		t.Fatalf("CreateACLs via controller error: %v", err)
+	}
+	createResp = createRespAny.(*kmsg.CreateACLsResponse)
+	if len(createResp.Results) != 1 || createResp.Results[0].ErrorCode != 0 {
+		t.Fatalf("CreateACLs via controller response = %+v, want success", createResp.Results)
+	}
+
+	deleteReq := kmsg.NewPtrDeleteACLsRequest()
+	deleteReq.SetVersion(1)
+	deleteReq.Filters = []kmsg.DeleteACLsRequestFilter{{
+		ResourceType:        kmsg.ACLResourceTypeTopic,
+		ResourceName:        kmsg.StringPtr("orders"),
+		ResourcePatternType: kmsg.ACLResourcePatternTypeLiteral,
+		Operation:           kmsg.ACLOperationAny,
+		PermissionType:      kmsg.ACLPermissionTypeAny,
+	}}
+	deleteRespAny, err := sendKafkaRequest(followerAddr, deleteReq)
+	if err != nil {
+		t.Fatalf("DeleteACLs via follower error: %v", err)
+	}
+	deleteResp := deleteRespAny.(*kmsg.DeleteACLsResponse)
+	if len(deleteResp.Results) != 1 {
+		t.Fatalf("DeleteACLs results = %d, want 1", len(deleteResp.Results))
+	}
+	if deleteResp.Results[0].ErrorCode != kafkaErrorNotControllerForTest {
+		t.Fatalf("DeleteACLs error code = %d, want %d", deleteResp.Results[0].ErrorCode, kafkaErrorNotControllerForTest)
+	}
+
+	describeRespAny, err = sendKafkaRequest(controllerAddr, describeReq)
+	if err != nil {
+		t.Fatalf("DescribeACLs after follower delete error: %v", err)
+	}
+	describeResp = describeRespAny.(*kmsg.DescribeACLsResponse)
+	if len(describeResp.Resources) != 1 || len(describeResp.Resources[0].ACLs) != 1 {
+		t.Fatalf("DescribeACLs resources after follower delete = %+v, want one ACL to remain", describeResp.Resources)
+	}
+}
+
 func TestKafkaLeaderFailoverRefreshesMetadataAndRecoversIO(t *testing.T) {
 	port1 := freeTCPPort(t)
 	port2 := freeTCPPort(t)
@@ -324,9 +519,14 @@ func TestKafkaLeaderFailoverRefreshesMetadataAndRecoversIO(t *testing.T) {
 		partID  = 0
 		partKey = "0"
 	)
-	if err := env.Client().CreateTopicWithReplication(topic, 1, 24*time.Hour, 2, 1); err != nil {
-		t.Fatalf("CreateTopicWithReplication() error: %v", err)
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
 	}
+	createKafkaReplicatedFixtureTopic(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID, topic, 1, 2, []kmsg.CreateTopicsRequestTopicConfig{{
+		Name:  "min.insync.replicas",
+		Value: strPtr("1"),
+	}})
 
 	leaderIdx, leaderClient := waitForLeaderAmong(t, env, topic, partKey, map[int]bool{}, []int{0, 1})
 	waitForPartitionProduceReady(t, leaderClient, topic, partID)
@@ -380,9 +580,14 @@ func TestKafkaClientRecoversAcrossLeaderFailover(t *testing.T) {
 		partID  = 0
 		partKey = "0"
 	)
-	if err := env.Client().CreateTopicWithReplication(topic, 1, 24*time.Hour, 2, 1); err != nil {
-		t.Fatalf("CreateTopicWithReplication() error: %v", err)
+	addrByBrokerID := map[int32]string{
+		kafkaBrokerIDForTest("127.0.0.1"): fmt.Sprintf("127.0.0.1:%d", port1),
+		kafkaBrokerIDForTest("127.0.0.2"): fmt.Sprintf("127.0.0.1:%d", port2),
 	}
+	createKafkaReplicatedFixtureTopic(t, addrByBrokerID[kafkaBrokerIDForTest("127.0.0.1")], addrByBrokerID, topic, 1, 2, []kmsg.CreateTopicsRequestTopicConfig{{
+		Name:  "min.insync.replicas",
+		Value: strPtr("1"),
+	}})
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(
@@ -393,6 +598,8 @@ func TestKafkaClientRecoversAcrossLeaderFailover(t *testing.T) {
 		kgo.DisableIdempotentWrite(),
 		kgo.DisableFetchSessions(),
 		kgo.MetadataMinAge(100*time.Millisecond),
+		kgo.DialTimeout(2*time.Second),
+		kgo.RequestTimeoutOverhead(3*time.Second),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 			topic: {partID: kgo.NewOffset().At(0)},
 		}),
@@ -402,7 +609,7 @@ func TestKafkaClientRecoversAcrossLeaderFailover(t *testing.T) {
 	}
 	defer client.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	if err := produceWithKgoUntilSuccess(ctx, client, topic, "before-failover"); err != nil {

@@ -63,7 +63,7 @@ func New(t testing.TB, opts ...Option) *Env {
 		cacheDir := t.TempDir()
 		cfg := &config.Config{
 			Server: config.ServerConfig{
-				Address:         ":0",
+				Address:         "127.0.0.1:0",
 				InternalAddress: "127.0.0.1:0",
 				InstanceID:      instanceID,
 			},
@@ -95,7 +95,7 @@ func New(t testing.TB, opts ...Option) *Env {
 			t.Fatalf("camutest: creating server instance %d: %v", i, err)
 		}
 
-		if err := srv.StartOnPort(0); err != nil {
+		if err := srv.Start(); err != nil {
 			t.Fatalf("camutest: starting server instance %d: %v", i, err)
 		}
 
@@ -189,7 +189,7 @@ func (e *Env) RestartInstance(idx int) {
 	// local recovery and replication routing behave like a restarted node.
 	cfg := &config.Config{
 		Server: config.ServerConfig{
-			Address:         ":0", // new random port
+			Address:         "127.0.0.1:0", // new random port
 			InternalAddress: "127.0.0.1:0",
 			InstanceID:      ic.cfg.Server.InstanceID,
 		},
@@ -210,7 +210,7 @@ func (e *Env) RestartInstance(idx int) {
 		e.t.Fatalf("camutest: RestartInstance %d: creating server: %v", idx, err)
 	}
 
-	if err := srv.StartOnPort(0); err != nil {
+	if err := srv.Start(); err != nil {
 		e.t.Fatalf("camutest: RestartInstance %d: starting server: %v", idx, err)
 	}
 

@@ -181,67 +181,7 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 // a (possibly new) leader. It cancels any existing fetch loop if the leader or
 // epoch changed, and starts a new one pointing at the pushed leader.
 func (s *Server) reconfigureFollower(ctx context.Context, req pushAssignmentRequest) {
-	ps := s.partitionManager.GetPartitionState(req.Topic, req.Partition)
-	if ps == nil {
-		slog.Warn("reconfigureFollower: partition not found", "topic", req.Topic, "partition", req.Partition)
-		return
-	}
-
-	ps.mu.Lock()
-	// If already following the same leader at the same or higher epoch, nothing to do.
-	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == req.Leader && ps.epoch >= req.Epoch {
-		ps.mu.Unlock()
-		return
-	}
-	existingCancel := ps.fetchCancel
-	existingDone := ps.fetchDone
-	ps.fetchCancel = nil
-	ps.fetchDone = nil
-	localOffset := ps.nextOffset
-	localEpoch := ps.epoch
-	ps.mu.Unlock()
-
-	// Cancel existing fetch loop outside the lock.
-	if existingCancel != nil {
-		existingCancel()
-		if existingDone != nil {
-			<-existingDone
-		}
-	}
-
-	// Resolve leader address.
-	leaderInfo, err := s.registry.GetInstanceInfo(ctx, req.Leader)
-	if err != nil {
-		slog.Warn("reconfigureFollower: resolve leader", "leader", req.Leader, "error", err)
-		return
-	}
-	addr := leaderInfo.InternalAddress
-	if addr == "" {
-		addr = leaderInfo.Address
-	}
-	leaderAddr := routablePeerAddress(req.Leader, addr)
-
-	// Start new fetch loop.
-	ps.mu.Lock()
-	ps.isLeader = false
-	ps.leaderID = req.Leader
-	ps.replicaState = nil
-	ps.epoch = req.Epoch
-	fetchDone := make(chan struct{})
-	fetchCtx, cancel := context.WithCancel(context.Background())
-	ps.fetchCancel = cancel
-	ps.fetchDone = fetchDone
-	ps.mu.Unlock()
-
-	slog.Info("reconfigureFollower: starting fetch",
-		"topic", req.Topic, "partition", req.Partition,
-		"leader", req.Leader, "leader_addr", leaderAddr,
-		"local_offset", localOffset, "epoch", localEpoch)
-
-	go func() {
-		defer close(fetchDone)
-		s.followerFetcher.Run(fetchCtx, req.Topic, req.Partition, leaderAddr, localOffset, localEpoch, s.instanceID, s.partitionManager)
-	}()
+	s.partitionFollower().reconfigureFollower(ctx, req)
 }
 
 // containsString reports whether ss contains s.

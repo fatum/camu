@@ -109,6 +109,10 @@ func (gc *kafkaGroupCoordinator) joinGroup(ctx context.Context, req *kmsg.JoinGr
 			membershipChanged = true
 		}
 		existing, exists := group.Members[memberID]
+		if req.MemberID != "" && !exists {
+			resp.ErrorCode = kafkaErrorUnknownMemberID
+			return resp, nil
+		}
 		if !exists ||
 			existing.SessionTimeout != time.Duration(req.SessionTimeoutMillis)*time.Millisecond ||
 			!slices.Equal(existing.ProtocolMetadata, selected.Metadata) {
@@ -163,6 +167,14 @@ func (gc *kafkaGroupCoordinator) syncGroup(ctx context.Context, req *kmsg.SyncGr
 		}
 
 		if len(req.GroupAssignment) > 0 {
+			if req.MemberID != group.LeaderID {
+				resp.ErrorCode = kafkaErrorRebalanceInProgress
+				return resp, nil
+			}
+			if !kafkaAssignmentsMatchMembers(group.Members, req.GroupAssignment) {
+				resp.ErrorCode = kafkaErrorRebalanceInProgress
+				return resp, nil
+			}
 			group.Assignments = make(map[string][]byte, len(req.GroupAssignment))
 			for _, assignment := range req.GroupAssignment {
 				group.Assignments[assignment.MemberID] = append([]byte(nil), assignment.MemberAssignment...)
@@ -244,13 +256,22 @@ func (gc *kafkaGroupCoordinator) leaveGroup(ctx context.Context, req *kmsg.Leave
 			memberIDs = append(memberIDs, req.MemberID)
 		}
 
+		removedAny := false
 		for _, memberID := range memberIDs {
 			if _, ok := group.Members[memberID]; !ok {
-				resp.ErrorCode = kafkaErrorUnknownMemberID
+				if req.GetVersion() >= 3 {
+					resp.Members = append(resp.Members, kmsg.LeaveGroupResponseMember{
+						MemberID:  memberID,
+						ErrorCode: kafkaErrorUnknownMemberID,
+					})
+				} else {
+					resp.ErrorCode = kafkaErrorUnknownMemberID
+				}
 				continue
 			}
 			delete(group.Members, memberID)
 			delete(group.Assignments, memberID)
+			removedAny = true
 			if req.GetVersion() >= 3 {
 				resp.Members = append(resp.Members, kmsg.LeaveGroupResponseMember{MemberID: memberID})
 			}
@@ -266,6 +287,8 @@ func (gc *kafkaGroupCoordinator) leaveGroup(ctx context.Context, req *kmsg.Leave
 		memberIDs = sortedGroupMemberIDs(group.Members)
 		if group.LeaderID == "" || !slices.Contains(memberIDs, group.LeaderID) {
 			group.LeaderID = memberIDs[0]
+		}
+		if removedAny {
 			group.Generation++
 			group.Assignments = make(map[string][]byte)
 		}
@@ -407,6 +430,16 @@ func (gc *kafkaGroupCoordinator) loadGroupLocked(ctx context.Context, groupID st
 	group, err := gc.readGroup(ctx, groupID)
 	if err != nil {
 		return nil, err
+	}
+	// On cold load from S3 (new coordinator taking over), reset member heartbeat
+	// timestamps to now. The persisted LastHeartbeat is an absolute time from the
+	// old coordinator — if the switchover took longer than SessionTimeout, members
+	// would be immediately expired. Resetting gives clients a fresh session window
+	// to reconnect after coordinator failover.
+	now := gc.now()
+	for id, member := range group.Members {
+		member.LastHeartbeat = now
+		group.Members[id] = member
 	}
 	entry.state = cloneKafkaGroupState(group)
 	return group, nil
@@ -569,6 +602,23 @@ func selectJoinProtocol(current string, protocols []kmsg.JoinGroupRequestProtoco
 		return kmsg.JoinGroupRequestProtocol{}, false
 	}
 	return protocols[0], len(protocols) > 0
+}
+
+func kafkaAssignmentsMatchMembers(members map[string]kafkaGroupMember, assignments []kmsg.SyncGroupRequestGroupAssignment) bool {
+	if len(assignments) != len(members) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(assignments))
+	for _, assignment := range assignments {
+		if _, ok := members[assignment.MemberID]; !ok {
+			return false
+		}
+		if _, ok := seen[assignment.MemberID]; ok {
+			return false
+		}
+		seen[assignment.MemberID] = struct{}{}
+	}
+	return true
 }
 
 func sortedGroupMemberIDs(members map[string]kafkaGroupMember) []string {

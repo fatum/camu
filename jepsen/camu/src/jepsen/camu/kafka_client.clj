@@ -6,29 +6,14 @@
   (:import (java.time Duration)
            (java.util Properties UUID)
            (java.util.concurrent ExecutionException)
+           (org.apache.kafka.clients.admin AdminClient AdminClientConfig NewTopic)
            (org.apache.kafka.clients.consumer ConsumerConfig KafkaConsumer)
            (org.apache.kafka.clients.producer KafkaProducer ProducerConfig ProducerRecord RecordMetadata)
            (org.apache.kafka.common TopicPartition)
+           (org.apache.kafka.common.errors TopicExistsException)
            (org.apache.kafka.common.serialization StringDeserializer StringSerializer)))
 
-(def default-topic "jepsen-test")
 (def kafka-timeout-ms 5000)
-(def drain-timeout-ms 15000)
-
-(defn topic-name
-  [this test]
-  (or (:topic this) (:topic test) default-topic))
-
-(defn route-partition
-  "Matches camu's producer.Router: FNV-32a over UTF-8 bytes."
-  [key num-partitions]
-  (let [data (.getBytes ^String key "UTF-8")
-        hash (reduce (fn [h b]
-                       (let [h (bit-xor h (bit-and (int b) 0xff))]
-                         (bit-and (* h 16777619) 0xffffffff)))
-                     2166136261
-                     data)]
-    (int (mod hash num-partitions))))
 
 (defn kafka-port
   [test]
@@ -70,6 +55,62 @@
    ConsumerConfig/MAX_POLL_RECORDS_CONFIG "1000"
    ConsumerConfig/SESSION_TIMEOUT_MS_CONFIG "6000"})
 
+(defn admin-config
+  [test]
+  {AdminClientConfig/BOOTSTRAP_SERVERS_CONFIG (bootstrap-servers test)
+   AdminClientConfig/REQUEST_TIMEOUT_MS_CONFIG "10000"
+   AdminClientConfig/DEFAULT_API_TIMEOUT_MS_CONFIG "30000"})
+
+(defn open-admin
+  [test]
+  (AdminClient/create (->properties (admin-config test))))
+
+(defn- create-topic-request
+  "Builds a NewTopic from opts."
+  [topic opts]
+  (let [partitions (get opts :num-partitions 4)
+        rf         (short (get opts :replication-factor 1))
+        new-topic  (NewTopic. topic (int partitions) rf)
+        configs    (cond-> {}
+                     (> rf 1) (assoc "min.insync.replicas"
+                                     (str (get opts :min-insync-replicas 1))))]
+    (when (seq configs)
+      (.configs new-topic configs))
+    new-topic))
+
+(defn ensure-topic-created!
+  "Retries topic creation via Kafka AdminClient until it succeeds."
+  [test topic opts timeout-ms]
+  (let [deadline  (+ (System/currentTimeMillis) timeout-ms)
+        new-topic (create-topic-request topic opts)]
+    (with-open [admin (open-admin test)]
+      (loop []
+        (let [created? (try
+                         (.. admin (createTopics [new-topic]) (all) (get))
+                         (info "Topic" topic "created via Kafka AdminClient")
+                         true
+                         (catch ExecutionException e
+                           (if (instance? TopicExistsException (.getCause e))
+                             (do (info "Topic" topic "already exists")
+                                 true)
+                             (do (warn "Kafka AdminClient create-topic failed:"
+                                       (.getMessage (.getCause e)))
+                                 false)))
+                         (catch Exception e
+                           (warn "Kafka AdminClient create-topic failed:" (.getMessage e))
+                           false))]
+          (cond
+            created?
+            (info "Topic" topic "ready (Kafka protocol)")
+
+            (> (System/currentTimeMillis) deadline)
+            (throw (ex-info "timed out creating topic via Kafka AdminClient"
+                            {:type :topic-not-ready :topic topic}))
+
+            :else
+            (do (Thread/sleep 1000)
+                (recur))))))))
+
 (defn open-producer
   [test]
   (KafkaProducer. (->properties (producer-config test))))
@@ -85,35 +126,37 @@
 (defn wait-for-kafka-topic-metadata-ready!
   [test topic timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-    (loop []
-      (let [ready?
-            (try
-              (with-open [producer (open-producer test)]
+    (with-open [producer (open-producer test)]
+      (loop []
+        (let [ready?
+              (try
                 (let [partitions (.partitionsFor producer topic)]
                   (boolean
                    (when (and (= (count partitions) (get test :num-partitions 4))
                               (every? #(some? (.leader %)) partitions))
                      (info "Kafka topic" topic "metadata ready")
-                     true))))
-              (catch ExecutionException e
-                (warn e "Kafka metadata readiness check failed for" topic)
-                false)
-              (catch Exception e
-                (warn e "Kafka metadata readiness check failed for" topic)
-                false))]
-        (cond
-          ready?
-          true
+                     true)))
+                (catch ExecutionException e
+                  (warn "Kafka metadata readiness check failed for" topic
+                        (.getMessage (execution-root-cause e)))
+                  false)
+                (catch Exception e
+                  (warn "Kafka metadata readiness check failed for" topic
+                        (.getMessage e))
+                  false))]
+          (cond
+            ready?
+            true
 
-          (> (System/currentTimeMillis) deadline)
-          (throw (ex-info "kafka topic metadata readiness timeout"
-                          {:type :topic-not-ready
-                           :topic topic}))
+            (> (System/currentTimeMillis) deadline)
+            (throw (ex-info "kafka topic metadata readiness timeout"
+                            {:type :topic-not-ready
+                             :topic topic}))
 
-          :else
-          (do
-            (Thread/sleep 1000)
-            (recur)))))))
+            :else
+            (do
+              (Thread/sleep 1000)
+              (recur))))))))
 
 (defn send-produce!
   [^KafkaProducer producer topic partition key value]
@@ -142,7 +185,7 @@
 (defn drain-partition!
   [^KafkaConsumer consumer topic partition offset]
   (let [tp (TopicPartition. topic (int partition))
-        deadline (+ (System/currentTimeMillis) drain-timeout-ms)]
+        deadline (+ (System/currentTimeMillis) http-client/drain-timeout-ms)]
     (.assign consumer [tp])
     (.seek consumer tp (long offset))
     (loop [acc []
@@ -160,6 +203,14 @@
           :else
           (recur acc (inc empty-polls)))))))
 
+(defn- do-produce
+  "Shared produce logic for :produce and :idempotent-produce ops."
+  [producer topic num-partitions op]
+  (let [{:keys [key value partition]} (:value op)
+        partition (or partition (http-client/route-partition key num-partitions))]
+    (assoc op :type :ok :value (merge {:key key :value value :partition partition}
+                                      (send-produce! producer topic partition key value)))))
+
 (defrecord KafkaClient [node producer consumer topic]
   client/Client
   (open! [this test node']
@@ -172,10 +223,10 @@
              :consumer (open-consumer test group-id))))
 
   (setup! [this test]
-    (let [topic (topic-name this test)]
+    (let [topic (http-client/topic-name this test)]
       (when (= node (first (:nodes test)))
-        (http-client/ensure-topic-created!
-         (:nodes test)
+        (ensure-topic-created!
+         test
          topic
          (select-keys test [:replication-factor :min-insync-replicas :num-partitions])
          60000))
@@ -183,20 +234,11 @@
     this)
 
   (invoke! [this test op]
-    (let [topic (topic-name this test)]
+    (let [topic (http-client/topic-name this test)]
       (try
         (case (:f op)
-          :produce
-          (let [{:keys [key value partition]} (:value op)
-                partition (or partition (route-partition key (:num-partitions this)))]
-            (assoc op :type :ok :value (merge {:key key :value value :partition partition}
-                                              (send-produce! producer topic partition key value))))
-
-          :idempotent-produce
-          (let [{:keys [key value partition]} (:value op)
-                partition (or partition (route-partition key (:num-partitions this)))]
-            (assoc op :type :ok :value (merge {:key key :value value :partition partition}
-                                              (send-produce! producer topic partition key value))))
+          (:produce :idempotent-produce)
+          (do-produce producer topic (:num-partitions this) op)
 
           :consume
           (let [{:keys [partition offset]} (:value op)
@@ -225,11 +267,11 @@
 
   (close! [this test]
     (when producer
-      (.close ^KafkaProducer producer (Duration/ofMillis 0)))
+      (.close ^KafkaProducer producer (Duration/ofMillis kafka-timeout-ms)))
     (when consumer
       (.wakeup ^KafkaConsumer consumer)
       (try
-        (.close ^KafkaConsumer consumer (Duration/ofMillis 0))
+        (.close ^KafkaConsumer consumer (Duration/ofMillis kafka-timeout-ms))
         (catch Exception _)))))
 
 (defn client
