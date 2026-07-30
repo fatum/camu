@@ -415,6 +415,50 @@
          :checked    (count grouped)
          :violations (when (seq violations) (take 20 violations))}))))
 
+(defn hw-global-monotonicity-checker
+  "Partition-global HW check: groups by [process, partition] only (no node
+   scoping) and verifies the running max HW is non-decreasing. Catches HW
+   regressions that manifest across node switches — invisible to the per-node
+   hw-monotonicity-checker. May produce occasional false positives from
+   lagging-follower reads during routing disagreement; use alongside the
+   per-node checker for layered coverage."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [consumes (->> history
+                          (filter #(and (= (:f %) :consume)
+                                        (= (:type %) :ok)
+                                        (get-in % [:value :high-watermark]))))
+            grouped  (group-by (fn [op]
+                                 [(:process op)
+                                  (get-in op [:value :partition])])
+                               consumes)
+            violations
+            (reduce-kv
+             (fn [acc [proc part] ops]
+               (let [hws (map #(get-in % [:value :high-watermark]) ops)
+                     ;; Track running max; flag when HW drops below it
+                     [_ viols]
+                     (reduce (fn [[max-seen vs] hw]
+                               (let [new-max (max max-seen hw)]
+                                 (cond
+                                   (< hw max-seen)
+                                   [new-max (conj vs {:hw hw :prev-max max-seen})]
+                                   :else
+                                   [new-max vs])))
+                             [0 []]
+                             hws)]
+                 (if (seq viols)
+                   (conj acc {:process   proc
+                              :partition part
+                              :violations (take 20 viols)})
+                   acc)))
+             []
+             grouped)]
+        {:valid?     (empty? violations)
+         :checked    (count grouped)
+         :violations (when (seq violations) (take 20 violations))}))))
+
 (defn truncation-safety-checker
   "Like committed-durability but tracks partition and offset for diagnostics.
    Reports acked writes not found in drain, grouped by partition."

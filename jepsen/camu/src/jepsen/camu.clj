@@ -290,6 +290,7 @@
          (assoc :no-ghost-reads (camu-checker/no-ghost-reads-checker)
                 :single-leader (camu-checker/single-leader-checker)
                 :hw-monotonicity (camu-checker/hw-monotonicity-checker)
+                :hw-global-monotonicity (camu-checker/hw-global-monotonicity-checker)
                 :read-your-writes (camu-checker/read-your-writes-checker)
                 :replica-convergence (camu-checker/replica-convergence-checker)))
 

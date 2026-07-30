@@ -141,3 +141,57 @@
     (is (false? (:valid? checked)))
     (is (= 1 (count (:conflicts checked))))
     (is (= 1 (-> checked :conflicts first :partition)))))
+
+;;; hw-global-monotonicity-checker tests
+
+(defn- hwg-check
+  [history]
+  (checker/check (camu-checker/hw-global-monotonicity-checker) {} history {}))
+
+(defn- ok-consume-hw
+  [proc partition hw & [node]]
+  {:type :ok :f :consume :process proc :time 0
+   :value {:partition partition :high-watermark hw :node (or node "n1")}})
+
+(deftest hwg-accepts-increasing-hw
+  (let [checked (hwg-check
+                 [(ok-consume-hw 0 0 10)
+                  (ok-consume-hw 0 0 20)
+                  (ok-consume-hw 0 0 30)])]
+    (is (:valid? checked))
+    (is (nil? (:violations checked)))))
+
+(deftest hwg-accepts-equal-hw
+  (let [checked (hwg-check
+                 [(ok-consume-hw 0 0 50)
+                  (ok-consume-hw 0 0 50)
+                  (ok-consume-hw 0 0 50)])]
+    (is (:valid? checked))))
+
+(deftest hwg-detects-cross-node-hw-regression
+  (let [checked (hwg-check
+                 [(ok-consume-hw 0 0 100 "n1")
+                  (ok-consume-hw 0 0 50 "n2")])]
+    (is (false? (:valid? checked)))
+    (is (= 1 (count (:violations checked))))))
+
+(deftest hwg-per-node-checker-would-miss-this
+  "Same scenario but the per-node checker would not catch this because
+   each node's HW is independently monotonic. The global checker catches it."
+  (let [checked (hwg-check
+                 [(ok-consume-hw 0 0 10 "n1")
+                  (ok-consume-hw 0 0 20 "n1")
+                  (ok-consume-hw 0 0 5 "n2")
+                  (ok-consume-hw 0 0 15 "n2")])]
+    (is (false? (:valid? checked)))
+    (is (= 1 (count (:violations checked))))))
+
+(deftest hwg-multiple-partitions-independent
+  (let [checked (hwg-check
+                 [(ok-consume-hw 0 0 10)
+                  (ok-consume-hw 0 1 100)
+                  (ok-consume-hw 0 0 20)
+                  (ok-consume-hw 0 1 50)])]
+    (is (false? (:valid? checked)))
+    (is (= 1 (count (:violations checked))))
+    (is (= 1 (-> checked :violations first :partition)))))
