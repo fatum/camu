@@ -288,11 +288,12 @@
          :lost-data    (when (seq lost) (take 20 (sort lost)))}))))
 
 (defn read-your-writes-checker
-  "Verifies write visibility via the consume path: every key acknowledged
-   in a :produce :ok must appear in at least one :consume :ok from the
-   same partition. This is stricter than committed-durability (which only
-   checks the final drain) because it confirms the write was readable
-   through the consume API during or shortly after the fault window.
+  "Verifies write visibility via the consume path: for each key acknowledged
+   in a :produce :ok, if a :consume :ok from the same partition occurred
+   AFTER the produce was acked, that key must appear in at least one
+   consume's messages. Keys that were never re-read from their partition
+   (no consuming read after the produce) are not violations — the write
+   was simply never tested.
 
    Per-process read-your-writes is not testable with the shared consume
    cursor used by the mixed workload (one process may advance the cursor
@@ -304,18 +305,30 @@
       (let [produces (->> history
                           (filter #(and (= (:f %) :produce)
                                         (= (:type %) :ok))))
-            consumed (->> history
+            consumes (->> history
                           (filter #(and (= (:f %) :consume)
-                                        (= (:type %) :ok)))
+                                        (= (:type %) :ok))))
+            consumed (->> consumes
                           (mapcat (fn [op]
                                     (let [partition (get-in op [:value :partition])]
                                       (map (fn [msg] [partition (:key msg)])
                                            (get-in op [:value :messages])))))
                           (filter #(and (some? (first %)) (some? (second %))))
                           set)
-            missing  (remove #(consumed [(get-in % [:value :partition])
-                                         (get-in % [:value :key])])
-                             produces)]
+            latest-consume-time (->> consumes
+                                     (filter #(some? (:time %)))
+                                     (map :time)
+                                     (apply max 0))
+            missing  (remove
+                      (fn [prod]
+                        (let [key       (get-in prod [:value :key])
+                              partition (get-in prod [:value :partition])
+                              ptime     (:time prod)]
+                          (or (consumed [partition key])
+                              (not-any? #(and (= (get-in % [:value :partition]) partition)
+                                              (> (:time %) ptime))
+                                        consumes))))
+                      produces)]
         {:valid?     (empty? missing)
          :acked      (count produces)
          :consumed   (count consumed)

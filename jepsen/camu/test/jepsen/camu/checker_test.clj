@@ -16,7 +16,7 @@
 
 (defn- ok-consume-op
   [proc partition messages]
-  {:type :ok :f :consume :process proc :time 0
+  {:type :ok :f :consume :process proc :time 1
    :value {:partition partition :messages messages}})
 
 (defn- msg
@@ -42,7 +42,8 @@
 (deftest ryw-rejects-write-consumed-from-wrong-partition
   (let [checked (ryw-check
                  [(ok-produce-op 0 "k1" 0)
-                  (ok-consume-op 0 1 [(msg "k1" 0)])])]
+                  (ok-consume-op 0 1 [(msg "k1" 0)])
+                  (ok-consume-op 0 0 [(msg "k2" 1)])])]
     (is (false? (:valid? checked)))
     (is (= 1 (:missing checked)))
     (is (= 0 (-> checked :violations first :partition)))))
@@ -65,8 +66,9 @@
 (deftest ryw-ignores-failed-consumes
   (let [checked (ryw-check
                  [(ok-produce-op 0 "k1" 0)
-                  {:type :fail :f :consume :process 0 :time 0
-                   :value {:partition 0 :messages [(msg "k1" 0)]}}])]
+                  {:type :fail :f :consume :process 0 :time 1
+                   :value {:partition 0 :messages [(msg "k1" 0)]}}
+                  (ok-consume-op 0 0 [(msg "k2" 1)])])]
     (is (false? (:valid? checked)))
     (is (= 1 (:missing checked)))))
 
@@ -89,6 +91,16 @@
     (is (false? (:valid? checked)))
     (is (= 1 (:missing checked)))
     (is (= "k2" (-> checked :violations first :key)))))
+
+(deftest ryw-not-a-violation-when-never-read
+  "A produce acked on partition P where no consume from P ever occurred
+   afterward is not a RYW violation — the write was simply never tested."
+  (let [checked (ryw-check
+                 [(ok-produce-op 0 "k1" 0 0)
+                  (ok-consume-op 0 1 [(msg "k2" 0)])])]
+    (is (:valid? checked))
+    (is (zero? (:missing checked)))
+    (is (= 1 (:acked checked)))))
 
 ;;; no-split-brain-checker tests
 ;;; These verify the checker works with drain data containing no :leader-epoch
