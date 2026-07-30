@@ -89,3 +89,55 @@
     (is (false? (:valid? checked)))
     (is (= 1 (:missing checked)))
     (is (= "k2" (-> checked :violations first :key)))))
+
+;;; no-split-brain-checker tests
+;;; These verify the checker works with drain data containing no :leader-epoch
+;;; or :node — i.e. the Kafka protocol path where RecordMetadata doesn't
+;;; expose leader epoch.
+
+(defn- nsb-check
+  [history]
+  (checker/check (camu-checker/no-split-brain-checker) {} history {}))
+
+(defn- ok-drain-op
+  [partition messages]
+  {:type :ok :f :drain :value {:partition partition :messages messages}})
+
+(defn- drain-msg
+  "A drain message as the Kafka client returns it: no :node, no :leader-epoch."
+  [key value offset partition]
+  {:key key :value value :offset offset :partition partition})
+
+(deftest nsb-accepts-consistent-drain
+  (let [checked (nsb-check
+                 [(ok-drain-op 0 [(drain-msg "k1" "v1" 0 0)
+                                  (drain-msg "k2" "v2" 1 0)])])]
+    (is (:valid? checked))
+    (is (nil? (:conflicts checked)))))
+
+(deftest nsb-rejects-conflicting-values-at-same-offset
+  (let [checked (nsb-check
+                 [(ok-drain-op 0 [(drain-msg "k1" "v1" 0 0)])
+                  (ok-drain-op 0 [(drain-msg "k2" "v2" 0 0)])])]
+    (is (false? (:valid? checked)))
+    (is (= 1 (count (:conflicts checked))))
+    (is (= 0 (-> checked :conflicts first :partition)))
+    (is (= 0 (-> checked :conflicts first :offset)))
+    (is (= ["v1" "v2"] (-> checked :conflicts first :values)))))
+
+(deftest nsb-accepts-same-value-at-same-offset
+  (let [checked (nsb-check
+                 [(ok-drain-op 0 [(drain-msg "k1" "v1" 0 0)])
+                  (ok-drain-op 0 [(drain-msg "k1" "v1" 0 0)])])]
+    (is (:valid? checked))))
+
+(deftest nsb-works-across-multiple-partitions
+  (let [checked (nsb-check
+                 [(ok-drain-op 0 [(drain-msg "k1" "v1" 0 0)
+                                  (drain-msg "k2" "v2" 1 0)])
+                  (ok-drain-op 1 [(drain-msg "k3" "v3" 0 1)
+                                  (drain-msg "k4" "v4" 1 1)])
+                  (ok-drain-op 1 [(drain-msg "k5" "v5" 0 1)])])]
+    (is (false? (:valid? checked)))
+    (is (= 1 (count (:conflicts checked))))
+    (is (= 1 (-> checked :conflicts first :partition)))))

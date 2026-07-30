@@ -250,7 +250,16 @@
 
 (defn checker-suite
   "Returns the appropriate checker composition based on whether the test
-   is running in replicated mode."
+   is running in replicated mode.
+
+   Epoch-fencing coverage gap: single-leader-checker groups produces by
+   (partition, leader-epoch) and verifies one node per epoch. The HTTP
+   client captures :leader-epoch and :node from response headers; the
+   Kafka client's RecordMetadata does not expose leader epoch. Therefore
+   single-leader-checker is HTTP-only. For the Kafka replicated path we
+   fall back to no-split-brain-checker, which detects conflicting values
+   at the same (partition, offset) from drain data — a weaker but still
+   meaningful split-brain signal."
   [opts]
   (let [meta-checkers (cond-> {:stats         (checker/stats)
                                :availability  (camu-checker/availability-checker)
@@ -287,7 +296,8 @@
                       {:committed-durability (camu-checker/committed-durability-checker)
                        :truncation-safety    (camu-checker/truncation-safety-checker)
                        :offset-monotonicity  (camu-checker/offset-monotonicity-checker)
-                       :total-order          (camu-checker/total-order-checker)})
+                       :total-order          (camu-checker/total-order-checker)
+                       :no-split-brain       (camu-checker/no-split-brain-checker)})
          (http-api? opts)
          (assoc :no-ghost-reads (camu-checker/no-ghost-reads-checker)
                 :single-leader (camu-checker/single-leader-checker)
