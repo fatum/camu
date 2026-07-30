@@ -215,28 +215,16 @@
   [opts]
   (= :kafka (api-mode opts)))
 
-(def ^:private kafka-supported-workloads
-  "Workloads that can be meaningfully tested over the Kafka protocol.
-   :idempotent is excluded because the Kafka KafkaProducer has its own
-   client-side idempotence (ENABLE_IDEMPOTENCE_CONFIG=true); running it
-   over Kafka tests the Kafka client, not Camu's HTTP producer-ID/sequence
-   dedup path. Use --api http --workload idempotent to test Camu's
-   idempotent produce."
-  #{:mixed :large-requests :concurrent-writes})
-
 (defn supported-workload?
   [opts]
   (or (http-api? opts)
-      (contains? kafka-supported-workloads
+      (contains? #{:mixed :large-requests :concurrent-writes :idempotent}
                  (or (:workload opts) :mixed))))
 
 (defn validate-opts!
   [opts]
   (when-not (supported-workload? opts)
-    (throw (ex-info (if (and (kafka-api? opts)
-                             (= :idempotent (:workload opts)))
-                      "Kafka Jepsen path does not support the idempotent workload — it tests Kafka client-side idempotence, not Camu's producer-ID dedup. Use --api http --workload idempotent instead."
-                      "Kafka Jepsen path currently supports only mixed, large-requests, and concurrent-writes workloads")
+    (throw (ex-info "Kafka Jepsen path currently supports only mixed, large-requests, concurrent-writes, and idempotent workloads"
                     {:type :unsupported-workload
                      :api (api-mode opts)
                      :workload (:workload opts)})))
