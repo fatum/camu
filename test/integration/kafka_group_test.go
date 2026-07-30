@@ -827,6 +827,8 @@ func TestKafkaDeleteGroupsOnNonCoordinatorReturnsNotCoordinator(t *testing.T) {
 
 	addr1 := fmt.Sprintf("127.0.0.1:%d", port1)
 	addr2 := fmt.Sprintf("127.0.0.1:%d", port2)
+	waitForKafkaAddr(t, addr1)
+	waitForKafkaAddr(t, addr2)
 	groupID := "group-delete-non-coordinator"
 
 	findReq := kmsg.NewPtrFindCoordinatorRequest()
@@ -865,6 +867,7 @@ func TestKafkaDeleteGroupsMissingGroupReturnsNotFound(t *testing.T) {
 	defer env.Cleanup()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", kafkaPort)
+	waitForKafkaAddr(t, addr)
 	deleteReq := kmsg.NewPtrDeleteGroupsRequest()
 	deleteReq.Groups = []string{"group-missing"}
 	deleteRespAny, err := sendKafkaRequest(addr, deleteReq)
