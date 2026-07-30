@@ -188,15 +188,15 @@
         deadline (+ (System/currentTimeMillis) http-client/drain-timeout-ms)]
     (.assign consumer [tp])
     (.seek consumer tp (long offset))
-    (loop [acc []
-           empty-polls 0]
+(loop [acc []
+            empty-polls 0]
       (let [records (.records (.poll consumer (Duration/ofMillis 500)) tp)
             batch (records->messages records)]
         (cond
           (seq batch)
           (recur (into acc batch) 0)
 
-          (or (>= empty-polls 1)
+          (or (>= empty-polls 2)
               (> (System/currentTimeMillis) deadline))
           acc
 
