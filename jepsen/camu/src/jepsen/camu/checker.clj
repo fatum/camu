@@ -312,44 +312,46 @@
          :lost-data    (when (seq lost) (take 20 (sort lost)))}))))
 
 (defn read-your-writes-checker
-  "Verifies that each client can read its own writes immediately after producing.
-   For each consume operation, checks that any keys acked in prior produce operations
-   from the same process appear in the consumed messages."
+  "Verifies write visibility via the consume path: every key acknowledged
+   in a :produce :ok must appear in at least one :consume :ok from the
+   same partition. This is stricter than committed-durability (which only
+   checks the final drain) because it confirms the write was readable
+   through the consume API during or shortly after the fault window.
+
+   Per-process read-your-writes is not testable with the shared consume
+   cursor used by the mixed workload (one process may advance the cursor
+   past another process's write), so this checker tracks consumed keys
+   globally per partition rather than per process."
   []
   (reify checker/Checker
     (check [_ test history opts]
-      (let [events  (sort-by :time history)
-            by-proc (group-by :process events)
-            violations
-            (reduce-kv
-             (fn [acc proc ops]
-               (let [sorted       (sort-by :time ops)
-                     acked-keys   (atom #{})
-                     viols
-                     (reduce
-                      (fn [viols op]
-                        (cond
-                          (and (= :produce (:f op)) (= :ok (:type op)))
-                          (do (swap! acked-keys into (map :key (get-in op [:value :messages])))
-                              viols)
-
-                          (and (= :consume (:f op)) (= :ok (:type op)))
-                          (let [consumed-keys (set (map :key (get-in op [:value :messages])))
-                                missing       (set/difference @acked-keys consumed-keys)]
-                            (if (seq missing)
-                              (conj viols {:process proc
-                                           :time    (:time op)
-                                           :missing (vec (sort (take 10 missing)))})
-                              viols))
-
-                          :else viols))
-                      []
-                      sorted)]
-                 (into acc viols)))
-             []
-             by-proc)]
-        {:valid?     (empty? violations)
-         :violations (when (seq violations) (take 20 violations))}))))
+      (let [produces (->> history
+                          (filter #(and (= (:f %) :produce)
+                                        (= (:type %) :ok))))
+            consumed (->> history
+                          (filter #(and (= (:f %) :consume)
+                                        (= (:type %) :ok)))
+                          (mapcat (fn [op]
+                                    (let [partition (get-in op [:value :partition])]
+                                      (map (fn [msg] [partition (:key msg)])
+                                           (get-in op [:value :messages])))))
+                          (filter #(and (some? (first %)) (some? (second %))))
+                          set)
+            missing  (remove #(consumed [(get-in % [:value :partition])
+                                         (get-in % [:value :key])])
+                             produces)]
+        {:valid?     (empty? missing)
+         :acked      (count produces)
+         :consumed   (count consumed)
+         :missing    (count missing)
+         :violations (when (seq missing)
+                       (->> missing
+                            (map (fn [op]
+                                   {:process   (:process op)
+                                    :time      (:time op)
+                                    :key       (get-in op [:value :key])
+                                    :partition (get-in op [:value :partition])}))
+                            (take 20)))}))))
 
 (defn no-ghost-reads-checker
   "Verifies the consumer never sees data above the reported high watermark.
