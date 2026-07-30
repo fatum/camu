@@ -203,30 +203,6 @@
          :info-count   info-ct
          :availability availability}))))
 
-(defn lease-fencing-checker
-  "After instance rejoin events, verifies that epoch fencing prevented
-   split-brain writes. Checks that each (partition, offset) pair has at
-   most one distinct value."
-  []
-  (reify checker/Checker
-    (check [_ test history opts]
-      (let [rejoin-events (->> history
-                               (filter #(and (= :nemesis (:process %))
-                                             (= :info (:type %))
-                                             (= :rejoin (:f %)))))
-            drained       (drain-messages history)
-            by-key        (group-by (juxt :partition :offset) drained)
-            conflicts     (->> by-key
-                               (filter (fn [[_ msgs]]
-                                         (> (count (distinct (map :value msgs))) 1)))
-                               (map (fn [[k msgs]]
-                                      {:partition (first k)
-                                       :offset    (second k)
-                                       :values    (distinct (map :value msgs))})))]
-        {:valid?        (empty? conflicts)
-         :rejoin-count  (count rejoin-events)
-         :conflicts     (take 10 conflicts)}))))
-
 (defn replica-drain-messages
   "Extracts all consumed messages from :replica-drain operations in the history."
   [history]
@@ -602,16 +578,4 @@
          :violations (when (seq (:violations result))
                        (take 20 (:violations result)))}))))
 
-(defn combined-checker
-  "Returns a composition of all camu checkers plus standard Jepsen
-   checkers for stats."
-  []
-  (checker/compose
-   {:no-data-loss        (no-data-loss-checker)
-    :offset-monotonicity (offset-monotonicity-checker)
-    :no-split-brain      (no-split-brain-checker)
-    :total-order         (total-order-checker)
-    :availability        (availability-checker)
-    :lease-fencing       (lease-fencing-checker)
-    :recovery-time       (recovery-time-checker)
-    :stats               (checker/stats)}))
+

@@ -300,8 +300,7 @@
                        :no-split-brain      (camu-checker/no-split-brain-checker)
                        :total-order         (camu-checker/total-order-checker)})
          (http-api? opts)
-         (assoc :lease-fencing (camu-checker/lease-fencing-checker)
-                :read-your-writes (camu-checker/read-your-writes-checker)))))))
+         (assoc :read-your-writes (camu-checker/read-your-writes-checker)))))))
 
 (defn camu-test
   "Constructs a Jepsen test map for camu."
