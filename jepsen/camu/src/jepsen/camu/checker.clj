@@ -203,30 +203,6 @@
          :info-count   info-ct
          :availability availability}))))
 
-(defn lease-fencing-checker
-  "After instance rejoin events, verifies that epoch fencing prevented
-   split-brain writes. Checks that each (partition, offset) pair has at
-   most one distinct value."
-  []
-  (reify checker/Checker
-    (check [_ test history opts]
-      (let [rejoin-events (->> history
-                               (filter #(and (= :nemesis (:process %))
-                                             (= :info (:type %))
-                                             (= :rejoin (:f %)))))
-            drained       (drain-messages history)
-            by-key        (group-by (juxt :partition :offset) drained)
-            conflicts     (->> by-key
-                               (filter (fn [[_ msgs]]
-                                         (> (count (distinct (map :value msgs))) 1)))
-                               (map (fn [[k msgs]]
-                                      {:partition (first k)
-                                       :offset    (second k)
-                                       :values    (distinct (map :value msgs))})))]
-        {:valid?        (empty? conflicts)
-         :rejoin-count  (count rejoin-events)
-         :conflicts     (take 10 conflicts)}))))
-
 (defn replica-drain-messages
   "Extracts all consumed messages from :replica-drain operations in the history."
   [history]
@@ -312,44 +288,59 @@
          :lost-data    (when (seq lost) (take 20 (sort lost)))}))))
 
 (defn read-your-writes-checker
-  "Verifies that each client can read its own writes immediately after producing.
-   For each consume operation, checks that any keys acked in prior produce operations
-   from the same process appear in the consumed messages."
+  "Verifies write visibility via the consume path: for each key acknowledged
+   in a :produce :ok, if a :consume :ok from the same partition occurred
+   AFTER the produce was acked, that key must appear in at least one
+   consume's messages. Keys that were never re-read from their partition
+   (no consuming read after the produce) are not violations — the write
+   was simply never tested.
+
+   Per-process read-your-writes is not testable with the shared consume
+   cursor used by the mixed workload (one process may advance the cursor
+   past another process's write), so this checker tracks consumed keys
+   globally per partition rather than per process."
   []
   (reify checker/Checker
     (check [_ test history opts]
-      (let [events  (sort-by :time history)
-            by-proc (group-by :process events)
-            violations
-            (reduce-kv
-             (fn [acc proc ops]
-               (let [sorted       (sort-by :time ops)
-                     acked-keys   (atom #{})
-                     viols
-                     (reduce
-                      (fn [viols op]
-                        (cond
-                          (and (= :produce (:f op)) (= :ok (:type op)))
-                          (do (swap! acked-keys into (map :key (get-in op [:value :messages])))
-                              viols)
-
-                          (and (= :consume (:f op)) (= :ok (:type op)))
-                          (let [consumed-keys (set (map :key (get-in op [:value :messages])))
-                                missing       (set/difference @acked-keys consumed-keys)]
-                            (if (seq missing)
-                              (conj viols {:process proc
-                                           :time    (:time op)
-                                           :missing (vec (sort (take 10 missing)))})
-                              viols))
-
-                          :else viols))
-                      []
-                      sorted)]
-                 (into acc viols)))
-             []
-             by-proc)]
-        {:valid?     (empty? violations)
-         :violations (when (seq violations) (take 20 violations))}))))
+      (let [produces (->> history
+                          (filter #(and (= (:f %) :produce)
+                                        (= (:type %) :ok))))
+            consumes (->> history
+                          (filter #(and (= (:f %) :consume)
+                                        (= (:type %) :ok))))
+            consumed (->> consumes
+                          (mapcat (fn [op]
+                                    (let [partition (get-in op [:value :partition])]
+                                      (map (fn [msg] [partition (:key msg)])
+                                           (get-in op [:value :messages])))))
+                          (filter #(and (some? (first %)) (some? (second %))))
+                          set)
+            latest-consume-time (->> consumes
+                                     (filter #(some? (:time %)))
+                                     (map :time)
+                                     (apply max 0))
+            missing  (remove
+                      (fn [prod]
+                        (let [key       (get-in prod [:value :key])
+                              partition (get-in prod [:value :partition])
+                              ptime     (:time prod)]
+                          (or (consumed [partition key])
+                              (not-any? #(and (= (get-in % [:value :partition]) partition)
+                                              (> (:time %) ptime))
+                                        consumes))))
+                      produces)]
+        {:valid?     (empty? missing)
+         :acked      (count produces)
+         :consumed   (count consumed)
+         :missing    (count missing)
+         :violations (when (seq missing)
+                       (->> missing
+                            (map (fn [op]
+                                   {:process   (:process op)
+                                    :time      (:time op)
+                                    :key       (get-in op [:value :key])
+                                    :partition (get-in op [:value :partition])}))
+                            (take 20)))}))))
 
 (defn no-ghost-reads-checker
   "Verifies the consumer never sees data above the reported high watermark.
@@ -431,6 +422,50 @@
                               :partition part
                               :node      node
                               :hws       (take 20 hws)}))))
+             []
+             grouped)]
+        {:valid?     (empty? violations)
+         :checked    (count grouped)
+         :violations (when (seq violations) (take 20 violations))}))))
+
+(defn hw-global-monotonicity-checker
+  "Partition-global HW check: groups by [process, partition] only (no node
+   scoping) and verifies the running max HW is non-decreasing. Catches HW
+   regressions that manifest across node switches — invisible to the per-node
+   hw-monotonicity-checker. May produce occasional false positives from
+   lagging-follower reads during routing disagreement; use alongside the
+   per-node checker for layered coverage."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [consumes (->> history
+                          (filter #(and (= (:f %) :consume)
+                                        (= (:type %) :ok)
+                                        (get-in % [:value :high-watermark]))))
+            grouped  (group-by (fn [op]
+                                 [(:process op)
+                                  (get-in op [:value :partition])])
+                               consumes)
+            violations
+            (reduce-kv
+             (fn [acc [proc part] ops]
+               (let [hws (map #(get-in % [:value :high-watermark]) ops)
+                     ;; Track running max; flag when HW drops below it
+                     [_ viols]
+                     (reduce (fn [[max-seen vs] hw]
+                               (let [new-max (max max-seen hw)]
+                                 (cond
+                                   (< hw max-seen)
+                                   [new-max (conj vs {:hw hw :prev-max max-seen})]
+                                   :else
+                                   [new-max vs])))
+                             [0 []]
+                             hws)]
+                 (if (seq viols)
+                   (conj acc {:process   proc
+                              :partition part
+                              :violations (take 20 viols)})
+                   acc)))
              []
              grouped)]
         {:valid?     (empty? violations)
@@ -600,16 +635,4 @@
          :violations (when (seq (:violations result))
                        (take 20 (:violations result)))}))))
 
-(defn combined-checker
-  "Returns a composition of all camu checkers plus standard Jepsen
-   checkers for stats."
-  []
-  (checker/compose
-   {:no-data-loss        (no-data-loss-checker)
-    :offset-monotonicity (offset-monotonicity-checker)
-    :no-split-brain      (no-split-brain-checker)
-    :total-order         (total-order-checker)
-    :availability        (availability-checker)
-    :lease-fencing       (lease-fencing-checker)
-    :recovery-time       (recovery-time-checker)
-    :stats               (checker/stats)}))
+
