@@ -16,5 +16,5 @@ git_revision="$(git -C "$script_dir/../.." rev-parse --short HEAD)"
 image_tag="${IMAGE_TAG:-benchmark-${git_revision}-$(date -u +%Y%m%d%H%M%S)}"
 image="$(IMAGE_TAG="$image_tag" ./build-image.sh)"
 echo "Using published image: ${image}" >&2
-TF_VAR_camu_image="$image" terraform apply -auto-approve
+terraform apply -auto-approve -var="camu_image=$image"
 ./ips.sh
