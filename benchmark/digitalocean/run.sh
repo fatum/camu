@@ -19,6 +19,7 @@ output="${OUTPUT:-/tmp/camu-digitalocean-benchmark.json}"
 benchmark_api="${BENCHMARK_API:-http}"
 telemetry_output="${TELEMETRY_OUTPUT:-/tmp/camu-digitalocean-telemetry.jsonl}"
 run_id="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+topic="${TOPIC:-benchmark-typed-${run_id}}"
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
@@ -47,8 +48,11 @@ for ip in "${ips[@]}"; do
   [[ "$ready" == 1 ]] || { echo "Camu node $ip did not become ready" >&2; exit 1; }
 done
 
+echo "Running benchmark topic: $topic" >&2
+
 CAMU_URL="http://${ips[0]}:8080" \
 NODE_URLS="${node_urls%,}" \
+TOPIC="$topic" \
 BENCHMARK_API="$benchmark_api" \
 KAFKA_BROKERS="${KAFKA_BROKERS:-${kafka_brokers%,}}" \
 REPLICATION_FACTOR=5 \

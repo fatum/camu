@@ -6,12 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/storage"
 )
 
-const fetchParallelism = 4
+const (
+	fetchParallelism   = 4
+	maxRangeReadBytes  = 4 << 20
+	rangeReadAttempts  = 3
+	rangeRetryInterval = 50 * time.Millisecond
+)
 
 // Fetcher implements the read path: disk cache -> S3.
 // All instances use the same read path regardless of partition ownership.
@@ -158,9 +164,10 @@ func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, par
 // visit for each decoded message in offset order. Returning false from visit
 // stops the scan early.
 //
-// Sealed segments are read one RecordBatch at a time using their offset
-// sidecar. In particular, do not use fetchSegmentData here: it materializes an
-// entire segment in memory and defeats HTTP response back-pressure.
+// Sealed segments are read in bounded, contiguous RecordBatch ranges using
+// their offset sidecar. In particular, do not use fetchSegmentData for the
+// segment itself: it materializes an entire segment in memory and defeats HTTP
+// response back-pressure.
 func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, partitionID int, startOffset uint64, limit int, visit func(log.Message) bool) (uint64, error) {
 	if index == nil || limit <= 0 {
 		return startOffset, nil
@@ -183,35 +190,61 @@ func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, part
 		if err != nil {
 			return currentOffset, fmt.Errorf("read segment sidecar: %w", err)
 		}
-		for _, entry := range entries {
+		for entryIndex := 0; entryIndex < len(entries); {
+			entry := entries[entryIndex]
 			if entry.LastOffset < int64(currentOffset) {
+				entryIndex++
 				continue
 			}
 			if entry.BatchSize <= 0 || entry.Position < 0 {
 				return currentOffset, fmt.Errorf("invalid sidecar entry for segment %s", segRef.Key)
 			}
 
-			data, err := f.s3Client.GetRange(ctx, segRef.Key, entry.Position, int64(entry.BatchSize))
+			rangeStart := entry.Position
+			rangeEnd := entry.Position + int64(entry.BatchSize)
+			rangeEndIndex := entryIndex + 1
+			for rangeEndIndex < len(entries) {
+				next := entries[rangeEndIndex]
+				if next.BatchSize <= 0 || next.Position != rangeEnd {
+					break
+				}
+				nextEnd := next.Position + int64(next.BatchSize)
+				if nextEnd-rangeStart > maxRangeReadBytes {
+					break
+				}
+				rangeEnd = nextEnd
+				rangeEndIndex++
+			}
+
+			data, err := f.getRangeWithRetry(ctx, segRef.Key, rangeStart, rangeEnd-rangeStart)
 			if err != nil {
-				return currentOffset, fmt.Errorf("read segment batch: %w", err)
+				return currentOffset, fmt.Errorf("read segment range: %w", err)
 			}
-			msgs, err := log.DecodeRecordBatch(data)
-			if err != nil {
-				return currentOffset, fmt.Errorf("read segment batch: %w", err)
+			for _, batch := range entries[entryIndex:rangeEndIndex] {
+				start := batch.Position - rangeStart
+				end := start + int64(batch.BatchSize)
+				if start < 0 || end > int64(len(data)) {
+					return currentOffset, fmt.Errorf("short segment range for %s", segRef.Key)
+				}
+				msgs, err := log.DecodeRecordBatch(data[start:end])
+				if err != nil {
+					return currentOffset, fmt.Errorf("read segment batch: %w", err)
+				}
+				for _, msg := range msgs {
+					if msg.Offset < currentOffset {
+						continue
+					}
+					currentOffset = msg.Offset + 1
+					remaining--
+					if visit != nil && !visit(msg) {
+						return currentOffset, nil
+					}
+					if remaining == 0 {
+						return currentOffset, nil
+					}
+				}
 			}
-			for _, msg := range msgs {
-				if msg.Offset < currentOffset {
-					continue
-				}
-				currentOffset = msg.Offset + 1
-				remaining--
-				if visit != nil && !visit(msg) {
-					return currentOffset, nil
-				}
-				if remaining == 0 {
-					return currentOffset, nil
-				}
-			}
+			entryIndex = rangeEndIndex
 		}
 		if currentOffset <= segRef.EndOffset {
 			break
@@ -219,6 +252,28 @@ func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, part
 	}
 
 	return currentOffset, nil
+}
+
+func (f *Fetcher) getRangeWithRetry(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	var err error
+	for attempt := 0; attempt < rangeReadAttempts; attempt++ {
+		data, getErr := f.s3Client.GetRange(ctx, key, offset, length)
+		if getErr == nil {
+			return data, nil
+		}
+		err = getErr
+		if errors.Is(err, storage.ErrNotFound) || attempt == rangeReadAttempts-1 {
+			break
+		}
+		timer := time.NewTimer(rangeRetryInterval << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, err
 }
 
 type segmentFetchResult struct {

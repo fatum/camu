@@ -66,7 +66,9 @@ ordered public benchmark URLs are available as `terraform output -json benchmark
 
 The run script waits for all five nodes, uses their public HTTP addresses, and
 writes the report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT`
-is set. `TARGET_BYTES` and `MESSAGE_BYTES` can override the workload.
+is set. Each invocation uses a unique topic derived from its run ID, avoiding
+asynchronous deletion races between runs. Set `TOPIC` to override it.
+`TARGET_BYTES` and `MESSAGE_BYTES` can override the workload.
 During the run it scrapes each node's internal metrics endpoint every five
 seconds and writes raw samples to `/tmp/camu-digitalocean-telemetry.jsonl`
 unless `TELEMETRY_OUTPUT` is set.
