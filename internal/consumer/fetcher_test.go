@@ -1,11 +1,15 @@
 package consumer
 
 import (
+	"bytes"
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/metrics"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -29,6 +33,65 @@ func writeTestSegment(t *testing.T, msgs []log.Message) []byte {
 		segData = append(segData, log.EncodeRecordBatch(int64(msg.Offset), []log.Message{msg})...)
 	}
 	return segData
+}
+
+func TestFetcher_WalkRangeReadsOnlyNeededBatch(t *testing.T) {
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	if err != nil {
+		t.Fatalf("NewS3Client: %v", err)
+	}
+	diskCache, err := log.NewDiskCache(t.TempDir(), 100*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+
+	first := log.EncodeRecordBatch(0, makeTestMessages(2))
+	secondMessages := makeTestMessages(2)
+	for i := range secondMessages {
+		secondMessages[i].Offset += 2
+	}
+	second := log.EncodeRecordBatch(2, secondMessages)
+	segment := append(append([]byte(nil), first...), second...)
+	key := "test-topic/0/0-3.segment"
+	if err := s3Client.Put(context.Background(), key, segment, storage.PutOpts{}); err != nil {
+		t.Fatalf("put segment: %v", err)
+	}
+	var sidecar bytes.Buffer
+	if err := log.WriteSidecar(&sidecar, []log.IndexEntry{
+		{BaseOffset: 0, LastOffset: 1, Position: 0, BatchSize: int32(len(first))},
+		{BaseOffset: 2, LastOffset: 3, Position: int64(len(first)), BatchSize: int32(len(second))},
+	}, nil); err != nil {
+		t.Fatalf("WriteSidecar: %v", err)
+	}
+	if err := s3Client.Put(context.Background(), log.SegmentOffsetIndexKey(key), sidecar.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatalf("put sidecar: %v", err)
+	}
+
+	registry := metrics.NewRegistry()
+	s3Client.SetMetrics(registry)
+	idx := log.NewIndex()
+	idx.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 3, Key: key, CreatedAt: time.Now()})
+
+	var got []uint64
+	next, err := NewFetcher(s3Client, diskCache).Walk(context.Background(), idx, "test-topic", 0, 2, 1, func(m log.Message) bool {
+		got = append(got, m.Offset)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if len(got) != 1 || got[0] != 2 || next != 3 {
+		t.Fatalf("Walk = messages=%v next=%d, want [2], 3", got, next)
+	}
+
+	metricsText := registry.Handler()
+	wantRange := "camu_s3_bytes_total{direction=\"read\",operation=\"get_range\"} " + strconv.Itoa(len(second))
+	if !strings.Contains(metricsText, wantRange) {
+		t.Fatalf("range read metrics missing %q:\n%s", wantRange, metricsText)
+	}
+	if strings.Contains(metricsText, "operation=\"get\"} "+strconv.Itoa(len(segment))) {
+		t.Fatalf("Walk loaded the full segment:\n%s", metricsText)
+	}
 }
 
 func TestFetcher_ReadFromCache(t *testing.T) {

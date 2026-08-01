@@ -157,6 +157,10 @@ func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, par
 // Walk retrieves messages starting at startOffset, up to limit, and calls
 // visit for each decoded message in offset order. Returning false from visit
 // stops the scan early.
+//
+// Sealed segments are read one RecordBatch at a time using their offset
+// sidecar. In particular, do not use fetchSegmentData here: it materializes an
+// entire segment in memory and defeats HTTP response back-pressure.
 func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, partitionID int, startOffset uint64, limit int, visit func(log.Message) bool) (uint64, error) {
 	if index == nil || limit <= 0 {
 		return startOffset, nil
@@ -171,30 +175,45 @@ func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, part
 			break
 		}
 		segRef := segmentPlan[0]
-
-		data, err := f.fetchSegmentData(ctx, segRef.Key)
+		sidecar, err := f.fetchSegmentData(ctx, segRef.OffsetIndexObjectKey())
 		if err != nil {
-			return currentOffset, err
+			return currentOffset, fmt.Errorf("read segment sidecar: %w", err)
 		}
-		produced := 0
-		msgs, err := log.ReadSegmentBatchesAsMessages(data, currentOffset, remaining)
-		if err == nil {
+		entries, _, err := log.ReadSidecar(sidecar)
+		if err != nil {
+			return currentOffset, fmt.Errorf("read segment sidecar: %w", err)
+		}
+		for _, entry := range entries {
+			if entry.LastOffset < int64(currentOffset) {
+				continue
+			}
+			if entry.BatchSize <= 0 || entry.Position < 0 {
+				return currentOffset, fmt.Errorf("invalid sidecar entry for segment %s", segRef.Key)
+			}
+
+			data, err := f.s3Client.GetRange(ctx, segRef.Key, entry.Position, int64(entry.BatchSize))
+			if err != nil {
+				return currentOffset, fmt.Errorf("read segment batch: %w", err)
+			}
+			msgs, err := log.DecodeRecordBatch(data)
+			if err != nil {
+				return currentOffset, fmt.Errorf("read segment batch: %w", err)
+			}
 			for _, msg := range msgs {
-				produced++
+				if msg.Offset < currentOffset {
+					continue
+				}
 				currentOffset = msg.Offset + 1
 				remaining--
 				if visit != nil && !visit(msg) {
-					break
+					return currentOffset, nil
 				}
 				if remaining == 0 {
-					break
+					return currentOffset, nil
 				}
 			}
 		}
-		if err != nil {
-			return currentOffset, fmt.Errorf("read segment: %w", err)
-		}
-		if remaining == 0 || produced == 0 {
+		if currentOffset <= segRef.EndOffset {
 			break
 		}
 	}
