@@ -36,10 +36,23 @@ func (eh *EpochHistory) Append(entry EpochEntry) {
 // CheckDivergence determines whether a follower has divergent data relative to
 // this (leader) epoch history.
 //
-// It finds the entry matching followerEpoch, then examines the next entry's
-// StartOffset. If followerOffset >= nextEntry.StartOffset, the follower has
-// consumed data that belongs to a different epoch and must truncate back to
-// nextEntry.StartOffset.
+// followerOffset is the "next offset to fetch" — the follower holds all
+// records strictly below followerOffset. The check finds the entry matching
+// followerEpoch, then examines the next entry's StartOffset:
+//
+//   - followerOffset <= next.StartOffset: the follower has at most all of
+//     epoch N (offsets < next.StartOffset) and nothing yet from epoch N+1 —
+//     no divergence. Equality is *alignment at the boundary*: follower has
+//     everything epoch N produced and is ready to fetch epoch N+1.
+//   - followerOffset > next.StartOffset: the follower has some offsets in
+//     epoch N+1's range labeled as its own epoch N — divergent, truncate
+//     back to next.StartOffset.
+//
+// The strict-greater comparison is important: using >= causes an infinite
+// loop when a follower sits exactly on the boundary — the leader tells it
+// to truncate to next.StartOffset, which equals its current offset (no
+// actual truncation), so it re-fetches with the same offset and receives
+// the same response forever.
 //
 // Returns (truncateTo, true) when divergence is detected, or (0, false) when
 // the follower is consistent with the leader.
@@ -54,7 +67,7 @@ func (eh *EpochHistory) CheckDivergence(followerEpoch uint64, followerOffset uin
 			return 0, false
 		}
 		next := eh.Entries[i+1]
-		if followerOffset >= next.StartOffset {
+		if followerOffset > next.StartOffset {
 			return next.StartOffset, true
 		}
 		return 0, false

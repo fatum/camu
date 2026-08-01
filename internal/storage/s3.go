@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/uuid"
+	"github.com/maksim/camu/internal/metrics"
 )
 
 var (
@@ -57,6 +59,31 @@ type s3Backend interface {
 type S3Client struct {
 	cfg     S3Config
 	backend s3Backend
+	metrics *metrics.Registry
+}
+
+func (c *S3Client) SetMetrics(registry *metrics.Registry) { c.metrics = registry }
+
+func (c *S3Client) observe(op string, started time.Time, bytes int64, err error) {
+	if c.metrics == nil {
+		return
+	}
+	labels := map[string]string{"operation": op, "result": "ok"}
+	if err != nil {
+		labels["result"] = "error"
+	}
+	c.metrics.Inc("camu_s3_operations_total", "S3 operations", labels)
+	if bytes > 0 {
+		c.metrics.Add("camu_s3_bytes_total", "S3 payload bytes", map[string]string{"operation": op, "direction": direction(op)}, float64(bytes))
+	}
+	c.metrics.Observe("camu_s3_operation_duration", "S3 operation duration", map[string]string{"operation": op}, time.Since(started))
+}
+
+func direction(op string) string {
+	if op == "get" || op == "get_range" || op == "get_etag" {
+		return "read"
+	}
+	return "write"
 }
 
 // NewS3Client constructs an S3Client. If Endpoint is "memory://", uses in-memory backend.
@@ -76,39 +103,60 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 
 // Put stores data at key.
 func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpts) error {
-	return c.backend.put(ctx, key, data, opts)
+	started := time.Now()
+	err := c.backend.put(ctx, key, data, opts)
+	c.observe("put", started, int64(len(data)), err)
+	return err
 }
 
 // Get retrieves data at key. Returns ErrNotFound if missing.
 func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
-	return c.backend.get(ctx, key)
+	started := time.Now()
+	data, err := c.backend.get(ctx, key)
+	c.observe("get", started, int64(len(data)), err)
+	return data, err
 }
 
 // GetRange retrieves a byte range from key. Returns ErrNotFound if missing.
 func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	return c.backend.getRange(ctx, key, offset, length)
+	started := time.Now()
+	data, err := c.backend.getRange(ctx, key, offset, length)
+	c.observe("get_range", started, int64(len(data)), err)
+	return data, err
 }
 
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
 func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	return c.backend.getWithETag(ctx, key)
+	started := time.Now()
+	data, etag, err := c.backend.getWithETag(ctx, key)
+	c.observe("get_etag", started, int64(len(data)), err)
+	return data, etag, err
 }
 
 // Delete removes key. Does not error if key does not exist.
 func (c *S3Client) Delete(ctx context.Context, key string) error {
-	return c.backend.delete(ctx, key)
+	started := time.Now()
+	err := c.backend.delete(ctx, key)
+	c.observe("delete", started, 0, err)
+	return err
 }
 
 // List returns keys with the given prefix.
 func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
-	return c.backend.list(ctx, prefix)
+	started := time.Now()
+	keys, err := c.backend.list(ctx, prefix)
+	c.observe("list", started, 0, err)
+	return keys, err
 }
 
 // ConditionalPut writes data to key only if the current ETag matches etag.
 // An empty etag means "write unconditionally on first creation".
 // Returns the new ETag on success, or ErrConflict on mismatch.
 func (c *S3Client) ConditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error) {
-	return c.backend.conditionalPut(ctx, key, data, etag)
+	started := time.Now()
+	newETag, err := c.backend.conditionalPut(ctx, key, data, etag)
+	c.observe("conditional_put", started, int64(len(data)), err)
+	return newETag, err
 }
 
 // ---- In-memory backend ----

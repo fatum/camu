@@ -22,6 +22,21 @@
         kafka-port  (:kafka-port test 9092)
         segment-max-size (:segment-max-size test 104857600)
         segment-max-age (:segment-max-age test "1m")
+        ;; Turn on SQL + async parquet export whenever the workload
+        ;; needs them. The :sql workload sets :enable-sql? true.
+        sql?        (boolean (:enable-sql? test))
+        sql-block   (if sql?
+                      (str "\n"
+                           "sql:\n"
+                           "  enabled: true\n"
+                           "  cache_directory: \"" camu-data "/sql-cache\"\n"
+                           "  duckdb_temp_directory: \"" camu-data "/sql-tmp\"\n"
+                           "  query_timeout: \"30s\"\n"
+                           "\n"
+                           "maintenance:\n"
+                           "  parquet_export:\n"
+                           "    enabled: true\n")
+                      "")
         config      (str "server:\n"
                          "  address: \":" http-port "\"\n"
                          "  kafka_port: " kafka-port "\n"
@@ -49,7 +64,8 @@
                          "  lease_ttl: \"6s\"\n"
                          "  instance_ttl: \"8s\"\n"
                          "  heartbeat_interval: \"2s\"\n"
-                         "  rebalance_delay: \"2s\"\n")]
+                         "  rebalance_delay: \"2s\"\n"
+                         sql-block)]
     (c/exec :mkdir :-p "/etc/camu")
     (c/exec :echo config :> camu-config)))
 

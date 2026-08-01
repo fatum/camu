@@ -635,4 +635,223 @@
          :violations (when (seq (:violations result))
                        (take 20 (:violations result)))}))))
 
+(defn sql-row-keys
+  "Extracts keys from a final SQL drain while retaining multiplicity.
 
+   DuckDB serializes BLOB values as base64 in JSON, but string values are
+   literal. Decode only when the response schema says BLOB: a literal key
+   such as `ack` is itself valid Base64 and must not be guessed at."
+  [op]
+  (let [blob? (= "BLOB" (some-> op :value :columns first :type))]
+    (->> (get-in op [:value :rows])
+         (map first)
+         (map (fn [v]
+                (if (and blob? (string? v))
+                  (String. ^bytes (.decode (java.util.Base64/getDecoder) ^String v) "UTF-8")
+                  (str v))))
+         vec)))
+
+(defn readiness-probe-key?
+  "Setup probes establish that every partition accepts writes before Jepsen
+   starts recording history. They are control records, not workload actions."
+  [key]
+  (boolean (re-matches #"readiness-probe-[0-9]+" key)))
+
+(defn retention-export-checker
+  "Checks temporal ordering of source retention and durable export.
+
+   A retention observation lists source segment keys before reading the
+   partition checkpoint. The checker remembers every segment it has observed;
+   when that segment disappears in a later observation, the checkpoint read
+   after that later listing must cover the segment's end offset. This does not
+   claim an atomic S3 snapshot, but a deletion followed by an insufficient
+   durable checkpoint is unambiguously unsafe. SQL row visibility is checked
+   independently by sql-visibility-checker."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [acked (->> history
+                       (filter #(and (= :produce (:f %)) (= :ok (:type %))))
+                       (group-by #(get-in % [:value :partition])))
+            observations (->> history
+                              (filter #(and (= :retention-state (:f %)) (= :ok (:type %))))
+                              (sort-by :time))
+            {:keys [problems seen last-state]}
+            (reduce
+             (fn [{:keys [problems seen] :as acc} observation]
+               (let [states (get-in observation [:value :partitions])]
+                 (if-not (vector? states)
+                   (update acc :problems conj {:type :malformed-observation})
+                   (reduce
+                    (fn [{:keys [problems seen] :as state-acc} state]
+                      (let [partition (:partition state)
+                            segments (:segments state)
+                            checkpoint (:exported-through-offset state)]
+                        (cond
+                          (not (integer? partition))
+                          (update state-acc :problems conj {:type :malformed-partition-state :state state})
+
+                          (or (not (vector? segments))
+                              (some #(or (:malformed %)
+                                         (not (string? (:key %)))
+                                         (not (integer? (:base-offset %)))
+                                         (not (integer? (:end-offset %)))
+                                         (not (integer? (:epoch %))))
+                                    segments))
+                          (update state-acc :problems conj {:partition partition :type :malformed-segments})
+
+                          (and (some? checkpoint) (not (integer? checkpoint)))
+                          (update state-acc :problems conj {:partition partition :type :malformed-checkpoint})
+
+                          :else
+                          (let [current (into {} (map (juxt :key identity) segments))
+                                prior (get seen partition {})
+                                disappeared (remove #(contains? current (:key %)) (vals prior))
+                                premature (filter #(or (nil? checkpoint)
+                                                       (< checkpoint (:end-offset %)))
+                                                  disappeared)]
+                            (-> state-acc
+                                (update :problems into
+                                        (map #(assoc % :partition partition :type :source-deleted-before-checkpoint
+                                                     :checkpoint checkpoint)
+                                             premature))
+                                (assoc-in [:seen partition] (merge prior current))
+                                (assoc-in [:last-state partition] current))))))
+                    acc states))))
+             {:problems [] :seen {} :last-state {}}
+             observations)
+            final-state (when-let [observation (last observations)]
+                          (into {} (map (juxt :partition identity)
+                                        (get-in observation [:value :partitions]))))
+            problems (reduce-kv
+                      (fn [problems partition produces]
+                        (let [state (get final-state partition)
+                              required-offset (apply max (map #(get-in % [:value :offset]) produces))
+                              checkpoint (:exported-through-offset state)]
+                          (cond-> problems
+                            (nil? state) (conj {:partition partition :type :missing-state})
+                            (and state (seq (:segments state)))
+                            (conj {:partition partition :type :source-segments-remain
+                                   :segments (:segments state)})
+                            (and state (or (nil? checkpoint) (< checkpoint required-offset)))
+                            (conj {:partition partition :type :checkpoint-behind
+                                   :checkpoint checkpoint :required-offset required-offset}))))
+                      problems acked)]
+        {:valid? (boolean (and (seq observations) (empty? problems)))
+         :observations (count observations)
+         :missing-observation? (empty? observations)
+         :problems (when (seq problems) problems)}))))
+
+(defn sql-visibility-checker
+  "Verifies that every successfully acknowledged produce appears exactly once
+   in the rows returned by a drain-style final :sql-query.
+
+   Semantics:
+     - Produces that returned :ok must be visible in the SQL result
+       set by the end of the test (after export + final drain query).
+     - Produces that returned :info (ambiguous / timed out) are
+       allowed to be present OR absent — SQL visibility for ambiguous
+       writes is not constrained.
+     - SQL queries are allowed to return keys that never appeared in
+       any :ok produce ONLY if they appeared in some :info produce.
+       Rows that correspond to no produce at all are flagged as ghost
+       rows.
+
+   Scope: this checker is tuned for the parquet-sql workload, where
+   the final phase runs a drain-style `select key from <topic>` via
+   :sql-query and the checker compares row multiplicities against the produce
+   history."
+  []
+  (reify checker/Checker
+    (check [_ test history _opts]
+      (let [ok-keys    (->> history
+                            (filter #(and (= (:f %) :produce)
+                                          (= (:type %) :ok)))
+                            (map #(get-in % [:value :key]))
+                            (remove nil?)
+                            vec)
+            info-keys  (->> history
+                            (filter #(and (= (:f %) :produce)
+                                          (= (:type %) :info)))
+                            (map #(get-in % [:value :key]))
+                            (remove nil?)
+                            set)
+            sql-drains (->> history
+                            (filter #(and (= (:f %) :sql-query)
+                                          (= (:type %) :ok)))
+                            ;; The drain phase does a single final query
+                            ;; with :final true in its value; any earlier
+                            ;; :sql-query ops are diagnostic and ignored.
+                            (filter #(true? (get-in % [:value :final])))
+                            (sort-by :time))
+            sql-keys   (if (seq sql-drains)
+                         (sql-row-keys (last sql-drains))
+                         [])
+            visible-sql-keys (remove readiness-probe-key? sql-keys)
+            ok-counts   (frequencies ok-keys)
+            sql-counts  (frequencies visible-sql-keys)
+            ;; :info produces remain ambiguous. They may be absent or present
+            ;; in the final drain, so only successful produces impose a lower
+            ;; bound. For keys with no ambiguous produce, an excess row is a
+            ;; duplicate; otherwise it may be the ambiguous write completing.
+            missing     (into {}
+                              (keep (fn [[key expected]]
+                                      (let [observed (get sql-counts key 0)]
+                                        (when (< observed expected)
+                                          [key (- expected observed)]))))
+                              ok-counts)
+            duplicates  (into {}
+                              (keep (fn [[key observed]]
+                                      (let [expected (get ok-counts key 0)]
+                                        (when (and (not (contains? info-keys key))
+                                                   (> observed expected))
+                                          [key (- observed expected)]))))
+                              sql-counts)
+            ghosts      (->> sql-counts
+                              keys
+                              (remove #(or (contains? ok-counts %)
+                                           (contains? info-keys %)))
+                              sort
+                              vec)]
+        {:valid?          (boolean (and (empty? missing)
+                                         (empty? duplicates)
+                                         (empty? ghosts)
+                                         (seq sql-drains)))
+         :ok-produces     (count ok-keys)
+         :info-produces   (count info-keys)
+         :sql-rows        (count visible-sql-keys)
+         :missing         (when (seq missing) (into (sorted-map) (take 20 missing)))
+         :duplicates      (when (seq duplicates) (into (sorted-map) (take 20 duplicates)))
+         :ghosts          (when (seq ghosts) (take 20 ghosts))
+         :no-final-drain? (empty? sql-drains)}))))
+
+(defn typed-sql-checker
+  "Checks that the final typed SQL drain exposes physical typed columns and
+   that every returned row has an integer id and boolean paid value."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [drains (->> history
+                        (filter #(and (= :sql-query (:f %))
+                                      (= :ok (:type %))
+                                      (true? (get-in % [:value :final]))))
+                        (sort-by :time))
+            last-op (last drains)
+            columns (get-in last-op [:value :columns])
+            rows (get-in last-op [:value :rows])
+            names (mapv :name columns)
+            types (mapv #(some-> (:type %) clojure.string/lower-case) columns)
+            valid-schema? (and (= ["key" "id" "paid"] names)
+                               (some #(clojure.string/includes? % "int") (take 2 (drop 1 types)))
+                               (clojure.string/includes? (or (nth types 2 nil) "") "bool"))
+            bad-rows (->> rows
+                          (keep-indexed (fn [idx row]
+                                          (when (or (not= 3 (count row))
+                                                    (not (integer? (nth row 1 nil)))
+                                                    (not (boolean? (nth row 2 nil))))
+                                            {:row idx :value row})))
+                          vec)]
+        {:valid? (boolean (and last-op valid-schema? (empty? bad-rows)))
+         :final-drains (count drains)
+         :columns columns
+         :bad-rows (when (seq bad-rows) (take 20 bad-rows))}))))

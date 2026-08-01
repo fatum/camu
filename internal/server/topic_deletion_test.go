@@ -58,6 +58,8 @@ func TestDeleteTopicEnqueuesAsyncDisklessCleanupAndPreservesMetaUntilS3Deleted(t
 		tc.Name + "/0/segment.data",
 		"_coordination/assignments/" + tc.Name + ".json",
 		"_coordination/epochs/" + tc.Name + "/0.json",
+		parquetManifestKey(tc.Name, 0, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)),
+		parquetQueryCatalogTopicKey(tc.Name),
 	} {
 		if err := s.s3Client.Put(ctx, key, []byte("x"), storage.PutOpts{}); err != nil {
 			t.Fatalf("s3Client.Put(%s) error = %v", key, err)
@@ -96,6 +98,14 @@ func TestDeleteTopicEnqueuesAsyncDisklessCleanupAndPreservesMetaUntilS3Deleted(t
 
 	if _, err := s.s3Client.Get(ctx, tc.Name+"/0/segment.data"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected topic S3 data to be deleted after GC, got %v", err)
+	}
+	for _, key := range []string{
+		parquetManifestKey(tc.Name, 0, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)),
+		parquetQueryCatalogTopicKey(tc.Name),
+	} {
+		if _, err := s.s3Client.Get(ctx, key); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("expected parquet metadata %q to be deleted after GC, got %v", key, err)
+		}
 	}
 	head, err = s.disklessMeta.GetPartitionHead(ctx, tc.Name, 0)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,14 +22,16 @@ const (
 // topicConfigJSON is the on-disk representation of a TopicConfig.
 // Retention is stored as a nanosecond integer so it round-trips correctly.
 type topicConfigJSON struct {
-	Name                  string    `json:"name"`
-	Partitions            int       `json:"partitions"`
-	RetentionNs           int64     `json:"retention_ns"`
-	CreatedAt             time.Time `json:"created_at"`
-	ReplicationFactor     int       `json:"replication_factor"`
-	MinInsyncReplicas     int       `json:"min_insync_replicas"`
-	UncleanLeaderElection bool      `json:"unclean_leader_election"`
-	StorageMode           string    `json:"storage_mode,omitempty"`
+	Name                  string       `json:"name"`
+	Partitions            int          `json:"partitions"`
+	RetentionNs           int64        `json:"retention_ns"`
+	CreatedAt             time.Time    `json:"created_at"`
+	ReplicationFactor     int          `json:"replication_factor"`
+	MinInsyncReplicas     int          `json:"min_insync_replicas"`
+	UncleanLeaderElection bool         `json:"unclean_leader_election"`
+	ExportEnabled         bool         `json:"export_enabled"`
+	StorageMode           string       `json:"storage_mode,omitempty"`
+	Schema                *TopicSchema `json:"schema,omitempty"`
 }
 
 // TopicConfig holds the configuration for a single topic.
@@ -40,7 +43,51 @@ type TopicConfig struct {
 	ReplicationFactor     int
 	MinInsyncReplicas     int
 	UncleanLeaderElection bool
+	ExportEnabled         bool
 	StorageMode           string
+	Schema                *TopicSchema
+}
+
+type TopicSchema struct {
+	Encoding        string        `json:"encoding"`
+	Fields          []SchemaField `json:"fields"`
+	DeadLetterTopic string        `json:"dead_letter_topic,omitempty"`
+}
+
+type SchemaField struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Path     string `json:"path"`
+	Nullable bool   `json:"nullable,omitempty"`
+}
+
+func (s *TopicSchema) Validate() error {
+	if s == nil {
+		return nil
+	}
+	if s.Encoding != "json" {
+		return fmt.Errorf("schema encoding must be json")
+	}
+	if len(s.Fields) == 0 {
+		return fmt.Errorf("schema fields are required")
+	}
+	seen := map[string]bool{}
+	fixed := map[string]bool{"record_offset": true, "record_timestamp": true, "key": true, "value": true, "headers": true}
+	for _, f := range s.Fields {
+		if f.Name == "" || seen[strings.ToLower(f.Name)] || fixed[strings.ToLower(f.Name)] {
+			return fmt.Errorf("schema field names must be unique and non-empty")
+		}
+		seen[strings.ToLower(f.Name)] = true
+		switch f.Type {
+		case "string", "int64", "float64", "bool", "timestamp":
+		default:
+			return fmt.Errorf("unsupported schema field type %q", f.Type)
+		}
+		if len(f.Path) < 3 || f.Path[:2] != "$." || strings.Contains(f.Path, "[") || strings.Contains(f.Path, "'") || strings.HasSuffix(f.Path, ".") {
+			return fmt.Errorf("schema field %q path must start with $.", f.Name)
+		}
+	}
+	return nil
 }
 
 func (tc TopicConfig) toJSON() topicConfigJSON {
@@ -52,7 +99,9 @@ func (tc TopicConfig) toJSON() topicConfigJSON {
 		ReplicationFactor:     tc.ReplicationFactor,
 		MinInsyncReplicas:     tc.MinInsyncReplicas,
 		UncleanLeaderElection: tc.UncleanLeaderElection,
+		ExportEnabled:         tc.ExportEnabled,
 		StorageMode:           tc.StorageMode,
+		Schema:                tc.Schema,
 	}
 }
 
@@ -65,7 +114,9 @@ func fromJSON(j topicConfigJSON) TopicConfig {
 		ReplicationFactor:     j.ReplicationFactor,
 		MinInsyncReplicas:     j.MinInsyncReplicas,
 		UncleanLeaderElection: j.UncleanLeaderElection,
+		ExportEnabled:         j.ExportEnabled,
 		StorageMode:           j.StorageMode,
+		Schema:                j.Schema,
 	}
 	if cfg.ReplicationFactor == 0 {
 		cfg.ReplicationFactor = 1
@@ -93,6 +144,9 @@ func topicKey(name string) string {
 
 // Create stores a new topic configuration. Returns an error if the topic already exists.
 func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
+	if err := cfg.Schema.Validate(); err != nil {
+		return fmt.Errorf("Create: invalid schema: %w", err)
+	}
 	_, err := ts.Get(ctx, cfg.Name)
 	if err == nil {
 		return fmt.Errorf("topic %q already exists", cfg.Name)
@@ -106,6 +160,9 @@ func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
 	}
 	if cfg.MinInsyncReplicas == 0 {
 		cfg.MinInsyncReplicas = 1
+	}
+	if cfg.StorageMode == StorageModeDiskless && cfg.ExportEnabled {
+		return fmt.Errorf("Create: export_enabled is unsupported for diskless topics")
 	}
 
 	data, err := json.Marshal(cfg.toJSON())
@@ -124,14 +181,26 @@ func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
 
 // Update overwrites an existing topic configuration.
 func (ts *TopicStore) Update(ctx context.Context, cfg TopicConfig) error {
-	if _, err := ts.Get(ctx, cfg.Name); err != nil {
+	if err := cfg.Schema.Validate(); err != nil {
+		return fmt.Errorf("Update: invalid schema: %w", err)
+	}
+	current, err := ts.Get(ctx, cfg.Name)
+	if err != nil {
 		return fmt.Errorf("Update: checking existence of %q: %w", cfg.Name, err)
+	}
+	oldSchema, _ := json.Marshal(current.Schema)
+	newSchema, _ := json.Marshal(cfg.Schema)
+	if string(oldSchema) != string(newSchema) {
+		return fmt.Errorf("Update: schema is immutable")
 	}
 	if cfg.ReplicationFactor == 0 {
 		cfg.ReplicationFactor = 1
 	}
 	if cfg.MinInsyncReplicas == 0 {
 		cfg.MinInsyncReplicas = 1
+	}
+	if cfg.StorageMode == StorageModeDiskless && cfg.ExportEnabled {
+		return fmt.Errorf("Update: export_enabled is unsupported for diskless topics")
 	}
 
 	data, err := json.Marshal(cfg.toJSON())

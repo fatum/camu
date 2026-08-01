@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/metrics"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -49,41 +50,42 @@ type KafkaServer struct {
 }
 
 type KafkaServerCfg struct {
-	PartitionGetter              PartitionGetter
-	TopicLister                  TopicLister
-	MetadataFunc                 func(ctx context.Context, req *kmsg.MetadataRequest) (*kmsg.MetadataResponse, error)
-	CreateTopicsFunc             func(ctx context.Context, req *kmsg.CreateTopicsRequest) (*kmsg.CreateTopicsResponse, error)
-	DeleteTopicsFunc             func(ctx context.Context, req *kmsg.DeleteTopicsRequest) (*kmsg.DeleteTopicsResponse, error)
-	CreatePartitionsFunc         func(ctx context.Context, req *kmsg.CreatePartitionsRequest) (*kmsg.CreatePartitionsResponse, error)
-	DescribeConfigsFunc          func(ctx context.Context, req *kmsg.DescribeConfigsRequest) (*kmsg.DescribeConfigsResponse, error)
-	AlterConfigsFunc             func(ctx context.Context, req *kmsg.AlterConfigsRequest) (*kmsg.AlterConfigsResponse, error)
-	IncrementalAlterConfigsFunc  func(ctx context.Context, req *kmsg.IncrementalAlterConfigsRequest) (*kmsg.IncrementalAlterConfigsResponse, error)
-	DescribeClusterFunc          func(ctx context.Context, req *kmsg.DescribeClusterRequest) (*kmsg.DescribeClusterResponse, error)
-	CreateACLsFunc               func(ctx context.Context, req *kmsg.CreateACLsRequest) (*kmsg.CreateACLsResponse, error)
-	DescribeACLsFunc             func(ctx context.Context, req *kmsg.DescribeACLsRequest) (*kmsg.DescribeACLsResponse, error)
-	DeleteACLsFunc               func(ctx context.Context, req *kmsg.DeleteACLsRequest) (*kmsg.DeleteACLsResponse, error)
-	FindCoordinatorFunc          func(ctx context.Context, req *kmsg.FindCoordinatorRequest) (*kmsg.FindCoordinatorResponse, error)
-	InitProducerIDFunc           func(ctx context.Context, req *kmsg.InitProducerIDRequest) (*kmsg.InitProducerIDResponse, error)
-	DescribeGroupsFunc           func(ctx context.Context, req *kmsg.DescribeGroupsRequest) (*kmsg.DescribeGroupsResponse, error)
-	ListGroupsFunc               func(ctx context.Context, req *kmsg.ListGroupsRequest) (*kmsg.ListGroupsResponse, error)
-	DeleteGroupsFunc             func(ctx context.Context, req *kmsg.DeleteGroupsRequest) (*kmsg.DeleteGroupsResponse, error)
-	OffsetDeleteFunc             func(ctx context.Context, req *kmsg.OffsetDeleteRequest) (*kmsg.OffsetDeleteResponse, error)
-	JoinGroupFunc                func(ctx context.Context, req *kmsg.JoinGroupRequest) (*kmsg.JoinGroupResponse, error)
-	SyncGroupFunc                func(ctx context.Context, req *kmsg.SyncGroupRequest) (*kmsg.SyncGroupResponse, error)
-	HeartbeatFunc                func(ctx context.Context, req *kmsg.HeartbeatRequest) (*kmsg.HeartbeatResponse, error)
-	LeaveGroupFunc               func(ctx context.Context, req *kmsg.LeaveGroupRequest) (*kmsg.LeaveGroupResponse, error)
-	ListOffsetsFunc              func(ctx context.Context, topic string, partition int, timestamp int64) (KafkaOffsetResponse, error)
-	OffsetCommitFunc             func(ctx context.Context, req *kmsg.OffsetCommitRequest) (*kmsg.OffsetCommitResponse, error)
-	OffsetFetchFunc              func(ctx context.Context, req *kmsg.OffsetFetchRequest) (*kmsg.OffsetFetchResponse, error)
-	PartitionErrorFunc           func(ctx context.Context, topic string, partition int) int16
-	AppendRawBatchFunc           func(ctx context.Context, topic string, partition int, batch []byte) (int64, error)
-	AppendBatchFunc              func(topic string, partition int, batch log.Batch) ([]uint64, error)
-	AppendFunc                   func(topic string, partition int, msgs []log.Message) ([]uint64, error)
-	FetchRawBatchesFunc          func(ctx context.Context, topic string, partition int, startOffset int64, maxBytes int) ([]byte, int64, error)
-	FetchFunc                    func(topic string, partition int, startOffset uint64, maxBytes int32) (KafkaFetchResult, error)
-	RequestHandler               func(req kmsg.Request) (kmsg.Response, error)
-	BrokerID                     int32
-	BrokerAddr                   string
+	Metrics                     *metrics.Registry
+	PartitionGetter             PartitionGetter
+	TopicLister                 TopicLister
+	MetadataFunc                func(ctx context.Context, req *kmsg.MetadataRequest) (*kmsg.MetadataResponse, error)
+	CreateTopicsFunc            func(ctx context.Context, req *kmsg.CreateTopicsRequest) (*kmsg.CreateTopicsResponse, error)
+	DeleteTopicsFunc            func(ctx context.Context, req *kmsg.DeleteTopicsRequest) (*kmsg.DeleteTopicsResponse, error)
+	CreatePartitionsFunc        func(ctx context.Context, req *kmsg.CreatePartitionsRequest) (*kmsg.CreatePartitionsResponse, error)
+	DescribeConfigsFunc         func(ctx context.Context, req *kmsg.DescribeConfigsRequest) (*kmsg.DescribeConfigsResponse, error)
+	AlterConfigsFunc            func(ctx context.Context, req *kmsg.AlterConfigsRequest) (*kmsg.AlterConfigsResponse, error)
+	IncrementalAlterConfigsFunc func(ctx context.Context, req *kmsg.IncrementalAlterConfigsRequest) (*kmsg.IncrementalAlterConfigsResponse, error)
+	DescribeClusterFunc         func(ctx context.Context, req *kmsg.DescribeClusterRequest) (*kmsg.DescribeClusterResponse, error)
+	CreateACLsFunc              func(ctx context.Context, req *kmsg.CreateACLsRequest) (*kmsg.CreateACLsResponse, error)
+	DescribeACLsFunc            func(ctx context.Context, req *kmsg.DescribeACLsRequest) (*kmsg.DescribeACLsResponse, error)
+	DeleteACLsFunc              func(ctx context.Context, req *kmsg.DeleteACLsRequest) (*kmsg.DeleteACLsResponse, error)
+	FindCoordinatorFunc         func(ctx context.Context, req *kmsg.FindCoordinatorRequest) (*kmsg.FindCoordinatorResponse, error)
+	InitProducerIDFunc          func(ctx context.Context, req *kmsg.InitProducerIDRequest) (*kmsg.InitProducerIDResponse, error)
+	DescribeGroupsFunc          func(ctx context.Context, req *kmsg.DescribeGroupsRequest) (*kmsg.DescribeGroupsResponse, error)
+	ListGroupsFunc              func(ctx context.Context, req *kmsg.ListGroupsRequest) (*kmsg.ListGroupsResponse, error)
+	DeleteGroupsFunc            func(ctx context.Context, req *kmsg.DeleteGroupsRequest) (*kmsg.DeleteGroupsResponse, error)
+	OffsetDeleteFunc            func(ctx context.Context, req *kmsg.OffsetDeleteRequest) (*kmsg.OffsetDeleteResponse, error)
+	JoinGroupFunc               func(ctx context.Context, req *kmsg.JoinGroupRequest) (*kmsg.JoinGroupResponse, error)
+	SyncGroupFunc               func(ctx context.Context, req *kmsg.SyncGroupRequest) (*kmsg.SyncGroupResponse, error)
+	HeartbeatFunc               func(ctx context.Context, req *kmsg.HeartbeatRequest) (*kmsg.HeartbeatResponse, error)
+	LeaveGroupFunc              func(ctx context.Context, req *kmsg.LeaveGroupRequest) (*kmsg.LeaveGroupResponse, error)
+	ListOffsetsFunc             func(ctx context.Context, topic string, partition int, timestamp int64) (KafkaOffsetResponse, error)
+	OffsetCommitFunc            func(ctx context.Context, req *kmsg.OffsetCommitRequest) (*kmsg.OffsetCommitResponse, error)
+	OffsetFetchFunc             func(ctx context.Context, req *kmsg.OffsetFetchRequest) (*kmsg.OffsetFetchResponse, error)
+	PartitionErrorFunc          func(ctx context.Context, topic string, partition int) int16
+	AppendRawBatchFunc          func(ctx context.Context, topic string, partition int, batch []byte) (int64, error)
+	AppendBatchFunc             func(topic string, partition int, batch log.Batch) ([]uint64, error)
+	AppendFunc                  func(topic string, partition int, msgs []log.Message) ([]uint64, error)
+	FetchRawBatchesFunc         func(ctx context.Context, topic string, partition int, startOffset int64, maxBytes int) ([]byte, int64, error)
+	FetchFunc                   func(topic string, partition int, startOffset uint64, maxBytes int32) (KafkaFetchResult, error)
+	RequestHandler              func(req kmsg.Request) (kmsg.Response, error)
+	BrokerID                    int32
+	BrokerAddr                  string
 }
 
 type KafkaOffsetResponse struct {

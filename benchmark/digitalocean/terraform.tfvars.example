@@ -1,0 +1,10 @@
+digitalocean_token = ""
+spaces_access_key  = ""
+spaces_secret_key  = ""
+spaces_bucket_name = "replace-with-a-globally-unique-name"
+registry_name      = "replace-with-a-globally-unique-registry-name"
+camu_image         = "registry.digitalocean.com/replace-with-registry-name/camu:benchmark"
+ssh_key_name       = "replace-with-your-digitalocean-ssh-key"
+
+ssh_cidr       = ["203.0.113.10/32"]
+benchmark_cidr = ["203.0.113.10/32"]

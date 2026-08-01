@@ -21,3 +21,9 @@
          clojure.lang.ExceptionInfo
          #"only supports leader read-mode"
          (camu/validate-opts! {:api :kafka :workload :mixed :read-mode :replica})))))
+
+(deftest retention-checker-is-lifecycle-only
+  (is (contains? (camu/sql-checkers {:workload :sql}) :sql-visibility))
+  (is (not (contains? (camu/sql-checkers {:workload :sql}) :retention-export)))
+  (is (contains? (camu/sql-checkers {:workload :sql :retention-lifecycle true})
+                 :retention-export)))

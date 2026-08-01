@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -46,6 +47,59 @@ func NewClient(baseURL string) *Client {
 // BaseURL returns the base URL of the client.
 func (c *Client) BaseURL() string {
 	return c.baseURL
+}
+
+// SQLQueryRequest mirrors the /v1/sql request envelope.
+type SQLQueryRequest struct {
+	SQL       string         `json:"sql"`
+	Params    []any          `json:"params,omitempty"`
+	Topics    []string       `json:"topics"`
+	TimeRange *SQLTimeRange  `json:"time_range,omitempty"`
+	Limit     int            `json:"limit,omitempty"`
+}
+
+type SQLTimeRange struct {
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
+}
+
+// SQLQueryColumn describes one column in a SQL result.
+type SQLQueryColumn struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// SQLQueryResponse is the /v1/sql response envelope.
+type SQLQueryResponse struct {
+	Columns []SQLQueryColumn `json:"columns"`
+	Rows    [][]any          `json:"rows"`
+}
+
+// SQLQuery issues a POST /v1/sql and returns the decoded response.
+func (c *Client) SQLQuery(req SQLQueryRequest) (*SQLQueryResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequest(http.MethodPost, c.baseURL+"/v1/sql", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("POST /v1/sql: status %d: %s", resp.StatusCode, string(raw))
+	}
+	var out SQLQueryResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("decode sql response: %w (body=%s)", err, string(raw))
+	}
+	return &out, nil
 }
 
 type apiError struct {

@@ -4,7 +4,9 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/fatum/camu.svg)](https://pkg.go.dev/github.com/fatum/camu)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
 
-**A Jepsen-verified, S3-native event log with HTTP and Kafka wire protocol support.** Camu stores native Kafka RecordBatch data in local active segments, seals immutable segments to object storage, and coordinates multi-instance ownership through S3 conditional writes — no ZooKeeper, no Raft, no external metadata service.
+**Camu is an S3-native event log for teams that want Kafka-style durability and replication without running Kafka’s full operational stack.**
+
+It stores native Kafka `RecordBatch` bytes, serves both HTTP and Kafka clients, coordinates cluster state through object storage, and keeps the deployable unit simple: one binary, object storage, and optional local cache.
 
 ```
                    +-----------+     +-----------+
@@ -27,51 +29,225 @@
                  +-----------+
 ```
 
-```bash
-# Create a topic
-curl -X POST http://localhost:8080/v1/topics \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"events","partitions":4,"retention":"168h"}'
-
-# Produce
-curl -X POST http://localhost:8080/v1/topics/events/messages \
-  -H 'Content-Type: application/json' \
-  -d '[{"key":"user-123","value":"clicked"}]'
-
-# Consume
-curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limit=100"
-```
-
 ## Why Camu
 
-| | |
-|---|---|
-| **S3-native** | Segments, indexes, topic metadata, offsets, and coordination state all live in object storage. No local disk is required for durability. |
-| **Single binary** | One Go binary. No ZooKeeper, no Raft cluster, no external metadata service. Deploy as a static binary, a container, or a systemd unit. |
-| **Dual protocol** | HTTP-first API for produce, consume, SSE streaming, and topic management. Kafka wire-protocol support for the implemented API subset, with advertised version ranges via `ApiVersions`. |
-| **ISR replication** | Kafka-style replicated topics with configurable `replication_factor` and `min_insync_replicas`. Writes are only acknowledged after the ISR quorum confirms. |
-| **Exactly-once produce** | Idempotent produce with producer IDs and sequence tracking. Duplicate retries on replicated topics wait for the original batch commit before confirming. |
-| **Jepsen-verified** | 22 passing fault scenarios across kill, leader-kill, pause, partition, rejoin, membership churn, S3 isolation, clock skew, and combined-fault runs. Every claim has a reproducible artifact. |
+Camu is built for the cases where the value is the log, not the infrastructure around the log.
+
+- **Object-storage-native durability**: segments, indexes, offsets, assignments, and control-plane state live in S3-compatible storage.
+- **Single-binary deployment**: no ZooKeeper, no Raft quorum, no external metadata plane.
+- **Dual protocol surface**: HTTP for product-friendly integration, Kafka wire protocol for existing Kafka clients and tooling.
+- **Replicated writes with ISR semantics**: `replication_factor` and `min_insync_replicas` work the way operators expect.
+- **Idempotent produce**: duplicate retry handling with producer IDs and sequence tracking.
+- **Classic and diskless modes**: pick local active-segment buffering or object-storage-first ingestion depending on the workload.
+- **Parquet + SQL layer**: export classic sealed segments into Parquet and query them through embedded DuckDB.
+- **Resumable background maintenance**: topic deletion, retention, and classic sealed-segment merge are durable workflows rather than best-effort cleanup.
+- **Jepsen-backed confidence**: the project is fault-tested, not only unit-tested.
+
+## Feature Set
+
+### Storage and Durability
+
+- Native Kafka `RecordBatch` bytes are the canonical log format.
+- Immutable sealed segments are uploaded to S3-compatible storage.
+- Local active segments provide a fast mutable tail in `classic` mode.
+- `diskless` topics keep the storage path object-store-centric while preserving the same external API shape.
+- Time-based retention is asynchronous and resumable in both modes.
+- Classic sealed-segment merge reduces cold object fan-out through partition-leader background jobs.
+
+## Diskless Mode
+
+`diskless` is the mode for teams that want Camu to lean harder into object
+storage and lighter into local segment ownership.
+
+Instead of relying on the normal `classic` active-segment lifecycle,
+`diskless` topics use the diskless engine and metastore path while keeping the
+same external HTTP and Kafka topic model.
+
+### What It Gives You
+
+- **Object-storage-first write path**: the topic’s durable shape is built around the diskless engine rather than classic local segment ownership.
+- **Same client-facing contracts**: produce, consume, offsets, and Kafka metadata still look like the same product surface.
+- **Good fit for stateless-ish nodes**: useful when you want nodes to carry less local log responsibility and put more of the durable path in shared storage.
+- **Same topic abstraction**: `diskless` topics still behave like first-class topics rather than a separate product or API family.
+
+### Metastore Model
+
+`diskless` topics use a metastore that maps topic-partition offset ranges to backing objects in shared storage.
+
+- The metastore records which file contains which partition data and the byte range for that partition slice.
+- One backing object can be referenced by multiple partition slices, so object ownership is not one-file-per-partition.
+- Reads resolve through the metastore first, then fetch and decode the referenced data from object storage.
+- Earliest retained offset for a partition is derived from the current live metastore view, not assumed to start at `0`.
+
+### How It Differs From Classic
+
+| Area | `classic` | `diskless` |
+|---|---|---|
+| Mutable write tail | local active segment | diskless engine path |
+| Read path | sealed segments + active segment merge | diskless fetch/decode path |
+| Retention unit | classic segment objects | backing file references |
+| Retention behavior | delete segment/index, then metadata | delete S3 data first, then metastore refs |
+| Cold-data optimization | sealed-segment merge | not the same merge path |
+
+### Operational Characteristics
+
+- The metastore is part of the durable read path, not just background bookkeeping.
+- `diskless` retention is resumable and ordered safely: delete S3 data first, then remove metastore refs.
+- `diskless` retention is also conservative at the backing-file level. If a file still contains newer live refs, old refs in that file remain until the whole file becomes eligible.
+- Kafka topic creation supports `diskless` directly through `camu.storage.mode=diskless`.
+- Storage mode is immutable after topic creation.
+- Arbitrary timestamp lookup through Kafka `ListOffsets` is currently unsupported for `diskless` topics and returns an explicit invalid-request style error.
+
+### When To Choose It
+
+Choose `diskless` when you care more about:
+
+- pushing durability and state coordination toward object storage
+- minimizing dependence on classic local active-segment ownership
+- keeping the same public API while changing the internal storage path
+
+Choose `classic` when you care more about:
+
+- the most mature local-tail behavior
+- classic segment/index lifecycle
+- classic sealed-segment optimizations such as segment merge
+
+### Creating Diskless Topics
+
+Over HTTP:
+
+```json
+{
+  "name": "events",
+  "partitions": 4,
+  "retention": "168h",
+  "storage_mode": "diskless"
+}
+```
+
+Over Kafka `CreateTopics`:
+
+- `camu.storage.mode=diskless`
+
+The detailed creation and API examples live in [docs/api.md](docs/api.md).
+
+### Protocols and Client Compatibility
+
+- HTTP API for topic admin, produce, consume, offsets, and SSE streaming.
+- Kafka wire protocol support for the implemented API subset, advertised through `ApiVersions`.
+- Existing Kafka clients can produce and consume without custom protocol adapters.
+- HTTP and Kafka topic creation both support `classic` and `diskless` storage modes.
+
+### Replication and Correctness
+
+- Partition leadership and cluster assignments are coordinated through S3 conditional writes.
+- Replicated writes wait for ISR quorum acknowledgement.
+- Reads are capped by readable high watermark so consumers do not see uncommitted replicated data.
+- Failover uses assignment epochs and epoch history to fence stale leaders.
+- Follower fetch, proxying, and failover are now isolated behind follower-specific service logic rather than scattered checks.
+
+### Operations
+
+- One binary, one config file, and an S3-compatible bucket are enough to start.
+- Background maintenance is bounded by `coordination.maintenance_max_concurrency`.
+- Topic deletion is asynchronous, resumable, and safe for restart.
+- Retention and classic merge are partition-leader-executed durable jobs.
+
+## Parquet and SQL
+
+Camu can project committed records from export-enabled classic topics into Parquet and expose those files through a bounded read-only SQL endpoint.
+
+- A fenced Parquet consumer runs asynchronously for each partition leader and never blocks produce.
+- Physical file layout uses ingest-time buckets:
+  - `parquet/dt=YYYY-MM-DD/topic={topic}/hour=HH/{file-id}.parquet`
+- Query visibility is manifest-driven, not raw directory-list-driven.
+- `POST /v1/sql` only reads files referenced by published manifests.
+
+SQL authentication: when `server.auth_token` is configured, `/v1/sql` requires
+`Authorization: Bearer <token>`. TLS is expected to terminate at the deployment
+proxy; Camu does not provide TLS in this release.
+
+Each consumer batch is bounded by
+`maintenance.parquet_export.max_records` and `max_duration`; DuckDB conversion uses the configured
+`maintenance.parquet_export.temp_directory`. Parquet compaction is deferred and
+is not an executable maintenance job in this release.
+- Query execution uses embedded DuckDB with local cache and explicit bounds:
+  - `sql.enabled`
+  - `sql.cache_directory`
+  - `sql.duckdb_temp_directory`
+  - `sql.cache_max_size`
+  - `sql.duckdb_memory_limit`
+  - `sql.max_concurrency`
+  - `sql.query_timeout`
+  - `sql.max_scan_files`
+
+Current shape:
+
+- SQL is read-only: `SELECT` / `WITH` queries only.
+- Queries are topic-scoped and must name one or more topics in the request envelope.
+- Query nodes can run separately with `server.mode = "query"`.
+- Parquet export is opt-in per classic topic with `export_enabled: true`.
+- With export enabled, classic retention deletes a sealed native segment only
+  after its durable pipeline checkpoint covers the segment's end offset. If the
+  checkpoint is absent, behind, or unreadable, retention pauses for that
+  partition rather than risking a permanent SQL data gap.
+- Export-enabled topics require `unclean_leader_election=false`. Export
+  publishes per-ingest-hour manifests and cannot atomically reconcile a
+  divergent offset history after an unclean leader election. Before enabling
+  export, turn off unclean leader election for that topic. A stream node
+  refuses to start while an export-enabled classic topic remains
+  incompatible; Camu does not rewrite or migrate topic configuration.
+
+For a dedicated query node, use [`camu.query.yaml.example`](camu.query.yaml.example):
+SQL is required, and the node does not need an internal or Kafka listener. Give
+it read-only object-store access limited to `parquet/`, `_meta/parquet_manifests/`,
+and `_meta/topics/`; `/v1/cluster/status` is local node status, not cluster discovery.
+
+Example:
+
+```bash
+curl -X POST http://localhost:8080/v1/sql \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sql":"select count(*)::BIGINT as n from \"events\"",
+    "topics":["events"]
+  }'
+```
+
+## Jepsen Notes
+
+Camu has a repository-local Jepsen harness. The goal is not to claim "everything is linearizable"; the goal is to prove the durability and failover properties that the product actually depends on.
+
+- The harness runs a five-node Docker cluster against MinIO-backed storage.
+- The currently documented matrix includes **22 passing scenarios** across `kill`, `partition`, `pause`, `leader-kill`, `leave`, `membership`, `rejoin`, `s3-partition`, `clock-skew`, and combined faults.
+- The strongest claim is for replicated topics: acknowledged writes survive the tested fault matrix and committed prefixes survive leader failover.
+- Jepsen is complemented by unit and integration coverage; it is not the only correctness layer.
+- Every run produces artifacts you can inspect locally, including `results.edn`, `history.edn`, `jepsen.log`, and per-node `camu.log` files.
+
+Jepsen in Camu is mainly a **durability and failover** signal, not a blanket claim about arbitrary low-latency replica-read freshness under all conditions.
+
+For the harness, scenarios, and run commands, see [jepsen/camu/README.md](jepsen/camu/README.md). For the higher-level interpretation of what the Jepsen matrix proves, see [docs/reliability.md](docs/reliability.md).
+
+## Where It Fits
+
+Camu is a strong fit when you want:
+
+- a durable append log backed by object storage
+- Kafka client compatibility without operating Kafka itself
+- a simpler control plane than broker + controller + metadata quorum stacks
+- HTTP-first integration for internal services, edge systems, or product backends
+- replicated write semantics with a smaller operational footprint
+
+It is not trying to be a full Kafka clone. The project is intentionally focused on a well-supported subset with explicit unsupported behavior rather than maximal protocol surface.
 
 ## What An Ack Means
 
 | Mode | Durability guarantee |
-|------|---------------------|
+|---|---|
 | `rf=1`, `minISR=1` | A successful produce is durable in the local active segment on the owning node. |
-| `rf>1` | A successful produce is durable on the leader **and** only acknowledged after the configured ISR quorum confirms it. |
+| `rf>1` | A successful produce is durable on the leader and only acknowledged after the configured ISR quorum confirms it. |
 
-Flush to S3 is asynchronous. Cross-instance visibility for non-replica reads follows segment flush timing, not ack timing. Reads are capped by the readable high watermark, so consumers never observe uncommitted replicated writes.
-
-Time-based retention cleanup is also asynchronous and resumable in both modes.
-Partition leaders execute retention through durable partition jobs. For classic
-topics, they delete segment data and index objects first, invalidate local
-sealed-segment cache/index state, and only then remove the metadata sidecar.
-For diskless topics, they delete S3 data first and only then remove diskless
-metastore refs. Diskless retention is therefore conservative at the file level
-when a backing file is still shared by newer data.
-Partition-leader maintenance is bounded per node by
-`coordination.maintenance_max_concurrency`, so retention and merge work stay
-parallel but controlled.
+Flush to object storage is asynchronous. Cross-instance visibility for non-replica reads follows flush timing, not ack timing.
 
 ## Quick Start
 
@@ -134,346 +310,50 @@ cp camu.yaml.example camu.yaml
 ./camu serve --config camu.yaml
 ```
 
-Check readiness:
+### First Requests
 
 ```bash
 curl http://localhost:8080/v1/ready
-```
 
-## API Overview
-
-### Topics
-
-```bash
 curl -X POST http://localhost:8080/v1/topics \
   -H 'Content-Type: application/json' \
-  -d '{
-    "name":"orders",
-    "partitions":4,
-    "retention":"168h",
-    "replication_factor":3,
-    "min_insync_replicas":2
-  }'
+  -d '{"name":"events","partitions":4,"retention":"168h"}'
 
-curl http://localhost:8080/v1/topics
-curl http://localhost:8080/v1/topics/orders
-curl -X DELETE http://localhost:8080/v1/topics/orders
-```
-
-Topic creation supports both `classic` and `diskless` modes. Over HTTP, set
-`"storage_mode":"diskless"` to create a diskless topic. Over Kafka
-`CreateTopics`, use `camu.storage.mode=diskless`.
-
-Topic deletion is asynchronous and resumable. A delete hides the topic
-immediately from HTTP and Kafka metadata, then background GC removes S3 data
-and, for diskless topics, clears diskless metastore state before removing the
-deletion marker. Topic deletion remains coordination-leader-led rather than
-partition-runtime-led so it can resume after restart even when no topic runtime
-is active anymore.
-
-### Produce
-
-High-level produce routes by key. The same key always maps to the same partition; messages without a key use round-robin routing.
-
-```bash
-curl -X POST http://localhost:8080/v1/topics/orders/messages \
+curl -X POST http://localhost:8080/v1/topics/events/messages \
   -H 'Content-Type: application/json' \
-  -d '[{"key":"user-123","value":"order placed","headers":{"trace-id":"abc"}}]'
+  -d '[{"key":"user-123","value":"clicked"}]'
 
-curl -X POST http://localhost:8080/v1/topics/orders/messages \
-  -H 'Content-Type: application/json' \
-  -d '[{"key":"u1","value":"m1"},{"key":"u2","value":"m2"}]'
-
-curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
-  -H 'Content-Type: application/json' \
-  -d '[{"value":"direct-partition-write"}]'
+curl "http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limit=100"
 ```
 
-Both produce endpoints are batch-shaped: send a JSON array for regular produce, even for a single message. The partition-specific endpoint also accepts the idempotent batch object shown below.
+## Documentation
 
-If a request lands on a non-owner, Camu either proxies internally to the leader or returns `421 Misdirected Request` with the current routing map:
+- [API Guide](docs/api.md)
+- [API Support Matrix](docs/api-support-matrix.md)
+- [Parquet + SQL Design](docs/parquet-sql-design.md)
+- [Architecture](docs/architecture.md)
+- [Coordination Architecture](docs/architecture/coordination.md)
+- [Reliability Notes](docs/reliability.md)
+- [Partition Maintenance Refactor](docs/partition-maintenance-refactor.md)
 
-```bash
-curl http://localhost:8080/v1/topics/orders/routing
-```
+## Current Highlights
 
-### Kafka Wire Protocol
-
-Camu implements the Kafka wire protocol for seamless client compatibility. Any Kafka client (librdkafka, franz-go, kafka-python, etc.) can produce to and consume from Camu without modification.
-
-```bash
-# Using kcat
-echo "hello" | kcat -b localhost:9092 -t orders -P
-kcat -b localhost:9092 -t orders -C -e
-```
-
-Supported Kafka APIs: Produce, Fetch, Metadata, ListOffsets, OffsetCommit,
-OffsetFetch, FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
-DescribeGroups, ListGroups, DeleteGroups, CreateTopics, DeleteTopics,
-CreatePartitions, DescribeConfigs, AlterConfigs, IncrementalAlterConfigs,
-DescribeCluster, ApiVersions, InitProducerID, and ACL operations.
-
-Kafka admin notes:
-
-- `CreateTopics` supports `camu.storage.mode=diskless` at create time
+- `CreateTopics` supports `camu.storage.mode=diskless`
 - `camu.storage.mode` is immutable after creation
-- retention is time-based via `retention.ms`
 - `retention.bytes` is explicitly unsupported
-- `CreatePartitions` is expand-only; partition count cannot be decreased
-- time-based retention in both `classic` and `diskless` is partition-leader-executed through durable partition jobs and a dedicated partition-leader maintenance service
-- classic sealed-segment merge now runs through the same partition-job model with a conservative automatic discovery policy for adjacent retained segments
-- follower-side leader proxying and failover handling are now grouped behind a dedicated partition-follower service layer
+- `CreatePartitions` is expand-only
+- retention is time-based and resumable in both `classic` and `diskless`
+- follower-side leader proxying and failover handling are isolated behind a dedicated service layer
 
-The canonical current support status lives in
-[docs/api-support-matrix.md](docs/api-support-matrix.md).
+## Status
 
-### Idempotent Produce
+The canonical current support status lives in [docs/api-support-matrix.md](docs/api-support-matrix.md).
 
-Idempotent produce is tracked per `(producer_id, topic, partition)` and is only supported on the partition-specific produce endpoint:
+The project is deliberately optimized for:
 
-```text
-POST /v1/topics/{topic}/partitions/{id}/messages
-```
-
-The high-level routed endpoint rejects idempotent batch bodies with `400 Bad Request`.
-
-The client normally allocates a producer ID once, then sends a monotonically increasing `sequence` for that partition stream.
-
-```bash
-curl -X POST http://localhost:8080/v1/producers/init
-# {"producer_id":42}
-
-curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "producer_id":42,
-    "sequence":0,
-    "messages":[
-      {"key":"u1","value":"hello"},
-      {"key":"u2","value":"world"}
-    ]
-  }'
-
-curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "producer_id":42,
-    "sequence":2,
-    "messages":[
-      {"key":"u3","value":"next batch"}
-    ]
-  }'
-```
-
-Retrying the first batch with the same `producer_id`, `sequence`, and routed messages is safe:
-
-```bash
-curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "producer_id":42,
-    "sequence":0,
-    "messages":[
-      {"key":"u1","value":"hello"},
-      {"key":"u2","value":"world"}
-    ]
-  }'
-```
-
-Current behavior:
-
-- duplicate sequence: `200 OK` with `{"duplicate":true}`
-- sequence gap: `422`
-- unknown producer with non-zero sequence: `422`
-- omit `producer_id` and `sequence` for regular at-least-once produce
-- a fresh producer ID with `sequence=0` is auto-registered, but `POST /v1/producers/init` is the intended path
-
-Operational details:
-
-- sequence advances by the batch size for that partition
-- duplicate retries do not append again
-- on replicated topics, duplicate retries wait for the original batch to reach the replicated commit point before returning success
-- the manager stores the last offset of the accepted batch so duplicate retries can join that commit wait
-- idempotency state is checkpointed during flush and rebuilt from native batch metadata on recovery
-- inactive producer state is eventually evicted, so producer IDs are not meant to live forever
-
-Practical rules:
-
-- retry the exact same request body when re-sending a batch
-- keep one sequence stream per `(producer_id, topic, partition)`
-- use `POST /v1/producers/init` to get a unique producer ID
-- send idempotent batches only to `POST /v1/topics/{topic}/partitions/{id}/messages`
-
-This gives exactly-once produce deduplication for retried batches on a partition stream. It is not a cross-topic transaction system and it does not make consumer-side processing exactly-once by itself.
-
-### Consume
-
-```bash
-curl "http://localhost:8080/v1/topics/orders/partitions/0/messages?offset=0&limit=100"
-
-curl -N \
-  -H 'Accept: text/event-stream' \
-  "http://localhost:8080/v1/topics/orders/partitions/0/stream?offset=0"
-```
-
-Polling returns JSON with `messages` and `next_offset`. SSE uses `id: {offset}` and resumes from `Last-Event-ID + 1`.
-
-### Offsets
-
-```bash
-curl -X POST http://localhost:8080/v1/groups/my-group/commit \
-  -H 'Content-Type: application/json' \
-  -d '{"offsets":{"0":100,"1":200}}'
-
-curl http://localhost:8080/v1/groups/my-group/offsets
-
-curl -X POST http://localhost:8080/v1/topics/orders/offsets/consumer-1 \
-  -H 'Content-Type: application/json' \
-  -d '{"offsets":{"0":100}}'
-
-curl http://localhost:8080/v1/topics/orders/offsets/consumer-1
-```
-
-## Multi-Instance Model
-
-Multiple Camu instances can share one bucket.
-
-- Topic config lives in `_meta/topics/{topic}.json`
-- Partition ownership lives in `_coordination/assignments/{topic}.json`
-- Instance liveness lives in `_coordination/instances/{instanceID}.json`
-- Segments live under `{topic}/{partition}/`
-- Offsets live in `_coordination/groups/` and `_coordination/consumers/`
-
-Ownership is fenced in three places:
-
-- local ownership checks reject writes on stale owners
-- every flush re-verifies ownership from S3 before uploading a segment
-- segment filenames include the leader epoch, so stale uploads are distinguishable
-
-Replicated topics use ISR-style follower fetch from the leader over the internal h2c listener on `server.internal_address`.
-
-## Configuration
-
-`camu.yaml.example` is the canonical starting point. Current defaults from the code path:
-
-| Setting | Default | Notes |
-|---------|---------|-------|
-| `server.address` | `:8080` | Public HTTP API |
-| `server.internal_address` | `:8081` | Internal h2c listener for replication and leader proxying |
-| `server.kafka_port` | `9092` | Kafka wire protocol listener |
-| `server.instance_id` | auto-generated UUID | Stable IDs are useful for fixed deployments |
-| `storage.bucket` | required | S3 or compatible object store bucket |
-| `storage.region` | empty unless set | Required by many S3 providers |
-| `storage.endpoint` | empty | Set this for MinIO, R2, Backblaze, etc. |
-| `segments.max_size` | `8 MiB` | Flush-by-size threshold |
-| `segments.max_age` | `5s` | Flush-by-time threshold |
-| `segments.compression` | `none` | `none`, `snappy`, `zstd` |
-| `segments.record_batch_target_size` | `16 KiB` | Batch framing target inside a segment |
-| `segments.index_interval_bytes` | `4096` | Sparse segment offset-index cadence |
-| `cache.directory` | `/var/lib/camu/cache` | Local segment cache |
-| `cache.max_size` | `10 GiB` | Disk LRU cap |
-| `coordination.lease_ttl` | `30s` | Lease expiry window |
-| `coordination.instance_ttl` | `lease_ttl * 3` | Defaults to `90s` when omitted |
-| `coordination.heartbeat_interval` | `10s` | Lease renewal interval |
-| `coordination.rebalance_delay` | `5s` | Delay before publishing new assignments |
-| `coordination.isr_expansion_threshold` | `1000` | Follower catch-up threshold before ISR rejoin |
-| `coordination.replication_timeout` | `30s` | Produce wait timeout for replicated topics |
-
-## Jepsen Verification
-
-Camu ships with a repository-local Jepsen harness that runs a five-node Docker cluster against MinIO-backed storage, injects adversarial faults, then drains all partitions and verifies the observed history against acknowledged operations.
-
-**22 passing fault scenarios** across three replication modes:
-
-| Mode | Faults tested |
-|------|---------------|
-| `rf=3`, `minISR=2` | kill, partition, pause, leader-kill, leave, membership, rejoin, s3-partition, clock-skew, kill+partition, leader-kill+s3-partition (10s and 45s durations) |
-| `rf=3`, `minISR=3` | kill, leader-kill, membership, s3-partition, leader-kill+s3-partition |
-| `rf=1`, `minISR=1` | kill |
-
-**9 correctness checkers** verify every run:
-
-| Checker | What it proves |
-|---------|----------------|
-| committed-durability | Acknowledged writes survive to final drain |
-| single-leader | No conflicting values at the same (partition, offset) |
-| total-order | Partition histories remain ordered and contiguous |
-| offset-monotonicity | Offsets never duplicate or regress |
-| truncation-safety | Committed suffixes are not lost after failover |
-| hw-monotonicity | Observed high watermarks do not go backward |
-| no-ghost-reads | Reads do not invent unacknowledged data |
-| availability | Successful operation ratio during faults |
-| recovery-time | Latency from injected fault to next success |
-
-See [docs/reliability.md](docs/reliability.md) for the full matrix and [jepsen/camu/README.md](jepsen/camu/README.md) for the harness.
-
-## Project Layout
-
-```text
-cmd/camu/                        CLI entry point
-internal/
-  config/                        Config loading and validation
-  log/                           Active segments, sealed segments, indexes, cache, retention
-  server/
-    handlers_produce.go          HTTP produce handlers (high-level + partition-specific)
-    handlers_consume.go          HTTP consume handlers (polling + SSE streaming)
-    handlers_producers.go        Producer ID allocation
-    produce_types.go             Produce request/response DTOs
-    produce_parse.go             Body parsing and decoding utilities
-    produce_append.go            RecordBatch append fast-path, replication wait
-    produce_leadership.go        Leadership proxy/reject helpers
-    consume_types.go             Consume response DTOs
-    consume_iterator.go          Multi-source merge iterator
-    consume_stream.go            Streaming JSON response writer
-    consume_helpers.go           High watermark, message merge, encoding
-    kafka_types.go               Kafka server types, config, interfaces
-    kafka_wire.go                Kafka wire protocol: conn, decode, encode, routing
-    kafka_handlers_data.go       Kafka produce + fetch handlers
-    kafka_metadata_discovery.go  Kafka Metadata, ListOffsets, FindCoordinator
-    kafka_topic_admin.go         Kafka topic admin + topic config handling
-    kafka_acl_admin.go           Kafka ACL admin handlers and filter validation
-    kafka_offsets.go             Kafka OffsetCommit, OffsetFetch, OffsetDelete
-    kafka_group_handlers.go      Kafka group/coordinator handler wrappers
-    kafka_groups.go              Kafka consumer group coordinator state machine
-    kafka_codec.go               RecordBatch encode/decode, compression
-    kafka_helpers.go             Partition lookup, error mapping, adapters
-    topic_deletion.go            Async/resumable topic deletion workflow
-    coordination_gc.go           Background coordination GC and cleanup
-    server.go                    HTTP server, bootstrap, lifecycle
-    partition_manager.go         Partition state, flush, recovery
-  replication/                   ISR replication and follower fetch
-  coordination/                  S3 leases, registry, assignment store
-  meta/                          Topic metadata
-  storage/                       S3 client and offset persistence
-  consumer/                      SSE streaming support
-  producer/                      Backpressure and producer utilities
-  idempotency/                   Producer sequence tracking and deduplication
-pkg/camutest/                    Multi-instance test helpers
-test/integration/                Real-server integration tests
-test/bench/                      Benchmarks
-jepsen/camu/                     Jepsen fault-injection harness (Clojure)
-docs/                            Architecture, reliability, and design notes
-```
-
-## Development
-
-```bash
-go test ./internal/...
-go test -tags integration ./test/integration/ -timeout 120s
-go test -tags integration ./test/bench/ -bench=. -benchtime=10s
-
-cd jepsen/camu
-./run.sh
-./run.sh leader-kill 45
-RF=3 MIN_ISR=3 ./run.sh leader-kill,s3-partition 45
-```
-
-## More Docs
-
-- [docs/architecture.md](docs/architecture.md) -- System architecture and data path
-- [docs/architecture/coordination.md](docs/architecture/coordination.md) -- Coordination, failover, and consumer groups
-- [docs/reliability.md](docs/reliability.md) -- Correctness claims and verification layers
-- [jepsen/camu/README.md](jepsen/camu/README.md) -- Jepsen harness, fault matrix, and checkers
+- strong correctness of the supported subset
+- explicit unsupported behavior
+- simple deployment and operational clarity
 
 ## License
 

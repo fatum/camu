@@ -175,7 +175,7 @@ func (s *Server) kafkaControllerBroker(ctx context.Context) (int32, string, int3
 		}
 	}
 
-	host, port := splitKafkaBrokerAddr(kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort))
+	host, port := splitKafkaBrokerAddr(kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort, s.cfg.Server.KafkaAdvertiseAddress))
 	return kafkaBrokerID(s.instanceID), host, port, nil
 }
 

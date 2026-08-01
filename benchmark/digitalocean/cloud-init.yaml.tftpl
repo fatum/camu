@@ -1,0 +1,56 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - docker.io
+
+runcmd:
+  - systemctl enable --now docker
+  - mkdir -p /etc/camu /var/lib/camu/cache
+  - echo '${digitalocean_token}' | docker login --username doctl --password-stdin ${registry_endpoint}
+  - |
+    private_ip="$(ip -4 route show ${vpc_cidr} | awk '{for (i = 1; i <= NF; i++) if ($i == "src") {print $(i + 1); exit}}')"
+    public_ip="$(curl -fsS http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)"
+    test -n "$private_ip"
+    test -n "$public_ip"
+    cat >/etc/camu/benchmark.yaml <<CAMU_CONFIG
+    server:
+      address: ":8080"
+      internal_address: "$private_ip:8081"
+      instance_id: "${node_name}"
+      kafka_port: 9092
+      kafka_advertise_address: "$public_ip:9092"
+      mode: stream
+    sql:
+      enabled: true
+    storage:
+      bucket: "${bucket_name}"
+      region: "${spaces_region}"
+      endpoint: "https://${spaces_region}.digitaloceanspaces.com"
+      credentials:
+        access_key: "${spaces_access_key}"
+        secret_key: "${spaces_secret_key}"
+    segments:
+      max_size: 67108864
+      max_age: 1m
+      compression: snappy
+    cache:
+      directory: /var/lib/camu/cache
+      max_size: 4294967296
+    coordination:
+      lease_ttl: 30s
+      heartbeat_interval: 5s
+      rebalance_delay: 15s
+    maintenance:
+      parquet_export:
+        max_records: 16384
+    CAMU_CONFIG
+  - docker pull ${camu_image}
+  - docker rm -f camu 2>/dev/null || true
+  - >-
+    docker run -d --name camu --restart unless-stopped --network host
+    -e CAMU_LOG_LEVEL=error -e CAMU_REQUEST_LOG=0
+    -v /etc/camu/benchmark.yaml:/etc/camu.yaml:ro
+    -v /var/lib/camu:/var/lib/camu
+    ${camu_image} serve --config /etc/camu.yaml

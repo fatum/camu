@@ -3,6 +3,8 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -12,12 +14,23 @@ func (s *Server) publicRoutes() http.Handler {
 
 func (s *Server) publicAPIHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	if s.cfg.SQL.EnabledValue(s.isQueryMode()) {
+		mux.Handle("POST /v1/sql", s.requireSQLAuth(http.HandlerFunc(s.handleSQLQuery)))
+	}
+	if s.isQueryMode() {
+		mux.HandleFunc("GET /v1/ready", s.handleReady)
+		mux.HandleFunc("GET /v1/cluster/status", s.handleClusterStatus)
+		mux.HandleFunc("GET /v1/cluster/ready", s.handleClusterReady)
+		return mux
+	}
 	mux.HandleFunc("POST /v1/topics", s.handleCreateTopic)
 	mux.HandleFunc("GET /v1/topics", s.handleListTopics)
 	mux.HandleFunc("GET /v1/topics/{topic}", s.handleGetTopic)
 	mux.HandleFunc("DELETE /v1/topics/{topic}", s.handleDeleteTopic)
 	mux.HandleFunc("GET /v1/ready", s.handleReady)
 	mux.HandleFunc("GET /v1/cluster/status", s.handleClusterStatus)
+	mux.HandleFunc("GET /v1/cluster/ready", s.handleClusterReady)
 	mux.HandleFunc("GET /v1/topics/{topic}/routing", s.handleRouting)
 	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
 	mux.HandleFunc("POST /v1/topics/{topic}/partitions/{id}/messages", s.handleProduceLowLevel)
@@ -29,6 +42,23 @@ func (s *Server) publicAPIHandler() http.Handler {
 	mux.HandleFunc("GET /v1/groups/{group_id}/offsets", s.handleGetOffsets)
 	mux.HandleFunc("POST /v1/producers/init", s.handleInitProducer)
 	return mux
+}
+
+func (s *Server) requireSQLAuth(next http.Handler) http.Handler {
+	token := s.cfg.Server.AuthToken
+	if token == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+		auth := r.Header.Get("Authorization")
+		if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix || auth[len(prefix):] != token {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="camu-sql"`)
+			writeError(w, http.StatusUnauthorized, "valid bearer token required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // PublicHandler returns the server's public API handler.
@@ -44,8 +74,12 @@ func (s *Server) PublicAPIHandler() http.Handler {
 
 func (s *Server) internalRoutes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/internal/replicate/{topic}/{pid}", s.handleReplicaFetch)
 	mux.HandleFunc("GET /v1/ready", s.handleReady)
+	mux.HandleFunc("GET /v1/internal/readiness", s.handleInternalReadiness)
+	if s.isQueryMode() {
+		return s.withMiddleware(mux)
+	}
+	mux.HandleFunc("GET /v1/internal/replicate/{topic}/{pid}", s.handleReplicaFetch)
 	// Produce endpoints are registered here so proxied requests from
 	// non-leader nodes can be handled by the leader's internal server.
 	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)
@@ -63,16 +97,36 @@ func (s *Server) internalRoutes() http.Handler {
 
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: 200}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Camu-Instance-ID", s.instanceID)
-		s.requestLogger(next).ServeHTTP(w, r)
+		if r.URL.Path == "/metrics" {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		}
+		handler := next
+		if os.Getenv("CAMU_REQUEST_LOG") != "0" {
+			handler = s.requestLogger(next)
+		}
+		handler.ServeHTTP(sw, r)
+		path := r.Pattern
+		if path == "" {
+			path = "unmatched"
+		}
+		s.metricInc("camu_http_requests_total", "HTTP requests handled", map[string]string{"method": r.Method, "path": path, "status": strconv.Itoa(sw.status)})
+		s.metricObserve("camu_http_request_duration", "HTTP request duration", map[string]string{"method": r.Method, "path": path}, time.Since(start))
 	})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = w.Write([]byte(s.metrics.Handler()))
 }
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip noisy health/status endpoints — log them at Debug level only.
-		isNoise := r.URL.Path == "/v1/cluster/status" || r.URL.Path == "/v1/ready"
+		isNoise := r.URL.Path == "/metrics" || r.URL.Path == "/v1/cluster/status" || r.URL.Path == "/v1/cluster/ready" || r.URL.Path == "/v1/ready" || r.URL.Path == "/v1/internal/readiness"
 
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: 200}
