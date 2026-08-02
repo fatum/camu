@@ -43,7 +43,9 @@ Camu is an S3-native event log that stores native Kafka `RecordBatch` bytes as i
 3. **Append**: The partition leader appends batch bytes to a local active segment.
 4. **Replicate**: For replicated topics, followers fetch raw batches from the leader over the internal h2c listener. The leader advances the high watermark when ISR followers confirm progress.
 5. **Acknowledge**: The produce response is sent only after the ISR quorum has confirmed the write.
-6. **Flush**: The batcher seals active segments and uploads immutable segment files plus sidecars to object storage.
+6. **Persist**: A background flusher seals active segments and publishes their
+   immutable files, sidecars, state, and producer checkpoint to object storage.
+   This work is not on the produce request path.
 
 ### Read Path
 
@@ -120,6 +122,7 @@ internal/server/
 Each partition keeps:
 
 - one active segment on local disk
+- at most one sealed segment awaiting object-store publication
 - in-memory offset and timestamp indexes for the active segment
 - per-partition producer-sequence state for idempotent produce
 - replication state when the topic uses `replication_factor > 1`
@@ -136,15 +139,24 @@ The local active segment is the only mutable log file. Recovery truncates partia
 
 ## Flush
 
-Flush is triggered by `segments.max_size` or `segments.max_age`.
+Flush is triggered by `segments.max_size` or `segments.max_age` and runs in the
+background. Produce only appends locally and schedules the work; it never waits
+for an object-store upload.
 
 Flush steps:
 
-1. Verify ownership from S3 (fences stale leaders)
-2. Seal the active segment
-3. Upload the sealed `.log` and `.index`
-4. Persist partition state and producer checkpoint
-5. Open the next active segment at the current log end
+1. Verify ownership from S3 (fences stale leaders).
+2. Seal the active segment and open its successor at the current log end.
+3. Keep the sealed files as explicit pending work; follower fetches can read
+   them locally while publication is in progress.
+4. Upload the segment, sidecar, metadata, partition state, and producer
+   checkpoint.
+5. Add the segment to the shared index and remove the local pending files only
+   after publication succeeds. Retries publish the same sealed files.
+
+In-flight flush bytes count toward backpressure. If object storage is slow,
+produce is rejected with backpressure instead of waiting on an upload or
+allowing unbounded local growth.
 
 ## Topic Deletion
 

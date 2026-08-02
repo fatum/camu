@@ -63,5 +63,8 @@ func (f serverFencer) TopicDeletionPending(ctx context.Context, topic string) bo
 }
 
 func (s *Server) newParquetStore() *parquet.Store {
+	if s.parquetStoreFactory != nil {
+		return s.parquetStoreFactory()
+	}
 	return parquet.NewStore(parquetObjectAdapter{client: s.s3Client}, serverFencer{s: s})
 }

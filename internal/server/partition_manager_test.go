@@ -808,3 +808,22 @@ func TestAppendReplicatedRawBatches_PartitionNotFound(t *testing.T) {
 		t.Fatal("expected error for unknown partition, got nil")
 	}
 }
+
+func TestUpdateFollowerProgressDoesNotAdvertiseUnreplicatedOffsets(t *testing.T) {
+	pm := newTestPartitionManager(t)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	ps.mu.Lock()
+	ps.nextOffset = 100
+	ps.mu.Unlock()
+
+	pm.UpdateFollowerProgress("topic", 0, 1, 1_000, 99)
+
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.followerHW != 100 {
+		t.Fatalf("follower high watermark = %d, want local log end 100", ps.followerHW)
+	}
+}

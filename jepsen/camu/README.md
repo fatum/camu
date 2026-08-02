@@ -65,6 +65,10 @@ The harness currently supports:
 - `replica-flushed-reads`
   - a produce-heavy workload used for follower-read checks after graceful flushes
 
+`scripts/async-segment-publish-smoke.sh` forces 64 KiB / 2s segment sealing
+and runs leader-kill plus S3-isolation faults. Use it for changes to segment
+sealing, publish retry, or local pending-segment reads.
+
 Read mode can be controlled independently:
 
 - `leader`
@@ -148,6 +152,7 @@ The `scripts/` directory contains reusable scenarios:
 ./scripts/large-requests.sh
 ./scripts/high-concurrency-large-requests.sh
 ./scripts/replica-flushed-reads.sh
+./scripts/async-segment-publish-smoke.sh
 ```
 
 Useful shortcuts:

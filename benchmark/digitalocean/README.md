@@ -40,9 +40,12 @@ Provision the registry, build and push the image, then create the five nodes:
 
 Each provisioning run publishes a unique timestamped image tag and applies
 that exact tag to the droplets, preventing stale or deleted registry tags from
-being reused. Set `IMAGE_TAG` to choose a specific tag.
+being reused. Existing nodes are updated sequentially: the script waits for a
+node to become ready before restarting the next one. Set `IMAGE_TAG` to choose
+a specific tag, `SSH_USER` to change the deployment user, or
+`SKIP_CONTAINER_RESTART=1` to apply Terraform without restarting containers.
 
-To build and publish another image after provisioning (`doctl` is optional):
+To build and publish an image without deploying it (`doctl` is optional):
 
 ```bash
 IMAGE_TAG=benchmark-next ./build-image.sh
@@ -60,15 +63,31 @@ ordered public benchmark URLs are available as `terraform output -json benchmark
 ## Run and destroy
 
 ```bash
-./run.sh 1GiB
+TOPIC=benchmark-typed-demo ./run.sh produce 1GiB
+TOPIC=benchmark-typed-demo ./run.sh consume 1GiB
+TOPIC=benchmark-typed-demo ./run.sh sql 1GiB
 ./destroy.sh
 ```
 
-The run script waits for all five nodes, uses their public HTTP addresses, and
-writes the report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT`
-is set. Each invocation uses a unique topic derived from its run ID, avoiding
-asynchronous deletion races between runs. Set `TOPIC` to override it.
-`TARGET_BYTES` and `MESSAGE_BYTES` can override the workload.
+The benchmark has separate `produce`, `consume`, and `sql` operations. Use the
+same `TOPIC`, target size, and message size for each operation. The script
+waits for all five nodes, uses their public HTTP addresses, and writes the
+report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT` is set. A
+topic is retained by default; set `CLEANUP=1` only when the final operation may
+delete it. Each invocation without `TOPIC` creates a unique topic, which is
+appropriate for a standalone `produce` run but not a later consume or SQL run.
+`TARGET_BYTES`, `MESSAGE_BYTES`, and `PARTITIONS` can override the workload.
+The default is four partitions. Byte values accept a positive byte count or a
+binary unit such as `1GiB`, `512MiB`, or `64KiB`.
+
+`consume` reads partition `p` through node `p`, rather than concentrating every
+partition on the first public endpoint. It logs the page offset, response size,
+and per-partition progress. `sql` logs every visibility poll and its error or
+row-count progress. Use `all` only for the legacy sequential flow:
+
+```bash
+TOPIC=benchmark-typed-demo ./run.sh all 1GiB
+```
 During the run it scrapes each node's internal metrics endpoint every five
 seconds and writes raw samples to `/tmp/camu-digitalocean-telemetry.jsonl`
 unless `TELEMETRY_OUTPUT` is set.
@@ -80,7 +99,7 @@ The default producer/consumer API is HTTP. To benchmark the Kafka protocol,
 open port 9092 from `benchmark_cidr`, apply the firewall update, and run:
 
 ```bash
-BENCHMARK_API=kafka ./run.sh 1GiB
+TOPIC=benchmark-typed-demo BENCHMARK_API=kafka ./run.sh produce 1GiB
 ```
 
 Kafka brokers default to all five public droplet addresses on port 9092. Set

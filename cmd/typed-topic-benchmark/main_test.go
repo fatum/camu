@@ -33,3 +33,39 @@ func TestHashStateDeterministicAndOrdering(t *testing.T) {
 		t.Fatal("expected ordering error")
 	}
 }
+
+func TestParseByteSize(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{name: "bytes", raw: "1073741824", want: 1073741824},
+		{name: "kibibytes", raw: "2KiB", want: 2 * 1024},
+		{name: "mebibytes", raw: "3MiB", want: 3 * 1024 * 1024},
+		{name: "gibibytes", raw: "1GiB", want: 1024 * 1024 * 1024},
+		{name: "case and whitespace", raw: " 4gIb ", want: 4 * 1024 * 1024 * 1024},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("TARGET_BYTES", test.raw)
+			got, err := parseByteSize("TARGET_BYTES", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("parseByteSize() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseByteSizeRejectsInvalidValue(t *testing.T) {
+	for _, raw := range []string{"0", "-1", "1GB", "1GiBB", "9000000TiB"} {
+		t.Run(raw, func(t *testing.T) {
+			t.Setenv("TARGET_BYTES", raw)
+			if _, err := parseByteSize("TARGET_BYTES", 1); err == nil {
+				t.Fatalf("parseByteSize(%q) succeeded", raw)
+			}
+		})
+	}
+}

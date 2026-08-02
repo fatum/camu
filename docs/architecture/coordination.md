@@ -67,7 +67,7 @@ Each partition leader is responsible for:
 - Accepting writes and encoding them as RecordBatch bytes
 - Serving replication traffic to followers over h2c
 - Tracking ISR follower progress and advancing the high watermark
-- Sealing active segments and uploading to object storage
+- Scheduling background segment sealing and object-store publication
 - Persisting idempotent producer checkpoints during flush
 - Executing retention through durable partition jobs
 - Fencing itself if the local epoch falls behind the assignment epoch
@@ -77,6 +77,11 @@ owner loses leadership mid-job, the stale owner stops. The new owner
 re-discovers the same durable work and resumes it under the new leader epoch.
 This partition-local maintenance path now runs behind a dedicated
 partition-leader service layer.
+
+Segment publication is not part of the produce acknowledgement path. A sealed
+segment is retained as local pending work until its immutable objects and
+metadata are published; retries use that same segment, and follower fetches can
+read it while publication is pending.
 
 ### Partition Follower
 

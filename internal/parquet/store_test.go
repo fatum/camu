@@ -206,6 +206,92 @@ func TestReplaceOverlappingEntriesRejectsInvalidSourceWithoutChangingManifest(t 
 	}
 }
 
+func TestReplaceOverlappingEntriesRetriesTransientCASConflict(t *testing.T) {
+	ctx := context.Background()
+	objects := newFakeObjectStore()
+	store := NewStore(objects, nil)
+	store.manifestRetry = manifestCASRetryPolicy{attempts: 4}
+	const (
+		topic     = "events"
+		partition = 2
+		date      = "2026-08-02"
+		hour      = "13"
+	)
+	key := ManifestKeyForBucket(topic, partition, date, hour)
+	objects.injectConditionalPutConflict(key, 2)
+	entry := Entry{ObjectKey: "data/events/2/0-9.parquet", BaseOffset: 0, EndOffset: 9, SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: 7}
+
+	var conflicts []ManifestConflict
+	store.SetManifestConflictObserver(func(conflict ManifestConflict) {
+		conflicts = append(conflicts, conflict)
+	})
+	got, err := store.ReplaceOverlappingEntries(ctx, topic, partition, date, hour, []Entry{entry})
+	if err != nil {
+		t.Fatalf("ReplaceOverlappingEntries() error = %v", err)
+	}
+	if got.Generation != 1 || !reflect.DeepEqual(got.Entries, []Entry{entry}) {
+		t.Fatalf("published manifest = %+v, want one replacement entry", got)
+	}
+	if len(conflicts) != 2 || conflicts[0].Attempt != 1 || conflicts[1].Attempt != 2 {
+		t.Fatalf("conflicts = %+v, want attempts 1 and 2", conflicts)
+	}
+
+	// A retry of the same source range converges on the already published
+	// immutable object reference instead of creating a second manifest entry.
+	retry, err := store.ReplaceOverlappingEntries(ctx, topic, partition, date, hour, []Entry{entry})
+	if err != nil {
+		t.Fatalf("retry ReplaceOverlappingEntries() error = %v", err)
+	}
+	if retry.Generation != got.Generation || len(retry.Entries) != 1 || retry.Entries[0].ObjectKey != entry.ObjectKey {
+		t.Fatalf("retry manifest = %+v, want exactly one original reference", retry)
+	}
+}
+
+func TestReplaceOverlappingEntriesExhaustedCASConflictLeavesManifestUnchanged(t *testing.T) {
+	ctx := context.Background()
+	objects := newFakeObjectStore()
+	store := NewStore(objects, nil)
+	store.manifestRetry = manifestCASRetryPolicy{attempts: 3}
+	const (
+		topic     = "events"
+		partition = 2
+		date      = "2026-08-02"
+		hour      = "14"
+	)
+	key := ManifestKeyForBucket(topic, partition, date, hour)
+	objects.injectConditionalPutConflict(key, 3)
+	_, err := store.ReplaceOverlappingEntries(ctx, topic, partition, date, hour, []Entry{{ObjectKey: "data/events/2/10-19.parquet", BaseOffset: 10, EndOffset: 19, SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: 7}})
+	var conflictErr *ManifestCASConflictError
+	if !errors.As(err, &conflictErr) || conflictErr.Attempts != 3 || conflictErr.Key != key {
+		t.Fatalf("ReplaceOverlappingEntries() error = %v, want exhausted CAS error for %q", err, key)
+	}
+	if _, err := objects.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("manifest after exhausted conflicts = %v, want not found", err)
+	}
+}
+
+func TestReplaceOverlappingEntriesStopsRetryWhenContextCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	objects := newFakeObjectStore()
+	store := NewStore(objects, nil)
+	store.manifestRetry = manifestCASRetryPolicy{attempts: 4, initial: time.Second, max: time.Second}
+	const (
+		topic     = "events"
+		partition = 2
+		date      = "2026-08-02"
+		hour      = "15"
+	)
+	key := ManifestKeyForBucket(topic, partition, date, hour)
+	objects.injectConditionalPutConflict(key, 4)
+	store.SetManifestConflictObserver(func(ManifestConflict) { cancel() })
+
+	_, err := store.ReplaceOverlappingEntries(ctx, topic, partition, date, hour, []Entry{{ObjectKey: "data/events/2/20-29.parquet", BaseOffset: 20, EndOffset: 29, SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: 7}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReplaceOverlappingEntries() error = %v, want context cancellation", err)
+	}
+}
+
 // planFence is a Fencer controlled from tests.
 type planFence struct{ pending map[string]bool }
 

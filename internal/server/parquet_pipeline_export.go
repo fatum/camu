@@ -59,6 +59,14 @@ func parquetSinkFailureStage(err error) string {
 	return "unknown"
 }
 
+func parquetManifestErrorDetails(err error) (category, key string, attempts int) {
+	var conflict *parquet.ManifestCASConflictError
+	if errors.As(err, &conflict) {
+		return "cas_conflict_exhausted", conflict.Key, conflict.Attempts
+	}
+	return "manifest_write_error", "", 0
+}
+
 func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, cp *pipeline.Checkpoint) {
 	if !tc.ExportEnabled || identity.Role != PartitionRoleLeader || tc.StorageMode == meta.StorageModeDiskless || tc.UncleanLeaderElection {
 		return
@@ -165,7 +173,13 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 			sinkLabels := mergeMetricLabels(labels, "stage", stage)
 			s.metricInc("camu_parquet_export_pipeline_sink_failures_total", "Parquet export pipeline sink failures", sinkLabels)
 			s.metricSet("camu_parquet_export_pipeline_last_sink_failure_unixtime", "Unix timestamp of the latest Parquet export pipeline sink failure", sinkLabels, float64(time.Now().Unix()))
-			slog.Warn("parquet_pipeline_sink_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_start_offset", valid[0].Offset, "source_end_offset", valid[len(valid)-1].Offset, "parquet_object_key", objectKey, "parquet_bytes", len(data), "stage", stage, "error", err)
+			attributes := []any{"topic", tc.Name, "partition", identity.Partition, "leader_epoch", identity.LeaderEpoch, "checkpoint_offset", cp.NextOffset, "source_start_offset", valid[0].Offset, "source_end_offset", valid[len(valid)-1].Offset, "parquet_object_key", objectKey, "parquet_bytes", len(data), "stage", stage, "error", err}
+			if stage == parquetSinkStageManifestPublish {
+				category, key, attempts := parquetManifestErrorDetails(err)
+				s.metricInc("camu_parquet_export_pipeline_manifest_failures_total", "Parquet manifest publication failures", mergeMetricLabels(labels, "category", category))
+				attributes = append(attributes, "manifest_error_category", category, "manifest_key", key, "manifest_attempts", attempts)
+			}
+			slog.Warn("parquet_pipeline_sink_failed", attributes...)
 			return
 		}
 		s.metricAdd("camu_parquet_export_pipeline_bytes_total", "Parquet bytes uploaded by the export pipeline", labels, float64(len(data)))
@@ -270,6 +284,9 @@ func parquetPipelineObjectKey(topic string, partition int, ingestTime time.Time,
 	return parquet.ExportObjectKey(topic, partition, ingestTime, int64(start), int64(end), 1, "pipeline")
 }
 
+// TODO: Add server-scheduled reconciliation/GC for deterministic Parquet
+// uploads retained after fencing or manifest publication failure. They must not
+// be deleted inline: a successor can concurrently publish the same object.
 func fenceWriteParquet(ctx context.Context, s *Server, fence pipeline.Fence, tc meta.TopicConfig, identity PartitionIdentity, objectKey string, data []byte, ingestTime time.Time, start, end uint64) error {
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
 		return parquetSinkError(parquetSinkStageFencedBeforeUpload, pipeline.ErrFenced)
@@ -279,36 +296,35 @@ func fenceWriteParquet(ctx context.Context, s *Server, fence pipeline.Fence, tc 
 		return parquetSinkError(parquetSinkStageObjectUpload, err)
 	}
 	store := s.newParquetStore()
+	store.SetManifestPublishFence(func(checkCtx context.Context) error {
+		if fence.Fenced(checkCtx, tc.Name, identity.Partition, identity.LeaderEpoch) {
+			return pipeline.ErrFenced
+		}
+		return nil
+	})
+	store.SetManifestConflictObserver(func(conflict parquet.ManifestConflict) {
+		labels := map[string]string{"topic": tc.Name, "partition": strconv.Itoa(identity.Partition), "category": "cas_conflict"}
+		s.metricInc("camu_parquet_export_pipeline_manifest_conflicts_total", "Parquet manifest conditional-write conflicts", labels)
+		slog.Warn("parquet_pipeline_manifest_cas_conflict", "topic", tc.Name, "partition", identity.Partition, "leader_epoch", identity.LeaderEpoch, "manifest_key", conflict.Key, "attempt", conflict.Attempt, "max_attempts", conflict.MaxAttempts, "error_category", "cas_conflict", "error", conflict.Err)
+	})
 	entry := parquet.Entry{ObjectKey: objectKey, BaseOffset: int64(start), EndOffset: int64(end), SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: identity.LeaderEpoch}
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
-		return parquetSinkError(parquetSinkStageFencedAfterUpload, cleanupUnreferencedParquetUpload(ctx, store, s.s3Client, tc.Name, identity.Partition, ingestTime, objectKey, pipeline.ErrFenced))
+		// The object key is deterministic for this source range.  Do not delete
+		// it on fencing: a successor may concurrently reuse and publish this
+		// object, and a read-then-delete cleanup can race that publication.
+		// Retain unreferenced immutable uploads safely pending a future GC
+		// mechanism.
+		return parquetSinkError(parquetSinkStageFencedAfterUpload, pipeline.ErrFenced)
 	}
 	if _, err := store.ReplaceOverlappingEntries(ctx, tc.Name, identity.Partition, date, hour, []parquet.Entry{entry}); err != nil {
-		return parquetSinkError(parquetSinkStageManifestPublish, cleanupUnreferencedParquetUpload(ctx, store, s.s3Client, tc.Name, identity.Partition, ingestTime, objectKey, err))
+		// A manifest outcome can be ambiguous (and a successor can publish the
+		// same deterministic object while this call returns). Retain the
+		// immutable upload safely pending a future GC mechanism rather than
+		// risking deletion of a now-referenced object.
+		return parquetSinkError(parquetSinkStageManifestPublish, err)
 	}
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
 		return parquetSinkError(parquetSinkStageFencedAfterManifest, pipeline.ErrFenced)
 	}
 	return nil
-}
-
-// cleanupPipelineParquetUpload deletes an object only when the manifest does
-// not reference it. A manifest write can be acknowledged ambiguously, so an
-// unconditional delete would corrupt a durable export.
-func cleanupUnreferencedParquetUpload(ctx context.Context, store *parquet.Store, client *storage.S3Client, topic string, partition int, ingestTime time.Time, objectKey string, cause error) error {
-	checkCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if m, err := store.GetManifest(checkCtx, topic, partition, ingestTime); err == nil {
-		for _, entry := range m.Entries {
-			if entry.ObjectKey == objectKey {
-				return cause
-			}
-		}
-	} else if !errors.Is(err, parquet.ErrNotFound) && !errors.Is(err, storage.ErrNotFound) {
-		return fmt.Errorf("%w; manifest verification failed: %v", cause, err)
-	}
-	if err := client.Delete(checkCtx, objectKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return fmt.Errorf("%w; cleanup uploaded object: %v", cause, err)
-	}
-	return cause
 }

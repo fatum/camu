@@ -409,8 +409,7 @@ func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []by
 		Body:   bytes.NewReader(data),
 	}
 	if etag != "" {
-		quoted := `"` + etag + `"`
-		input.IfMatch = aws.String(quoted)
+		input.IfMatch = aws.String(etag)
 	} else {
 		// Create-if-not-exists: fail if object already exists.
 		input.IfNoneMatch = aws.String("*")

@@ -42,48 +42,30 @@ Integration coverage exercises end-to-end paths with real servers:
 
 ### Jepsen
 
-Jepsen is the strongest evidence for distributed behavior. The harness runs a five-node Docker cluster against MinIO-backed storage.
+Jepsen is the strongest evidence for distributed behavior. The repository-local
+harness runs five Camu nodes against MinIO and writes every run's
+`results.edn`, history, and node logs under `jepsen/camu/store/`.
 
-**22 passing fault scenarios:**
+The fault matrix covers kill, leader kill, network partition, pause,
+membership changes, rejoin, object-store partition, clock skew, and selected
+combined faults. The current commands live in
+[jepsen/camu/README.md](../jepsen/camu/README.md); rely on the persisted result
+for a specific run rather than a stale aggregate availability table.
 
-| Mode | Faults | Duration | Availability |
-|------|--------|----------|--------------|
-| `rf=3`, `minISR=2` | `kill` | 10s | 0.938 |
-| `rf=3`, `minISR=2` | `partition` | 10s | 1.0 |
-| `rf=3`, `minISR=2` | `pause` | 10s | 0.925 |
-| `rf=3`, `minISR=2` | `leader-kill` | 10s | 0.991 |
-| `rf=3`, `minISR=2` | `leave` | 10s | 0.935 |
-| `rf=3`, `minISR=2` | `membership` | 10s | 1.0 |
-| `rf=3`, `minISR=2` | `rejoin` | 10s | 0.918 |
-| `rf=3`, `minISR=2` | `s3-partition` | 10s | 0.938 |
-| `rf=3`, `minISR=2` | `clock-skew` | 10s | 1.0 |
-| `rf=3`, `minISR=2` | `kill` | 45s | 0.996 |
-| `rf=3`, `minISR=2` | `leader-kill` | 45s | 1.0 |
-| `rf=3`, `minISR=2` | `membership` | 45s | 1.0 |
-| `rf=3`, `minISR=2` | `rejoin` | 45s | 0.996 |
-| `rf=3`, `minISR=2` | `s3-partition` | 45s | 0.938 |
-| `rf=3`, `minISR=2` | `kill,partition` | 45s | 1.0 |
-| `rf=3`, `minISR=2` | `leader-kill,s3-partition` | 45s | 0.980 |
-| `rf=3`, `minISR=3` | `kill` | 45s | 1.0 |
-| `rf=3`, `minISR=3` | `leader-kill` | 45s | 1.0 |
-| `rf=3`, `minISR=3` | `membership` | 45s | 1.0 |
-| `rf=3`, `minISR=3` | `s3-partition` | 45s | 0.948 |
-| `rf=3`, `minISR=3` | `leader-kill,s3-partition` | 45s | 0.936 |
-| `rf=1`, `minISR=1` | `kill` | 10s | n/a |
+Replicated HTTP runs check:
 
-**9 checkers verify every run:**
+| Checker | What it establishes |
+| --- | --- |
+| `committed-durability` | Acknowledged writes appear in the final drain. |
+| `truncation-safety` | A committed suffix is not lost during recovery. |
+| `single-leader`, `no-split-brain` | Conflicting leadership is not observed. |
+| `total-order`, `offset-monotonicity` | Partition histories remain ordered. |
+| `hw-monotonicity`, `no-ghost-reads` | Reads respect the committed boundary. |
+| `replica-convergence` | Recovered replicas contain the final leader data. |
 
-| Checker | What it proves |
-|---------|----------------|
-| `committed-durability` | Acknowledged writes survive to final drain |
-| `single-leader` | No conflicting values at the same (partition, offset) |
-| `total-order` | Partition histories remain ordered and contiguous |
-| `offset-monotonicity` | Offsets never duplicate or regress |
-| `truncation-safety` | Committed suffixes are not lost after failover |
-| `hw-monotonicity` | Observed high watermarks do not go backward |
-| `no-ghost-reads` | Reads do not invent unacknowledged data |
-| `availability` | Successful operation ratio during faults |
-| `recovery-time` | Latency from injected fault to next success |
+`read-your-writes` is a leader-read property. Replica-read workloads instead
+check committed boundaries and final convergence, because a follower may
+legitimately lag a newly acknowledged leader write.
 
 ## Read Model
 

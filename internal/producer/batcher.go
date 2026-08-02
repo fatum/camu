@@ -21,10 +21,11 @@ type BatcherConfig struct {
 
 // partitionBuffer holds size metadata for a single partition — no messages.
 type partitionBuffer struct {
-	count int
-	size  int64
-	timer *time.Timer
-	mu    sync.Mutex
+	count    int
+	size     int64
+	timer    *time.Timer
+	flushing bool
+	mu       sync.Mutex
 }
 
 // Batcher tracks per-partition size metadata and triggers flushes when either a
@@ -35,6 +36,9 @@ type Batcher struct {
 	buffers   map[int]*partitionBuffer
 	mu        sync.Mutex
 	totalSize atomic.Int64 // total buffered bytes across all partitions
+	stopped   atomic.Bool
+	flushWG   sync.WaitGroup
+	stopMu    sync.Mutex // prevents a flush from being scheduled after Stop starts waiting
 }
 
 // NewBatcher creates a new Batcher with the given configuration.
@@ -61,9 +65,13 @@ func (b *Batcher) getOrCreate(partitionID int) *partitionBuffer {
 // Append records that msgSize bytes were added to partitionID. If the total
 // buffered size across all partitions exceeds HighWaterMark (when non-zero),
 // ErrBackpressure is returned. If the partition buffer exceeds MaxSize after the
-// append, a synchronous flush is triggered. Otherwise the age timer is
+// append, a background flush is scheduled. Otherwise the age timer is
 // (re)started so the buffer is flushed after MaxAge even without further writes.
+// OnFlush is never invoked on the caller's goroutine.
 func (b *Batcher) Append(partitionID int, msgSize int64) error {
+	if b.stopped.Load() {
+		return ErrBackpressure
+	}
 	// Check backpressure before buffering.
 	if b.cfg.HighWaterMark > 0 && b.totalSize.Load()+msgSize > b.cfg.HighWaterMark {
 		return ErrBackpressure
@@ -82,7 +90,7 @@ func (b *Batcher) Append(partitionID int, msgSize int64) error {
 		// Start or reset the age timer.
 		if buf.timer == nil {
 			buf.timer = time.AfterFunc(b.cfg.MaxAge, func() {
-				_ = b.flushPartition(partitionID)
+				b.scheduleFlush(partitionID)
 			})
 		} else {
 			buf.timer.Reset(b.cfg.MaxAge)
@@ -91,14 +99,44 @@ func (b *Batcher) Append(partitionID int, msgSize int64) error {
 	buf.mu.Unlock()
 
 	if shouldFlush {
-		_ = b.flushPartition(partitionID)
+		b.scheduleFlush(partitionID)
 	}
 	return nil
 }
 
-// flushPartition drains the metadata for partitionID and calls OnFlush. It is
-// safe to call concurrently; the buffer mutex ensures only one flush runs at a
-// time and an empty buffer is a no-op.
+// scheduleFlush starts a flush in the background unless one is already running
+// for this partition.
+func (b *Batcher) scheduleFlush(partitionID int) {
+	b.stopMu.Lock()
+	defer b.stopMu.Unlock()
+	if b.stopped.Load() {
+		return
+	}
+	b.mu.Lock()
+	buf, ok := b.buffers[partitionID]
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	buf.mu.Lock()
+	if buf.count == 0 || buf.flushing {
+		buf.mu.Unlock()
+		return
+	}
+	buf.flushing = true
+	buf.mu.Unlock()
+
+	b.flushWG.Add(1)
+	go func() {
+		defer b.flushWG.Done()
+		_ = b.flushPartition(partitionID)
+	}()
+}
+
+// flushPartition drains a partition's metadata and calls OnFlush outside the
+// buffer lock. This lets producers continue appending while a segment upload is
+// in progress. Callers must mark buf.flushing before invoking it.
 func (b *Batcher) flushPartition(partitionID int) error {
 	b.mu.Lock()
 	buf, ok := b.buffers[partitionID]
@@ -109,25 +147,12 @@ func (b *Batcher) flushPartition(partitionID int) error {
 
 	buf.mu.Lock()
 	if buf.count == 0 {
+		buf.flushing = false
 		buf.mu.Unlock()
 		return nil
 	}
 
-	if b.cfg.OnFlush != nil {
-		if err := b.cfg.OnFlush(partitionID); err != nil {
-			// Keep the buffered state intact and retry later.
-			if buf.timer == nil && b.cfg.MaxAge > 0 {
-				buf.timer = time.AfterFunc(b.cfg.MaxAge, func() {
-					_ = b.flushPartition(partitionID)
-				})
-			} else if buf.timer != nil {
-				buf.timer.Reset(b.cfg.MaxAge)
-			}
-			buf.mu.Unlock()
-			return err
-		}
-	}
-
+	flushedCount := buf.count
 	flushedSize := buf.size
 	buf.count = 0
 	buf.size = 0
@@ -137,17 +162,63 @@ func (b *Batcher) flushPartition(partitionID int) error {
 	}
 	buf.mu.Unlock()
 
-	b.totalSize.Add(-flushedSize)
-	return nil
+	var err error
+	if b.cfg.OnFlush != nil {
+		err = b.cfg.OnFlush(partitionID)
+	}
+
+	buf.mu.Lock()
+	buf.flushing = false
+	if err != nil {
+		// Preserve the failed work so it is retried with any bytes appended while
+		// the flush was in flight.
+		buf.count += flushedCount
+		buf.size += flushedSize
+	}
+	if err == nil {
+		b.totalSize.Add(-flushedSize)
+	}
+	shouldFlush := err == nil && buf.count > 0 && buf.size >= b.cfg.MaxSize
+	if !shouldFlush && buf.count > 0 && !b.stopped.Load() {
+		if buf.timer == nil {
+			buf.timer = time.AfterFunc(b.cfg.MaxAge, func() {
+				b.scheduleFlush(partitionID)
+			})
+		} else {
+			buf.timer.Reset(b.cfg.MaxAge)
+		}
+	}
+	buf.mu.Unlock()
+
+	if shouldFlush {
+		b.scheduleFlush(partitionID)
+	}
+	return err
 }
 
 // Flush manually flushes the buffer for partitionID.
 func (b *Batcher) Flush(partitionID int) error {
+	b.mu.Lock()
+	buf, ok := b.buffers[partitionID]
+	b.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	buf.mu.Lock()
+	if buf.count == 0 || buf.flushing {
+		buf.mu.Unlock()
+		return nil
+	}
+	buf.flushing = true
+	buf.mu.Unlock()
 	return b.flushPartition(partitionID)
 }
 
 // Stop flushes all remaining partition buffers and stops all timers.
 func (b *Batcher) Stop() {
+	b.stopMu.Lock()
+	b.stopped.Store(true)
+	b.stopMu.Unlock()
 	b.mu.Lock()
 	ids := make([]int, 0, len(b.buffers))
 	for id := range b.buffers {
@@ -155,11 +226,6 @@ func (b *Batcher) Stop() {
 	}
 	b.mu.Unlock()
 
-	for _, id := range ids {
-		_ = b.flushPartition(id)
-	}
-
-	// Stop any timers that fired between the flush and now (edge case).
 	b.mu.Lock()
 	for _, buf := range b.buffers {
 		buf.mu.Lock()
@@ -170,4 +236,9 @@ func (b *Batcher) Stop() {
 		buf.mu.Unlock()
 	}
 	b.mu.Unlock()
+
+	b.flushWG.Wait()
+	for _, id := range ids {
+		_ = b.Flush(id)
+	}
 }

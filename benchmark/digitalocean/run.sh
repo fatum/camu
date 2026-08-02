@@ -9,12 +9,15 @@ if [[ -f "$script_dir/.env" ]]; then
   set +a
 fi
 
-target_arg="${1:-1073741824}"
-case "$target_arg" in
-  1GiB) target_arg=1073741824 ;;
+operation="${1:-}"
+case "$operation" in
+  produce|consume|sql|all) ;;
+  *) echo "usage: $0 {produce|consume|sql|all} [target_bytes]" >&2; exit 2 ;;
 esac
+target_arg="${2:-1073741824}"
 target_bytes="${TARGET_BYTES:-$target_arg}"
 message_bytes="${MESSAGE_BYTES:-1024}"
+partitions="${PARTITIONS:-4}"
 output="${OUTPUT:-/tmp/camu-digitalocean-benchmark.json}"
 benchmark_api="${BENCHMARK_API:-http}"
 telemetry_output="${TELEMETRY_OUTPUT:-/tmp/camu-digitalocean-telemetry.jsonl}"
@@ -53,12 +56,14 @@ echo "Running benchmark topic: $topic" >&2
 CAMU_URL="http://${ips[0]}:8080" \
 NODE_URLS="${node_urls%,}" \
 TOPIC="$topic" \
+BENCHMARK_OPERATION="$operation" \
 BENCHMARK_API="$benchmark_api" \
 KAFKA_BROKERS="${KAFKA_BROKERS:-${kafka_brokers%,}}" \
 REPLICATION_FACTOR=5 \
 MIN_IN_SYNC_REPLICAS=3 \
 TARGET_BYTES="$target_bytes" \
 MESSAGE_BYTES="$message_bytes" \
+PARTITIONS="$partitions" \
 OUTPUT="$output" \
   "$repo_dir/scripts/typed-topic-benchmark.sh" &
 benchmark_pid=$!

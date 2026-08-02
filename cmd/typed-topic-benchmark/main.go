@@ -26,7 +26,7 @@ import (
 )
 
 type config struct {
-	BaseURL, Topic, Output, API                      string
+	BaseURL, Topic, Output, API, Operation           string
 	NodeURLs                                         []string
 	KafkaBrokers                                     []string
 	TargetBytes, MessageBytes                        int64
@@ -37,6 +37,7 @@ type config struct {
 }
 
 type result struct {
+	Operation     string                 `json:"operation"`
 	Topic         string                 `json:"topic"`
 	Expected      int64                  `json:"expected_records,omitempty"`
 	Produced      int64                  `json:"produced_records,omitempty"`
@@ -133,33 +134,65 @@ func env(key, def string) string {
 func benchmarkLog(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "[benchmark] %s %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, args...))
 }
-func parseInt(key string, def int64) int64 {
-	v, err := strconv.ParseInt(env(key, strconv.FormatInt(def, 10)), 10, 64)
+func parsePositiveInt(key string, def int64) (int64, error) {
+	raw := strings.TrimSpace(env(key, strconv.FormatInt(def, 10)))
+	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || v <= 0 {
-		panic(fmt.Sprintf("invalid %s", key))
+		return 0, fmt.Errorf("%s must be a positive integer, got %q", key, raw)
 	}
-	return v
+	return v, nil
 }
-func parseIntOption(key string, def int64) int {
-	v := parseInt(key, def)
+
+func parseByteSize(key string, def int64) (int64, error) {
+	raw := strings.TrimSpace(env(key, strconv.FormatInt(def, 10)))
+	lower := strings.ToLower(raw)
+	multiplier := int64(1)
+	for _, unit := range []struct {
+		suffix     string
+		multiplier int64
+	}{
+		{"kib", 1 << 10},
+		{"mib", 1 << 20},
+		{"gib", 1 << 30},
+		{"tib", 1 << 40},
+	} {
+		if strings.HasSuffix(lower, unit.suffix) {
+			lower = strings.TrimSpace(strings.TrimSuffix(lower, unit.suffix))
+			multiplier = unit.multiplier
+			break
+		}
+	}
+	v, err := strconv.ParseInt(lower, 10, 64)
+	if err != nil || v <= 0 || v > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("%s must be a positive byte count (for example 1073741824 or 1GiB), got %q", key, raw)
+	}
+	return v * multiplier, nil
+}
+
+func parseIntOption(key string, def int64) (int, error) {
+	v, err := parsePositiveInt(key, def)
+	if err != nil {
+		return 0, err
+	}
 	maxInt := int64(^uint(0) >> 1)
 	if v > maxInt {
-		panic(fmt.Sprintf("invalid %s: exceeds int range", key))
+		return 0, fmt.Errorf("%s exceeds int range", key)
 	}
-	return int(v)
+	return int(v), nil
 }
-func loadConfig() config {
-	d, _ := time.ParseDuration(env("QUERY_INTERVAL", "5s"))
-	if d <= 0 {
-		panic("invalid QUERY_INTERVAL")
+
+func loadConfig() (config, error) {
+	d, err := time.ParseDuration(env("QUERY_INTERVAL", "5s"))
+	if err != nil || d <= 0 {
+		return config{}, fmt.Errorf("QUERY_INTERVAL must be a positive duration")
 	}
 	topic := env("TOPIC", "benchmark-typed")
 	if topic == "" || strings.IndexByte(topic, 0) >= 0 || strings.ContainsAny(topic, " \t\r\n\"'") {
-		panic("TOPIC contains unsafe characters")
+		return config{}, fmt.Errorf("TOPIC contains unsafe characters")
 	}
-	consumeTimeout, _ := time.ParseDuration(env("CONSUME_TIMEOUT", "10m"))
-	if consumeTimeout <= 0 {
-		panic("invalid CONSUME_TIMEOUT")
+	consumeTimeout, err := time.ParseDuration(env("CONSUME_TIMEOUT", "10m"))
+	if err != nil || consumeTimeout <= 0 {
+		return config{}, fmt.Errorf("CONSUME_TIMEOUT must be a positive duration")
 	}
 	nodeURLs := []string{}
 	if raw := env("NODE_URLS", ""); raw != "" {
@@ -171,7 +204,7 @@ func loadConfig() config {
 	}
 	api := strings.ToLower(env("BENCHMARK_API", "http"))
 	if api != "http" && api != "kafka" {
-		panic("BENCHMARK_API must be http or kafka")
+		return config{}, fmt.Errorf("BENCHMARK_API must be http or kafka")
 	}
 	kafkaBrokers := []string{}
 	for _, broker := range strings.Split(env("KAFKA_BROKERS", ""), ",") {
@@ -180,9 +213,41 @@ func loadConfig() config {
 		}
 	}
 	if api == "kafka" && len(kafkaBrokers) == 0 {
-		panic("KAFKA_BROKERS is required when BENCHMARK_API=kafka")
+		return config{}, fmt.Errorf("KAFKA_BROKERS is required when BENCHMARK_API=kafka")
 	}
-	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: parseInt("TARGET_BYTES", 5*1024*1024*1024), MessageBytes: parseInt("MESSAGE_BYTES", 1024), Partitions: parseIntOption("PARTITIONS", 4), ReplicationFactor: parseIntOption("REPLICATION_FACTOR", 1), MinInSyncReplicas: parseIntOption("MIN_IN_SYNC_REPLICAS", 1), BatchMessages: parseIntOption("BATCH_MESSAGES", 500), ProducerConcurrency: parseIntOption("PRODUCER_CONCURRENCY", 4), QueryInterval: d, ConsumeTimeout: consumeTimeout}
+	operation := strings.ToLower(env("BENCHMARK_OPERATION", "all"))
+	if operation != "all" && operation != "produce" && operation != "consume" && operation != "sql" {
+		return config{}, fmt.Errorf("BENCHMARK_OPERATION must be all, produce, consume, or sql")
+	}
+	targetBytes, err := parseByteSize("TARGET_BYTES", 5*1024*1024*1024)
+	if err != nil {
+		return config{}, err
+	}
+	messageBytes, err := parseByteSize("MESSAGE_BYTES", 1024)
+	if err != nil {
+		return config{}, err
+	}
+	partitions, err := parseIntOption("PARTITIONS", 4)
+	if err != nil {
+		return config{}, err
+	}
+	replicationFactor, err := parseIntOption("REPLICATION_FACTOR", 1)
+	if err != nil {
+		return config{}, err
+	}
+	minInSyncReplicas, err := parseIntOption("MIN_IN_SYNC_REPLICAS", 1)
+	if err != nil {
+		return config{}, err
+	}
+	batchMessages, err := parseIntOption("BATCH_MESSAGES", 500)
+	if err != nil {
+		return config{}, err
+	}
+	producerConcurrency, err := parseIntOption("PRODUCER_CONCURRENCY", 4)
+	if err != nil {
+		return config{}, err
+	}
+	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, QueryInterval: d, ConsumeTimeout: consumeTimeout}, nil
 }
 
 type client struct {
@@ -334,6 +399,16 @@ func targetCount(target, messageBytes int64) (int64, error) {
 	}
 	return count, nil
 }
+
+func expectedStatesFor(cfg config, count int64) []hashState {
+	expected := make([]hashState, cfg.Partitions)
+	payloadText := payload(cfg.MessageBytes)
+	for i := int64(0); i < count; i++ {
+		expected[int(i%int64(cfg.Partitions))].add(typedValue{ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i})
+	}
+	return expected
+}
+
 func (c client) produce(ctx context.Context, cfg config, count int64, expected []hashState, progress func(int64)) (phaseResult, error) {
 	start := time.Now()
 	var total int64
@@ -455,17 +530,26 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 		go func() {
 			defer wg.Done()
 			var off uint64
+			partitionClient := c
+			if len(cfg.NodeURLs) > 0 {
+				partitionClient.base = cfg.NodeURLs[p%len(cfg.NodeURLs)]
+			}
+			benchmarkLog("consume partition=%d endpoint=%s expected_records=%d", p, partitionClient.base, expected[p].recordsSnapshot())
 			for {
 				var resp consumeResponse
-				err := c.request(ctx, http.MethodGet, fmt.Sprintf("/v1/topics/%s/partitions/%d/messages?offset=%d&limit=20000", url.PathEscape(cfg.Topic), p, off), nil, &resp)
+				started := time.Now()
+				err := partitionClient.request(ctx, http.MethodGet, fmt.Sprintf("/v1/topics/%s/partitions/%d/messages?offset=%d&limit=1000", url.PathEscape(cfg.Topic), p, off), nil, &resp)
 				if err != nil {
+					benchmarkLog("consume partition=%d endpoint=%s offset=%d failed after=%s error=%v", p, partitionClient.base, off, time.Since(started), err)
 					errs <- err
 					return
 				}
 				if len(resp.Messages) == 0 {
 					if actual[p].recordsSnapshot() >= expected[p].recordsSnapshot() {
+						benchmarkLog("consume partition=%d complete records=%d offset=%d", p, actual[p].recordsSnapshot(), off)
 						return
 					}
+					benchmarkLog("consume partition=%d endpoint=%s offset=%d empty records=%d expected=%d duration=%s", p, partitionClient.base, off, actual[p].recordsSnapshot(), expected[p].recordsSnapshot(), time.Since(started))
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
@@ -479,6 +563,7 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 					progress(1)
 				}
 				off = resp.NextOffset
+				benchmarkLog("consume partition=%d endpoint=%s records=%d next_offset=%d total_records=%d duration=%s", p, partitionClient.base, len(resp.Messages), off, actual[p].recordsSnapshot(), time.Since(started))
 			}
 		}()
 	}
@@ -538,12 +623,135 @@ func (c client) sql(ctx context.Context, cfg config) (sqlMetrics, float64, error
 	row := resp.Rows[0]
 	return sqlMetrics{Count: toInt(row[0]), MinSequence: toInt(row[1]), MaxSequence: toInt(row[2]), PayloadBytes: toInt(row[3])}, time.Since(start).Seconds() * 1000, nil
 }
+
+func verifyConsumeStates(expected, actual []hashState) bool {
+	for p := range expected {
+		er, eb, ed, ee := expected[p].result()
+		ar, ab, ad, ae := actual[p].result()
+		if ee != nil || ae != nil || er != ar || eb != ab || ed != ad {
+			return false
+		}
+	}
+	return true
+}
+
+func (c client) waitForSQL(ctx context.Context, cfg config, res *result, count int64) (sqlMetrics, error) {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		metrics, ms, err := c.sql(ctx, cfg)
+		sample := sqlSample{At: time.Now(), LatencyMS: ms, ExecutionMS: ms, Visible: metrics.Count, MinSequence: metrics.MinSequence, MaxSequence: metrics.MaxSequence, PayloadBytes: metrics.PayloadBytes}
+		if err != nil {
+			sample.Error = err.Error()
+			benchmarkLog("sql topic=%s failed latency_ms=%.2f error=%v", cfg.Topic, ms, err)
+		} else {
+			benchmarkLog("sql topic=%s visible=%d/%d min_sequence=%d max_sequence=%d payload_bytes=%d latency_ms=%.2f", cfg.Topic, metrics.Count, count, metrics.MinSequence, metrics.MaxSequence, metrics.PayloadBytes, ms)
+		}
+		res.SQL.Samples = append(res.SQL.Samples, sample)
+		res.SQL.FinalVisible = metrics.Count
+		res.SQL.FinalMinSequence = metrics.MinSequence
+		res.SQL.FinalMaxSequence = metrics.MaxSequence
+		res.SQL.FinalPayloadBytes = metrics.PayloadBytes
+		res.SQL.FinalLatencyMS = ms
+		res.SQL.FinalExecutionMS = ms
+		if err == nil && metrics.Count >= count {
+			return metrics, nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return metrics, err
+			}
+			return metrics, errors.New("timed out waiting for SQL visibility")
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-ctx.Done():
+			return metrics, ctx.Err()
+		}
+	}
+}
+
+func runSingleOperation(ctx context.Context, c client, cfg config, res *result) {
+	if err := c.waitClusterReady(ctx); err != nil {
+		res.Integrity.Error = "cluster readiness: " + err.Error()
+		benchmarkLog("cluster readiness failed: %v", err)
+		return
+	}
+	count, err := targetCount(cfg.TargetBytes, cfg.MessageBytes)
+	if err != nil {
+		res.Integrity.Error = err.Error()
+		return
+	}
+	res.Expected, res.ExpectedBytes = count, count*cfg.MessageBytes
+	expected := expectedStatesFor(cfg, count)
+	produce := c.produce
+	consume := c.consume
+	if cfg.API == "kafka" {
+		produce, consume = produceKafka, consumeKafka
+	}
+	switch cfg.Operation {
+	case "produce":
+		benchmarkLog("creating topic %q", cfg.Topic)
+		if err := c.create(ctx, cfg); err != nil {
+			res.Integrity.Error = "create topic: " + err.Error()
+			benchmarkLog("topic creation failed: %v", err)
+			return
+		}
+		var produced int64
+		pr, err := produce(ctx, cfg, count, expected, func(n int64) {
+			if total := atomic.AddInt64(&produced, n); total%(int64(cfg.BatchMessages)*10) == 0 {
+				benchmarkLog("produce progress records=%d/%d", total, count)
+			}
+		})
+		if err != nil {
+			res.Integrity.Error = "produce: " + err.Error()
+			benchmarkLog("produce failed: %v", err)
+			return
+		}
+		res.Producer, res.Produced = pr, pr.Records
+		res.Integrity.OK = pr.Records == count
+		benchmarkLog("produce complete: records=%d bytes=%d duration=%.3fs rate=%.2f records/s %.2f bytes/s", pr.Records, pr.Bytes, pr.DurationSeconds, pr.RecordsPerSecond, pr.BytesPerSecond)
+	case "consume":
+		benchmarkLog("starting consumer verification")
+		actual := make([]hashState, cfg.Partitions)
+		cr, err := consume(ctx, cfg, expected, actual, count, func(int64) {})
+		if err != nil {
+			res.Integrity.Error = "consume: " + err.Error()
+			benchmarkLog("consume failed: %v", err)
+			return
+		}
+		res.Consumer, res.Consumed, res.ConsumedBytes = cr, cr.Records, cr.Bytes
+		res.Throughput.ReadBytesPerSecond = cr.BytesPerSecond
+		res.Integrity.OK = cr.Records == count && cr.Bytes == res.ExpectedBytes && verifyConsumeStates(expected, actual)
+		if !res.Integrity.OK {
+			res.Integrity.Error = "consume integrity mismatch"
+		}
+		benchmarkLog("consume complete: records=%d bytes=%d duration=%.3fs rate=%.2f records/s %.2f bytes/s integrity_ok=%t", cr.Records, cr.Bytes, cr.DurationSeconds, cr.RecordsPerSecond, cr.BytesPerSecond, res.Integrity.OK)
+	case "sql":
+		benchmarkLog("waiting for SQL visibility of %d records", count)
+		metrics, err := c.waitForSQL(ctx, cfg, res, count)
+		if err != nil {
+			res.Integrity.Error = "sql: " + err.Error()
+			benchmarkLog("SQL visibility failed: %v", err)
+			return
+		}
+		res.Integrity.OK = metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && metrics.PayloadBytes == res.ExpectedBytes
+		if !res.Integrity.OK {
+			res.Integrity.Error = "SQL integrity mismatch"
+		}
+		benchmarkLog("SQL complete: integrity_ok=%t", res.Integrity.OK)
+	}
+}
+
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[benchmark] configuration error: %v\n", err)
+		os.Exit(2)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	c := client{base: cfg.BaseURL, http: &http.Client{Timeout: 2 * time.Minute}, token: os.Getenv("CAMU_AUTH_TOKEN")}
-	res := result{Topic: cfg.Topic}
-	cleanup := true
+	res := result{Topic: cfg.Topic, Operation: cfg.Operation}
+	cleanup := env("CLEANUP", "0") == "1"
 	var queryDone chan struct{}
 	var readinessDone chan struct{}
 	var sqlMu sync.Mutex
@@ -587,11 +795,14 @@ func main() {
 			benchmarkLog("result written to %s", cfg.Output)
 		}
 	}()
-	benchmarkLog("configuration: api=%s endpoint=%s topic=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d batch_messages=%d producer_concurrency=%d", cfg.API, cfg.BaseURL, cfg.Topic, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.BatchMessages, cfg.ProducerConcurrency)
-	benchmarkLog("cleanup is enabled; the topic will be deleted after the run")
-	benchmarkLog("removing any previous topic %q", cfg.Topic)
-	if err := c.deleteAndWait(ctx, cfg.Topic); err != nil {
-		benchmarkLog("initial topic cleanup failed: %v", err)
+	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d batch_messages=%d producer_concurrency=%d", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.BatchMessages, cfg.ProducerConcurrency)
+	if cleanup {
+		benchmarkLog("cleanup is enabled; topic %q will be deleted after the run", cfg.Topic)
+	} else {
+		benchmarkLog("cleanup is disabled; topic %q will be retained", cfg.Topic)
+	}
+	if cfg.Operation != "all" {
+		runSingleOperation(ctx, c, cfg, &res)
 		return
 	}
 	benchmarkLog("creating topic %q", cfg.Topic)
@@ -661,6 +872,9 @@ func main() {
 				samp := sqlSample{At: time.Now(), LatencyMS: ms, ExecutionMS: ms, Visible: metrics.Count, MinSequence: metrics.MinSequence, MaxSequence: metrics.MaxSequence, PayloadBytes: metrics.PayloadBytes}
 				if e != nil {
 					samp.Error = e.Error()
+					benchmarkLog("sql sample topic=%s failed latency_ms=%.2f error=%v", cfg.Topic, ms, e)
+				} else {
+					benchmarkLog("sql sample topic=%s visible=%d min_sequence=%d max_sequence=%d payload_bytes=%d latency_ms=%.2f", cfg.Topic, metrics.Count, metrics.MinSequence, metrics.MaxSequence, metrics.PayloadBytes, ms)
 				}
 				sqlMu.Lock()
 				if e == nil {

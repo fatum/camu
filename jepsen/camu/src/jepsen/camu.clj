@@ -265,6 +265,10 @@
   [opts]
   (= :kafka (api-mode opts)))
 
+(defn leader-read-mode?
+  [opts]
+  (= :leader (or (:read-mode opts) :leader)))
+
 (defn supported-workload?
   [opts]
   (or (http-api? opts)
@@ -340,10 +344,12 @@
     (checker/compose
      (cond
        (= :idempotent (:workload opts))
-       (merge base
-              {:exactly-once        (camu-checker/exactly-once-checker)
-               :offset-monotonicity (camu-checker/offset-monotonicity-checker)
-               :total-order         (camu-checker/total-order-checker)})
+       (cond-> (merge replicated-base
+                      {:exactly-once        (camu-checker/exactly-once-checker)
+                       :offset-monotonicity (camu-checker/offset-monotonicity-checker)
+                       :total-order         (camu-checker/total-order-checker)})
+         (and (replicated? opts) (http-api? opts))
+         (assoc :replica-convergence (camu-checker/replica-convergence-checker)))
 
        (= :offsets (:workload opts))
        (merge replicated-base
@@ -368,9 +374,12 @@
          (assoc :no-ghost-reads (camu-checker/no-ghost-reads-checker)
                 :single-leader (camu-checker/single-leader-checker)
                 :hw-monotonicity (camu-checker/hw-monotonicity-checker)
-                :hw-global-monotonicity (camu-checker/hw-global-monotonicity-checker)
-                :read-your-writes (camu-checker/read-your-writes-checker)
-                :replica-convergence (camu-checker/replica-convergence-checker)))
+                :replica-convergence (camu-checker/replica-convergence-checker))
+
+         (and (http-api? opts)
+              (leader-read-mode? opts))
+         (assoc :read-your-writes (camu-checker/read-your-writes-checker)
+                :hw-global-monotonicity (camu-checker/hw-global-monotonicity-checker)))
 
        :else
        (cond-> (merge base
