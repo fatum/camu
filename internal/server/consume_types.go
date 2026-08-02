@@ -14,3 +14,8 @@ type consumedMessage struct {
 }
 
 const maxConsumeLimit = 20000
+
+// maxAtomicConsumeLimit bounds the response that must be completely read
+// before the HTTP status and JSON body are written. Larger clients continue
+// from NextOffset; callers that need an unbounded stream should use SSE.
+const maxAtomicConsumeLimit = 1000

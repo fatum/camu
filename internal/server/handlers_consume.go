@@ -128,6 +128,9 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 			limit = int(maxReadable)
 		}
 	}
+	if limit > maxAtomicConsumeLimit {
+		limit = maxAtomicConsumeLimit
+	}
 
 	slog.Debug("consume_begin",
 		"topic", topicName,
@@ -139,18 +142,20 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		"high_watermark", readableHW,
 	)
 
-	streamCount, nextOffset, err := s.streamMessagesJSON(r.Context(), w, topicName, partitionID, startOffset, limit, index, ps)
+	messages, nextOffset, err := s.readMessagesPage(r.Context(), topicName, partitionID, startOffset, limit, index, ps)
 	if err != nil {
 		slog.Error("consume_failed", "topic", topicName, "partition", partitionID, "offset", startOffset, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "consume source unavailable")
 		return
 	}
+	writeJSON(w, http.StatusOK, consumeResponse{Messages: messages, NextOffset: nextOffset})
 
 	slog.Debug("consume_complete",
 		"topic", topicName,
 		"partition", partitionID,
 		"offset", startOffset,
 		"limit", limit,
-		"returned_messages", streamCount,
+		"returned_messages", len(messages),
 		"next_offset", nextOffset,
 		"owned", owned,
 		"high_watermark", readableHW,

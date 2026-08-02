@@ -9,13 +9,14 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/metrics"
 	"github.com/maksim/camu/internal/storage"
 )
 
 const (
 	fetchParallelism   = 4
 	maxRangeReadBytes  = 4 << 20
-	rangeReadAttempts  = 3
+	rangeReadAttempts  = 5
 	rangeRetryInterval = 50 * time.Millisecond
 )
 
@@ -24,6 +25,23 @@ const (
 type Fetcher struct {
 	s3Client  *storage.S3Client
 	diskCache *log.DiskCache
+	metrics   *metrics.Registry
+}
+
+func (f *Fetcher) SetMetrics(registry *metrics.Registry) {
+	f.metrics = registry
+}
+
+func (f *Fetcher) recordRetry(operation string) {
+	if f.metrics != nil {
+		f.metrics.Inc("camu_consume_s3_read_retries_total", "S3 read retries performed by the consume path", map[string]string{"operation": operation})
+	}
+}
+
+func (f *Fetcher) recordExhaustedRead(operation string) {
+	if f.metrics != nil {
+		f.metrics.Inc("camu_consume_s3_read_failures_total", "S3 reads that exhausted consume-path retries", map[string]string{"operation": operation})
+	}
 }
 
 // NewFetcher creates a new Fetcher.
@@ -265,6 +283,7 @@ func (f *Fetcher) getRangeWithRetry(ctx context.Context, key string, offset, len
 		if errors.Is(err, storage.ErrNotFound) || attempt == rangeReadAttempts-1 {
 			break
 		}
+		f.recordRetry("get_range")
 		timer := time.NewTimer(rangeRetryInterval << attempt)
 		select {
 		case <-ctx.Done():
@@ -273,6 +292,31 @@ func (f *Fetcher) getRangeWithRetry(ctx context.Context, key string, offset, len
 		case <-timer.C:
 		}
 	}
+	f.recordExhaustedRead("get_range")
+	return nil, err
+}
+
+func (f *Fetcher) getWithRetry(ctx context.Context, key string) ([]byte, error) {
+	var err error
+	for attempt := 0; attempt < rangeReadAttempts; attempt++ {
+		data, getErr := f.s3Client.Get(ctx, key)
+		if getErr == nil {
+			return data, nil
+		}
+		err = getErr
+		if errors.Is(err, storage.ErrNotFound) || attempt == rangeReadAttempts-1 {
+			break
+		}
+		f.recordRetry("get")
+		timer := time.NewTimer(rangeRetryInterval << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	f.recordExhaustedRead("get")
 	return nil, err
 }
 
@@ -309,7 +353,7 @@ func (f *Fetcher) fetchSegmentData(ctx context.Context, key string) ([]byte, err
 		}
 		slog.Debug("consume_segment_cache_miss", "segment_key", key)
 		// Cache miss — fetch from S3.
-		data, err = f.s3Client.Get(ctx, key)
+		data, err = f.getWithRetry(ctx, key)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, err

@@ -2,14 +2,14 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"strconv"
 
 	logstore "github.com/maksim/camu/internal/log"
 )
 
-func (s *Server) streamMessagesJSON(ctx context.Context, w http.ResponseWriter, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) (int, uint64, error) {
+// readMessagesPage reads one bounded page before the HTTP response begins. This
+// keeps failures from an S3 sidecar or range read representable as an HTTP
+// error instead of truncating a started JSON document.
+func (s *Server) readMessagesPage(ctx context.Context, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) ([]consumedMessage, uint64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -75,29 +75,16 @@ func (s *Server) streamMessagesJSON(ctx context.Context, w http.ResponseWriter, 
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"messages":[`))
-	enc := json.NewEncoder(w)
-
-	written := 0
+	messages := make([]consumedMessage, 0, limit)
 	nextOffset := startOffset
 	writeMsg := func(m logstore.Message) error {
-		if written > 0 {
-			if _, err := w.Write([]byte(",")); err != nil {
-				return err
-			}
-		}
-		if err := enc.Encode(consumedMessage{
+		messages = append(messages, consumedMessage{
 			Offset:    m.Offset,
 			Timestamp: m.Timestamp,
 			Key:       string(m.Key),
 			Value:     tryString(m.Value),
 			Headers:   m.Headers,
-		}); err != nil {
-			return err
-		}
-		written++
+		})
 		nextOffset = m.Offset + 1
 		return nil
 	}
@@ -156,21 +143,18 @@ func (s *Server) streamMessagesJSON(ctx context.Context, w http.ResponseWriter, 
 		return msg, nil
 	}
 
-	for written < limit {
+	for len(messages) < limit {
 		msg, err := pickLowest()
 		if err != nil {
-			return written, nextOffset, err
+			return nil, startOffset, err
 		}
 		if msg == nil {
 			break
 		}
 		if err := writeMsg(*msg); err != nil {
-			return written, nextOffset, err
+			return nil, startOffset, err
 		}
 	}
 
-	_, _ = w.Write([]byte(`],"next_offset":`))
-	_, _ = w.Write([]byte(strconv.FormatUint(nextOffset, 10)))
-	_, _ = w.Write([]byte("}"))
-	return written, nextOffset, nil
+	return messages, nextOffset, nil
 }

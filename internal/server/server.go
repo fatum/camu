@@ -236,6 +236,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	s.partitionManager = pm
 	s.fetcher = consumer.NewFetcher(s3Client, pm.GetDiskCache())
+	s.fetcher.SetMetrics(s.metrics)
 	s.offsetStore = storage.NewOffsetStore(s3Client)
 	s.aclStore = storage.NewACLStore(s3Client)
 	s.groupCoord = newKafkaGroupCoordinator(s3Client, instanceID)
