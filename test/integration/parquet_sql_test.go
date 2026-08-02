@@ -30,8 +30,12 @@ import (
 )
 
 func createExportTopic(c *camutest.Client, name string, partitions int, retention time.Duration) error {
+	return createTopicWithExport(c, name, partitions, retention, true)
+}
+
+func createTopicWithExport(c *camutest.Client, name string, partitions int, retention time.Duration, exportEnabled bool) error {
 	body, err := json.Marshal(map[string]any{
-		"name": name, "partitions": partitions, "retention": retention.String(), "export_enabled": true,
+		"name": name, "partitions": partitions, "retention": retention.String(), "export_enabled": exportEnabled,
 	})
 	if err != nil {
 		return err
@@ -80,7 +84,10 @@ func TestIntegrationProduceThenSQLQuery(t *testing.T) {
 	ctx := context.Background()
 	topic := "events-sql"
 
-	if err := createExportTopic(client, topic, 1, 24*time.Hour); err != nil {
+	// This test writes the Parquet manifest itself, so leave the async
+	// exporter disabled. Otherwise two independent writers race to publish the
+	// same bucket and the generation assertion below is meaningless.
+	if err := createTopicWithExport(client, topic, 1, 24*time.Hour, false); err != nil {
 		t.Fatalf("CreateTopic: %v", err)
 	}
 
@@ -435,7 +442,7 @@ func testIntegrationProduceThenExportThenQuery(t *testing.T, topic string, produ
 	tc := meta.TopicConfig{
 		Name: topic, Partitions: 1, Retention: 24 * time.Hour,
 		CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1,
-		StorageMode: meta.StorageModeClassic,
+		StorageMode: meta.StorageModeClassic, ExportEnabled: true,
 	}
 
 	// Wait up to ~15s for the exporter to expose the rows via SQL.

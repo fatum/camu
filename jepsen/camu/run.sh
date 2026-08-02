@@ -19,16 +19,19 @@ TYPED="${TYPED:-false}"
 MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASS="${MINIO_PASS:-minioadmin}"
 MINIO_BUCKET="${MINIO_BUCKET:-camu-data}"
-COMPOSE_BIN="${COMPOSE_BIN:-docker-compose}"
-
-if ! command -v "$COMPOSE_BIN" >/dev/null 2>&1; then
-  echo "Compose command not found: $COMPOSE_BIN" >&2
-  echo "Install docker-compose or set COMPOSE_BIN to a compatible wrapper." >&2
-  exit 1
+if [[ -n "${COMPOSE_BIN:-}" ]]; then
+	read -r -a compose_cmd <<<"$COMPOSE_BIN"
+elif command -v docker-compose >/dev/null 2>&1; then
+	compose_cmd=(docker-compose)
+elif docker compose version >/dev/null 2>&1; then
+	compose_cmd=(docker compose)
+else
+	echo "Docker Compose is required (docker compose or docker-compose)." >&2
+	exit 1
 fi
 
 compose() {
-  "$COMPOSE_BIN" "$@"
+	"${compose_cmd[@]}" "$@"
 }
 
 echo "Building camu for Linux (inside container — go-duckdb requires CGO)..."
