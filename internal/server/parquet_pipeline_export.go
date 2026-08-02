@@ -41,6 +41,10 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	if index == nil || highWatermark == 0 {
 		return
 	}
+	labels := map[string]string{"topic": tc.Name, "partition": strconv.Itoa(identity.Partition)}
+	s.metricSet("camu_parquet_export_pipeline_high_watermark", "Latest readable source high watermark for the Parquet export pipeline", labels, float64(highWatermark-1))
+	s.metricSet("camu_parquet_export_pipeline_checkpoint_offset", "Latest Parquet pipeline checkpoint offset", labels, checkpointMetricOffset(cp.NextOffset))
+	s.metricSet("camu_parquet_export_pipeline_lag_records", "Committed source records not yet checkpointed by the Parquet export pipeline", labels, float64(pipelineLagRecords(highWatermark, cp.NextOffset)))
 
 	fence := serverPipelineFence{server: s}
 	reader := pipeline.NewReader(s.fetcher, fence)
@@ -48,6 +52,14 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	if cp.NextOffset >= highWatermark {
 		return
 	}
+	startOffset := cp.NextOffset
+	started := time.Now()
+	result := "unknown"
+	defer func() {
+		s.metricInc("camu_parquet_export_pipeline_passes_total", "Parquet export pipeline passes", mergeMetricLabels(labels, "result", result))
+		s.metricObserve("camu_parquet_export_pipeline_pass_duration", "Parquet export pipeline pass duration", mergeMetricLabels(labels, "result", result), time.Since(started))
+	}()
+	slog.Debug("parquet_pipeline_pass_started", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", startOffset, "high_watermark", highWatermark, "lag_records", pipelineLagRecords(highWatermark, startOffset))
 	maxRecords := s.cfg.Maintenance.ParquetExport.MaxRecordsValue()
 	if maxRecords < 1 {
 		maxRecords = 4096
@@ -57,11 +69,16 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	messages, next, err := reader.Read(passCtx, index, tc.Name, identity.Partition, cp.NextOffset, highWatermark, identity.LeaderEpoch, maxRecords)
 	if err != nil {
 		if !errors.Is(err, pipeline.ErrFenced) {
-			slog.Warn("parquet_pipeline_read_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			result = "read_error"
+			slog.Warn("parquet_pipeline_read_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "high_watermark", highWatermark, "error", err)
+		} else {
+			result = "fenced"
 		}
 		return
 	}
 	if len(messages) == 0 || next <= cp.NextOffset {
+		result = "no_messages"
+		slog.Debug("parquet_pipeline_pass_no_messages", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "high_watermark", highWatermark, "next_offset", next)
 		return
 	}
 
@@ -78,7 +95,8 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	}
 	if len(failed) > 0 {
 		if err := s.handleSchemaDecodeFailures(passCtx, tc, identity, failed); err != nil {
-			slog.Warn("parquet_pipeline_dlq_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			result = "dlq_error"
+			slog.Warn("parquet_pipeline_dlq_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "failed_records", len(failed), "error", err)
 			return
 		}
 	}
@@ -90,7 +108,8 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		ingestTime := parquetExportIngestTime(index, valid[0].Offset, valid[0].Timestamp)
 		pendingKey = parquetPendingExportKey(tc.Name, identity.Partition, valid[0].Offset, valid[len(valid)-1].Offset)
 		if persisted, err := s.loadOrCreateParquetPendingExport(passCtx, pendingKey, ingestTime); err != nil {
-			slog.Warn("parquet_pipeline_pending_export_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			result = "pending_error"
+			slog.Warn("parquet_pipeline_pending_export_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_end_offset", valid[len(valid)-1].Offset, "error", err)
 			return
 		} else {
 			ingestTime = persisted
@@ -101,13 +120,16 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		objectKey = parquetPipelineObjectKey(tc.Name, identity.Partition, ingestTime, valid[0].Offset, valid[len(valid)-1].Offset)
 		data, err := writeParquetChunk(valid, tc.Schema, s.cfg.Maintenance.ParquetExport.TempDirectoryValue())
 		if err != nil {
-			slog.Warn("parquet_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			result = "encode_error"
+			slog.Warn("parquet_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "records", len(valid), "error", err)
 			return
 		}
 		if err := fenceWriteParquet(passCtx, s, fence, tc, identity, objectKey, data, ingestTime, valid[0].Offset, valid[len(valid)-1].Offset); err != nil {
-			slog.Warn("parquet_pipeline_sink_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			result = "sink_error"
+			slog.Warn("parquet_pipeline_sink_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_end_offset", valid[len(valid)-1].Offset, "parquet_bytes", len(data), "error", err)
 			return
 		}
+		s.metricAdd("camu_parquet_export_pipeline_bytes_total", "Parquet bytes uploaded by the export pipeline", labels, float64(len(data)))
 		outputStart, outputEnd = cp.OutputEnd+1, cp.OutputEnd+uint64(len(valid))
 	} else {
 		outputStart, outputEnd = cp.OutputEnd, cp.OutputEnd
@@ -115,14 +137,43 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 
 	nextCP := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: identity.Partition, NextOffset: next, SourceEpoch: identity.LeaderEpoch, Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, OutputStart: outputStart, OutputEnd: outputEnd, Generation: cp.Generation + 1}
 	if err := checkpoints.Publish(passCtx, parquetPipelineName, nextCP); err != nil {
-		slog.Warn("parquet_pipeline_checkpoint_publish_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		result = "checkpoint_error"
+		slog.Warn("parquet_pipeline_checkpoint_publish_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "next_offset", next, "error", err)
 		return
 	}
 	if pendingKey != "" {
 		_ = s.s3Client.Delete(context.Background(), pendingKey)
 	}
 	*cp = nextCP
+	result = "success"
 	s.metricSet("camu_parquet_export_pipeline_checkpoint_offset", "Latest Parquet pipeline checkpoint offset", map[string]string{"topic": tc.Name, "partition": strconv.Itoa(identity.Partition)}, float64(next-1))
+	s.metricSet("camu_parquet_export_pipeline_lag_records", "Committed source records not yet checkpointed by the Parquet export pipeline", labels, float64(pipelineLagRecords(highWatermark, next)))
+	s.metricSet("camu_parquet_export_pipeline_last_success_unixtime", "Unix timestamp of the latest successful Parquet export pass", labels, float64(time.Now().Unix()))
+	s.metricAdd("camu_parquet_export_pipeline_records_total", "Source records checkpointed by the Parquet export pipeline", labels, float64(next-startOffset))
+	slog.Info("parquet_pipeline_pass_completed", "topic", tc.Name, "partition", identity.Partition, "source_start_offset", startOffset, "source_end_offset", next-1, "records", next-startOffset, "checkpoint_offset", next-1, "high_watermark", highWatermark, "lag_records", pipelineLagRecords(highWatermark, next), "duration", time.Since(started))
+}
+
+func checkpointMetricOffset(nextOffset uint64) float64 {
+	if nextOffset == 0 {
+		return -1
+	}
+	return float64(nextOffset - 1)
+}
+
+func pipelineLagRecords(highWatermark, nextOffset uint64) uint64 {
+	if nextOffset >= highWatermark {
+		return 0
+	}
+	return highWatermark - nextOffset
+}
+
+func mergeMetricLabels(labels map[string]string, key, value string) map[string]string {
+	merged := make(map[string]string, len(labels)+1)
+	for label, labelValue := range labels {
+		merged[label] = labelValue
+	}
+	merged[key] = value
+	return merged
 }
 
 type parquetPendingExport struct {
