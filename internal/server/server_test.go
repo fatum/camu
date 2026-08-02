@@ -3,10 +3,14 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -38,6 +42,8 @@ func newTestServer(t *testing.T) *Server {
 	cfg := &config.Config{}
 	cfg.Server.InstanceID = "n1"
 	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
+	cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
+	cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
 	cfg.Storage.Bucket = "test"
 
 	s, err := NewWithS3Client(cfg, s3Client)
@@ -47,6 +53,40 @@ func newTestServer(t *testing.T) *Server {
 	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", time.Minute)
 	return s
 }
+
+func newQueryTestServer(t *testing.T) *Server {
+	t.Helper()
+
+	s3Client, err := storage.NewS3Client(storage.S3Config{
+		Bucket:   "test",
+		Endpoint: "memory://",
+	})
+	if err != nil {
+		t.Fatalf("NewS3Client() error = %v", err)
+	}
+
+	cfg := &config.Config{}
+	cfg.Server.InstanceID = "query-1"
+	cfg.Server.Mode = config.ServerModeQuery
+	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
+	cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
+	cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
+	cfg.Storage.Bucket = "test"
+
+	s, err := NewWithS3Client(cfg, s3Client)
+	if err != nil {
+		t.Fatalf("NewWithS3Client() error = %v", err)
+	}
+	return s
+}
+
+type rejectedStartupListener struct{ closed bool }
+
+func (l *rejectedStartupListener) Accept() (net.Conn, error) {
+	return nil, errors.New("should not accept")
+}
+func (l *rejectedStartupListener) Close() error   { l.closed = true; return nil }
+func (l *rejectedStartupListener) Addr() net.Addr { return &net.TCPAddr{} }
 
 func TestInitPartitionAsLeader_RF1SkipsReplicaState(t *testing.T) {
 	s := newTestServer(t)
@@ -260,6 +300,908 @@ func TestHandleConsumeLowLevel_DisklessBeyondEndReturnsRequestedOffset(t *testin
 	}
 }
 
+func TestPublicAPIHandler_QueryModeDisablesStreamingEndpoints(t *testing.T) {
+	s := newQueryTestServer(t)
+	s.ready.Store(true)
+
+	handler := s.publicAPIHandler()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/ready", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/ready status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/cluster/status", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/cluster/status status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/v1/cluster/ready", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /v1/cluster/ready status = %d, want %d in query mode", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader("{"))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/sql status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/topics", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("POST /v1/topics status = %d, want %d in query mode", rec.Code, http.StatusNotFound)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/topics", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /v1/topics status = %d, want %d in query mode", rec.Code, http.StatusNotFound)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/topics/topic/partitions/0/messages?offset=0", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET consume status = %d, want %d in query mode", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestInternalRoutes_QueryModeOnlyReady(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.Server.Mode = config.ServerModeQuery
+	s.ready.Store(true)
+
+	handler := s.internalRoutes()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/ready", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/ready status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET internal replicate status = %d, want %d in query mode", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestInternalReadinessReportsInitializedPartitions(t *testing.T) {
+	s := newTestServer(t)
+	s.ready.Store(true)
+	tc := meta.TopicConfig{Name: "ready-topic", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{0: 7}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/readiness", nil)
+	rec := httptest.NewRecorder()
+	s.handleInternalReadiness(rec, req)
+	var got localReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode readiness: %v", err)
+	}
+	if !got.Ready || len(got.Partitions) != 1 || got.Partitions[0].Topic != tc.Name || got.Partitions[0].Epoch != 7 {
+		t.Fatalf("readiness = %+v, want ready partition epoch 7", got)
+	}
+}
+
+func TestStartWithListener_QueryModeSkipsClusterStartup(t *testing.T) {
+	s := newQueryTestServer(t)
+	// An invalid internal address proves query mode neither binds nor serves h2c.
+	s.cfg.Server.InternalAddress = "not-a-listening-address"
+	s.cfg.Server.KafkaPort = 9092
+	s.registry = nil
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer ln.Close()
+
+	if err := s.startWithListener(ln); err != nil {
+		t.Fatalf("startWithListener() error = %v", err)
+	}
+	defer func() {
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown() error = %v", err)
+		}
+	}()
+
+	if !s.ready.Load() {
+		t.Fatal("ready = false, want true")
+	}
+	if s.registry != nil {
+		t.Fatalf("registry = %#v, want nil in query mode", s.registry)
+	}
+	if s.kafkaServer != nil {
+		t.Fatalf("kafkaServer = %#v, want nil in query mode", s.kafkaServer)
+	}
+	if s.disklessEngine != nil {
+		t.Fatalf("disklessEngine = %#v, want nil in query mode", s.disklessEngine)
+	}
+	if s.internalListener != nil {
+		t.Fatalf("internalListener = %#v, want nil in query mode", s.internalListener)
+	}
+	if s.partitionManager != nil {
+		t.Fatalf("partitionManager = %#v, want nil in query mode", s.partitionManager)
+	}
+	if s.leaderElection != nil || s.assignmentStore != nil || s.isrStore != nil {
+		t.Fatal("query mode constructed coordination services")
+	}
+	if s.fetcher != nil || s.offsetStore != nil || s.aclStore != nil || s.groupCoord != nil || s.idempotencyManager != nil {
+		t.Fatal("query mode constructed stream-only services")
+	}
+}
+
+func TestHandleSQLQueryInvalidBody(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader("{"))
+	rec := httptest.NewRecorder()
+
+	s.handleSQLQuery(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestSQLAuthTokenEnforced(t *testing.T) {
+	s := newQueryTestServer(t)
+	s.cfg.Server.AuthToken = "secret"
+	h := s.PublicHandler()
+	body := strings.NewReader(`{"sql":"select 1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", body)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing auth status = %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1"}`))
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid auth status = %d", rec.Code)
+	}
+}
+
+func TestSQLAuthTokenAllowsValidCredential(t *testing.T) {
+	s := newQueryTestServer(t)
+	s.cfg.Server.AuthToken = "secret"
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1"}`))
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	s.PublicHandler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatal("valid auth was rejected")
+	}
+}
+
+func TestHandleSQLQueryAdmitsScopeResolutionThroughSQLLimiter(t *testing.T) {
+	s := newTestServer(t)
+	s.sqlLimiter = make(chan struct{}, 1)
+	s.sqlLimiter <- struct{}{}
+	if err := s.topicStore.Create(context.Background(), meta.TopicConfig{
+		Name: "events", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(),
+		ReplicationFactor: 1, MinInsyncReplicas: 1,
+	}); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.handleSQLQuery(rec, httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1","topics":["events"]}`)))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("SQL request resolved scope without acquiring the limiter")
+	case <-time.After(20 * time.Millisecond):
+	}
+	<-s.sqlLimiter
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SQL request did not continue after limiter release")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 after scope resolution finds no parquet; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSQLRequestContextCancelledByShutdown(t *testing.T) {
+	s := newTestServer(t)
+	ctx, cancel, err := s.sqlRequestContext(context.Background())
+	if err != nil {
+		t.Fatalf("sqlRequestContext() error = %v", err)
+	}
+	defer cancel()
+
+	s.sqlCtxCancel()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("context error = %v, want context.Canceled", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SQL request context was not cancelled by shutdown context")
+	}
+}
+
+func TestResolveSQLQueryScopeUsesManifests(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "events",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if _, err := s.publishParquetManifest(ctx, ParquetManifest{
+		Topic:         "events",
+		Partition:     0,
+		Date:          "2026-04-11",
+		Hour:          "13",
+		SchemaVersion: 1,
+		Entries: []ParquetManifestEntry{
+			{ObjectKey: parquetExportObjectKey("events", 0, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC), 0, 9, 1, "events/0/0-9-1.segment|epoch=1"), BaseOffset: 0, EndOffset: 9, SchemaVersion: 1, SourceKey: "events/0/0-9-1.segment", SourceEpoch: 1},
+		},
+	}); err != nil {
+		t.Fatalf("publishParquetManifest() error = %v", err)
+	}
+
+	scope, err := s.resolveSQLQueryScope(ctx, sqlQueryRequest{
+		SQL:    "select 1",
+		Topics: []string{"events"},
+		TimeRange: &sqlTimeRange{
+			From: "2026-04-11T00:00:00Z",
+			To:   "2026-04-11T23:59:59Z",
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolveSQLQueryScope() error = %v", err)
+	}
+	if len(scope.Topics) != 1 || scope.Topics[0] != "events" {
+		t.Fatalf("scope.Topics = %v, want [events]", scope.Topics)
+	}
+	if len(scope.Manifests["events"]) != 1 {
+		t.Fatalf("len(scope.Manifests[events]) = %d, want 1", len(scope.Manifests["events"]))
+	}
+}
+
+func TestHandleSQLQueryUnknownTopic(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1","topics":["missing"]}`))
+	rec := httptest.NewRecorder()
+
+	s.handleSQLQuery(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestHandleSQLQueryReturnsNotImplementedAfterScopeResolution(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "events",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+
+	s.handleSQLQuery(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestPublicAPIHandler_SQLRouteDisabledByDefaultInStreamMode(t *testing.T) {
+	s := newTestServer(t)
+	// Stream mode is the default, and with SQL.Enabled unset the endpoint
+	// should not be registered on the public mux — analytical SQL load
+	// must not land on hot streaming nodes by default.
+	handler := s.publicAPIHandler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 404/405 (route not registered); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicAPIHandler_SQLRouteEnabledExplicitly(t *testing.T) {
+	s := newTestServer(t)
+	enabled := true
+	s.cfg.SQL.Enabled = &enabled
+	if err := s.topicStore.Create(context.Background(), meta.TopicConfig{
+		Name: "events", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(),
+		ReplicationFactor: 1, MinInsyncReplicas: 1,
+	}); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	handler := s.publicAPIHandler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	// The handler runs through the pipeline (topic exists, no parquet ⇒
+	// 400). What matters is that the route is reachable, not 404.
+	if rec.Code == http.StatusNotFound || rec.Code == http.StatusMethodNotAllowed {
+		t.Fatalf("SQL route not registered when explicitly enabled: status=%d", rec.Code)
+	}
+}
+
+func TestHandleSQLQueryRejectsUnsafeTopicName(t *testing.T) {
+	s := newTestServer(t)
+	for _, bad := range []string{"../etc/passwd", `events" or "1`, "events space", ""} {
+		body := fmt.Sprintf(`{"sql":"select 1","topics":[%q]}`, bad)
+		req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.handleSQLQuery(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("topic=%q status=%d, want 400; body=%s", bad, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestPrepareSQLConnectionEnforcesScanBudget(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.SQL.MaxScanFiles = 2
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name: "events", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(),
+		ReplicationFactor: 1, MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create: %v", err)
+	}
+
+	// Plant stub parquet files so ensureLocalParquetObject succeeds.
+	planted := []string{}
+	ts := time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		key := parquetExportObjectKey("events", 0, ts, int64(i*10), int64(i*10+9), 1, fmt.Sprintf("events/0/%d-%d-1.segment|epoch=1", i*10, i*10+9))
+		if err := s.s3Client.Put(ctx, key, []byte("stub"), storage.PutOpts{}); err != nil {
+			t.Fatalf("plant: %v", err)
+		}
+		planted = append(planted, key)
+	}
+	entries := make([]ParquetManifestEntry, len(planted))
+	for i, k := range planted {
+		entries[i] = ParquetManifestEntry{ObjectKey: k, BaseOffset: int64(i * 10), EndOffset: int64(i*10 + 9), SchemaVersion: 1, SourceKey: fmt.Sprintf("events/0/%d-%d-1.segment", i*10, i*10+9), SourceEpoch: 1}
+	}
+	if _, err := s.publishParquetManifest(ctx, ParquetManifest{
+		Topic: "events", Partition: 0, Date: "2026-04-11", Hour: "13", SchemaVersion: 1, Entries: entries,
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	scope, err := s.resolveSQLQueryScope(ctx, sqlQueryRequest{
+		SQL: "select 1", Topics: []string{"events"},
+	})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	db, err := s.sqlDBHandle()
+	if err != nil {
+		t.Skipf("duckdb unavailable: %v", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer conn.Close()
+
+	_, err = s.prepareSQLConnection(ctx, conn, scope)
+	if !errors.Is(err, errSQLScanBudgetExceeded) {
+		t.Fatalf("prepareSQLConnection err = %v, want errSQLScanBudgetExceeded", err)
+	}
+	cacheEntries, err := os.ReadDir(s.cfg.SQL.CacheDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(cache): %v", err)
+	}
+	if len(cacheEntries) != 0 {
+		t.Fatalf("cache directory should stay empty when scan budget is exceeded: %v", cacheEntries)
+	}
+	tempEntries, err := os.ReadDir(s.cfg.SQL.TempDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(temp): %v", err)
+	}
+	for _, entry := range tempEntries {
+		if strings.HasPrefix(entry.Name(), "camu-query-") && strings.HasSuffix(entry.Name(), ".parquet") {
+			t.Fatalf("scan budget exceeded should not leave query temp files behind: %s", entry.Name())
+		}
+	}
+}
+
+func TestEnsureLocalParquetObjectCoalescesConcurrentFetches(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// Plant an object whose key is deterministic.
+	key := parquetExportObjectKey("events", 0, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC), 0, 9, 1, "events/0/0-9-1.segment|epoch=1")
+	if err := s.s3Client.Put(ctx, key, []byte("content-bytes"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+
+	// Scrub any in-process cache that a previous test might have left.
+	cachePath := s.parquetCachePath(key)
+	_ = os.Remove(cachePath)
+
+	const workers = 16
+	type result struct {
+		file localParquetFile
+		err  error
+	}
+	results := make(chan result, workers)
+	for range workers {
+		go func() {
+			p, err := s.ensureLocalParquetObject(ctx, key)
+			results <- result{file: p, err: err}
+		}()
+	}
+	paths := map[string]int{}
+	files := make([]localParquetFile, 0, workers)
+	for range workers {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("ensureLocalParquetObject: %v", r.err)
+		}
+		if r.file.Temporary {
+			t.Fatal("concurrent cache acquisition unexpectedly used a temporary file")
+		}
+		paths[r.file.Path]++
+		files = append(files, r.file)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("concurrent fetches returned %d distinct paths, want 1: %v", len(paths), paths)
+	}
+	// Exactly one canonical file — no leftover `.tmp` siblings from the
+	// race condition the fix targets.
+	dir := filepath.Dir(cachePath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var parquetFiles, tmpFiles int
+	for _, e := range entries {
+		name := e.Name()
+		switch {
+		case strings.HasSuffix(name, ".parquet.tmp"):
+			tmpFiles++
+		case strings.HasSuffix(name, ".parquet"):
+			parquetFiles++
+		}
+	}
+	if parquetFiles != 1 {
+		t.Fatalf("parquet cache files = %d, want 1", parquetFiles)
+	}
+	if tmpFiles != 0 {
+		t.Fatalf("leftover .tmp files = %d, want 0", tmpFiles)
+	}
+	s.parquetCacheMu.Lock()
+	pins := s.parquetCachePins[cachePath]
+	s.parquetCacheMu.Unlock()
+	if pins != workers {
+		t.Fatalf("cache pins = %d, want %d", pins, workers)
+	}
+	for _, file := range files {
+		file.Release()
+	}
+	s.parquetCacheMu.Lock()
+	pins = s.parquetCachePins[cachePath]
+	s.parquetCacheMu.Unlock()
+	if pins != 0 {
+		t.Fatalf("cache pins after release = %d, want 0", pins)
+	}
+}
+
+func TestEnsureLocalParquetObjectKeepsPinnedFileDuringCachePressure(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.SQL.CacheMaxSize = 6
+	ctx := context.Background()
+	ts := time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)
+	firstKey := parquetExportObjectKey("events", 0, ts, 0, 0, 1, "events/0/0-0-1.segment|epoch=1")
+	secondKey := parquetExportObjectKey("events", 0, ts, 1, 1, 1, "events/0/1-1-1.segment|epoch=1")
+	if err := s.s3Client.Put(ctx, firstKey, []byte("1234"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant first object: %v", err)
+	}
+	if err := s.s3Client.Put(ctx, secondKey, []byte("5678"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant second object: %v", err)
+	}
+
+	first, err := s.ensureLocalParquetObject(ctx, firstKey)
+	if err != nil || first.Temporary {
+		t.Fatalf("first cache result = %+v, err=%v; want cached file", first, err)
+	}
+	defer first.Release()
+	second, err := s.ensureLocalParquetObject(ctx, secondKey)
+	if err != nil {
+		t.Fatalf("second cache result: %v", err)
+	}
+	if !second.Temporary {
+		t.Fatal("second cache result should fall back to a temporary file while first is pinned")
+	}
+	defer cleanupLocalParquetFiles([]localParquetFile{second})
+
+	data, err := os.ReadFile(first.Path)
+	if err != nil {
+		t.Fatalf("read pinned cache file: %v", err)
+	}
+	if string(data) != "1234" {
+		t.Fatalf("pinned cache file = %q, want %q", data, "1234")
+	}
+	if _, err := os.Stat(second.Path); err != nil {
+		t.Fatalf("temporary fallback missing: %v", err)
+	}
+}
+
+func TestEnsureLocalParquetObjectEvictsToAggregateCacheLimit(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.SQL.CacheMaxSize = 6
+	ctx := context.Background()
+	ts := time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)
+	firstKey := parquetExportObjectKey("events", 0, ts, 0, 0, 1, "events/0/0-0-1.segment|epoch=1")
+	secondKey := parquetExportObjectKey("events", 0, ts, 1, 1, 1, "events/0/1-1-1.segment|epoch=1")
+	if err := s.s3Client.Put(ctx, firstKey, []byte("1234"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant first object: %v", err)
+	}
+	if err := s.s3Client.Put(ctx, secondKey, []byte("5678"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant second object: %v", err)
+	}
+
+	first, err := s.ensureLocalParquetObject(ctx, firstKey)
+	if err != nil || first.Temporary {
+		t.Fatalf("first cache result = %+v, err=%v; want cached file", first, err)
+	}
+	first.Release()
+	second, err := s.ensureLocalParquetObject(ctx, secondKey)
+	if err != nil || second.Temporary {
+		t.Fatalf("second cache result = %+v, err=%v; want cached file", second, err)
+	}
+
+	if _, err := os.Stat(first.Path); !os.IsNotExist(err) {
+		t.Fatalf("first cache entry still exists after eviction: err=%v", err)
+	}
+	if _, err := os.Stat(second.Path); err != nil {
+		t.Fatalf("second cache entry missing after install: %v", err)
+	}
+	entries, err := os.ReadDir(s.cfg.SQL.CacheDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(cache): %v", err)
+	}
+	var total int64
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".parquet") {
+			info, err := entry.Info()
+			if err != nil {
+				t.Fatalf("stat cache entry: %v", err)
+			}
+			total += info.Size()
+		}
+	}
+	if total > s.cfg.SQL.CacheMaxSize {
+		t.Fatalf("cache size = %d, limit = %d", total, s.cfg.SQL.CacheMaxSize)
+	}
+}
+
+func TestEnsureLocalParquetObjectReconcilesPreexistingCacheOnHit(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.SQL.CacheMaxSize = 6
+	ctx := context.Background()
+	ts := time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)
+	keptKey := parquetExportObjectKey("events", 0, ts, 0, 0, 1, "events/0/0-0-1.segment|epoch=1")
+	staleKey := parquetExportObjectKey("events", 0, ts, 1, 1, 1, "events/0/1-1-1.segment|epoch=1")
+	keptPath := s.parquetCachePath(keptKey)
+	stalePath := s.parquetCachePath(staleKey)
+	if err := os.MkdirAll(filepath.Dir(keptPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(cache): %v", err)
+	}
+	if err := os.WriteFile(keptPath, []byte("1234"), 0o644); err != nil {
+		t.Fatalf("write kept cache entry: %v", err)
+	}
+	if err := os.WriteFile(stalePath, []byte("5678"), 0o644); err != nil {
+		t.Fatalf("write stale cache entry: %v", err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stalePath, old, old); err != nil {
+		t.Fatalf("age stale cache entry: %v", err)
+	}
+
+	file, err := s.ensureLocalParquetObject(ctx, keptKey)
+	if err != nil || file.Temporary {
+		t.Fatalf("cache hit = %+v, err=%v; want cached file", file, err)
+	}
+	defer file.Release()
+	if _, err := os.Stat(keptPath); err != nil {
+		t.Fatalf("reused cache entry missing: %v", err)
+	}
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("stale oversized cache entry remains: %v", err)
+	}
+	info, err := os.Stat(keptPath)
+	if err != nil {
+		t.Fatalf("stat kept cache entry: %v", err)
+	}
+	if info.Size() > s.cfg.SQL.CacheMaxSize {
+		t.Fatalf("cache size = %d, limit = %d", info.Size(), s.cfg.SQL.CacheMaxSize)
+	}
+}
+
+func TestLocalParquetFilesForObjectKeysCleansPartialAcquisition(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.SQL.CacheMaxSize = 6
+	ctx := context.Background()
+	ts := time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)
+	cachedKey := parquetExportObjectKey("events", 0, ts, 0, 0, 1, "events/0/0-0-1.segment|epoch=1")
+	temporaryKey := parquetExportObjectKey("events", 0, ts, 1, 1, 1, "events/0/1-1-1.segment|epoch=1")
+	missingKey := parquetExportObjectKey("events", 0, ts, 2, 2, 1, "events/0/2-2-1.segment|epoch=1")
+	if err := s.s3Client.Put(ctx, cachedKey, []byte("1234"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant cached object: %v", err)
+	}
+	if err := s.s3Client.Put(ctx, temporaryKey, []byte("5678"), storage.PutOpts{}); err != nil {
+		t.Fatalf("plant temporary object: %v", err)
+	}
+
+	_, err := s.localParquetFilesForObjectKeys(ctx, []string{cachedKey, temporaryKey, missingKey})
+	if err == nil {
+		t.Fatal("partial acquisition unexpectedly succeeded")
+	}
+	entries, err := os.ReadDir(s.cfg.SQL.TempDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(temp): %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "camu-query-") && strings.HasSuffix(entry.Name(), ".parquet") {
+			t.Fatalf("partial acquisition left temporary parquet file behind: %s", entry.Name())
+		}
+	}
+	cachePath := s.parquetCachePath(cachedKey)
+	s.parquetCacheMu.Lock()
+	pins := s.parquetCachePins[cachePath]
+	s.parquetCacheMu.Unlock()
+	if pins != 0 {
+		t.Fatalf("cached file pins after partial acquisition = %d, want 0", pins)
+	}
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("released cache file should remain available for eviction: %v", err)
+	}
+}
+
+func TestHandleSQLQueryRemovesOversizedTempFiles(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.SQL.CacheMaxSize = 1
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "events",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	objectKey := parquetExportObjectKey("events", 0, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC), 0, 1, 1, "events/0/0-1-1.segment|epoch=1")
+	writeTestParquetObject(t, s, objectKey, []string{
+		`CREATE TABLE events AS SELECT 1::BIGINT AS id, 'alpha'::VARCHAR AS name UNION ALL SELECT 2::BIGINT, 'beta'::VARCHAR`,
+	})
+	if _, err := s.publishParquetManifest(ctx, ParquetManifest{
+		Topic:         "events",
+		Partition:     0,
+		Date:          "2026-04-11",
+		Hour:          "13",
+		SchemaVersion: 1,
+		Entries: []ParquetManifestEntry{
+			{ObjectKey: objectKey, BaseOffset: 0, EndOffset: 1, SchemaVersion: 1, SourceKey: "events/0/0-1.segment", SourceEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("publishParquetManifest() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select id, name from events order by id","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+	s.handleSQLQuery(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	entries, err := os.ReadDir(s.cfg.SQL.TempDirectory)
+	if err != nil {
+		t.Fatalf("ReadDir(temp): %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "camu-query-") && strings.HasSuffix(entry.Name(), ".parquet") {
+			t.Fatalf("oversized parquet temp file leaked after query: %s", entry.Name())
+		}
+	}
+}
+
+func TestShutdownCancelsSQLContext(t *testing.T) {
+	s := newTestServer(t)
+	if s.sqlCtx == nil {
+		t.Fatal("sqlCtx not initialized")
+	}
+	if err := s.sqlCtx.Err(); err != nil {
+		t.Fatalf("sqlCtx already cancelled before Shutdown: %v", err)
+	}
+	// Don't actually bind and serve — just exercise the Shutdown codepath
+	// that cancels in-flight SQL work and closes the DuckDB handle.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if s.sqlCtx.Err() == nil {
+		t.Fatal("sqlCtx still live after Shutdown, want cancelled")
+	}
+}
+
+func TestPublicAPIHandler_QueryModeExposesSQLRoute(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.Server.Mode = config.ServerModeQuery
+	s.ready.Store(true)
+	if err := s.topicStore.Create(context.Background(), meta.TopicConfig{
+		Name:              "events",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	handler := s.publicAPIHandler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select 1","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/sql status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleSQLQueryExecutesManifestScopedQuery(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "events",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+
+	objectKey := parquetExportObjectKey("events", 0, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC), 0, 1, 1, "events/0/0-1-1.segment|epoch=1")
+	writeTestParquetObject(t, s, objectKey, []string{
+		`CREATE TABLE events AS SELECT 1::BIGINT AS id, 'alpha'::VARCHAR AS name UNION ALL SELECT 2::BIGINT, 'beta'::VARCHAR`,
+	})
+	if _, err := s.publishParquetManifest(ctx, ParquetManifest{
+		Topic:         "events",
+		Partition:     0,
+		Date:          "2026-04-11",
+		Hour:          "13",
+		SchemaVersion: 1,
+		Entries: []ParquetManifestEntry{
+			{ObjectKey: objectKey, BaseOffset: 0, EndOffset: 1, SchemaVersion: 1, SourceKey: "events/0/0-1.segment", SourceEpoch: 0},
+		},
+	}); err != nil {
+		t.Fatalf("publishParquetManifest() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"select id, name from events order by id","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+
+	s.handleSQLQuery(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var resp sqlQueryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(resp.Columns) != 2 {
+		t.Fatalf("len(columns) = %d, want 2", len(resp.Columns))
+	}
+	if len(resp.Rows) != 2 {
+		t.Fatalf("len(rows) = %d, want 2", len(resp.Rows))
+	}
+	if got := resp.Rows[0][0]; got != float64(1) {
+		t.Fatalf("row[0][0] = %#v, want 1", got)
+	}
+	if got := resp.Rows[1][1]; got != "beta" {
+		t.Fatalf("row[1][1] = %#v, want beta", got)
+	}
+}
+
+func TestHandleSQLQueryRejectsMutatingStatement(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.topicStore.Create(ctx, meta.TopicConfig{
+		Name:              "events",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/sql", strings.NewReader(`{"sql":"delete from events","topics":["events"]}`))
+	rec := httptest.NewRecorder()
+
+	s.handleSQLQuery(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func writeTestParquetObject(t *testing.T, s *Server, objectKey string, setup []string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	parquetPath := filepath.Join(tmpDir, "test.parquet")
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("sql.Open(duckdb) error = %v", err)
+	}
+	defer db.Close()
+
+	for _, stmt := range setup {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("duckdb exec %q error = %v", stmt, err)
+		}
+	}
+	if _, err := db.Exec(`COPY events TO '` + strings.ReplaceAll(parquetPath, `'`, `''`) + `' (FORMAT PARQUET)`); err != nil {
+		t.Fatalf("duckdb COPY TO parquet error = %v", err)
+	}
+
+	data, err := os.ReadFile(parquetPath)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%s) error = %v", parquetPath, err)
+	}
+	if err := s.s3Client.Put(context.Background(), objectKey, data, storage.PutOpts{ContentType: "application/octet-stream"}); err != nil {
+		t.Fatalf("s3Client.Put(%s) error = %v", objectKey, err)
+	}
+}
+
 func TestHandleKafkaMetadataIncludesUnknownRequestedTopic(t *testing.T) {
 	s := newTestServer(t)
 
@@ -338,6 +1280,185 @@ func TestKafkaCreateTopicRequestAcceptsDisklessStorageMode(t *testing.T) {
 	}
 	if reqBody.StorageMode != "diskless" {
 		t.Fatalf("kafkaCreateTopicRequest() storage mode = %q, want %q", reqBody.StorageMode, "diskless")
+	}
+}
+
+func TestParquetExportRejectsUncleanLeaderElectionOnHTTPTopicCreate(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics", strings.NewReader(`{
+"name":"events","partitions":1,"unclean_leader_election":true,"export_enabled":true
+}`))
+	rec := httptest.NewRecorder()
+	s.PublicHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/topics status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unclean_leader_election") {
+		t.Fatalf("POST /v1/topics body = %q, want parquet compatibility error", rec.Body.String())
+	}
+}
+
+func TestParquetExportDisabledAllowsUncleanLeaderElectionOnHTTPTopicCreate(t *testing.T) {
+	s := newTestServer(t)
+	if err := s.registry.Register(context.Background()); err != nil {
+		t.Fatalf("register test instance: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/topics", strings.NewReader(`{
+"name":"events","partitions":1,"unclean_leader_election":true,"storage_mode":"diskless"
+}`))
+	rec := httptest.NewRecorder()
+	s.PublicHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/topics status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+}
+
+func TestParquetExportRejectsStartupForPersistedUncleanClassicTopic(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.topicStore.Create(ctx, meta.TopicConfig{
+		Name:                  "unclean-events",
+		Partitions:            1,
+		Retention:             time.Hour,
+		CreatedAt:             time.Now(),
+		ReplicationFactor:     1,
+		MinInsyncReplicas:     1,
+		UncleanLeaderElection: true,
+		StorageMode:           meta.StorageModeClassic,
+		ExportEnabled:         true,
+	}); err != nil {
+		t.Fatalf("seed topic: %v", err)
+	}
+
+	listener := &rejectedStartupListener{}
+	err := s.startWithListener(listener)
+	if err == nil || !strings.Contains(err.Error(), "unclean-events") {
+		t.Fatalf("startWithListener() error = %v, want incompatible topic", err)
+	}
+	if !listener.closed {
+		t.Fatal("startup rejection did not close supplied listener")
+	}
+	instances, err := s.registry.ActiveInstances(ctx)
+	if err != nil {
+		t.Fatalf("list registry: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("startup rejection registered stream instance: %v", instances)
+	}
+	if s.ready.Load() || s.partitionManager != nil && len(s.partitionManager.partitions) != 0 {
+		t.Fatal("startup rejection initialized serving or partitions")
+	}
+}
+
+func TestParquetExportGuardsKafkaUncleanElectionMutation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+		invoke  func(*Server, context.Context, string, string) (int16, error)
+	}{
+		{
+			name: "alter_configs",
+			invoke: func(s *Server, ctx context.Context, value, export string) (int16, error) {
+				req := kmsg.NewPtrAlterConfigsRequest()
+				req.Resources = []kmsg.AlterConfigsRequestResource{{
+					ResourceType: kmsg.ConfigResourceTypeTopic,
+					ResourceName: "events",
+					Configs:      []kmsg.AlterConfigsRequestResourceConfig{{Name: "unclean.leader.election.enable", Value: &value}, {Name: "camu.export.enabled", Value: &export}},
+				}}
+				resp, err := s.handleKafkaAlterConfigs(ctx, req)
+				if err != nil {
+					return 0, err
+				}
+				return resp.Resources[0].ErrorCode, nil
+			},
+		},
+		{
+			name: "incremental_alter_configs",
+			invoke: func(s *Server, ctx context.Context, value, export string) (int16, error) {
+				req := kmsg.NewPtrIncrementalAlterConfigsRequest()
+				req.Resources = []kmsg.IncrementalAlterConfigsRequestResource{{
+					ResourceType: kmsg.ConfigResourceTypeTopic,
+					ResourceName: "events",
+					Configs:      []kmsg.IncrementalAlterConfigsRequestResourceConfig{{Name: "unclean.leader.election.enable", Op: kmsg.IncrementalAlterConfigOpSet, Value: &value}, {Name: "camu.export.enabled", Op: kmsg.IncrementalAlterConfigOpSet, Value: &export}},
+				}}
+				resp, err := s.handleKafkaIncrementalAlterConfigs(ctx, req)
+				if err != nil {
+					return 0, err
+				}
+				return resp.Resources[0].ErrorCode, nil
+			},
+		},
+	} {
+		for _, enabled := range []bool{true, false} {
+			t.Run(test.name+"/export_"+strconv.FormatBool(enabled), func(t *testing.T) {
+				s := newTestServer(t)
+				s.leaderLease = coordination.LeaderLease{InstanceID: s.instanceID, ExpiresAt: time.Now().Add(time.Minute)}
+				ctx := context.Background()
+				if err := s.topicStore.Create(ctx, meta.TopicConfig{Name: "events", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeClassic, ExportEnabled: enabled}); err != nil {
+					t.Fatalf("seed topic: %v", err)
+				}
+
+				export := strconv.FormatBool(enabled)
+				code, err := test.invoke(s, ctx, "true", export)
+				if err != nil {
+					t.Fatalf("mutation: %v", err)
+				}
+				want := int16(0)
+				if enabled {
+					want = kafkaErrorInvalidConfig
+				}
+				if code != want {
+					t.Fatalf("mutation error code = %d, want %d", code, want)
+				}
+				got, err := s.topicStore.Get(ctx, "events")
+				if err != nil {
+					t.Fatalf("load topic: %v", err)
+				}
+				if got.UncleanLeaderElection != !enabled {
+					t.Fatalf("persisted unclean_leader_election = %v, want %v", got.UncleanLeaderElection, !enabled)
+				}
+			})
+		}
+	}
+}
+
+func TestParquetExportRejectsUncleanLeaderElectionOnKafkaTopicCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		want    int16
+	}{
+		{name: "enabled", enabled: true, want: kafkaErrorInvalidConfig},
+		{name: "disabled", enabled: false, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			s.leaderLease = coordination.LeaderLease{InstanceID: s.instanceID, ExpiresAt: time.Now().Add(time.Minute)}
+			unclean := "true"
+			exportEnabled := strconv.FormatBool(tc.enabled)
+			req := kmsg.NewPtrCreateTopicsRequest()
+			req.ValidateOnly = true
+			req.Topics = []kmsg.CreateTopicsRequestTopic{{
+				Topic:             "events",
+				NumPartitions:     1,
+				ReplicationFactor: 1,
+				Configs: []kmsg.CreateTopicsRequestTopicConfig{{
+					Name:  "unclean.leader.election.enable",
+					Value: &unclean,
+				}, {Name: "camu.export.enabled", Value: &exportEnabled}},
+			}}
+
+			resp, err := s.handleKafkaCreateTopics(context.Background(), req)
+			if err != nil {
+				t.Fatalf("handleKafkaCreateTopics() error = %v", err)
+			}
+			if len(resp.Topics) != 1 || resp.Topics[0].ErrorCode != tc.want {
+				t.Fatalf("CreateTopics error = %d, want %d", resp.Topics[0].ErrorCode, tc.want)
+			}
+		})
 	}
 }
 

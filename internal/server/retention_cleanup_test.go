@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/pipeline"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -509,4 +511,144 @@ func TestDisklessRetentionOwnerJobResumesAfterReassignment(t *testing.T) {
 	if len(jobs) != 0 {
 		t.Fatalf("partition jobs after reassignment resume = %+v, want none", jobs)
 	}
+}
+
+func TestClassicRetentionWaitsForPipelineCheckpoint(t *testing.T) {
+	s, tc, identity, segments := setupClassicRetentionGate(t)
+	ctx := context.Background()
+
+	// Without a checkpoint, discovery must fail closed and enqueue nothing.
+	s.discoverClassicRetentionJobs(ctx, tc, identity)
+	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs() error = %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("jobs without Parquet pipeline checkpoint = %+v, want none", jobs)
+	}
+
+	store := pipeline.NewCheckpointStore(s.s3Client, pipeline.NoFence{})
+	if err := store.Publish(ctx, parquetPipelineName, pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, NextOffset: 10, Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, Generation: 1}); err != nil {
+		t.Fatalf("publish parquet pipeline checkpoint: %v", err)
+	}
+	s.discoverClassicRetentionJobs(ctx, tc, identity)
+	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs() error = %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs with checkpoint through first segment = %+v, want one", jobs)
+	}
+	if err := s.runRetentionJob(ctx, jobs[0]); err != nil {
+		t.Fatalf("runRetentionJob(covered) error = %v", err)
+	}
+	if _, err := s.s3Client.Get(ctx, segments[0].segmentKey); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("covered segment was not removed: %v", err)
+	}
+	if _, err := s.s3Client.Get(ctx, segments[1].segmentKey); err != nil {
+		t.Fatalf("uncovered segment was removed: %v", err)
+	}
+}
+
+func TestClassicRetentionRechecksStaleJobBeforeDeleting(t *testing.T) {
+	s, tc, identity, segments := setupClassicRetentionGate(t)
+	ctx := context.Background()
+
+	// This models a job queued before the checkpoint became stale. Omit
+	// EndOffset to also verify compatibility with pre-gate job payloads.
+	payload, err := json.Marshal(ClassicRetentionPayload{
+		StorageMode:    meta.StorageModeClassic,
+		SegmentKey:     segments[1].segmentKey,
+		OffsetIndexKey: segments[1].indexKey,
+		MetadataKey:    segments[1].metaKey,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(payload) error = %v", err)
+	}
+	job := PartitionJob{
+		ID:            partitionJobID(PartitionJobTypeRetention, segments[1].segmentKey),
+		Topic:         tc.Name,
+		Partition:     0,
+		Type:          PartitionJobTypeRetention,
+		ExpectedOwner: identity.Leader,
+		ExpectedEpoch: identity.LeaderEpoch,
+		State:         PartitionJobStatePending,
+		Phase:         PartitionJobPhaseDeleteData,
+		Payload:       payload,
+	}
+	if err := s.putPartitionJob(ctx, job); err != nil {
+		t.Fatalf("putPartitionJob() error = %v", err)
+	}
+	err = s.runRetentionJob(ctx, job)
+	if !errors.Is(err, errRetentionAwaitingParquetExport) {
+		t.Fatalf("runRetentionJob() error = %v, want parquet export block", err)
+	}
+	if _, err := s.s3Client.Get(ctx, segments[1].segmentKey); err != nil {
+		t.Fatalf("blocked retention deleted segment: %v", err)
+	}
+	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs() error = %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].State != PartitionJobStatePending {
+		t.Fatalf("blocked job = %+v, want retained pending job", jobs)
+	}
+}
+
+type retentionGateSegment struct {
+	segmentKey string
+	indexKey   string
+	metaKey    string
+}
+
+func setupClassicRetentionGate(t *testing.T) (*Server, meta.TopicConfig, PartitionIdentity, []retentionGateSegment) {
+	t.Helper()
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name: "parquet-retention", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(),
+		ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeClassic,
+		ExportEnabled: true,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	identity := PartitionIdentity{Partition: 0, Leader: s.instanceID, LeaderEpoch: 1}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{0: {
+			Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: identity.LeaderEpoch,
+		}},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: identity.LeaderEpoch}}
+	s.assignmentsMu.Unlock()
+
+	segments := make([]retentionGateSegment, 0, 2)
+	for _, end := range []uint64{9, 19} {
+		segmentKey := fmt.Sprintf("%s/0/00000000000000000000-%d-1.segment", tc.Name, end)
+		indexKey := log.SegmentOffsetIndexKey(segmentKey)
+		metaKey := log.SegmentMetadataKey(segmentKey)
+		metaData, err := json.Marshal(log.SegmentMetadata{
+			BaseOffset: end - 9, EndOffset: end, Epoch: 1, SegmentKey: segmentKey,
+			OffsetIndexKey: indexKey, CreatedAt: time.Now().Add(-2 * time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("json.Marshal(segment metadata) error = %v", err)
+		}
+		for _, item := range []struct {
+			key  string
+			data []byte
+		}{
+			{segmentKey, []byte("segment")}, {indexKey, []byte("index")}, {metaKey, metaData},
+		} {
+			if err := s.s3Client.Put(ctx, item.key, item.data, storage.PutOpts{}); err != nil {
+				t.Fatalf("s3Client.Put(%s) error = %v", item.key, err)
+			}
+		}
+		segments = append(segments, retentionGateSegment{segmentKey, indexKey, metaKey})
+	}
+	return s, tc, identity, segments
 }

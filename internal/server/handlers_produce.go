@@ -75,6 +75,14 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "at least one message is required")
 		return
 	}
+	if topicCfg.Schema != nil {
+		for i, m := range msgs {
+			if err := validateTypedValue(topicCfg.Schema, m.Value); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("message %d: %v", i, err))
+				return
+			}
+		}
+	}
 
 	router := s.partitionManager.GetRouter(topicName)
 	if router == nil {
@@ -289,6 +297,14 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "at least one message is required")
 		return
 	}
+	if tc.Schema != nil {
+		for i, m := range msgs {
+			if err := validateTypedValue(tc.Schema, m.Value); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("message %d: %v", i, err))
+				return
+			}
+		}
+	}
 
 	batch := make([]log.Message, len(msgs))
 	for i, m := range msgs {
@@ -334,7 +350,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 			Sequence: sequence,
 		})
 		if errors.Is(err, idempotency.ErrDuplicateSequence) {
-			s.handleDuplicateSequence(w, r, ps, producerID)
+			s.handleDuplicateSequence(w, r, ps, partitionID, producerID)
 			return
 		}
 	} else {
@@ -379,9 +395,12 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 // handleDuplicateSequence handles the ErrDuplicateSequence case for idempotent
 // produce. It waits for the original batch to be replicated before confirming.
-func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request, ps *partitionState, producerID uint64) {
+func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request, ps *partitionState, partition int, producerID uint64) {
 	if ps == nil {
-		writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+		writeJSON(w, http.StatusOK, struct {
+			Duplicate bool         `json:"duplicate"`
+			Offsets   []offsetInfo `json:"offsets"`
+		}{Duplicate: true})
 		return
 	}
 
@@ -392,7 +411,10 @@ func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request,
 	ps.mu.RUnlock()
 
 	if ok && hwOK && hw > lastOff {
-		writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+		writeJSON(w, http.StatusOK, struct {
+			Duplicate bool         `json:"duplicate"`
+			Offsets   []offsetInfo `json:"offsets"`
+		}{Duplicate: true, Offsets: []offsetInfo{{Partition: partition, Offset: lastOff}}})
 		return
 	}
 	if ok && replicaState != nil {
@@ -402,5 +424,8 @@ func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]bool{"duplicate": true})
+	writeJSON(w, http.StatusOK, struct {
+		Duplicate bool         `json:"duplicate"`
+		Offsets   []offsetInfo `json:"offsets"`
+	}{Duplicate: true, Offsets: []offsetInfo{{Partition: partition, Offset: lastOff}}})
 }

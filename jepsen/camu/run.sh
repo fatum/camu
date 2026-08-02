@@ -13,31 +13,55 @@ NUM_PARTITIONS="${NUM_PARTITIONS:-4}"
 KAFKA_PORT="${KAFKA_PORT:-9092}"
 SEGMENT_MAX_SIZE="${SEGMENT_MAX_SIZE:-104857600}"
 SEGMENT_MAX_AGE="${SEGMENT_MAX_AGE:-1m}"
+TOPIC_RETENTION="${TOPIC_RETENTION:-24h}"
+RETENTION_LIFECYCLE="${RETENTION_LIFECYCLE:-false}"
+TYPED="${TYPED:-false}"
 MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASS="${MINIO_PASS:-minioadmin}"
 MINIO_BUCKET="${MINIO_BUCKET:-camu-data}"
+COMPOSE_BIN="${COMPOSE_BIN:-docker-compose}"
 
-echo "Building camu for Linux..."
+if ! command -v "$COMPOSE_BIN" >/dev/null 2>&1; then
+  echo "Compose command not found: $COMPOSE_BIN" >&2
+  echo "Install docker-compose or set COMPOSE_BIN to a compatible wrapper." >&2
+  exit 1
+fi
+
+compose() {
+  "$COMPOSE_BIN" "$@"
+}
+
+echo "Building camu for Linux (inside container — go-duckdb requires CGO)..."
 cd "$(dirname "$0")/../.."
-GOOS=linux GOARCH=amd64 go build -o jepsen/camu/camu ./cmd/camu/
+# Build inside a matching-arch golang image so the CGO bindings for
+# go-duckdb compile without a host cross-toolchain. The named volumes
+# cache the module and build cache across runs so only the first
+# invocation pays the dep-download cost.
+docker run --rm \
+  -v "$PWD:/src" \
+  -v camu-jepsen-gocache:/root/.cache/go-build \
+  -v camu-jepsen-gomodcache:/go/pkg/mod \
+  -w /src \
+  golang:1.25.6-bookworm \
+  go build -o jepsen/camu/camu ./cmd/camu/
 cd jepsen/camu
 
 echo "Cleaning previous Docker Compose state..."
-docker compose down -v --remove-orphans 2>/dev/null || true
+compose down -v --remove-orphans 2>/dev/null || true
 docker rm -f camu-setup-minio-1 camu-minio-1 camu-n1-1 camu-n2-1 camu-n3-1 camu-n4-1 camu-n5-1 2>/dev/null || true
 docker network rm camu_jepsen 2>/dev/null || true
 docker volume rm camu_shared-ssh 2>/dev/null || true
 
 echo "Starting infrastructure (minio, nodes)..."
-docker compose up -d minio setup-minio n1 n2 n3 n4 n5
+compose up -d minio setup-minio n1 n2 n3 n4 n5
 
 echo "Waiting for MinIO to be ready..."
-until docker compose run --rm setup-minio sh -c "mc alias set local http://minio:9000 $MINIO_USER $MINIO_PASS >/dev/null 2>&1"; do
+until compose run --rm setup-minio sh -c "mc alias set local http://minio:9000 $MINIO_USER $MINIO_PASS >/dev/null 2>&1"; do
   sleep 1
 done
 
 echo "Clearing existing S3 state from bucket $MINIO_BUCKET..."
-docker compose run --rm --entrypoint sh setup-minio -c "
+compose run --rm --entrypoint sh setup-minio -c "
   mc alias set local http://minio:9000 $MINIO_USER $MINIO_PASS >/dev/null 2>&1
   mc rb --force local/$MINIO_BUCKET 2>/dev/null
   mc mb local/$MINIO_BUCKET
@@ -49,13 +73,13 @@ docker compose run --rm --entrypoint sh setup-minio -c "
 "
 
 echo "Rebuilding Jepsen control image..."
-docker compose build control
+compose build control
 
 echo "Waiting for services to be ready..."
 sleep 10
 
-echo "Running Jepsen tests (api=$API, faults=$FAULTS, time-limit=$TIME_LIMIT, rf=$REPLICATION_FACTOR, minISR=$MIN_INSYNC_REPLICAS, partitions=$NUM_PARTITIONS, workload=$WORKLOAD, concurrency=$CONCURRENCY, read-mode=$READ_MODE, kafka_port=$KAFKA_PORT, segment_max_size=$SEGMENT_MAX_SIZE, segment_max_age=$SEGMENT_MAX_AGE)..."
-docker compose run --rm \
+echo "Running Jepsen tests (api=$API, faults=$FAULTS, time-limit=$TIME_LIMIT, rf=$REPLICATION_FACTOR, minISR=$MIN_INSYNC_REPLICAS, partitions=$NUM_PARTITIONS, workload=$WORKLOAD, concurrency=$CONCURRENCY, read-mode=$READ_MODE, kafka_port=$KAFKA_PORT, segment_max_size=$SEGMENT_MAX_SIZE, segment_max_age=$SEGMENT_MAX_AGE, topic_retention=$TOPIC_RETENTION, retention_lifecycle=$RETENTION_LIFECYCLE, typed=$TYPED)..."
+compose run --rm \
   -e CAMU_DISABLE_NODE_LOGS \
   -e CAMU_QUIET_CLIENT_LOGS \
   control bash -c "
@@ -80,6 +104,9 @@ docker compose run --rm \
     --num-partitions $NUM_PARTITIONS \
     --segment-max-size $SEGMENT_MAX_SIZE \
     --segment-max-age $SEGMENT_MAX_AGE \
+    --topic-retention $TOPIC_RETENTION \
+    --retention-lifecycle $RETENTION_LIFECYCLE \
+    --typed $TYPED \
     --replication-factor $REPLICATION_FACTOR \
     --min-insync-replicas $MIN_INSYNC_REPLICAS
 "

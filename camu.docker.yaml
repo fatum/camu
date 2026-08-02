@@ -2,6 +2,7 @@ server:
   address: ":8080"
   internal_address: ":8081"
   kafka_port: 9092
+  mode: stream
 
 storage:
   bucket: camu-data

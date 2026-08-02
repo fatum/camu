@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -33,6 +34,12 @@ func (s *Server) handleKafkaCreateTopics(ctx context.Context, req *kmsg.CreateTo
 		}
 
 		reqBody, errCode, errMsg := s.kafkaCreateTopicRequest(topic)
+		if errCode == 0 {
+			if err := s.validateParquetExportTopicConfig(reqBody.ExportEnabled, reqBody.UncleanLeaderElection); err != nil {
+				errCode = kafkaErrorInvalidConfig
+				errMsg = err.Error()
+			}
+		}
 		if errCode == 0 && seen[topic.Topic] {
 			errCode = kafkaErrorInvalidRequest
 			errMsg = "duplicate topic in request"
@@ -250,6 +257,13 @@ func (s *Server) handleKafkaAlterConfigs(ctx context.Context, req *kmsg.AlterCon
 			resp.Resources = append(resp.Resources, resourceResp)
 			continue
 		}
+		if err := s.validateParquetExportTopicConfig(next.ExportEnabled, next.UncleanLeaderElection); err != nil {
+			resourceResp.ErrorCode = kafkaErrorInvalidConfig
+			msg := err.Error()
+			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
+			resp.Resources = append(resp.Resources, resourceResp)
+			continue
+		}
 		if !req.ValidateOnly {
 			if err := s.topicStore.Update(ctx, next); err != nil {
 				return nil, err
@@ -293,6 +307,13 @@ func (s *Server) handleKafkaIncrementalAlterConfigs(ctx context.Context, req *km
 		}
 		next, err := applyKafkaTopicIncrementalConfigs(tc, resource.Configs)
 		if err != nil {
+			resourceResp.ErrorCode = kafkaErrorInvalidConfig
+			msg := err.Error()
+			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
+			resp.Resources = append(resp.Resources, resourceResp)
+			continue
+		}
+		if err := s.validateParquetExportTopicConfig(next.ExportEnabled, next.UncleanLeaderElection); err != nil {
 			resourceResp.ErrorCode = kafkaErrorInvalidConfig
 			msg := err.Error()
 			resourceResp.ErrorMessage = kmsg.StringPtr(msg)
@@ -378,6 +399,21 @@ func (s *Server) kafkaCreateTopicRequest(topic kmsg.CreateTopicsRequestTopic) (c
 				return reqBody, kafkaErrorInvalidConfig, "invalid camu.storage.mode"
 			}
 			reqBody.StorageMode = *cfg.Value
+		case "camu.export.enabled":
+			v, err := strconv.ParseBool(*cfg.Value)
+			if err != nil {
+				return reqBody, kafkaErrorInvalidConfig, "invalid camu.export.enabled"
+			}
+			reqBody.ExportEnabled = v
+		case "camu.schema":
+			var schema meta.TopicSchema
+			if err := json.Unmarshal([]byte(*cfg.Value), &schema); err != nil {
+				return reqBody, kafkaErrorInvalidConfig, "invalid camu.schema JSON"
+			}
+			if err := schema.Validate(); err != nil {
+				return reqBody, kafkaErrorInvalidConfig, err.Error()
+			}
+			reqBody.Schema = &schema
 		case "retention.bytes":
 			return reqBody, kafkaErrorInvalidConfig, "retention.bytes is unsupported; use retention.ms (time-based retention only)"
 		case "retention.ms":
@@ -421,12 +457,23 @@ func kafkaTopicDescribeConfigs(tc meta.TopicConfig) []kmsg.DescribeConfigsRespon
 	}
 
 	return []kmsg.DescribeConfigsResponseResourceConfig{
+		{Name: "camu.schema", Value: topicSchemaConfigValue(tc.Schema), IsDefault: tc.Schema == nil},
 		{Name: "camu.storage.mode", Value: kmsg.StringPtr(storageMode), IsDefault: storageMode == "classic"},
+		{Name: "camu.export.enabled", Value: kmsg.StringPtr(strconv.FormatBool(tc.ExportEnabled)), IsDefault: !tc.ExportEnabled},
 		{Name: "cleanup.policy", Value: kmsg.StringPtr(cleanupPolicy), IsDefault: true},
 		{Name: "min.insync.replicas", Value: kmsg.StringPtr(minISR), IsDefault: false},
 		{Name: "retention.ms", Value: kmsg.StringPtr(retentionMs), IsDefault: false},
 		{Name: "unclean.leader.election.enable", Value: kmsg.StringPtr(unclean), IsDefault: !tc.UncleanLeaderElection},
 	}
+}
+
+func topicSchemaConfigValue(schema *meta.TopicSchema) *string {
+	if schema == nil {
+		return nil
+	}
+	b, _ := json.Marshal(schema)
+	v := string(b)
+	return &v
 }
 
 func kafkaAlterConfigsToMap(configs []kmsg.AlterConfigsRequestResourceConfig) map[string]*string {
@@ -459,10 +506,13 @@ func applyKafkaTopicConfigs(tc meta.TopicConfig, values map[string]*string, rese
 		next.Retention = 7 * 24 * time.Hour
 		next.MinInsyncReplicas = 1
 		next.UncleanLeaderElection = false
+		next.ExportEnabled = false
 	}
 
 	for name, value := range values {
 		switch name {
+		case "camu.schema":
+			return tc, fmt.Errorf("camu.schema is immutable")
 		case "camu.storage.mode":
 			if value == nil {
 				return tc, fmt.Errorf("camu.storage.mode is immutable")
@@ -473,6 +523,19 @@ func applyKafkaTopicConfigs(tc meta.TopicConfig, values map[string]*string, rese
 			if *value != next.StorageMode && !(*value == "classic" && next.StorageMode == "") {
 				return tc, fmt.Errorf("camu.storage.mode is immutable")
 			}
+		case "camu.export.enabled":
+			if value == nil {
+				next.ExportEnabled = false
+				continue
+			}
+			v, err := strconv.ParseBool(*value)
+			if err != nil {
+				return tc, fmt.Errorf("invalid camu.export.enabled")
+			}
+			if v && next.StorageMode == meta.StorageModeDiskless {
+				return tc, fmt.Errorf("export_enabled is unsupported for diskless topics")
+			}
+			next.ExportEnabled = v
 		case "cleanup.policy":
 			if value == nil {
 				continue

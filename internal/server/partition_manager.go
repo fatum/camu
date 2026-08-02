@@ -258,6 +258,9 @@ func (ps *partitionState) rebuildProducerSeqsFromBatches(batches []log.BatchMeta
 		if end > state.NextSeq {
 			state.NextSeq = end
 		}
+		if b.LastOffset > state.LastOffset {
+			state.LastOffset = b.LastOffset
+		}
 		state.LastActiveAt = now
 	}
 }

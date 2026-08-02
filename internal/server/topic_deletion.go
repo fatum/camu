@@ -138,6 +138,10 @@ func (s *Server) gcPendingTopicDeletions(ctx context.Context) {
 	}
 
 	for _, rec := range recs {
+		if err := s.deleteParquetTopicMetadata(ctx, rec.Topic.Name); err != nil {
+			slog.Warn("topic_delete_cleanup_parquet_meta_failed", "topic", rec.Topic.Name, "error", err)
+			continue
+		}
 		if err := s.deleteTopicS3Data(ctx, rec.Topic.Name); err != nil {
 			slog.Warn("topic_delete_cleanup_s3_failed", "topic", rec.Topic.Name, "error", err)
 			continue

@@ -1,0 +1,24 @@
+# Read-only query role. No internal or Kafka listener is required.
+server:
+  address: ":8080"
+  mode: "query"
+  # Optional bearer token required by /v1/sql.
+  auth_token: ""
+
+storage:
+  bucket: "camu-data"
+  region: "us-east-1"
+  endpoint: ""
+  credentials:
+    access_key: ""
+    secret_key: ""
+
+sql:
+  enabled: true
+  cache_directory: "/var/lib/camu/sql-cache"
+  duckdb_temp_directory: "/var/lib/camu/sql-tmp"
+  cache_max_size: 5368709120
+  duckdb_memory_limit: "1GB"
+  max_concurrency: 4
+  query_timeout: "30s"
+  max_scan_files: 4096

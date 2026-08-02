@@ -52,6 +52,22 @@ func NewIndex() *Index {
 	return &Index{}
 }
 
+// Clone returns a stable read-only snapshot of the index. Partition readers
+// may hold a snapshot while flush/merge updates the live index under its
+// partition lock.
+func (idx *Index) Clone() *Index {
+	if idx == nil {
+		return nil
+	}
+	clone := &Index{
+		segments:      append([]SegmentRef(nil), idx.segments...),
+		baseOffsets:   append([]uint64(nil), idx.baseOffsets...),
+		epochHistory:  append([]EpochEntry(nil), idx.epochHistory...),
+		highWatermark: idx.highWatermark,
+	}
+	return clone
+}
+
 // Add inserts ref into the index in sorted order by BaseOffset.
 func (idx *Index) Add(ref SegmentRef) {
 	// A newly flushed segment may replace the prior tail segment after leader

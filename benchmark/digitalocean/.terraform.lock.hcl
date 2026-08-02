@@ -1,0 +1,26 @@
+# This file is maintained automatically by "terraform init".
+# Manual edits may be lost in future updates.
+
+provider "registry.terraform.io/digitalocean/digitalocean" {
+  version     = "2.98.0"
+  constraints = "~> 2.0"
+  hashes = [
+    "h1:/luWM+HIAP7UoqMl5TQd8DZ1gcw7P+xN8ujJoEzt1Bk=",
+    "zh:000e881ced54dbeaa0e9bc495c4ea8bc596c42e91295da01baaccafa7e7ce5a3",
+    "zh:040d48e637d7f61999c5df5c2afd4436a1881fd550321f215fccaaaf9296a6cd",
+    "zh:1c6492fb1158b2ad69e17f46b751f87e26d7f584ef49104cb706d0672fc88d46",
+    "zh:1e7c079e16704cb702edadc39305b608ddaa3a273699d3ed5170228654a2ec48",
+    "zh:1f15c135e332578114ed1653605a6ad6bdf5c8816b43f6eade751b9c4ae9a94a",
+    "zh:4b4873392ae41a4cedceacdfcd821b3d1927da7637918c11355ee3ee48a6f220",
+    "zh:56b5be960e93598a02925e56f4f9f67ce536352bb290681f594af8d490f02500",
+    "zh:6b9d50c88dabc41ea295d976ed1f1a5f682f7288a713d0cdb2f10c0c32ac5a7d",
+    "zh:6f05ff1bd9b609c815248b02438a54f9bd5865fad140934c28113cb7e0e85145",
+    "zh:800e113530f3d5dff8eeeea4354b30d23df27424a061b0383a8d26287dbcf175",
+    "zh:aff81f1101fc5949d906575b0db7d80f33d4b6176e0b466f5c923af9738a7830",
+    "zh:b3194706e5538ca46536fee899189e865f292f2a785f81be52d93725d3424d7d",
+    "zh:b71083ec64f098877b91376ec157dc84c7cde93fc99b0cd727ab60f74a91664d",
+    "zh:f129d870d0cd76a6573e504168c8e176e821bf76d7e9499fd517124f2b98e464",
+    "zh:ff83e3a640c4a0a02f02931a99994f601e2dab6cdde69189b9032fd174c87908",
+    "zh:ffcbf11615cdb38782367397871e39430393ca583b11785bea6663858e35654a",
+  ]
+}

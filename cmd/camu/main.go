@@ -16,8 +16,15 @@ import (
 )
 
 func main() {
+	level := slog.LevelInfo
+	if value := strings.ToLower(os.Getenv("CAMU_LOG_LEVEL")); value != "" {
+		if err := level.UnmarshalText([]byte(value)); err != nil {
+			fmt.Fprintf(os.Stderr, "invalid CAMU_LOG_LEVEL %q: %v\n", value, err)
+			os.Exit(1)
+		}
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: level,
 	}))
 	slog.SetDefault(logger)
 

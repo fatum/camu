@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -50,8 +51,10 @@ func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc
 		return
 	}
 	if identity.Role != PartitionRoleLeader {
+		p.server.stopParquetConsumer(tc.Name, partition)
 		return
 	}
+	p.server.ensureParquetConsumer(tc, identity)
 
 	if tc.StorageMode == meta.StorageModeDiskless {
 		p.server.discoverDisklessRetentionJobs(ctx, tc, identity)
@@ -104,6 +107,9 @@ func (p partitionLeaderService) runJob(ctx context.Context, job PartitionJob) er
 	case PartitionJobTypeSegmentMerge:
 		return p.server.runSegmentMergeJob(ctx, job)
 	default:
-		return nil
+		// Fail loudly on unknown job types: a silent no-op turns a
+		// wiring gap (e.g. a declared-but-not-dispatched job type) into
+		// a job that vanishes from the queue every tick without effect.
+		return fmt.Errorf("partition_job: unhandled type %q for %s/%d (job %s)", job.Type, job.Topic, job.Partition, job.ID)
 	}
 }

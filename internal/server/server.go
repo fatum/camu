@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -18,6 +19,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/consumer"
@@ -26,6 +28,7 @@ import (
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/metrics"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -46,6 +49,7 @@ type Server struct {
 	offsetStore      *storage.OffsetStore
 	aclStore         *storage.ACLStore
 	instanceID       string
+	metrics          *metrics.Registry
 	listener         net.Listener
 
 	// Leader-based coordination.
@@ -93,6 +97,32 @@ type Server struct {
 
 	// coordinationGCTick counts renewal ticks; GC runs every 10th tick.
 	coordinationGCTick uint64
+
+	sqlLimiter   chan struct{}
+	sqlDBMu      sync.Mutex
+	sqlDB        *sql.DB
+	sqlCtx       context.Context
+	sqlCtxCancel context.CancelFunc
+
+	// parquetFetchGroup coalesces concurrent cache fetches per cache
+	// path. Kept per-Server (not package-scoped) so two server instances
+	// in the same process (tests) do not share the group.
+	parquetFetchGroup singleflight.Group
+	parquetCacheMu    sync.Mutex
+	parquetCachePins  map[string]int
+
+	// One local consumer runs for each partition led by this instance. Its
+	// ownership is fenced by Camu's partition epoch, not a Kafka group.
+	parquetConsumersMu sync.Mutex
+	parquetConsumers   map[string]parquetConsumer
+}
+
+type parquetConsumer struct {
+	topicConfig meta.TopicConfig
+	epoch       uint64
+	cancel      context.CancelFunc
+	done        chan struct{}
+	stopping    bool
 }
 
 // DisklessMeta returns the diskless MetaStore used by the server.
@@ -147,6 +177,27 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		instanceID = uuid.NewString()
 	}
 
+	s := &Server{
+		cfg:              cfg,
+		s3Client:         s3Client,
+		topicStore:       meta.NewTopicStore(s3Client),
+		instanceID:       instanceID,
+		metrics:          metrics.NewRegistry(),
+		sqlLimiter:       make(chan struct{}, cfg.SQL.MaxConcurrencyValue()),
+		parquetConsumers: make(map[string]parquetConsumer),
+	}
+	s.sqlCtx, s.sqlCtxCancel = context.WithCancel(context.Background())
+	s3Client.SetMetrics(s.metrics)
+	s.httpServer = &http.Server{Handler: s.publicRoutes()}
+
+	// Query nodes only need the read-only topic and Parquet manifest stores used
+	// by SQL scope resolution. Do not construct streaming services here: doing so
+	// can allocate local log state or require coordination configuration despite
+	// query nodes never joining the stream cluster.
+	if s.isQueryMode() {
+		return s, nil
+	}
+
 	leaseTTL, err := cfg.Coordination.LeaseTTLDuration()
 	if err != nil {
 		return nil, fmt.Errorf("parsing coordination.lease_ttl: %w", err)
@@ -183,26 +234,20 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	idempotencyMgr := idempotency.NewManager(s3Client)
 
-	s := &Server{
-		cfg:                  cfg,
-		s3Client:             s3Client,
-		topicStore:           meta.NewTopicStore(s3Client),
-		partitionManager:     pm,
-		fetcher:              consumer.NewFetcher(s3Client, pm.GetDiskCache()),
-		offsetStore:          storage.NewOffsetStore(s3Client),
-		aclStore:             storage.NewACLStore(s3Client),
-		groupCoord:           newKafkaGroupCoordinator(s3Client, instanceID),
-		leaderElection:       coordination.NewLeaderElection(s3Client, instanceID, leaseTTL),
-		assignmentStore:      coordination.NewAssignmentStore(s3Client),
-		isrStore:             replication.NewISRStore(s3Client),
-		idempotencyManager:   idempotencyMgr,
-		instanceID:           instanceID,
-		myPartitions:         make(map[string]map[int]localPartitionAssignment),
-		leaseStop:            make(chan struct{}),
-		leaseTTL:             leaseTTL,
-		leaseRenewalInterval: leaseRenewalInterval,
-		replicationTimeout:   replicationTimeout,
-	}
+	s.partitionManager = pm
+	s.fetcher = consumer.NewFetcher(s3Client, pm.GetDiskCache())
+	s.offsetStore = storage.NewOffsetStore(s3Client)
+	s.aclStore = storage.NewACLStore(s3Client)
+	s.groupCoord = newKafkaGroupCoordinator(s3Client, instanceID)
+	s.leaderElection = coordination.NewLeaderElection(s3Client, instanceID, leaseTTL)
+	s.assignmentStore = coordination.NewAssignmentStore(s3Client)
+	s.isrStore = replication.NewISRStore(s3Client)
+	s.idempotencyManager = idempotencyMgr
+	s.myPartitions = make(map[string]map[int]localPartitionAssignment)
+	s.leaseStop = make(chan struct{})
+	s.leaseTTL = leaseTTL
+	s.leaseRenewalInterval = leaseRenewalInterval
+	s.replicationTimeout = replicationTimeout
 	s.readAssignments = s.assignmentStore.Read
 	s.groupCoord.controllerEpoch = s.currentControllerEpoch
 
@@ -214,10 +259,6 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	// If ownership lost, revokes the partition so future writes are rejected locally.
 	pm.SetLeaseChecker(s.verifyOwnershipFromS3)
 
-	s.httpServer = &http.Server{
-		Handler: s.publicRoutes(),
-	}
-
 	h2s := &http2.Server{}
 	s.internalServer = &http.Server{
 		Handler: h2c.NewHandler(s.internalRoutes(), h2s),
@@ -226,8 +267,19 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	return s, nil
 }
 
+func (s *Server) isQueryMode() bool {
+	return s.cfg != nil && s.cfg.Server.IsQueryMode()
+}
+
+func (s *Server) isStreamMode() bool {
+	return !s.isQueryMode()
+}
+
 // Start starts the HTTP server on the configured address.
 func (s *Server) Start() error {
+	if err := s.validateParquetExportExistingTopics(context.Background()); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", s.cfg.Server.Address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.cfg.Server.Address, err)
@@ -237,6 +289,9 @@ func (s *Server) Start() error {
 
 // StartOnPort starts the HTTP server on a specific port.
 func (s *Server) StartOnPort(port int) error {
+	if err := s.validateParquetExportExistingTopics(context.Background()); err != nil {
+		return err
+	}
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -247,7 +302,19 @@ func (s *Server) StartOnPort(port int) error {
 
 // startWithListener completes server startup once a listener is available.
 func (s *Server) startWithListener(ln net.Listener) error {
+	// startWithListener is used directly by tests and embedding code. Keep the
+	// check here too so no stream startup path can register or serve an
+	// incompatible persisted topic.
+	if err := s.validateParquetExportExistingTopics(context.Background()); err != nil {
+		_ = ln.Close()
+		return err
+	}
 	s.listener = ln
+	if s.isQueryMode() {
+		s.ready.Store(true)
+		go func() { _ = s.httpServer.Serve(ln) }()
+		return nil
+	}
 	internalLn, err := net.Listen("tcp", s.cfg.Server.InternalAddress)
 	if err != nil {
 		return fmt.Errorf("listen internal on %s: %w", s.cfg.Server.InternalAddress, err)
@@ -259,7 +326,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	}
 	kafkaAddr := ""
 	if s.cfg.Server.KafkaPort > 0 {
-		kafkaAddr = kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort)
+		kafkaAddr = kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort, s.cfg.Server.KafkaAdvertiseAddress)
 	}
 	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), s.InternalAddress(), kafkaAddr, instanceTTL)
 	if err := s.registry.Register(context.Background()); err != nil {
@@ -307,7 +374,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 // startKafkaServer starts the Kafka protocol server on the given port.
 func (s *Server) startKafkaServer(port int) {
 	addr := fmt.Sprintf(":%d", port)
-	brokerAddr := kafkaAdvertiseAddr(s.instanceID, s.Address(), port)
+	brokerAddr := kafkaAdvertiseAddr(s.instanceID, s.Address(), port, s.cfg.Server.KafkaAdvertiseAddress)
 	brokerID := kafkaBrokerID(s.instanceID)
 
 	// Create partition getter that wraps partition manager
@@ -317,6 +384,7 @@ func (s *Server) startKafkaServer(port int) {
 	tl := &kafkaTopicLister{ts: s.topicStore}
 
 	s.kafkaServer = NewKafkaServer(&KafkaServerCfg{
+		Metrics:                     s.metrics,
 		PartitionGetter:             pg,
 		TopicLister:                 tl,
 		MetadataFunc:                s.handleKafkaMetadata,
@@ -590,14 +658,28 @@ func kafkaFetchHighWatermark(highWatermark uint64, ok bool, nextOffset uint64) i
 func (s *Server) Shutdown(ctx context.Context) error {
 	// 1. Stop accepting new writes.
 	s.shuttingDown.Store(true)
+	s.stopAllParquetConsumers()
 
 	// 2. Shut down HTTP servers (waits for in-flight requests to finish).
 	httpErr := s.httpServer.Shutdown(ctx)
-	if err := s.internalServer.Shutdown(ctx); err != nil && httpErr == nil {
-		httpErr = err
+	if s.internalServer != nil {
+		if err := s.internalServer.Shutdown(ctx); err != nil && httpErr == nil {
+			httpErr = err
+		}
 	}
 	if s.kafkaServer != nil {
 		if err := s.kafkaServer.Close(); err != nil && httpErr == nil {
+			httpErr = err
+		}
+	}
+	// Cancel all in-flight SQL queries before closing the DuckDB handle.
+	// Without this, sql.DB.Close waits for connections to return, and a
+	// long-running user query would block server shutdown indefinitely.
+	if s.sqlCtxCancel != nil {
+		s.sqlCtxCancel()
+	}
+	if s.sqlDB != nil {
+		if err := s.sqlDB.Close(); err != nil && httpErr == nil {
 			httpErr = err
 		}
 	}
@@ -608,17 +690,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	// 4. Cancel all follower fetch loops.
-	s.partitionManager.CancelAllFetchLoops()
+	var pmErr error
+	if s.partitionManager != nil {
+		s.partitionManager.CancelAllFetchLoops()
 
-	// 4. Flush batcher / close local segments.
-	pmErr := s.partitionManager.Shutdown(ctx)
+		// 4. Flush batcher / close local segments.
+		pmErr = s.partitionManager.Shutdown(ctx)
+	}
 
 	// 5. Stop coordination goroutine.
-	close(s.leaseStop)
-	s.leaseWg.Wait()
+	if s.leaseStop != nil {
+		close(s.leaseStop)
+		s.leaseWg.Wait()
+	}
 
 	// 6. Deregister from cluster.
-	s.registry.Deregister(ctx)
+	if s.registry != nil {
+		s.registry.Deregister(ctx)
+	}
 
 	if httpErr != nil {
 		return httpErr
@@ -626,7 +715,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if pmErr != nil {
 		return pmErr
 	}
-	_ = s.registry.Deregister(ctx)
 	return nil
 }
 
@@ -662,7 +750,13 @@ func routableHTTPAddress(instanceID, rawAddr string) string {
 	return "http://" + net.JoinHostPort(host, port)
 }
 
-func kafkaAdvertiseAddr(instanceID, rawAddr string, kafkaPort int) string {
+func kafkaAdvertiseAddr(instanceID, rawAddr string, kafkaPort int, override string) string {
+	if override != "" {
+		if _, _, err := net.SplitHostPort(override); err == nil {
+			return override
+		}
+		return net.JoinHostPort(override, strconv.Itoa(kafkaPort))
+	}
 	host, _, err := net.SplitHostPort(rawAddr)
 	if err != nil || host == "" {
 		host = instanceID

@@ -39,6 +39,44 @@ func TestEpochHistory_NoDivergence(t *testing.T) {
 	}
 }
 
+// TestEpochHistory_NoDivergenceAtBoundary verifies that a follower whose next
+// fetch offset exactly equals the start of the next epoch is treated as
+// aligned, not divergent. followerOffset is exclusive — at the boundary the
+// follower has all of epoch N (offsets 100..199) and nothing yet from epoch
+// N+1. A >= check would treat this as divergence and ask the follower to
+// truncate to the same offset it is already at, producing an infinite
+// fetch/truncate loop that surfaces as n-GB/minute log spam.
+func TestEpochHistory_NoDivergenceAtBoundary(t *testing.T) {
+	eh := &EpochHistory{}
+	eh.Append(EpochEntry{Epoch: 5, StartOffset: 100})
+	eh.Append(EpochEntry{Epoch: 6, StartOffset: 200})
+	eh.Append(EpochEntry{Epoch: 7, StartOffset: 300})
+
+	truncateTo, diverged := eh.CheckDivergence(5, 200)
+	if diverged {
+		t.Fatalf("expected no divergence at boundary, got truncateTo=%d", truncateTo)
+	}
+}
+
+// TestEpochHistory_DivergenceOneOffBoundary verifies that a follower one
+// offset past the next epoch's start *is* divergent (the follower received
+// one record labeled as its own epoch that the leader recorded as belonging
+// to the next epoch) — truncate back to the boundary.
+func TestEpochHistory_DivergenceOneOffBoundary(t *testing.T) {
+	eh := &EpochHistory{}
+	eh.Append(EpochEntry{Epoch: 5, StartOffset: 100})
+	eh.Append(EpochEntry{Epoch: 6, StartOffset: 200})
+	eh.Append(EpochEntry{Epoch: 7, StartOffset: 300})
+
+	truncateTo, diverged := eh.CheckDivergence(5, 201)
+	if !diverged {
+		t.Fatal("expected divergence one offset past boundary, got none")
+	}
+	if truncateTo != 200 {
+		t.Fatalf("expected truncateTo=200, got %d", truncateTo)
+	}
+}
+
 // TestEpochHistory_Persistence verifies that SaveToFile / LoadEpochHistory
 // round-trip correctly.
 func TestEpochHistory_Persistence(t *testing.T) {

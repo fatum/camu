@@ -2,110 +2,82 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net/url"
-	"sort"
-	"strings"
-	"time"
 
+	"github.com/maksim/camu/internal/jobqueue"
+	"github.com/maksim/camu/internal/jobs"
 	"github.com/maksim/camu/internal/storage"
 )
 
 const partitionJobPrefix = "_coordination/partition_jobs/"
 
-type PartitionJobType string
+type PartitionJobType = jobs.Type
+type PartitionJobState = jobs.State
+type PartitionJobPhase = jobs.Phase
+type PartitionJob = jobs.Record
 
 const (
-	PartitionJobTypeRetention    PartitionJobType = "retention"
-	PartitionJobTypeSegmentMerge PartitionJobType = "segment_merge"
+	PartitionJobTypeRetention    = jobs.TypeRetention
+	PartitionJobTypeSegmentMerge = jobs.TypeSegmentMerge
 )
-
-type PartitionJobState string
 
 const (
-	PartitionJobStatePending PartitionJobState = "pending"
-	PartitionJobStateRunning PartitionJobState = "running"
+	PartitionJobStatePending = jobs.StatePending
+	PartitionJobStateRunning = jobs.StateRunning
 )
-
-type PartitionJobPhase string
 
 const (
-	PartitionJobPhasePublishData PartitionJobPhase = "publish_data"
-	PartitionJobPhasePublishMeta PartitionJobPhase = "publish_metadata"
-	PartitionJobPhaseDeleteData  PartitionJobPhase = "delete_data"
-	PartitionJobPhaseDeleteMeta  PartitionJobPhase = "delete_metadata"
+	PartitionJobPhasePublishData = jobs.PhasePublishData
+	PartitionJobPhasePublishMeta = jobs.PhasePublishMeta
+	PartitionJobPhaseDeleteData  = jobs.PhaseDeleteData
+	PartitionJobPhaseDeleteMeta  = jobs.PhaseDeleteMeta
 )
 
-type PartitionJob struct {
-	ID            string            `json:"id"`
-	Topic         string            `json:"topic"`
-	Partition     int               `json:"partition"`
-	Type          PartitionJobType  `json:"type"`
-	ExpectedOwner string            `json:"expected_owner"`
-	ExpectedEpoch uint64            `json:"expected_epoch"`
-	State         PartitionJobState `json:"state"`
-	Phase         PartitionJobPhase `json:"phase"`
-	Payload       json.RawMessage   `json:"payload"`
-	StartedAt     time.Time         `json:"started_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+// jobObjectAdapter wraps *storage.S3Client to satisfy jobqueue.ObjectStore,
+// translating storage.ErrNotFound into jobqueue.ErrNotFound. Writes are
+// stamped with application/json content-type.
+type jobObjectAdapter struct{ client *storage.S3Client }
+
+func (a jobObjectAdapter) Put(ctx context.Context, key string, data []byte) error {
+	return a.client.Put(ctx, key, data, storage.PutOpts{ContentType: "application/json"})
 }
 
-func partitionJobKey(topic string, partition int, jobID string) string {
-	return fmt.Sprintf("%s%s/%d/%s.json", partitionJobPrefix, topic, partition, url.PathEscape(jobID))
+func (a jobObjectAdapter) Get(ctx context.Context, key string) ([]byte, error) {
+	data, err := a.client.Get(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, errors.Join(err, jobqueue.ErrNotFound)
+	}
+	return data, err
+}
+
+func (a jobObjectAdapter) Delete(ctx context.Context, key string) error {
+	err := a.client.Delete(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return errors.Join(err, jobqueue.ErrNotFound)
+	}
+	return err
+}
+
+func (a jobObjectAdapter) List(ctx context.Context, prefix string) ([]string, error) {
+	return a.client.List(ctx, prefix)
+}
+
+func (s *Server) partitionJobStore() *jobs.Store {
+	return jobs.NewStore(jobObjectAdapter{client: s.s3Client}, partitionJobPrefix)
 }
 
 func (s *Server) putPartitionJob(ctx context.Context, job PartitionJob) error {
-	job.UpdatedAt = time.Now()
-	data, err := json.Marshal(job)
-	if err != nil {
-		return fmt.Errorf("marshal partition job %q: %w", job.ID, err)
-	}
-	if err := s.s3Client.Put(ctx, partitionJobKey(job.Topic, job.Partition, job.ID), data, storage.PutOpts{
-		ContentType: "application/json",
-	}); err != nil {
-		return fmt.Errorf("put partition job %q: %w", job.ID, err)
-	}
-	return nil
+	return s.partitionJobStore().Put(ctx, job)
 }
 
 func (s *Server) deletePartitionJob(ctx context.Context, topic string, partition int, jobID string) error {
-	if err := s.s3Client.Delete(ctx, partitionJobKey(topic, partition, jobID)); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return err
-	}
-	return nil
+	return s.partitionJobStore().Delete(ctx, topic, partition, jobID)
 }
 
 func (s *Server) listPartitionJobs(ctx context.Context, topic string, partition int) ([]PartitionJob, error) {
-	keys, err := s.s3Client.List(ctx, fmt.Sprintf("%s%s/%d/", partitionJobPrefix, topic, partition))
-	if err != nil {
-		return nil, err
-	}
-	jobs := make([]PartitionJob, 0, len(keys))
-	for _, key := range keys {
-		data, err := s.s3Client.Get(ctx, key)
-		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				continue
-			}
-			return nil, err
-		}
-		var job PartitionJob
-		if err := json.Unmarshal(data, &job); err != nil {
-			return nil, fmt.Errorf("unmarshal partition job %q: %w", key, err)
-		}
-		jobs = append(jobs, job)
-	}
-	sort.Slice(jobs, func(i, j int) bool {
-		if jobs[i].UpdatedAt.Equal(jobs[j].UpdatedAt) {
-			return jobs[i].ID < jobs[j].ID
-		}
-		return jobs[i].UpdatedAt.Before(jobs[j].UpdatedAt)
-	})
-	return jobs, nil
+	return s.partitionJobStore().List(ctx, topic, partition)
 }
 
 func partitionJobID(kind PartitionJobType, key string) string {
-	return string(kind) + "/" + strings.TrimSuffix(url.PathEscape(key), ".json")
+	return jobs.ID(kind, key)
 }

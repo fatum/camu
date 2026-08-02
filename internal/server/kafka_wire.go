@@ -6,12 +6,26 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func (ks *KafkaServer) HandleRequest(_ context.Context, req kmsg.Request) (kmsg.Response, error) {
+func (ks *KafkaServer) HandleRequest(_ context.Context, req kmsg.Request) (resp kmsg.Response, err error) {
+	started := time.Now()
+	defer func() {
+		if ks.cfg.Metrics == nil {
+			return
+		}
+		labels := map[string]string{"api_key": strconv.Itoa(int(req.Key())), "result": "ok"}
+		if err != nil {
+			labels["result"] = "error"
+		}
+		ks.cfg.Metrics.Inc("camu_kafka_requests_total", "Kafka protocol requests", labels)
+		ks.cfg.Metrics.Observe("camu_kafka_request_duration", "Kafka protocol request duration", map[string]string{"api_key": strconv.Itoa(int(req.Key()))}, time.Since(started))
+	}()
 	if ks.cfg.RequestHandler != nil {
 		return ks.cfg.RequestHandler(req)
 	}

@@ -2,6 +2,11 @@ server:
   address: ":8080"
   internal_address: ":8081"
   instance_id: ""
+  # "stream" is the default; use "query" with camu.query.yaml.example for
+  # read-only SQL nodes. Query nodes do not need internal_address or kafka_port.
+  mode: "stream"
+  # Optional bearer token required by /v1/sql when SQL is enabled.
+  auth_token: ""
 storage:
   bucket: "camu-data"
   region: "us-east-1"
@@ -18,6 +23,15 @@ segments:
 cache:
   directory: "/var/lib/camu/cache"
   max_size: 10737418240
+sql:
+  enabled: false
+  cache_directory: "/var/lib/camu/sql-cache"
+  duckdb_temp_directory: "/var/lib/camu/sql-tmp"
+  cache_max_size: 5368709120
+  duckdb_memory_limit: "1GB"
+  max_concurrency: 4
+  query_timeout: "30s"
+  max_scan_files: 4096
 coordination:
   lease_ttl: "30s"
   rebalance_delay: "5s"
@@ -25,3 +39,10 @@ coordination:
   maintenance_max_concurrency: 4
   isr_expansion_threshold: 1000
   replication_timeout: "30s"
+maintenance:
+  parquet_export:
+    # Requires unclean_leader_election: false on every topic.
+    enabled: false
+    max_records: 16384
+    max_duration: "30s"
+    temp_directory: "/var/lib/camu/parquet-tmp"

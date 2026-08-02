@@ -16,23 +16,27 @@ import (
 )
 
 type createTopicRequest struct {
-	Name                  string `json:"name"`
-	Partitions            int    `json:"partitions"`
-	Retention             string `json:"retention"`
-	ReplicationFactor     int    `json:"replication_factor"`
-	MinInsyncReplicas     int    `json:"min_insync_replicas"`
-	UncleanLeaderElection bool   `json:"unclean_leader_election"`
-	StorageMode           string `json:"storage_mode"`
+	Name                  string            `json:"name"`
+	Partitions            int               `json:"partitions"`
+	Retention             string            `json:"retention"`
+	ReplicationFactor     int               `json:"replication_factor"`
+	MinInsyncReplicas     int               `json:"min_insync_replicas"`
+	UncleanLeaderElection bool              `json:"unclean_leader_election"`
+	ExportEnabled         bool              `json:"export_enabled"`
+	StorageMode           string            `json:"storage_mode"`
+	Schema                *meta.TopicSchema `json:"schema,omitempty"`
 }
 
 type topicResponse struct {
-	Name                  string `json:"name"`
-	Partitions            int    `json:"partitions"`
-	Retention             string `json:"retention"`
-	ReplicationFactor     int    `json:"replication_factor"`
-	MinInsyncReplicas     int    `json:"min_insync_replicas"`
-	UncleanLeaderElection bool   `json:"unclean_leader_election"`
-	StorageMode           string `json:"storage_mode,omitempty"`
+	Name                  string            `json:"name"`
+	Partitions            int               `json:"partitions"`
+	Retention             string            `json:"retention"`
+	ReplicationFactor     int               `json:"replication_factor"`
+	MinInsyncReplicas     int               `json:"min_insync_replicas"`
+	UncleanLeaderElection bool              `json:"unclean_leader_election"`
+	ExportEnabled         bool              `json:"export_enabled"`
+	StorageMode           string            `json:"storage_mode,omitempty"`
+	Schema                *meta.TopicSchema `json:"schema,omitempty"`
 }
 
 type errorResponse struct {
@@ -57,13 +61,18 @@ func topicToResponse(tc meta.TopicConfig) topicResponse {
 		ReplicationFactor:     tc.ReplicationFactor,
 		MinInsyncReplicas:     tc.MinInsyncReplicas,
 		UncleanLeaderElection: tc.UncleanLeaderElection,
+		ExportEnabled:         tc.ExportEnabled,
 		StorageMode:           tc.StorageMode,
+		Schema:                tc.Schema,
 	}
 }
 
 func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.TopicConfig, error) {
 	if req.Name == "" {
 		return meta.TopicConfig{}, fmt.Errorf("name is required")
+	}
+	if err := s.validateParquetExportTopicConfig(req.ExportEnabled, req.UncleanLeaderElection); err != nil {
+		return meta.TopicConfig{}, err
 	}
 	if _, err := s.getTopicDeletion(ctx, req.Name); err == nil {
 		return meta.TopicConfig{}, fmt.Errorf("topic %q deletion in progress", req.Name)
@@ -72,6 +81,26 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	}
 	if req.Partitions < 1 {
 		return meta.TopicConfig{}, fmt.Errorf("partitions must be at least 1")
+	}
+	if req.Schema != nil {
+		if err := req.Schema.Validate(); err != nil {
+			return meta.TopicConfig{}, err
+		}
+		if req.Schema.DeadLetterTopic == req.Name {
+			return meta.TopicConfig{}, fmt.Errorf("dead_letter_topic cannot equal topic name")
+		}
+		if req.Schema.DeadLetterTopic != "" {
+			dlq, err := s.topicStore.Get(ctx, req.Schema.DeadLetterTopic)
+			if err != nil {
+				return meta.TopicConfig{}, fmt.Errorf("dead_letter_topic must reference an existing topic: %w", err)
+			}
+			if dlq.Schema != nil {
+				return meta.TopicConfig{}, fmt.Errorf("dead_letter_topic must reference a raw topic")
+			}
+			if dlq.Partitions != req.Partitions {
+				return meta.TopicConfig{}, fmt.Errorf("dead_letter_topic partition count must match")
+			}
+		}
 	}
 
 	retention := 168 * time.Hour // default 7 days
@@ -110,6 +139,12 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	if storageMode != meta.StorageModeClassic && storageMode != meta.StorageModeDiskless {
 		return meta.TopicConfig{}, fmt.Errorf("invalid storage_mode, must be classic or diskless")
 	}
+	if storageMode == meta.StorageModeDiskless && req.Schema != nil {
+		return meta.TopicConfig{}, fmt.Errorf("typed schemas are unsupported for diskless topics")
+	}
+	if storageMode == meta.StorageModeDiskless && req.ExportEnabled {
+		return meta.TopicConfig{}, fmt.Errorf("export_enabled is unsupported for diskless topics")
+	}
 
 	tc := meta.TopicConfig{
 		Name:                  req.Name,
@@ -119,7 +154,9 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 		ReplicationFactor:     rf,
 		MinInsyncReplicas:     minISR,
 		UncleanLeaderElection: req.UncleanLeaderElection,
+		ExportEnabled:         req.ExportEnabled,
 		StorageMode:           storageMode,
+		Schema:                req.Schema,
 	}
 
 	if err := s.topicStore.Create(ctx, tc); err != nil {
@@ -189,6 +226,34 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	return tc, nil
 }
 
+// validateParquetExportTopicConfig preserves the immutable-history
+// requirement of the Parquet manifest layout.
+func (s *Server) validateParquetExportTopicConfig(exportEnabled, uncleanLeaderElection bool) error {
+	if exportEnabled && uncleanLeaderElection {
+		return fmt.Errorf("unclean_leader_election must be false when export_enabled is true")
+	}
+	return nil
+}
+
+// validateParquetExportExistingTopics refuses to start a stream node if an
+// existing classic topic permits unclean election. Parquet manifests cannot
+// atomically replace divergent histories across ingest-hour buckets.
+func (s *Server) validateParquetExportExistingTopics(ctx context.Context) error {
+	if !s.isStreamMode() {
+		return nil
+	}
+	topics, err := s.topicStore.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list topics for parquet export validation: %w", err)
+	}
+	for _, topic := range topics {
+		if topic.ExportEnabled && (topic.StorageMode == "" || topic.StorageMode == meta.StorageModeClassic) && topic.UncleanLeaderElection {
+			return fmt.Errorf("cannot start with export_enabled=true: topic %q has unclean_leader_election=true; disable unclean leader election before starting", topic.Name)
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 	var req createTopicRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -208,7 +273,11 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 			strings.Contains(err.Error(), "invalid retention duration"),
 			strings.Contains(err.Error(), "replication_factor"),
 			strings.Contains(err.Error(), "min_insync_replicas"),
-			strings.Contains(err.Error(), "storage_mode"):
+			strings.Contains(err.Error(), "unclean_leader_election"),
+			strings.Contains(err.Error(), "export_enabled"),
+			strings.Contains(err.Error(), "storage_mode"),
+			strings.Contains(err.Error(), "schema"),
+			strings.Contains(err.Error(), "dead_letter_topic"):
 			writeError(w, http.StatusBadRequest, err.Error())
 		default:
 			slog.Error("topic_create_failed", "topic", req.Name, "error", err)
@@ -249,6 +318,13 @@ func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteTopic(ctx context.Context, name string) error {
+	if topics, err := s.topicStore.List(ctx); err == nil {
+		for _, tc := range topics {
+			if tc.Schema != nil && tc.Schema.DeadLetterTopic == name {
+				return fmt.Errorf("topic %q is referenced as dead_letter_topic by %q", name, tc.Name)
+			}
+		}
+	}
 	if _, err := s.getTopicDeletion(ctx, name); err == nil {
 		if err := s.topicStore.Delete(ctx, name); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return err

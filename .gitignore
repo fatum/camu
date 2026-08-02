@@ -11,6 +11,8 @@
 *.swp
 jepsen/camu/store/
 jepsen/camu/camu
+jepsen/camu/target/
 superpowers
 .claude
 bin
+.local/minio/
