@@ -38,12 +38,20 @@ Provision the registry, build and push the image, then create the five nodes:
 ./provision.sh
 ```
 
-Each provisioning run publishes a unique timestamped image tag and applies
-that exact tag to the droplets, preventing stale or deleted registry tags from
-being reused. Existing nodes are updated sequentially: the script waits for a
-node to become ready before restarting the next one. Set `IMAGE_TAG` to choose
-a specific tag, `SSH_USER` to change the deployment user, or
-`SKIP_CONTAINER_RESTART=1` to apply Terraform without restarting containers.
+Each provisioning run publishes a unique timestamped image tag and creates the
+nodes with that exact tag, preventing stale or deleted registry tags from being
+reused. Set `IMAGE_TAG` to choose a specific tag.
+
+To publish a new image and roll it across existing nodes without applying
+Terraform, use:
+
+```bash
+./deploy.sh
+```
+
+`deploy.sh` updates nodes sequentially, waiting for `/v1/ready` before
+restarting the next node. Set `IMAGE_TAG` to choose a specific tag or
+`SSH_USER` to change the deployment user.
 
 To build and publish an image without deploying it (`doctl` is optional):
 
