@@ -24,6 +24,20 @@ func TestParquetPipelineObjectKeyIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestParquetSinkFailureStage(t *testing.T) {
+	cause := errors.New("object store unavailable")
+	err := parquetSinkError(parquetSinkStageObjectUpload, cause)
+	if got := parquetSinkFailureStage(err); got != parquetSinkStageObjectUpload {
+		t.Fatalf("sink failure stage = %q, want %q", got, parquetSinkStageObjectUpload)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("sink failure does not unwrap cause: %v", err)
+	}
+	if got := parquetSinkFailureStage(errors.New("unclassified")); got != "unknown" {
+		t.Fatalf("unclassified sink failure stage = %q, want unknown", got)
+	}
+}
+
 func TestParquetExportIngestTimeUsesStableSegmentMetadata(t *testing.T) {
 	created := time.Date(2026, time.July, 31, 12, 34, 0, 0, time.UTC)
 	index := log.NewIndex()

@@ -24,6 +24,41 @@ import (
 const parquetPipelineName = "parquet-export"
 const parquetPipelineVersion = "v1"
 
+const (
+	parquetSinkStageFencedBeforeUpload  = "fenced_before_upload"
+	parquetSinkStageObjectUpload        = "object_upload"
+	parquetSinkStageFencedAfterUpload   = "fenced_after_upload"
+	parquetSinkStageManifestPublish     = "manifest_publish"
+	parquetSinkStageFencedAfterManifest = "fenced_after_manifest"
+)
+
+// parquetSinkFailure retains the failing sink operation without turning a
+// potentially unbounded backend error string into a metric label.
+type parquetSinkFailure struct {
+	stage string
+	err   error
+}
+
+func (e *parquetSinkFailure) Error() string {
+	return fmt.Sprintf("%s: %v", e.stage, e.err)
+}
+
+func (e *parquetSinkFailure) Unwrap() error {
+	return e.err
+}
+
+func parquetSinkError(stage string, err error) error {
+	return &parquetSinkFailure{stage: stage, err: err}
+}
+
+func parquetSinkFailureStage(err error) string {
+	var failure *parquetSinkFailure
+	if errors.As(err, &failure) {
+		return failure.stage
+	}
+	return "unknown"
+}
+
 func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, cp *pipeline.Checkpoint) {
 	if !tc.ExportEnabled || identity.Role != PartitionRoleLeader || tc.StorageMode == meta.StorageModeDiskless || tc.UncleanLeaderElection {
 		return
@@ -126,7 +161,11 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		}
 		if err := fenceWriteParquet(passCtx, s, fence, tc, identity, objectKey, data, ingestTime, valid[0].Offset, valid[len(valid)-1].Offset); err != nil {
 			result = "sink_error"
-			slog.Warn("parquet_pipeline_sink_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_end_offset", valid[len(valid)-1].Offset, "parquet_bytes", len(data), "error", err)
+			stage := parquetSinkFailureStage(err)
+			sinkLabels := mergeMetricLabels(labels, "stage", stage)
+			s.metricInc("camu_parquet_export_pipeline_sink_failures_total", "Parquet export pipeline sink failures", sinkLabels)
+			s.metricSet("camu_parquet_export_pipeline_last_sink_failure_unixtime", "Unix timestamp of the latest Parquet export pipeline sink failure", sinkLabels, float64(time.Now().Unix()))
+			slog.Warn("parquet_pipeline_sink_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_start_offset", valid[0].Offset, "source_end_offset", valid[len(valid)-1].Offset, "parquet_object_key", objectKey, "parquet_bytes", len(data), "stage", stage, "error", err)
 			return
 		}
 		s.metricAdd("camu_parquet_export_pipeline_bytes_total", "Parquet bytes uploaded by the export pipeline", labels, float64(len(data)))
@@ -233,22 +272,22 @@ func parquetPipelineObjectKey(topic string, partition int, ingestTime time.Time,
 
 func fenceWriteParquet(ctx context.Context, s *Server, fence pipeline.Fence, tc meta.TopicConfig, identity PartitionIdentity, objectKey string, data []byte, ingestTime time.Time, start, end uint64) error {
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
-		return pipeline.ErrFenced
+		return parquetSinkError(parquetSinkStageFencedBeforeUpload, pipeline.ErrFenced)
 	}
 	date, hour := parquet.BucketDateHour(ingestTime)
 	if err := putImmutableParquetObject(ctx, s.s3Client, objectKey, data); err != nil {
-		return err
+		return parquetSinkError(parquetSinkStageObjectUpload, err)
 	}
 	store := s.newParquetStore()
 	entry := parquet.Entry{ObjectKey: objectKey, BaseOffset: int64(start), EndOffset: int64(end), SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: identity.LeaderEpoch}
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
-		return cleanupUnreferencedParquetUpload(ctx, store, s.s3Client, tc.Name, identity.Partition, ingestTime, objectKey, pipeline.ErrFenced)
+		return parquetSinkError(parquetSinkStageFencedAfterUpload, cleanupUnreferencedParquetUpload(ctx, store, s.s3Client, tc.Name, identity.Partition, ingestTime, objectKey, pipeline.ErrFenced))
 	}
 	if _, err := store.ReplaceOverlappingEntries(ctx, tc.Name, identity.Partition, date, hour, []parquet.Entry{entry}); err != nil {
-		return cleanupUnreferencedParquetUpload(ctx, store, s.s3Client, tc.Name, identity.Partition, ingestTime, objectKey, err)
+		return parquetSinkError(parquetSinkStageManifestPublish, cleanupUnreferencedParquetUpload(ctx, store, s.s3Client, tc.Name, identity.Partition, ingestTime, objectKey, err))
 	}
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
-		return pipeline.ErrFenced
+		return parquetSinkError(parquetSinkStageFencedAfterManifest, pipeline.ErrFenced)
 	}
 	return nil
 }
