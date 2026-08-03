@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -86,6 +87,101 @@ func TestMultiInstance_PartitionDistribution(t *testing.T) {
 	if total != 6 {
 		t.Errorf("expected 6 total partition assignments, got %d", total)
 	}
+}
+
+func TestMultiInstance_RF5ReplicasAndLeadersSpreadAcrossFiveNodes(t *testing.T) {
+	const (
+		topic      = "rf5-five-nodes"
+		partitions = 4
+		replicas   = 5
+		minISR     = 3
+	)
+	instanceIDs := []string{"127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"}
+	env := camutest.New(t,
+		camutest.WithInstances(len(instanceIDs)),
+		camutest.WithInstanceIDs(instanceIDs...),
+	)
+	defer env.Cleanup()
+
+	if err := env.Client().CreateTopicWithReplication(topic, partitions, 24*time.Hour, replicas, minISR); err != nil {
+		t.Fatalf("CreateTopicWithReplication() error: %v", err)
+	}
+
+	wantReplicas := make(map[string]struct{}, len(instanceIDs))
+	for _, id := range instanceIDs {
+		wantReplicas[id] = struct{}{}
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	var routing *camutest.RoutingResponse
+	for time.Now().Before(deadline) {
+		var err error
+		routing, err = env.Client().GetRouting(topic)
+		if err == nil && routingHasFullRF5Layout(routing, partitions, wantReplicas) {
+			status, statusErr := env.Client().ClusterStatus()
+			if statusErr == nil && status.Ready && status.ActiveInstances == replicas &&
+				status.ReadyInstances == replicas && status.InitializedPartitions == partitions &&
+				status.ExpectedPartitions == partitions {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if routing == nil || !routingHasFullRF5Layout(routing, partitions, wantReplicas) {
+		t.Fatalf("routing never assigned every partition to all five replicas: %#v", routing)
+	}
+	status, err := env.Client().ClusterStatus()
+	if err != nil {
+		t.Fatalf("ClusterStatus() error: %v", err)
+	}
+	if !status.Ready || status.ActiveInstances != replicas || status.ReadyInstances != replicas ||
+		status.InitializedPartitions != partitions || status.ExpectedPartitions != partitions {
+		t.Fatalf("cluster did not initialize the RF=5 layout: %+v", status)
+	}
+
+	leaders := make(map[string]struct{}, partitions)
+	for partition := 0; partition < partitions; partition++ {
+		info := routing.Partitions[strconv.Itoa(partition)]
+		leaders[info.InstanceID] = struct{}{}
+		leaderIdx := env.InstanceIndex(info.InstanceID)
+		if leaderIdx < 0 {
+			t.Fatalf("partition %d leader %q is not a test instance", partition, info.InstanceID)
+		}
+		if _, err := env.ClientFor(leaderIdx).ProduceToPartition(topic, partition, []camutest.ProduceMessage{{Key: "key", Value: "value"}}); err != nil {
+			t.Fatalf("ProduceToPartition(%d) via leader %q error: %v", partition, info.InstanceID, err)
+		}
+	}
+	if len(leaders) != partitions {
+		t.Fatalf("leaders = %v, want one distinct leader for each of %d partitions", leaders, partitions)
+	}
+}
+
+func routingHasFullRF5Layout(routing *camutest.RoutingResponse, partitions int, wantReplicas map[string]struct{}) bool {
+	if routing == nil || len(routing.Partitions) != partitions {
+		return false
+	}
+	for partition := 0; partition < partitions; partition++ {
+		info, ok := routing.Partitions[strconv.Itoa(partition)]
+		if !ok {
+			return false
+		}
+		if _, ok := wantReplicas[info.InstanceID]; !ok {
+			return false
+		}
+		gotReplicas := make(map[string]struct{}, len(info.Replicas))
+		for _, replica := range info.Replicas {
+			gotReplicas[replica.InstanceID] = struct{}{}
+		}
+		if len(gotReplicas) != len(wantReplicas) {
+			return false
+		}
+		for id := range wantReplicas {
+			if _, ok := gotReplicas[id]; !ok {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func TestMultiInstance_ProduceConsumeAcrossInstances(t *testing.T) {

@@ -21,7 +21,14 @@ type TopicInfo struct {
 
 // ClusterStatusResponse holds the cluster status response.
 type ClusterStatusResponse struct {
-	Instances []InstanceInfo `json:"instances"`
+	Ready                 bool           `json:"ready"`
+	Status                string         `json:"status"`
+	ActiveInstances       int            `json:"active_instances"`
+	ReadyInstances        int            `json:"ready_instances"`
+	AssignedPartitions    int            `json:"assigned_partitions"`
+	InitializedPartitions int            `json:"initialized_partitions"`
+	ExpectedPartitions    int            `json:"expected_partitions"`
+	Instances             []InstanceInfo `json:"instances"`
 }
 
 // InstanceInfo holds info about a single server instance.
@@ -51,11 +58,11 @@ func (c *Client) BaseURL() string {
 
 // SQLQueryRequest mirrors the /v1/sql request envelope.
 type SQLQueryRequest struct {
-	SQL       string         `json:"sql"`
-	Params    []any          `json:"params,omitempty"`
-	Topics    []string       `json:"topics"`
-	TimeRange *SQLTimeRange  `json:"time_range,omitempty"`
-	Limit     int            `json:"limit,omitempty"`
+	SQL       string        `json:"sql"`
+	Params    []any         `json:"params,omitempty"`
+	Topics    []string      `json:"topics"`
+	TimeRange *SQLTimeRange `json:"time_range,omitempty"`
+	Limit     int           `json:"limit,omitempty"`
 }
 
 type SQLTimeRange struct {
@@ -554,6 +561,13 @@ type RoutingResponse struct {
 
 // RoutingPartitionInfo holds routing info for a single partition.
 type RoutingPartitionInfo struct {
+	InstanceID string               `json:"instance_id"`
+	Address    string               `json:"address"`
+	Replicas   []RoutingReplicaInfo `json:"replicas"`
+}
+
+// RoutingReplicaInfo identifies one assigned replica returned by the routing endpoint.
+type RoutingReplicaInfo struct {
 	InstanceID string `json:"instance_id"`
 	Address    string `json:"address"`
 }
