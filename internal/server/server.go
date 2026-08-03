@@ -1189,6 +1189,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	existingDone := ps.fetchDone
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
+	ps.fetchAssignmentEpoch = 0
 	ps.mu.Unlock()
 	if existingCancel != nil {
 		existingCancel()
@@ -1385,7 +1386,7 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	}
 
 	ps.mu.Lock()
-	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader && ps.epoch >= pa.LeaderEpoch {
+	if followerFetchMatchesAssignment(ps, pa.Leader, pa.LeaderEpoch) {
 		ps.mu.Unlock()
 		return
 	}
@@ -1448,6 +1449,7 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	ps.isLeader = false
 	ps.leaderID = pa.Leader
 	ps.replicaState = nil
+	ps.fetchAssignmentEpoch = pa.LeaderEpoch
 	localOffset := ps.nextOffset
 	fetchEpoch := ps.epoch
 	fetchDone := make(chan struct{})
@@ -1463,9 +1465,24 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		"leader", pa.Leader, "leader_addr", leaderAddr,
 		"local_offset", localOffset, "epoch", fetchEpoch)
 	go func() {
-		defer close(fetchDone)
+		defer func() {
+			close(fetchDone)
+			ps.mu.Lock()
+			if ps.fetchGeneration == generation {
+				ps.fetchCancel = nil
+				ps.fetchDone = nil
+				ps.fetchAssignmentEpoch = 0
+			}
+			ps.mu.Unlock()
+		}()
 		s.followerFetcher.Run(fetchCtx, topic, pid, leaderAddr, localOffset, fetchEpoch, s.instanceID, s.partitionManager)
 	}()
+}
+
+// followerFetchMatchesAssignment reports whether an active fetcher already
+// follows the supplied assignment. Callers must hold ps.mu.
+func followerFetchMatchesAssignment(ps *partitionState, leader string, epoch uint64) bool {
+	return !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == leader && ps.fetchAssignmentEpoch >= epoch
 }
 
 // startLeaseRenewal starts a background goroutine that renews owned leases.

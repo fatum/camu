@@ -143,6 +143,22 @@ func TestInitPartitionAsLeader_RF1SkipsReplicaState(t *testing.T) {
 	}
 }
 
+func TestFollowerFetchMatchesAssignment_UsesConfiguredAssignmentEpoch(t *testing.T) {
+	ps := &partitionState{
+		leaderID:             "n2",
+		fetchCancel:          func() {},
+		fetchAssignmentEpoch: 4,
+		epoch:                3,
+	}
+
+	if !followerFetchMatchesAssignment(ps, "n2", 4) {
+		t.Fatal("expected fetcher configured for assignment epoch 4 to be reused")
+	}
+	if followerFetchMatchesAssignment(ps, "n2", 5) {
+		t.Fatal("expected newer assignment epoch to reconfigure the fetcher")
+	}
+}
+
 func TestHandleKafkaListOffsets_ReplicatedPartitionNotReady(t *testing.T) {
 	s := newTestServer(t)
 

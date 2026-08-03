@@ -32,6 +32,7 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	existingDone := ps.fetchDone
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
+	ps.fetchAssignmentEpoch = 0
 	ps.mu.Unlock()
 
 	// 2. Cancel existing fetch loop (outside the lock, with captured handles).
