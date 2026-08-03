@@ -1497,7 +1497,10 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 	}
 
 	// Phase 2: Active segment.
-	if activeSeg != nil && remaining > 0 {
+	// A page may stop within the sealed prefix. Do not append the active tail
+	// unless the requested range reached its base offset: Kafka records must be
+	// contiguous, never a sealed page followed by a distant active batch.
+	if activeSeg != nil && remaining > 0 && currentOffset >= activeBase {
 		offsetIdx := activeSeg.OffsetIndex()
 		if len(offsetIdx) > 0 {
 			// Binary search for the first batch containing currentOffset.

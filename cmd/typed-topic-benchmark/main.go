@@ -357,6 +357,7 @@ func (c client) deleteAndWait(ctx context.Context, topic string) error {
 	}
 	return errors.New("topic deletion timeout")
 }
+
 func (c client) create(ctx context.Context, cfg config) error {
 	fields := []map[string]any{{"name": "id", "type": "int64", "path": "$.id"}, {"name": "payload", "type": "string", "path": "$.payload"}, {"name": "payload_bytes", "type": "int64", "path": "$.payload_bytes"}, {"name": "sequence", "type": "int64", "path": "$.sequence"}}
 	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled, "schema": map[string]any{"encoding": "json", "fields": fields}}
@@ -823,6 +824,15 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 		res.Integrity.OK = pr.Records == count
 		benchmarkLog("produce complete: records=%d bytes=%d duration=%.3fs rate=%.2f records/s %.2f bytes/s", pr.Records, pr.Bytes, pr.DurationSeconds, pr.RecordsPerSecond, pr.BytesPerSecond)
 	case "consume":
+		count, err = c.committedRecordCount(ctx, cfg)
+		if err != nil {
+			res.Integrity.Error = "read existing topic: " + err.Error()
+			benchmarkLog("read existing topic failed: %v", err)
+			return
+		}
+		res.Expected, res.ExpectedBytes = count, count*cfg.MessageBytes
+		expected = expectedStatesFor(cfg, count)
+		benchmarkLog("verifying existing topic %q records=%d", cfg.Topic, count)
 		benchmarkLog("starting consumer verification")
 		actual := make([]hashState, cfg.Partitions)
 		cr, err := consume(ctx, cfg, expected, actual, count, func(int64) {})

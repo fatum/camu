@@ -691,6 +691,52 @@ func TestReadReplicaRawBatchesDoesNotServeSealedPrefix(t *testing.T) {
 	}
 }
 
+func TestReadRawBatchesDoesNotJumpFromSealedPrefixToActiveTail(t *testing.T) {
+	ctx := context.Background()
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(ctx, newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatal(err)
+	}
+
+	sealed := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Key: []byte("sealed"), Value: []byte("zero")}})
+	ref := log.SegmentRef{BaseOffset: 0, EndOffset: 0, Key: "topic/0/0-0.segment"}
+	if err := pm.s3Client.Put(ctx, ref.Key, sealed, storage.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	var sidecar bytes.Buffer
+	if err := log.WriteSidecar(&sidecar, []log.IndexEntry{{BaseOffset: 0, LastOffset: 0, BatchSize: int32(len(sealed))}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.s3Client.Put(ctx, ref.OffsetIndexObjectKey(), sidecar.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "active"), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	tail := log.EncodeRecordBatch(100, []log.Message{{Offset: 100, Key: []byte("tail"), Value: []byte("hundred")}})
+	if err := active.Append(tail); err != nil {
+		t.Fatal(err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	ps.mu.Lock()
+	ps.activeSegment = active
+	ps.nextOffset = 101
+	ps.index.Add(ref)
+	ps.index.SetHighWatermark(101)
+	ps.mu.Unlock()
+
+	raw, _, err := pm.ReadRawBatches(ctx, "topic", 0, 0, len(sealed)+len(tail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, sealed) {
+		t.Fatalf("read crossed offset gap: got %d bytes, want only sealed %d bytes", len(raw), len(sealed))
+	}
+}
+
 func TestSyncFollowerSealedPrefixAdvancesLocalOffsetFromIndex(t *testing.T) {
 	pm := newTestPartitionManager(t)
 	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {

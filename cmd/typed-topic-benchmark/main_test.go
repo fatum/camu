@@ -210,3 +210,27 @@ func TestHTTPConsumeRejectsOffsetAdvancePastRecords(t *testing.T) {
 		t.Fatalf("consume error = %v, want next-offset validation failure", err)
 	}
 }
+
+func TestCommittedRecordCountUsesEachPartitionHighWatermark(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/topics/events/partitions/0/messages":
+			w.Header().Set("X-High-Watermark", "3")
+		case "/v1/topics/events/partitions/1/messages":
+			w.Header().Set("X-High-Watermark", "2")
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[],"next_offset":0}`))
+	}))
+	defer server.Close()
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	got, err := c.committedRecordCount(context.Background(), config{Topic: "events", Partitions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 5 {
+		t.Fatalf("committedRecordCount() = %d, want 5", got)
+	}
+}
