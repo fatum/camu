@@ -120,6 +120,24 @@ func TestEpochHistory_DivergenceOneOffBoundary(t *testing.T) {
 	}
 }
 
+// Partition 0 in the live bench2 bucket contained this history after a node
+// restart. Duplicate boundaries for epoch 1 are corrupt metadata, not leader
+// changes; treating them as transitions causes a follower to truncate and
+// re-fetch the same tail forever.
+func TestEpochHistory_LiveDuplicateEpochBoundariesDoNotDiverge(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 1, StartOffset: 262144},
+		{Epoch: 1, StartOffset: 262644},
+		{Epoch: 1, StartOffset: 262644},
+		{Epoch: 1, StartOffset: 262644},
+	}}
+
+	if truncateTo, diverged := eh.CheckDivergence(1, 263644); diverged {
+		t.Fatalf("duplicate epoch history requested truncation to %d", truncateTo)
+	}
+}
+
 // TestEpochHistory_Persistence verifies that SaveToFile / LoadEpochHistory
 // round-trip correctly.
 func TestEpochHistory_Persistence(t *testing.T) {

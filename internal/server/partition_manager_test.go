@@ -699,6 +699,7 @@ func TestSyncFollowerSealedPrefixAdvancesLocalOffsetFromIndex(t *testing.T) {
 	ps := pm.GetPartitionState("topic", 0)
 	ps.mu.Lock()
 	ps.index.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 9, Key: "topic/0/0-9.seg"})
+	ps.index.SetHighWatermark(10)
 	ps.nextOffset = 0
 	ps.mu.Unlock()
 
@@ -808,6 +809,65 @@ func TestFollowerRestartDoesNotRestoreFencedS3Tail(t *testing.T) {
 	}
 	if got := pm.SyncFollowerSealedPrefix(ctx, topic, 0, fenceOffset); got != fenceOffset {
 		t.Fatalf("SyncFollowerSealedPrefix() = %d, want fence boundary %d", got, fenceOffset)
+	}
+}
+
+// This is the exact partition-0 shape recovered from the live bench2 bucket:
+// a segment is present through 263643, but state.json commits only through
+// 263143. A follower may use the durable prefix but must not treat the 500
+// uncommitted records as replicated data after a restart.
+func TestFollowerRestartCapsS3PrefixAtPublishedHighWatermark(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
+	cfg.Segments.MaxSize = 1 << 20
+	cfg.Segments.MaxAge = "1h"
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	if err != nil {
+		t.Fatalf("NewS3Client: %v", err)
+	}
+
+	const (
+		topic           = "bench2"
+		fenceOffset     = uint64(262144)
+		publishedHW     = uint64(263144)
+		publishedLogEnd = uint64(263644)
+		followerEpoch   = uint64(1)
+	)
+	ref := log.SegmentRef{BaseOffset: 0, EndOffset: publishedLogEnd - 1, Epoch: followerEpoch, Key: log.FormatSegmentKey(topic, 0, 0, publishedLogEnd-1, followerEpoch)}
+	if err := s3Client.Put(ctx, ref.Key, []byte("segment beyond high watermark"), storage.PutOpts{}); err != nil {
+		t.Fatalf("put segment: %v", err)
+	}
+	state, err := (&log.PartitionState{
+		HighWatermark: publishedHW,
+		EpochHistory: []log.EpochEntry{
+			{Epoch: 1, StartOffset: 0},
+			{Epoch: 1, StartOffset: fenceOffset},
+			{Epoch: 1, StartOffset: 262644},
+			{Epoch: 1, StartOffset: 262644},
+			{Epoch: 1, StartOffset: 262644},
+		},
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := s3Client.Put(ctx, log.StateKey(topic, 0), state, storage.PutOpts{}); err != nil {
+		t.Fatalf("put state: %v", err)
+	}
+
+	pm, err := NewPartitionManager(cfg, s3Client)
+	if err != nil {
+		t.Fatalf("NewPartitionManager: %v", err)
+	}
+	tc := meta.TopicConfig{Name: topic, Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 5, MinInsyncReplicas: 3}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	if err := pm.TruncateLogFrom(topic, 0, fenceOffset); err != nil {
+		t.Fatalf("TruncateLogFrom: %v", err)
+	}
+	if got := pm.SyncFollowerSealedPrefix(ctx, topic, 0, publishedLogEnd); got != publishedHW {
+		t.Fatalf("SyncFollowerSealedPrefix() = %d, want published high watermark %d", got, publishedHW)
 	}
 }
 

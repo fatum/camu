@@ -445,6 +445,66 @@ func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
 	}
 }
 
+func TestHandleReplicaFetch_DuplicateEpochBoundaryServesRealTail(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 2,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	if err := s.partitionManager.ensureActiveSegment(tc.Name, 0); err != nil {
+		t.Fatalf("ensureActiveSegment: %v", err)
+	}
+
+	// This is the epoch history recovered from S3 after the old restart bug:
+	// two boundaries claim to be epoch 1. The second is not a real leadership
+	// transition, so an epoch-1 follower must be allowed to fetch the tail.
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.epoch = 1
+	ps.epochHistory = &replication.EpochHistory{Entries: []replication.EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 1, StartOffset: 10},
+	}}
+	ps.replicaState = replication.NewReplicaState("n1", 10, 1, 1000)
+	ps.replicaState.SetEpochHistory(ps.epochHistory)
+	ps.mu.Unlock()
+
+	raw := log.EncodeRecordBatch(10, []log.Message{{Offset: 10, Value: []byte("recovered-tail")}})
+	if err := s.partitionManager.AppendReplicatedRawBatch(ctx, tc.Name, 0, raw); err != nil {
+		t.Fatalf("AppendReplicatedRawBatch: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=10", nil)
+	req.SetPathValue("topic", tc.Name)
+	req.SetPathValue("pid", "0")
+	req.Header.Set("X-Replica-ID", "n2")
+	req.Header.Set("X-Replica-Offset", "11")
+	req.Header.Set("X-Replica-Epoch", "1")
+	rec := httptest.NewRecorder()
+	s.handleReplicaFetch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Truncate-To"); got != "" {
+		t.Fatalf("X-Truncate-To = %q, want no truncation", got)
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, raw) {
+		t.Fatalf("replica response = %x, want raw RecordBatch %x", got, raw)
+	}
+}
+
 func TestInternalReadinessReportsInitializedPartitions(t *testing.T) {
 	s := newTestServer(t)
 	s.ready.Store(true)

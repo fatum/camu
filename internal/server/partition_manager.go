@@ -188,24 +188,24 @@ type producerCheckpointEntry struct {
 
 // partitionState holds per-partition runtime state.
 type partitionState struct {
-	mu            sync.RWMutex       // unified per-partition lock for all read/write access
-	activeSegment *log.ActiveSegment // zero-copy RecordBatch storage (nil until wired)
-	index         *log.Index
-	nextOffset    uint64
-	epoch         uint64                    // always 0 in single-instance mode
-	replicaState  *replication.ReplicaState // nil for rf=1
-	isLeader      bool
-	leaderID      string // current leader for follower fetch state; empty when local leader
-	flushedOffset uint64 // highest offset flushed to S3
-	followerHW    uint64 // leader-advertised readable HW for follower reads
-	epochHistory  *replication.EpochHistory
-	fetchCancel   context.CancelFunc                 // cancel follower fetch goroutine
-	fetchDone     chan struct{}                      // closed when fetch goroutine exits
-	fetchGeneration uint64                           // fences concurrent follower reconfigurations
-	globalID      int                                // cached batcher partition ID, set on first append
-	globalIDSet   bool                               // true once globalID has been resolved
-	producerSeqs  map[uint64]*producerPartitionState // producerID -> sequence state
-	pendingFlush  *sealedSegment                     // sealed locally; retry this exact segment until uploaded
+	mu              sync.RWMutex       // unified per-partition lock for all read/write access
+	activeSegment   *log.ActiveSegment // zero-copy RecordBatch storage (nil until wired)
+	index           *log.Index
+	nextOffset      uint64
+	epoch           uint64                    // always 0 in single-instance mode
+	replicaState    *replication.ReplicaState // nil for rf=1
+	isLeader        bool
+	leaderID        string // current leader for follower fetch state; empty when local leader
+	flushedOffset   uint64 // highest offset flushed to S3
+	followerHW      uint64 // leader-advertised readable HW for follower reads
+	epochHistory    *replication.EpochHistory
+	fetchCancel     context.CancelFunc                 // cancel follower fetch goroutine
+	fetchDone       chan struct{}                      // closed when fetch goroutine exits
+	fetchGeneration uint64                             // fences concurrent follower reconfigurations
+	globalID        int                                // cached batcher partition ID, set on first append
+	globalIDSet     bool                               // true once globalID has been resolved
+	producerSeqs    map[uint64]*producerPartitionState // producerID -> sequence state
+	pendingFlush    *sealedSegment                     // sealed locally; retry this exact segment until uploaded
 }
 
 // sealedSegment is immutable upload work. Once a segment is sealed, retries
@@ -1372,11 +1372,18 @@ func (pm *PartitionManager) SyncFollowerSealedPrefix(ctx context.Context, topic 
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	// activeBase is the first offset in the leader's active tail. The S3
-	// prefix may advance a follower only to that boundary, never past it: the
-	// local index can still contain a stale segment which the leader just
-	// fenced and asked this follower to truncate.
-	if ps.index != nil && ps.nextOffset < activeBase && ps.index.NextOffset() >= activeBase {
-		ps.nextOffset = activeBase
+	// prefix may advance a follower only through a range that is both present
+	// in its index and published as durable in state.json. A segment object can
+	// contain an uncommitted tail from a previous leader, so its end offset is
+	// not itself a replication checkpoint.
+	if ps.index != nil {
+		durableEnd := ps.index.HighWatermark()
+		if durableEnd > activeBase {
+			durableEnd = activeBase
+		}
+		if ps.nextOffset < durableEnd && ps.index.NextOffset() >= durableEnd {
+			ps.nextOffset = durableEnd
+		}
 	}
 	return ps.nextOffset
 }

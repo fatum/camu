@@ -99,12 +99,20 @@ func (eh *EpochHistory) CheckDivergence(followerEpoch uint64, followerOffset uin
 		if entry.Epoch != followerEpoch {
 			continue
 		}
-		// Found the matching epoch. Check whether there is a next entry.
-		if i+1 >= len(eh.Entries) {
+		// A previous version could persist a duplicate boundary for the same
+		// epoch during restart recovery. It is not a leadership transition and
+		// must not fence a follower: doing so tells the follower to truncate
+		// and then continue with the identical epoch forever.
+		nextIndex := i + 1
+		for nextIndex < len(eh.Entries) && eh.Entries[nextIndex].Epoch == followerEpoch {
+			nextIndex++
+		}
+		// Found the matching epoch. Check whether there is a next distinct epoch.
+		if nextIndex >= len(eh.Entries) {
 			// followerEpoch is the latest epoch — no divergence possible.
 			return 0, false
 		}
-		next := eh.Entries[i+1]
+		next := eh.Entries[nextIndex]
 		if followerOffset > next.StartOffset {
 			return next.StartOffset, true
 		}
