@@ -35,6 +35,30 @@ func writeTestSegment(t *testing.T, msgs []log.Message) []byte {
 	return segData
 }
 
+func putTestSealedSegment(t *testing.T, s3Client *storage.S3Client, key string, data []byte) {
+	t.Helper()
+	if err := s3Client.Put(context.Background(), key, data, storage.PutOpts{}); err != nil {
+		t.Fatalf("put segment: %v", err)
+	}
+	var entries []log.IndexEntry
+	for position := 0; position < len(data); {
+		header, err := log.ReadRecordBatchHeader(data[position:])
+		if err != nil {
+			t.Fatalf("read batch header: %v", err)
+		}
+		batchSize := int(header.RecordBatchSize())
+		entries = append(entries, log.IndexEntry{BaseOffset: header.FirstOffset, LastOffset: header.LastOffset(), Position: int64(position), BatchSize: int32(batchSize)})
+		position += batchSize
+	}
+	var sidecar bytes.Buffer
+	if err := log.WriteSidecar(&sidecar, entries, nil); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	if err := s3Client.Put(context.Background(), log.SegmentOffsetIndexKey(key), sidecar.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatalf("put sidecar: %v", err)
+	}
+}
+
 func TestFetcher_WalkRangeReadsOnlyNeededBatch(t *testing.T) {
 	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
 	if err != nil {
@@ -94,8 +118,7 @@ func TestFetcher_WalkRangeReadsOnlyNeededBatch(t *testing.T) {
 	}
 }
 
-func TestFetcher_ReadFromCache(t *testing.T) {
-	// Set up S3 client (in-memory, but we won't put segment there).
+func TestFetcher_ReadsBoundedRangeFromS3(t *testing.T) {
 	s3Client, err := storage.NewS3Client(storage.S3Config{
 		Bucket:   "test",
 		Endpoint: "memory://",
@@ -126,14 +149,11 @@ func TestFetcher_ReadFromCache(t *testing.T) {
 		CreatedAt:  time.Now(),
 	})
 
-	// Put segment in disk cache (not in S3).
-	if err := diskCache.Put(segKey, segData); err != nil {
-		t.Fatalf("diskCache.Put: %v", err)
-	}
+	putTestSealedSegment(t, s3Client, segKey, segData)
 
 	fetcher := NewFetcher(s3Client, diskCache)
 
-	// Fetch from offset 0 — should read from cache.
+	// Fetch from offset 0 through the sidecar-guided range path.
 	result, nextOffset, err := fetcher.Fetch(context.Background(), idx, "test-topic", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
@@ -172,9 +192,7 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 
 	// Put segment in S3 (not in cache).
 	segKey := "test-topic/0/0-0.segment"
-	if err := s3Client.Put(context.Background(), segKey, segData, storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put: %v", err)
-	}
+	putTestSealedSegment(t, s3Client, segKey, segData)
 
 	// Build index.
 	idx := log.NewIndex()
@@ -188,7 +206,7 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 
 	fetcher := NewFetcher(s3Client, diskCache)
 
-	// First fetch — should come from S3 and be cached.
+	// First fetch reads a bounded S3 range; only the sidecar is cached.
 	result, nextOffset, err := fetcher.Fetch(context.Background(), idx, "test-topic", 0, 0, 10)
 	if err != nil {
 		t.Fatalf("Fetch (first): %v", err)
@@ -200,25 +218,8 @@ func TestFetcher_ReadFromS3(t *testing.T) {
 		t.Errorf("nextOffset = %d, want 3", nextOffset)
 	}
 
-	// Verify it was cached.
-	if !diskCache.Has(segKey) {
-		t.Error("expected segment to be cached after S3 fetch")
-	}
-
-	// Second fetch — should come from cache (we can verify by deleting from S3).
-	if err := s3Client.Delete(context.Background(), segKey); err != nil {
-		t.Fatalf("s3Client.Delete: %v", err)
-	}
-
-	result2, nextOffset2, err := fetcher.Fetch(context.Background(), idx, "test-topic", 0, 0, 10)
-	if err != nil {
-		t.Fatalf("Fetch (second, from cache): %v", err)
-	}
-	if len(result2) != 3 {
-		t.Fatalf("expected 3 messages from cache, got %d", len(result2))
-	}
-	if nextOffset2 != 3 {
-		t.Errorf("nextOffset = %d, want 3", nextOffset2)
+	if diskCache.Has(segKey) {
+		t.Error("segment payload must not be cached")
 	}
 }
 
@@ -244,9 +245,7 @@ func TestFetcher_FetchFromMiddleOfSegment(t *testing.T) {
 	}
 	segKey := "test-topic/0/10-0.segment"
 	segData := writeTestSegment(t, msgs)
-	if err := s3Client.Put(context.Background(), segKey, segData, storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(segment): %v", err)
-	}
+	putTestSealedSegment(t, s3Client, segKey, segData)
 
 	idx := log.NewIndex()
 	idx.Add(log.SegmentRef{
@@ -325,12 +324,8 @@ func TestFetcher_ReadAcrossMultipleSegments(t *testing.T) {
 
 	seg0Key := "test-topic/0/0-0.segment"
 	seg1Key := "test-topic/0/2-0.segment"
-	if err := s3Client.Put(context.Background(), seg0Key, writeTestSegment(t, seg0Msgs), storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(seg0): %v", err)
-	}
-	if err := s3Client.Put(context.Background(), seg1Key, writeTestSegment(t, seg1Msgs), storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(seg1): %v", err)
-	}
+	putTestSealedSegment(t, s3Client, seg0Key, writeTestSegment(t, seg0Msgs))
+	putTestSealedSegment(t, s3Client, seg1Key, writeTestSegment(t, seg1Msgs))
 
 	idx := log.NewIndex()
 	idx.Add(log.SegmentRef{
@@ -393,12 +388,8 @@ func TestFetcher_ReadAcrossMixedCacheAndS3Segments(t *testing.T) {
 		{Offset: 3, Timestamp: time.Now().UnixMilli(), Key: []byte("k3"), Value: []byte("v3")},
 	})
 
-	if err := diskCache.Put(seg0Key, seg0Data); err != nil {
-		t.Fatalf("diskCache.Put(seg0): %v", err)
-	}
-	if err := s3Client.Put(context.Background(), seg1Key, seg1Data, storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(seg1): %v", err)
-	}
+	putTestSealedSegment(t, s3Client, seg0Key, seg0Data)
+	putTestSealedSegment(t, s3Client, seg1Key, seg1Data)
 
 	idx := log.NewIndex()
 	idx.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 1, Key: seg0Key, CreatedAt: time.Now()})
@@ -415,8 +406,8 @@ func TestFetcher_ReadAcrossMixedCacheAndS3Segments(t *testing.T) {
 	if nextOffset != 4 {
 		t.Fatalf("nextOffset = %d, want 4", nextOffset)
 	}
-	if !diskCache.Has(seg1Key) {
-		t.Fatal("expected S3-fetched second segment to be cached")
+	if diskCache.Has(seg0Key) || diskCache.Has(seg1Key) {
+		t.Fatal("segment payloads must not be cached")
 	}
 }
 
@@ -437,12 +428,10 @@ func TestFetcher_ReturnsPartialResultsWhenLaterSegmentFetchFails(t *testing.T) {
 
 	seg0Key := "test-topic/0/0-0.segment"
 	seg1Key := "test-topic/0/2-0.segment"
-	if err := s3Client.Put(context.Background(), seg0Key, writeTestSegment(t, []log.Message{
+	putTestSealedSegment(t, s3Client, seg0Key, writeTestSegment(t, []log.Message{
 		{Offset: 0, Timestamp: time.Now().UnixMilli(), Key: []byte("k0"), Value: []byte("v0")},
 		{Offset: 1, Timestamp: time.Now().UnixMilli(), Key: []byte("k1"), Value: []byte("v1")},
-	}), storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put(seg0): %v", err)
-	}
+	}))
 
 	idx := log.NewIndex()
 	idx.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 1, Key: seg0Key, CreatedAt: time.Now()})

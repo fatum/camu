@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
@@ -52,130 +51,22 @@ func NewFetcher(s3Client *storage.S3Client, diskCache *log.DiskCache) *Fetcher {
 	}
 }
 
-// Fetch retrieves messages starting at startOffset, up to limit.
-// Read path: disk cache -> S3 fetch (cached on fetch).
-// Reads across multiple segments until limit is reached or no more data.
-// Returns the messages and the next offset to fetch from.
+// Fetch retrieves messages starting at startOffset, up to limit. It is a
+// collecting wrapper around Walk, so it keeps the same bounded range-read
+// behavior as streaming consumers.
 func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, partitionID int, startOffset uint64, limit int) ([]log.Message, uint64, error) {
-	if index == nil || limit <= 0 {
-		return nil, startOffset, nil
-	}
-
-	var allMsgs []log.Message
-	currentOffset := startOffset
-	remaining := limit
-
-	for remaining > 0 {
-		segmentPlan := index.SegmentsFrom(currentOffset, fetchParallelism)
-		if len(segmentPlan) == 0 {
-			slog.Debug("consume_fetch_plan_empty",
-				"topic", topic,
-				"partition", partitionID,
-				"offset", currentOffset,
-				"remaining", remaining,
-			)
-			break
+	messages := make([]log.Message, 0, limit)
+	nextOffset, err := f.Walk(ctx, index, topic, partitionID, startOffset, limit, func(msg log.Message) bool {
+		messages = append(messages, msg)
+		return true
+	})
+	if err != nil {
+		if len(messages) > 0 {
+			return messages, nextOffset, nil
 		}
-		slog.Debug("consume_fetch_plan",
-			"topic", topic,
-			"partition", partitionID,
-			"offset", currentOffset,
-			"remaining", remaining,
-			"planned_segments", len(segmentPlan),
-			"first_segment_base", segmentPlan[0].BaseOffset,
-			"first_segment_end", segmentPlan[0].EndOffset,
-			"last_segment_base", segmentPlan[len(segmentPlan)-1].BaseOffset,
-			"last_segment_end", segmentPlan[len(segmentPlan)-1].EndOffset,
-		)
-
-		fetched := f.fetchSegmentBatch(ctx, segmentPlan)
-		progressed := false
-		for i, segRef := range segmentPlan {
-			if fetched[i].err != nil {
-				slog.Debug("consume_segment_fetch_failed",
-					"topic", topic,
-					"partition", partitionID,
-					"offset", currentOffset,
-					"segment_key", segRef.Key,
-					"segment_base", segRef.BaseOffset,
-					"segment_end", segRef.EndOffset,
-					"error", fetched[i].err,
-					"returned_messages", len(allMsgs),
-				)
-				if len(allMsgs) > 0 {
-					remaining = 0
-					break
-				}
-				return nil, 0, fetched[i].err
-			}
-
-			msgs, err := decodeSegmentData(fetched[i].data, currentOffset, remaining)
-			if err != nil {
-				slog.Debug("consume_segment_decode_failed",
-					"topic", topic,
-					"partition", partitionID,
-					"offset", currentOffset,
-					"segment_key", segRef.Key,
-					"segment_base", segRef.BaseOffset,
-					"segment_end", segRef.EndOffset,
-					"error", err,
-					"returned_messages", len(allMsgs),
-				)
-				if len(allMsgs) > 0 {
-					remaining = 0
-					break
-				}
-				return nil, 0, fmt.Errorf("read segment: %w", err)
-			}
-
-			if len(msgs) == 0 {
-				slog.Debug("consume_segment_decode_empty",
-					"topic", topic,
-					"partition", partitionID,
-					"offset", currentOffset,
-					"remaining", remaining,
-					"segment_key", segRef.Key,
-					"segment_base", segRef.BaseOffset,
-					"segment_end", segRef.EndOffset,
-				)
-				break
-			}
-
-			prevOffset := currentOffset
-			progressed = true
-			allMsgs = append(allMsgs, msgs...)
-			remaining -= len(msgs)
-			currentOffset = msgs[len(msgs)-1].Offset + 1
-			slog.Debug("consume_segment_decoded",
-				"topic", topic,
-				"partition", partitionID,
-				"requested_offset", prevOffset,
-				"remaining_after_decode", remaining,
-				"segment_key", segRef.Key,
-				"segment_base", segRef.BaseOffset,
-				"segment_end", segRef.EndOffset,
-				"segment_bytes", len(fetched[i].data),
-				"decoded_messages", len(msgs),
-				"decoded_first_offset", firstDecodedOffset(msgs),
-				"decoded_last_offset", lastDecodedOffset(msgs),
-				"next_offset", currentOffset,
-			)
-			if remaining == 0 || currentOffset > segRef.EndOffset {
-				continue
-			}
-			break
-		}
-		if !progressed {
-			break
-		}
+		return nil, startOffset, err
 	}
-
-	nextOffset := startOffset
-	if len(allMsgs) > 0 {
-		nextOffset = allMsgs[len(allMsgs)-1].Offset + 1
-	}
-
-	return allMsgs, nextOffset, nil
+	return messages, nextOffset, nil
 }
 
 // Walk retrieves messages starting at startOffset, up to limit, and calls
@@ -183,9 +74,7 @@ func (f *Fetcher) Fetch(ctx context.Context, index *log.Index, topic string, par
 // stops the scan early.
 //
 // Sealed segments are read in bounded, contiguous RecordBatch ranges using
-// their offset sidecar. In particular, do not use fetchSegmentData for the
-// segment itself: it materializes an entire segment in memory and defeats HTTP
-// response back-pressure.
+// their offset sidecar.
 func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, partitionID int, startOffset uint64, limit int, visit func(log.Message) bool) (uint64, error) {
 	if index == nil || limit <= 0 {
 		return startOffset, nil
@@ -200,7 +89,7 @@ func (f *Fetcher) Walk(ctx context.Context, index *log.Index, topic string, part
 			break
 		}
 		segRef := segmentPlan[0]
-		sidecar, err := f.fetchSegmentData(ctx, segRef.OffsetIndexObjectKey())
+		sidecar, err := f.fetchSidecar(ctx, segRef.OffsetIndexObjectKey())
 		if err != nil {
 			return currentOffset, fmt.Errorf("read segment sidecar: %w", err)
 		}
@@ -320,39 +209,15 @@ func (f *Fetcher) getWithRetry(ctx context.Context, key string) ([]byte, error) 
 	return nil, err
 }
 
-type segmentFetchResult struct {
-	data []byte
-	err  error
-}
-
-func (f *Fetcher) fetchSegmentBatch(ctx context.Context, refs []log.SegmentRef) []segmentFetchResult {
-	results := make([]segmentFetchResult, len(refs))
-	var wg sync.WaitGroup
-	wg.Add(len(refs))
-	for i, ref := range refs {
-		go func(i int, ref log.SegmentRef) {
-			defer wg.Done()
-			data, err := f.fetchSegmentData(ctx, ref.Key)
-			if err != nil {
-				results[i].err = err
-				return
-			}
-			results[i].data = data
-		}(i, ref)
-	}
-	wg.Wait()
-	return results
-}
-
-// fetchSegmentData reads a segment from disk cache, falling back to S3.
-func (f *Fetcher) fetchSegmentData(ctx context.Context, key string) ([]byte, error) {
+// fetchSidecar reads a small immutable sidecar from disk cache, falling back
+// to S3 and caching it locally. Segment payloads are never cached here.
+func (f *Fetcher) fetchSidecar(ctx context.Context, key string) ([]byte, error) {
 	data, err := f.diskCache.Get(key)
 	if err != nil {
 		if !errors.Is(err, log.ErrCacheMiss) {
 			return nil, fmt.Errorf("disk cache get: %w", err)
 		}
-		slog.Debug("consume_segment_cache_miss", "segment_key", key)
-		// Cache miss — fetch from S3.
+		slog.Debug("consume_sidecar_cache_miss", "sidecar_key", key)
 		data, err = f.getWithRetry(ctx, key)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
@@ -364,27 +229,9 @@ func (f *Fetcher) fetchSegmentData(ctx context.Context, key string) ([]byte, err
 		if putErr := f.diskCache.Put(key, data); putErr != nil {
 			_ = putErr
 		}
-		slog.Debug("consume_segment_fetched_from_s3", "segment_key", key, "bytes", len(data))
+		slog.Debug("consume_sidecar_fetched_from_s3", "sidecar_key", key, "bytes", len(data))
 		return data, nil
 	}
-	slog.Debug("consume_segment_cache_hit", "segment_key", key, "bytes", len(data))
+	slog.Debug("consume_sidecar_cache_hit", "sidecar_key", key, "bytes", len(data))
 	return data, nil
-}
-
-func decodeSegmentData(data []byte, startOffset uint64, limit int) ([]log.Message, error) {
-	return log.ReadSegmentBatchesAsMessages(data, startOffset, limit)
-}
-
-func firstDecodedOffset(msgs []log.Message) any {
-	if len(msgs) == 0 {
-		return nil
-	}
-	return msgs[0].Offset
-}
-
-func lastDecodedOffset(msgs []log.Message) any {
-	if len(msgs) == 0 {
-		return nil
-	}
-	return msgs[len(msgs)-1].Offset
 }

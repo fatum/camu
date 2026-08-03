@@ -1291,9 +1291,7 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 			for currentOffset <= int64(ref.EndOffset) && remaining > 0 {
 				nextOffset, err := pm.appendSealedRawBatches(ctx, ref, currentOffset, upperBound, maxBytes, &out)
 				if err != nil {
-					slog.Warn("ReadRawBatches: failed to read sealed segment range",
-						"topic", topic, "partition", pid, "segment_key", ref.Key, "error", err)
-					break
+					return nil, upperBound, fmt.Errorf("read sealed segment %s: %w", ref.Key, err)
 				}
 				if nextOffset <= currentOffset {
 					break
@@ -1387,6 +1385,11 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 
 const maxSealedSegmentRangeReadBytes = 4 << 20
 
+const (
+	sealedSegmentRangeReadAttempts  = 5
+	sealedSegmentRangeRetryInterval = 50 * time.Millisecond
+)
+
 // appendSealedRawBatches appends complete Kafka RecordBatches from one sealed
 // segment. The sidecar lets us fetch only the requested contiguous range rather
 // than loading the full (up to 64 MiB) object into memory.
@@ -1467,37 +1470,48 @@ func (pm *PartitionManager) readSealedSegmentRange(ctx context.Context, ref log.
 	if pm.s3Client == nil {
 		return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
 	}
-	data, err := pm.s3Client.GetRange(ctx, ref.Key, offset, length)
+	data, err := pm.getS3WithRetry(ctx, func() ([]byte, error) {
+		return pm.s3Client.GetRange(ctx, ref.Key, offset, length)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 range get %s: %w", ref.Key, err)
 	}
 	return data, nil
 }
 
-// readSealedSegmentData reads a sealed segment's data from disk cache or S3.
-func (pm *PartitionManager) readSealedSegmentData(ctx context.Context, ref log.SegmentRef) ([]byte, error) {
-	// Try disk cache first.
-	if pm.diskCache != nil {
-		data, err := pm.diskCache.Get(ref.Key)
-		if err == nil && len(data) > 0 {
+func (pm *PartitionManager) getS3WithRetry(ctx context.Context, get func() ([]byte, error)) ([]byte, error) {
+	var err error
+	for attempt := 0; attempt < sealedSegmentRangeReadAttempts; attempt++ {
+		data, getErr := get()
+		if getErr == nil {
 			return data, nil
 		}
-	}
-
-	// Fall back to S3.
-	if pm.s3Client != nil {
-		data, err := pm.s3Client.Get(ctx, ref.Key)
-		if err != nil {
-			return nil, fmt.Errorf("s3 get %s: %w", ref.Key, err)
+		err = getErr
+		if errors.Is(err, storage.ErrNotFound) || attempt == sealedSegmentRangeReadAttempts-1 {
+			break
 		}
-		// Populate disk cache for next time.
-		if pm.diskCache != nil {
-			_ = pm.diskCache.Put(ref.Key, data)
+		timer := time.NewTimer(sealedSegmentRangeRetryInterval << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
 		}
-		return data, nil
 	}
+	return nil, err
+}
 
-	return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+// readSealedSegmentData reads a full sealed segment for maintenance work. The
+// normal consume path uses bounded range reads and never caches segment data.
+func (pm *PartitionManager) readSealedSegmentData(ctx context.Context, ref log.SegmentRef) ([]byte, error) {
+	if pm.s3Client == nil {
+		return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+	}
+	data, err := pm.s3Client.Get(ctx, ref.Key)
+	if err != nil {
+		return nil, fmt.Errorf("s3 get %s: %w", ref.Key, err)
+	}
+	return data, nil
 }
 
 // readSealedSegmentSidecar reads the CIDX sidecar for a sealed segment from
@@ -1515,7 +1529,9 @@ func (pm *PartitionManager) readSealedSegmentSidecar(ctx context.Context, ref lo
 		}
 	}
 	if pm.s3Client != nil {
-		data, err := pm.s3Client.Get(ctx, key)
+		data, err := pm.getS3WithRetry(ctx, func() ([]byte, error) {
+			return pm.s3Client.Get(ctx, key)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("s3 get %s: %w", key, err)
 		}
