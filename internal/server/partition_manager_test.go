@@ -733,6 +733,84 @@ func TestInitPartitionPreservesRecoveredFollowerEpoch(t *testing.T) {
 	}
 }
 
+// A restarted follower can find an obsolete, previously flushed tail in S3.
+// When the current leader fences that tail at its active-segment boundary, the
+// follower must not use its local S3 index to advance back into the fenced
+// range. That would make it report the same divergent offset forever.
+func TestFollowerRestartDoesNotRestoreFencedS3Tail(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
+	cfg.Segments.MaxSize = 1 << 20
+	cfg.Segments.MaxAge = "1h"
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	if err != nil {
+		t.Fatalf("NewS3Client: %v", err)
+	}
+
+	const (
+		topic         = "bench2"
+		fenceOffset   = uint64(262144)
+		staleLogEnd   = uint64(263144)
+		followerEpoch = uint64(1)
+	)
+	// This is the shared state left by the old leader: a durable prefix plus an
+	// epoch-1 segment that the current leader has subsequently fenced.
+	for _, ref := range []log.SegmentRef{
+		{BaseOffset: 0, EndOffset: fenceOffset - 1, Epoch: 0, Key: log.FormatSegmentKey(topic, 0, 0, fenceOffset-1, 0)},
+		{BaseOffset: fenceOffset, EndOffset: staleLogEnd - 1, Epoch: followerEpoch, Key: log.FormatSegmentKey(topic, 0, fenceOffset, staleLogEnd-1, followerEpoch)},
+	} {
+		if err := s3Client.Put(ctx, ref.Key, []byte("stale segment"), storage.PutOpts{}); err != nil {
+			t.Fatalf("put %s: %v", ref.Key, err)
+		}
+	}
+	state, err := (&log.PartitionState{
+		HighWatermark: fenceOffset,
+		EpochHistory: []log.EpochEntry{
+			{Epoch: 0, StartOffset: 0},
+			{Epoch: followerEpoch, StartOffset: fenceOffset},
+		},
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := s3Client.Put(ctx, log.StateKey(topic, 0), state, storage.PutOpts{}); err != nil {
+		t.Fatalf("put state: %v", err)
+	}
+
+	// Persisted local state from the follower before its process restart.
+	localPartitionDir := filepath.Join(cfg.Cache.Directory, "local", topic, "0")
+	if err := os.MkdirAll(localPartitionDir, 0o755); err != nil {
+		t.Fatalf("mkdir local partition: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localPartitionDir, "epoch"), []byte("1"), 0o644); err != nil {
+		t.Fatalf("write epoch sidecar: %v", err)
+	}
+
+	pm, err := NewPartitionManager(cfg, s3Client)
+	if err != nil {
+		t.Fatalf("NewPartitionManager after restart: %v", err)
+	}
+	tc := meta.TopicConfig{Name: topic, Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 5, MinInsyncReplicas: 3}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic after restart: %v", err)
+	}
+	ps := pm.GetPartitionState(topic, 0)
+	ps.mu.RLock()
+	gotEpoch, gotNextOffset := ps.epoch, ps.nextOffset
+	ps.mu.RUnlock()
+	if gotEpoch != followerEpoch || gotNextOffset != staleLogEnd {
+		t.Fatalf("restarted follower = epoch %d offset %d, want epoch %d offset %d", gotEpoch, gotNextOffset, followerEpoch, staleLogEnd)
+	}
+
+	if err := pm.TruncateLogFrom(topic, 0, fenceOffset); err != nil {
+		t.Fatalf("TruncateLogFrom: %v", err)
+	}
+	if got := pm.SyncFollowerSealedPrefix(ctx, topic, 0, fenceOffset); got != fenceOffset {
+		t.Fatalf("SyncFollowerSealedPrefix() = %d, want fence boundary %d", got, fenceOffset)
+	}
+}
+
 func TestReadRawBatches_UnknownTopicReturnsError(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 

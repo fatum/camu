@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2015,6 +2016,13 @@ func TestHandleProduceLowLevel_FencesStaleLeaderAfterReassignment(t *testing.T) 
 
 	if rec.Code != http.StatusMisdirectedRequest {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusMisdirectedRequest, rec.Body.String())
+	}
+	forwarded, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read forwarded body: %v", err)
+	}
+	if got, want := string(forwarded), `[{"key":"k","value":"v"}]`; got != want {
+		t.Fatalf("forwarded body = %q, want %q", got, want)
 	}
 }
 

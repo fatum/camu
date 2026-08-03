@@ -1371,8 +1371,12 @@ func (pm *PartitionManager) SyncFollowerSealedPrefix(ctx context.Context, topic 
 	}
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	if ps.index != nil && ps.index.NextOffset() > ps.nextOffset {
-		ps.nextOffset = ps.index.NextOffset()
+	// activeBase is the first offset in the leader's active tail. The S3
+	// prefix may advance a follower only to that boundary, never past it: the
+	// local index can still contain a stale segment which the leader just
+	// fenced and asked this follower to truncate.
+	if ps.index != nil && ps.nextOffset < activeBase && ps.index.NextOffset() >= activeBase {
+		ps.nextOffset = activeBase
 	}
 	return ps.nextOffset
 }
