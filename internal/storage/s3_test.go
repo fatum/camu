@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"os"
 	"testing"
 )
 
@@ -21,6 +23,42 @@ func TestS3Client_PutAndGet(t *testing.T) {
 	if string(data) != "hello" {
 		t.Errorf("Get() = %q, want %q", string(data), "hello")
 	}
+}
+
+func TestS3ClientConditionalPutFileAndComparison(t *testing.T) {
+	client := newTestClient(t)
+	ctx := context.Background()
+	first := newTempReadSeeker(t, []byte("immutable parquet bytes"))
+	defer first.Close()
+	if _, err := client.ConditionalPutFile(ctx, "cond/file.parquet", first, 23, ""); err != nil {
+		t.Fatalf("ConditionalPutFile(create) error = %v", err)
+	}
+	if _, err := client.ConditionalPutFile(ctx, "cond/file.parquet", first, 23, ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("ConditionalPutFile(conflict) error = %v, want ErrConflict", err)
+	}
+	equal, err := client.ObjectEqualsFile(ctx, "cond/file.parquet", first, 23)
+	if err != nil || !equal {
+		t.Fatalf("ObjectEqualsFile(equal) = %v, %v", equal, err)
+	}
+	different := newTempReadSeeker(t, []byte("immutable parquet diff!"))
+	defer different.Close()
+	equal, err = client.ObjectEqualsFile(ctx, "cond/file.parquet", different, 23)
+	if err != nil || equal {
+		t.Fatalf("ObjectEqualsFile(different) = %v, %v", equal, err)
+	}
+}
+
+func newTempReadSeeker(t *testing.T, data []byte) *os.File {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "s3-file-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	return file
 }
 
 func TestS3Client_Delete(t *testing.T) {

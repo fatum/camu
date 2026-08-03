@@ -13,47 +13,8 @@ func validateTypedValue(schema *meta.TopicSchema, value string) error {
 	if schema == nil {
 		return nil
 	}
-	var root any
-	if err := json.Unmarshal([]byte(value), &root); err != nil {
-		return fmt.Errorf("value is not valid JSON: %w", err)
-	}
-	obj, ok := root.(map[string]any)
-	if !ok {
-		return fmt.Errorf("value must be a JSON object")
-	}
-	for _, f := range schema.Fields {
-		v, found := jsonPathValue(obj, f.Path)
-		if !found || v == nil {
-			if f.Nullable {
-				continue
-			}
-			return fmt.Errorf("required field %q is missing", f.Name)
-		}
-		switch f.Type {
-		case "string":
-			if _, ok := v.(string); !ok {
-				return fmt.Errorf("field %q must be string", f.Name)
-			}
-		case "bool":
-			if _, ok := v.(bool); !ok {
-				return fmt.Errorf("field %q must be bool", f.Name)
-			}
-		case "int64":
-			n, ok := v.(float64)
-			if !ok || n != float64(int64(n)) {
-				return fmt.Errorf("field %q must be int64", f.Name)
-			}
-		case "float64":
-			if _, ok := v.(float64); !ok {
-				return fmt.Errorf("field %q must be number", f.Name)
-			}
-		case "timestamp":
-			if !validTimestamp(v) {
-				return fmt.Errorf("field %q must be RFC3339 timestamp", f.Name)
-			}
-		}
-	}
-	return nil
+	_, err := decodeTypedFields(schema, []byte(value))
+	return err
 }
 
 func jsonPathValue(root map[string]any, path string) (any, bool) {

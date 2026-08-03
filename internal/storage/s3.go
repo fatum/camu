@@ -53,6 +53,8 @@ type s3Backend interface {
 	delete(ctx context.Context, key string) error
 	list(ctx context.Context, prefix string) ([]string, error)
 	conditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error)
+	conditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error)
+	equalsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error)
 }
 
 // S3Client is the public S3 client, backed by either in-memory or real AWS S3.
@@ -157,6 +159,39 @@ func (c *S3Client) ConditionalPut(ctx context.Context, key string, data []byte, 
 	newETag, err := c.backend.conditionalPut(ctx, key, data, etag)
 	c.observe("conditional_put", started, int64(len(data)), err)
 	return newETag, err
+}
+
+// ConditionalPutFile conditionally uploads exactly size bytes from file. The
+// reader is rewound before use so callers can safely reuse an encoded temp
+// file after writing it. Unlike ConditionalPut, this path never needs to make
+// a complete in-memory copy of the upload.
+func (c *S3Client) ConditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error) {
+	if size < 0 {
+		return "", fmt.Errorf("conditional put file %q: negative size", key)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind conditional put file %q: %w", key, err)
+	}
+	started := time.Now()
+	newETag, err := c.backend.conditionalPutFile(ctx, key, file, size, etag)
+	c.observe("conditional_put", started, size, err)
+	return newETag, err
+}
+
+// ObjectEqualsFile compares an object with a seekable file in bounded chunks.
+// It is used to make immutable create retries idempotent after a conditional
+// create reports a conflict.
+func (c *S3Client) ObjectEqualsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error) {
+	if size < 0 {
+		return false, fmt.Errorf("compare object %q: negative size", key)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, fmt.Errorf("rewind comparison file %q: %w", key, err)
+	}
+	started := time.Now()
+	equal, err := c.backend.equalsFile(ctx, key, file, size)
+	c.observe("get", started, size, err)
+	return equal, err
 }
 
 // ---- In-memory backend ----
@@ -266,6 +301,53 @@ func (m *memBackend) conditionalPut(_ context.Context, key string, data []byte, 
 	newEtag := uuid.NewString()
 	m.objects[key] = memObject{data: cp, etag: newEtag}
 	return newEtag, nil
+}
+
+func (m *memBackend) conditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error) {
+	data := make([]byte, size)
+	if _, err := io.ReadFull(file, data); err != nil {
+		return "", fmt.Errorf("read conditional put file: %w", err)
+	}
+	if _, err := file.Read(make([]byte, 1)); err != io.EOF {
+		if err == nil {
+			return "", fmt.Errorf("conditional put file exceeds declared size")
+		}
+		return "", fmt.Errorf("read conditional put file: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return m.conditionalPut(ctx, key, data, etag)
+}
+
+func (m *memBackend) equalsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error) {
+	m.mu.RLock()
+	obj, ok := m.objects[key]
+	m.mu.RUnlock()
+	if !ok {
+		return false, ErrNotFound
+	}
+	if int64(len(obj.data)) != size {
+		return false, nil
+	}
+	buffer := make([]byte, 64*1024)
+	for offset := 0; offset < len(obj.data); {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		count := len(buffer)
+		if remaining := len(obj.data) - offset; remaining < count {
+			count = remaining
+		}
+		if _, err := io.ReadFull(file, buffer[:count]); err != nil {
+			return false, fmt.Errorf("read comparison file: %w", err)
+		}
+		if !bytes.Equal(obj.data[offset:offset+count], buffer[:count]) {
+			return false, nil
+		}
+		offset += count
+	}
+	return true, nil
 }
 
 // ---- Real AWS S3 backend ----
@@ -431,6 +513,69 @@ func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []by
 		newEtag = strings.Trim(*out.ETag, `"`)
 	}
 	return newEtag, nil
+}
+
+func (b *awsS3Backend) conditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind conditional put file %q: %w", key, err)
+	}
+	input := &s3.PutObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key), Body: file, ContentLength: aws.Int64(size)}
+	if etag != "" {
+		input.IfMatch = aws.String(etag)
+	} else {
+		input.IfNoneMatch = aws.String("*")
+	}
+	out, err := b.client.PutObject(ctx, input)
+	if err != nil {
+		if isS3Conflict(err) {
+			return "", ErrConflict
+		}
+		return "", fmt.Errorf("s3 ConditionalPutFile %q: %w", key, err)
+	}
+	newETag := ""
+	if out.ETag != nil {
+		newETag = strings.Trim(*out.ETag, `"`)
+	}
+	return newETag, nil
+}
+
+func (b *awsS3Backend) equalsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, fmt.Errorf("rewind comparison file %q: %w", key, err)
+	}
+	out, err := b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key)})
+	if err != nil {
+		if isS3NotFound(err) {
+			return false, ErrNotFound
+		}
+		return false, fmt.Errorf("s3 Get %q for comparison: %w", key, err)
+	}
+	defer out.Body.Close()
+	if out.ContentLength == nil || *out.ContentLength != size {
+		return false, nil
+	}
+	remote := make([]byte, 64*1024)
+	local := make([]byte, 64*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		count, readErr := out.Body.Read(remote)
+		if count > 0 {
+			if _, err := io.ReadFull(file, local[:count]); err != nil {
+				return false, fmt.Errorf("read comparison file: %w", err)
+			}
+			if !bytes.Equal(remote[:count], local[:count]) {
+				return false, nil
+			}
+		}
+		if readErr == io.EOF {
+			return true, nil
+		}
+		if readErr != nil {
+			return false, fmt.Errorf("read object %q for comparison: %w", key, readErr)
+		}
+	}
 }
 
 // isS3NotFound checks if an AWS error is a 404 / NoSuchKey.
