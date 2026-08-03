@@ -45,10 +45,17 @@ restart_camu() {
   ssh "${ssh_opts[@]}" "${ssh_user}@${ip}" /bin/sh -s -- "$image" <<'REMOTE'
 set -eu
 image="$1"
+docker pull gcr.io/cadvisor/cadvisor:v0.49.2
+docker rm -f cadvisor 2>/dev/null || true
+docker run -d --name cadvisor --restart unless-stopped --privileged --device=/dev/kmsg -p 8082:8080 \
+  -v /:/rootfs:ro -v /var/run:/var/run:ro -v /sys:/sys:ro \
+  -v /var/lib/docker:/var/lib/docker:ro \
+  gcr.io/cadvisor/cadvisor:v0.49.2
 docker pull "$image"
 docker rm -f camu 2>/dev/null || true
 docker run -d --name camu --restart unless-stopped --network host \
-  -e CAMU_LOG_LEVEL=error -e CAMU_REQUEST_LOG=0 \
+  --label=io.camu.component=server \
+  -e CAMU_LOG_LEVEL=info -e CAMU_REQUEST_LOG=0 \
   -v /etc/camu/benchmark.yaml:/etc/camu.yaml:ro \
   -v /var/lib/camu:/var/lib/camu \
   "$image" serve --config /etc/camu.yaml

@@ -88,6 +88,17 @@ appropriate for a standalone `produce` run but not a later consume or SQL run.
 The default is four partitions. Byte values accept a positive byte count or a
 binary unit such as `1GiB`, `512MiB`, or `64KiB`.
 
+Each benchmark invocation starts a local Prometheus, Loki, and Grafana stack.
+Prometheus scrapes Camu on port 8080 and cAdvisor on port 8082 from every
+benchmark node; the local collector follows each node's Camu container log and
+sends it to Loki. It also follows each node's kernel log and records Docker
+container state every five seconds, so OOM kills and restart loops appear in
+the same Grafana log view. Grafana is available during the run at
+<http://localhost:3000> (`admin` / `admin`) and is removed when the command
+exits. The dashboard provides the per-node CPU/memory, export-lag, S3/export
+error, and combined-log view needed to correlate a failure across the cluster.
+Set `BENCHMARK_MONITORING=0` to disable it.
+
 `consume` reads partition `p` through node `p`, rather than concentrating every
 partition on the first public endpoint. It logs the page offset, response size,
 and per-partition progress. `sql` logs every visibility poll and its error or

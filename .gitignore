@@ -16,3 +16,4 @@ superpowers
 .claude
 bin
 .local/minio/
+benchmark/digitalocean/monitoring/runtime/
