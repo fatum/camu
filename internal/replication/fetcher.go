@@ -94,6 +94,7 @@ func (f *FollowerFetcher) Run(
 	pm PartitionManager,
 ) {
 	const maxBackoff = 5 * time.Second
+	const caughtUpPollInterval = 100 * time.Millisecond
 	backoff := 100 * time.Millisecond
 	consecutiveErrors := 0
 
@@ -189,6 +190,17 @@ func (f *FollowerFetcher) Run(
 			localEpoch = resp.LeaderEpoch
 		}
 		pm.UpdateFollowerProgress(topic, pid, localEpoch, resp.HighWatermark, resp.FlushedOffset)
+
+		// A successful empty response means the follower has caught up. Without
+		// a delay, it immediately polls again and creates a tight request loop
+		// across every follower partition.
+		if !result.hasBatches {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(caughtUpPollInterval):
+			}
+		}
 	}
 }
 
