@@ -396,6 +396,54 @@ func TestInternalRoutes_QueryModeOnlyReady(t *testing.T) {
 	}
 }
 
+func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
+	s := newTestServer(t)
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 2,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.epoch = 3
+	ps.epochHistory = &replication.EpochHistory{Entries: []replication.EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 2, StartOffset: 10},
+		{Epoch: 3, StartOffset: 20},
+	}}
+	ps.replicaState = replication.NewReplicaState("n1", 20, 1, 1000)
+	ps.replicaState.SetEpochHistory(ps.epochHistory)
+	ps.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=15", nil)
+	req.SetPathValue("topic", tc.Name)
+	req.SetPathValue("pid", "0")
+	req.Header.Set("X-Replica-ID", "n2")
+	req.Header.Set("X-Replica-Offset", "15")
+	req.Header.Set("X-Replica-Epoch", "1")
+	rec := httptest.NewRecorder()
+	s.handleReplicaFetch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("X-Truncate-To"); got != "10" {
+		t.Errorf("X-Truncate-To = %q, want 10", got)
+	}
+	if got := rec.Header().Get("X-Leader-Epoch"); got != "2" {
+		t.Errorf("X-Leader-Epoch = %q, want 2", got)
+	}
+}
+
 func TestInternalReadinessReportsInitializedPartitions(t *testing.T) {
 	s := newTestServer(t)
 	s.ready.Store(true)

@@ -47,6 +47,15 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	truncateTo, diverged := ps.replicaState.CheckDivergence(replicaEpoch, replicaOffset)
 	if diverged {
 		epoch := ps.epoch
+		// A follower which is asked to truncate must continue at the epoch
+		// beginning at that offset. Returning the current partition epoch can
+		// leave it reporting an older epoch after it fetches the new tail,
+		// causing the same divergence check to repeat indefinitely.
+		if ps.epochHistory != nil {
+			if truncateEpoch, ok := ps.epochHistory.EpochAt(truncateTo); ok {
+				epoch = truncateEpoch
+			}
+		}
 		ps.mu.Unlock()
 		slog.Info("replica_fetch: epoch divergence, requesting truncation",
 			"topic", topic, "pid", pid, "replica", replicaID,

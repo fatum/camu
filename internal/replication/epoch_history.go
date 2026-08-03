@@ -33,6 +33,21 @@ func (eh *EpochHistory) Append(entry EpochEntry) {
 	eh.Entries = append(eh.Entries, entry)
 }
 
+// EpochAt returns the leader epoch containing offset. An epoch begins at its
+// StartOffset and remains current until the next entry begins.
+func (eh *EpochHistory) EpochAt(offset uint64) (uint64, bool) {
+	var epoch uint64
+	found := false
+	for _, entry := range eh.Entries {
+		if entry.StartOffset > offset {
+			break
+		}
+		epoch = entry.Epoch
+		found = true
+	}
+	return epoch, found
+}
+
 // CheckDivergence determines whether a follower has divergent data relative to
 // this (leader) epoch history.
 //

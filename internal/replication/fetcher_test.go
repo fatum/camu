@@ -238,7 +238,7 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	}
 }
 
-func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
+func TestFollowerFetcher_TruncationAdoptsEpochAtBoundary(t *testing.T) {
 	requestEpochs := make(chan string, 2)
 	requestOffsets := make(chan string, 2)
 	doneCh := make(chan struct{})
@@ -255,8 +255,8 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 		requestOffsets <- r.Header.Get("X-Replica-Offset")
 
 		if reqNum == 1 {
-			w.Header().Set("X-Truncate-To", "0")
-			w.Header().Set("X-High-Watermark", "0")
+			w.Header().Set("X-Truncate-To", "10")
+			w.Header().Set("X-High-Watermark", "10")
 			w.Header().Set("X-Leader-Epoch", "2")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -266,7 +266,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		w.Header().Set("X-High-Watermark", "0")
+		w.Header().Set("X-High-Watermark", "10")
 		w.Header().Set("X-Leader-Epoch", "2")
 		w.WriteHeader(http.StatusOK)
 		<-r.Context().Done()
@@ -279,7 +279,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 
 	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 	go func() {
-		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 0, "test-node", pm)
+		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 20, 1, "test-node", pm)
 	}()
 
 	select {
@@ -290,19 +290,19 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 	cancel()
 
 	truncated := pm.truncatedOffsets()
-	if len(truncated) == 0 || truncated[0] != 0 {
-		t.Fatalf("expected TruncateLogFrom(0), got %v", truncated)
+	if len(truncated) == 0 || truncated[0] != 10 {
+		t.Fatalf("expected TruncateLogFrom(10), got %v", truncated)
 	}
 
 	firstEpoch := <-requestEpochs
 	firstOffset := <-requestOffsets
 	secondEpoch := <-requestEpochs
 	secondOffset := <-requestOffsets
-	if firstEpoch != "0" || firstOffset != "0" {
-		t.Fatalf("first request headers = epoch %q offset %q, want 0/0", firstEpoch, firstOffset)
+	if firstEpoch != "1" || firstOffset != "20" {
+		t.Fatalf("first request headers = epoch %q offset %q, want 1/20", firstEpoch, firstOffset)
 	}
-	if secondEpoch != "2" || secondOffset != "0" {
-		t.Fatalf("second request headers = epoch %q offset %q, want 2/0", secondEpoch, secondOffset)
+	if secondEpoch != "2" || secondOffset != "10" {
+		t.Fatalf("second request headers = epoch %q offset %q, want 2/10", secondEpoch, secondOffset)
 	}
 }
 

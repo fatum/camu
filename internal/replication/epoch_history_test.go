@@ -25,6 +25,33 @@ func TestEpochHistory_DivergencePoint(t *testing.T) {
 	}
 }
 
+func TestEpochHistory_EpochAt(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{
+		{Epoch: 5, StartOffset: 100},
+		{Epoch: 6, StartOffset: 200},
+		{Epoch: 7, StartOffset: 300},
+	}}
+
+	tests := []struct {
+		offset uint64
+		epoch  uint64
+		found  bool
+	}{
+		{offset: 99},
+		{offset: 100, epoch: 5, found: true},
+		{offset: 199, epoch: 5, found: true},
+		{offset: 200, epoch: 6, found: true},
+		{offset: 299, epoch: 6, found: true},
+		{offset: 300, epoch: 7, found: true},
+	}
+	for _, tt := range tests {
+		got, found := eh.EpochAt(tt.offset)
+		if got != tt.epoch || found != tt.found {
+			t.Errorf("EpochAt(%d) = (%d, %t), want (%d, %t)", tt.offset, got, found, tt.epoch, tt.found)
+		}
+	}
+}
+
 // TestEpochHistory_NoDivergence verifies that a follower at epoch 5, offset
 // 150 is NOT detected as diverged (150 < 200, the start of epoch 6).
 func TestEpochHistory_NoDivergence(t *testing.T) {
