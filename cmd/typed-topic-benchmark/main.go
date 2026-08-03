@@ -645,8 +645,24 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 						errs <- err
 						return
 					}
+					if actual[p].recordsSnapshot() >= expected[p].recordsSnapshot() {
+						errs <- fmt.Errorf("consume HTTP: partition %d received record at offset %d after expected end offset %d", p, m.Offset, expected[p].recordsSnapshot())
+						return
+					}
+					if m.Offset > math.MaxInt64 {
+						errs <- fmt.Errorf("consume HTTP: partition %d offset %d exceeds int64", p, m.Offset)
+						return
+					}
+					if err := validateKafkaRecord(cfg, p, actual[p].recordsSnapshot(), int64(m.Offset), v); err != nil {
+						errs <- fmt.Errorf("%s", strings.Replace(err.Error(), "consume Kafka:", "consume HTTP:", 1))
+						return
+					}
 					actual[p].add(v)
 					progress(1)
+				}
+				if resp.NextOffset != uint64(actual[p].recordsSnapshot()) {
+					errs <- fmt.Errorf("consume HTTP: partition %d next offset gap or reordering: got %d, want %d", p, resp.NextOffset, actual[p].recordsSnapshot())
+					return
 				}
 				off = resp.NextOffset
 				benchmarkLog("consume partition=%d endpoint=%s records=%d next_offset=%d total_records=%d duration=%s", p, partitionClient.base, len(resp.Messages), off, actual[p].recordsSnapshot(), time.Since(started))

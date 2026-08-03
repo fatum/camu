@@ -164,3 +164,49 @@ func TestFirstSequenceForPartitionContinuesAnAppend(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateKafkaRecordRejectsGapsAndReordering(t *testing.T) {
+	cfg := config{Partitions: 4, SequenceStart: 0}
+	if err := validateKafkaRecord(cfg, 1, 2, 2, typedValue{Sequence: 9}); err != nil {
+		t.Fatalf("valid record rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		offset int64
+		value  typedValue
+	}{
+		{name: "offset gap", offset: 3, value: typedValue{Sequence: 9}},
+		{name: "sequence gap", offset: 2, value: typedValue{Sequence: 13}},
+		{name: "sequence reordering", offset: 2, value: typedValue{Sequence: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateKafkaRecord(cfg, 1, 2, tc.offset, tc.value); err == nil {
+				t.Fatal("validateKafkaRecord succeeded, want error")
+			}
+		})
+	}
+}
+
+func TestKafkaPartitionsCompleteRequiresEveryPartition(t *testing.T) {
+	if kafkaPartitionsComplete([]int64{2, 1}, []int64{2, 2}) {
+		t.Fatal("partitions complete despite missing record")
+	}
+	if !kafkaPartitionsComplete([]int64{2, 2}, []int64{2, 2}) {
+		t.Fatal("partitions not complete")
+	}
+}
+
+func TestHTTPConsumeRejectsOffsetAdvancePastRecords(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[{"offset":0,"value":"{\"id\":0,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":0}"}],"next_offset":2}`))
+	}))
+	defer server.Close()
+	cfg := config{BaseURL: server.URL, Topic: "events", Partitions: 1, MessageBytes: 1, ConsumeTimeout: time.Second, RequestTimeout: time.Second}
+	expected := expectedStatesFor(cfg, 1)
+	actual := make([]hashState, 1)
+	_, err := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}.consume(context.Background(), cfg, expected, actual, 1, func(int64) {})
+	if err == nil || !strings.Contains(err.Error(), "next offset gap or reordering") {
+		t.Fatalf("consume error = %v, want next-offset validation failure", err)
+	}
+}

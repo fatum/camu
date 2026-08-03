@@ -125,7 +125,11 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 	var records int64
 	var bytesRead int64
 	partitionRecords := make([]int64, cfg.Partitions)
-	for records < count {
+	partitionExpected := make([]int64, cfg.Partitions)
+	for partition := range partitionExpected {
+		partitionExpected[partition] = expected[partition].recordsSnapshot()
+	}
+	for !kafkaPartitionsComplete(partitionRecords, partitionExpected) {
 		reporter.beginPoll()
 		pollStarted := time.Now()
 		fetches := client.PollFetches(ctx)
@@ -133,7 +137,7 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 			return phaseResult{}, fmt.Errorf("consume Kafka: %v", errs[0].Err)
 		}
 		fetches.EachRecord(func(record *kgo.Record) {
-			if records >= count {
+			if err != nil {
 				return
 			}
 			var value typedValue
@@ -144,6 +148,14 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 			partition := int(record.Partition)
 			if partition < 0 || partition >= len(actual) {
 				err = fmt.Errorf("consume Kafka: invalid partition %d", partition)
+				return
+			}
+			if partitionRecords[partition] >= partitionExpected[partition] {
+				err = fmt.Errorf("consume Kafka: partition %d received record at offset %d after expected end offset %d", partition, record.Offset, partitionExpected[partition])
+				return
+			}
+			if validationErr := validateKafkaRecord(cfg, partition, partitionRecords[partition], record.Offset, value); validationErr != nil {
+				err = validationErr
 				return
 			}
 			actual[partition].add(value)
@@ -176,13 +188,36 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 	duration := time.Since(start)
 	digest := sha256.Sum256(h)
 	return phaseResult{
-		Records:          count,
+		Records:          records,
 		Bytes:            totalBytes,
 		DurationSeconds:  duration.Seconds(),
-		RecordsPerSecond: float64(count) / duration.Seconds(),
+		RecordsPerSecond: float64(records) / duration.Seconds(),
 		BytesPerSecond:   float64(totalBytes) / duration.Seconds(),
 		Digest:           hex.EncodeToString(digest[:]),
 	}, nil
+}
+
+// validateKafkaRecord verifies the benchmark's deterministic mapping before
+// hashing the record. The offset check catches duplicate or skipped Kafka
+// records; the sequence check catches a gap or reordering in the payload.
+func validateKafkaRecord(cfg config, partition int, expectedOffset, offset int64, value typedValue) error {
+	if offset != expectedOffset {
+		return fmt.Errorf("consume Kafka: partition %d offset gap or reordering: got %d, want %d", partition, offset, expectedOffset)
+	}
+	expectedSequence := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions) + expectedOffset*int64(cfg.Partitions)
+	if value.Sequence != expectedSequence {
+		return fmt.Errorf("consume Kafka: partition %d sequence gap or reordering at offset %d: got %d, want %d", partition, offset, value.Sequence, expectedSequence)
+	}
+	return nil
+}
+
+func kafkaPartitionsComplete(actual, expected []int64) bool {
+	for partition := range expected {
+		if actual[partition] != expected[partition] {
+			return false
+		}
+	}
+	return true
 }
 
 const kafkaConsumeLogInterval = time.Second
