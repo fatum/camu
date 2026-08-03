@@ -18,19 +18,29 @@ import (
 
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
-	AppendReplicatedRawBatches(ctx context.Context, topic string, pid int, batches [][]byte) error
+	AppendReplicatedRawBatch(ctx context.Context, topic string, pid int, batch []byte) error
 	TruncateLogFrom(topic string, pid int, offset uint64) error
+	SyncFollowerSealedPrefix(ctx context.Context, topic string, pid int, activeBase uint64) uint64
 	UpdateFollowerProgress(topic string, pid int, leaderEpoch, highWatermark, flushedOffset uint64)
 }
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
-	RawBatches    [][]byte
 	TruncateTo    uint64
 	HasTruncate   bool
 	HighWatermark uint64
 	LeaderEpoch   uint64
 	FlushedOffset uint64
+	ActiveBase    uint64
+}
+
+// fetchedBatches is the outcome of one fetch. Batches are appended while the
+// response body is read, so the follower never holds an entire replica fetch
+// response in memory.
+type fetchedBatches struct {
+	response   FetchResponse
+	lastOffset uint64
+	hasBatches bool
 }
 
 // OnLeaderDown is called when the follower detects leader failure.
@@ -96,7 +106,15 @@ func (f *FollowerFetcher) Run(
 		slog.Debug("fetcher: fetch cycle",
 			"topic", topic, "pid", pid, "offset", localOffset,
 			"epoch", localEpoch, "leader", leaderAddr)
-		resp, err := f.fetchFromLeader(ctx, leaderAddr, topic, pid, localOffset, localEpoch, instanceID)
+		result, err := f.fetchFromLeader(ctx, leaderAddr, topic, pid, localOffset, localEpoch, instanceID, func(batch []byte) error {
+			return pm.AppendReplicatedRawBatch(ctx, topic, pid, batch)
+		})
+		// A response may end after valid batches have been appended. Advance the
+		// local offset before retrying so a broken HTTP stream cannot duplicate
+		// those batches on the next request.
+		if result != nil && result.hasBatches {
+			localOffset = result.lastOffset + 1
+		}
 		if err != nil {
 			isNotReady := strings.Contains(err.Error(), "404")
 			if isNotReady {
@@ -132,6 +150,7 @@ func (f *FollowerFetcher) Run(
 		// Success — reset error tracking.
 		backoff = 100 * time.Millisecond
 		consecutiveErrors = 0
+		resp := &result.response
 
 		// Handle divergence: truncate before appending anything.
 		if resp.HasTruncate {
@@ -147,33 +166,18 @@ func (f *FollowerFetcher) Run(
 			continue
 		}
 
-		// Append new batches (preserving producer metadata for idempotency recovery).
-		if len(resp.RawBatches) > 0 {
-			var first, last uint64
-			for _, batch := range resp.RawBatches {
-				hdr, err := log.ReadRecordBatchHeader(batch)
-				if err != nil {
-					continue
-				}
-				base := uint64(hdr.FirstOffset)
-				end := uint64(hdr.LastOffset())
-				if first == 0 || base < first {
-					first = base
-				}
-				if end > last {
-					last = end
-				}
-			}
-			if err := pm.AppendReplicatedRawBatches(ctx, topic, pid, resp.RawBatches); err != nil {
-				slog.Warn("fetcher: AppendReplicatedRawBatches failed",
-					"topic", topic, "pid", pid, "err", err)
-			} else {
-				slog.Debug("fetcher: replicated raw batches",
-					"topic", topic, "pid", pid,
-					"batch_count", len(resp.RawBatches),
-					"offsets", fmt.Sprintf("%d-%d", first, last),
-					"leader_hw", resp.HighWatermark)
-				localOffset = last + 1
+		if result.hasBatches {
+			slog.Debug("fetcher: replicated raw batches",
+				"topic", topic, "pid", pid,
+				"last_offset", result.lastOffset,
+				"leader_hw", resp.HighWatermark)
+		}
+		if resp.ActiveBase > 0 {
+			// Sealed segments are already durable in shared storage. Do not copy
+			// them from the leader: refresh the local index and resume from the
+			// leader's active-segment base instead.
+			if syncedOffset := pm.SyncFollowerSealedPrefix(ctx, topic, pid, resp.ActiveBase); syncedOffset > localOffset {
+				localOffset = syncedOffset
 			}
 		}
 
@@ -194,7 +198,8 @@ func (f *FollowerFetcher) fetchFromLeader(
 	offset uint64,
 	epoch uint64,
 	instanceID string,
-) (*FetchResponse, error) {
+	appendBatch func([]byte) error,
+) (*fetchedBatches, error) {
 	url := fmt.Sprintf("http://%s/v1/internal/replicate/%s/%d?from_offset=%d",
 		leaderAddr, topic, pid, offset)
 
@@ -221,7 +226,8 @@ func (f *FollowerFetcher) fetchFromLeader(
 		return nil, fmt.Errorf("fetcher: leader returned status %d", httpResp.StatusCode)
 	}
 
-	var fr FetchResponse
+	var result fetchedBatches
+	fr := &result.response
 
 	if v := httpResp.Header.Get("X-Truncate-To"); v != "" {
 		fr.TruncateTo, err = strconv.ParseUint(v, 10, 64)
@@ -248,18 +254,65 @@ func (f *FollowerFetcher) fetchFromLeader(
 			return nil, fmt.Errorf("fetcher: parse X-Flushed-Offset: %w", err)
 		}
 	}
+	if v := httpResp.Header.Get("X-Active-Base"); v != "" {
+		fr.ActiveBase, err = strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("fetcher: parse X-Active-Base: %w", err)
+		}
+	}
 
-	body, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("fetcher: read body: %w", err)
+	if fr.HasTruncate {
+		return &result, nil
 	}
-	if len(body) == 0 {
-		return &fr, nil
+	if appendBatch == nil {
+		return nil, fmt.Errorf("fetcher: append callback is required")
 	}
-	rawBatches, err := log.ReadSegmentBatches(body, offset, 0)
-	if err != nil {
-		return nil, fmt.Errorf("fetcher: parse raw batches: %w", err)
+	if err := readReplicaBatches(httpResp.Body, offset, func(batch []byte, header log.RecordBatchHeader) error {
+		if err := appendBatch(batch); err != nil {
+			return err
+		}
+		result.lastOffset = uint64(header.LastOffset())
+		result.hasBatches = true
+		return nil
+	}); err != nil {
+		return &result, err
 	}
-	fr.RawBatches = rawBatches
-	return &fr, nil
+	return &result, nil
+}
+
+const maxReplicaBatchBytes = 16 << 20
+
+// readReplicaBatches reads the concatenated RecordBatch stream one batch at a
+// time. The protocol is self-framing: each batch has its total length in the
+// first 12 bytes, so no response-sized buffer is needed.
+func readReplicaBatches(r io.Reader, requestedOffset uint64, appendBatch func([]byte, log.RecordBatchHeader) error) error {
+	for {
+		var headerBytes [log.RecordBatchHeaderSize]byte
+		_, err := io.ReadFull(r, headerBytes[:])
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("fetcher: read batch header: %w", err)
+		}
+		header, err := log.ReadRecordBatchHeader(headerBytes[:])
+		if err != nil {
+			return fmt.Errorf("fetcher: parse batch header: %w", err)
+		}
+		batchSize := int(header.RecordBatchSize())
+		if batchSize < log.RecordBatchHeaderSize || batchSize > maxReplicaBatchBytes {
+			return fmt.Errorf("fetcher: invalid replica batch size %d", batchSize)
+		}
+		batch := make([]byte, batchSize)
+		copy(batch, headerBytes[:])
+		if _, err := io.ReadFull(r, batch[log.RecordBatchHeaderSize:]); err != nil {
+			return fmt.Errorf("fetcher: read batch body: %w", err)
+		}
+		if uint64(header.LastOffset()) < requestedOffset {
+			continue
+		}
+		if err := appendBatch(batch, header); err != nil {
+			return fmt.Errorf("fetcher: append raw batch: %w", err)
+		}
+	}
 }

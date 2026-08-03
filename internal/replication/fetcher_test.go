@@ -21,14 +21,12 @@ type mockPartitionManager struct {
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedRawBatches(_ context.Context, _ string, _ int, batches [][]byte) error {
+func (m *mockPartitionManager) AppendReplicatedRawBatch(_ context.Context, _ string, _ int, batch []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, batch := range batches {
-		cp := make([]byte, len(batch))
-		copy(cp, batch)
-		m.appendedRaw = append(m.appendedRaw, cp)
-	}
+	cp := make([]byte, len(batch))
+	copy(cp, batch)
+	m.appendedRaw = append(m.appendedRaw, cp)
 	return nil
 }
 
@@ -37,6 +35,10 @@ func (m *mockPartitionManager) TruncateLogFrom(_ string, _ int, offset uint64) e
 	defer m.mu.Unlock()
 	m.truncatedFrom = append(m.truncatedFrom, offset)
 	return nil
+}
+
+func (m *mockPartitionManager) SyncFollowerSealedPrefix(_ context.Context, _ string, _ int, _ uint64) uint64 {
+	return 0
 }
 
 func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, _ uint64, highWatermark, flushedOffset uint64) {
@@ -62,6 +64,47 @@ func (m *mockPartitionManager) progress() ([]uint64, []uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.highWatermarks, m.flushedOffsets
+}
+
+func TestReadReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
+	first := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("first")}})
+	second := log.EncodeRecordBatch(1, []log.Message{{Offset: 1, Value: []byte("second")}})
+
+	var got [][]byte
+	err := readReplicaBatches(bytes.NewReader(append(first, second...)), 0, func(batch []byte, header log.RecordBatchHeader) error {
+		if len(got) == 0 && header.FirstOffset != 0 {
+			t.Fatalf("first callback offset = %d, want 0", header.FirstOffset)
+		}
+		if len(got) == 1 && header.FirstOffset != 1 {
+			t.Fatalf("second callback offset = %d, want 1", header.FirstOffset)
+		}
+		got = append(got, append([]byte(nil), batch...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("readReplicaBatches() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("callback count = %d, want 2", len(got))
+	}
+	if !bytes.Equal(got[0], first) || !bytes.Equal(got[1], second) {
+		t.Fatal("streamed batches differ from the input")
+	}
+}
+
+func TestReadReplicaBatchesRejectsTruncatedBatch(t *testing.T) {
+	batch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("value")}})
+	called := false
+	err := readReplicaBatches(bytes.NewReader(batch[:len(batch)-1]), 0, func([]byte, log.RecordBatchHeader) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("readReplicaBatches() error = nil, want truncated-body error")
+	}
+	if called {
+		t.Fatal("callback was called for a truncated batch")
+	}
 }
 
 func TestFollowerFetcher_Basic(t *testing.T) {

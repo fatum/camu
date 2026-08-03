@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -649,6 +650,63 @@ func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
 	}
 }
 
+func TestReadReplicaRawBatchesDoesNotServeSealedPrefix(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 10)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	batch := log.EncodeRecordBatch(10, []log.Message{{Key: []byte("tail"), Value: []byte("v")}})
+	if err := as.Append(batch); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.nextOffset = 11
+	ps.mu.Unlock()
+
+	data, logEnd, err := pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadReplicaRawBatches() error = %v", err)
+	}
+	if logEnd != 11 {
+		t.Fatalf("log end = %d, want 11", logEnd)
+	}
+	if len(data) != 0 {
+		t.Fatalf("sealed-prefix read returned %d bytes, want none", len(data))
+	}
+
+	data, _, err = pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 10, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadReplicaRawBatches(active tail) error = %v", err)
+	}
+	if !bytes.Equal(data, batch) {
+		t.Fatal("active tail bytes differ from appended batch")
+	}
+}
+
+func TestSyncFollowerSealedPrefixAdvancesLocalOffsetFromIndex(t *testing.T) {
+	pm := newTestPartitionManager(t)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	ps.mu.Lock()
+	ps.index.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 9, Key: "topic/0/0-9.seg"})
+	ps.nextOffset = 0
+	ps.mu.Unlock()
+
+	if got := pm.SyncFollowerSealedPrefix(context.Background(), "topic", 0, 10); got != 10 {
+		t.Fatalf("SyncFollowerSealedPrefix() = %d, want 10", got)
+	}
+}
+
 func TestReadRawBatches_UnknownTopicReturnsError(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
@@ -849,6 +907,9 @@ func TestUpdateFollowerProgressCompactsOnlyDurableFollowerPrefix(t *testing.T) {
 	if err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{first, second}); err != nil {
 		t.Fatal(err)
 	}
+	ps.mu.Lock()
+	ps.index.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 1, Key: "topic/0/0-1.seg"})
+	ps.mu.Unlock()
 
 	pm.UpdateFollowerProgress("topic", 0, 1, 3, 1)
 	ps.mu.RLock()
@@ -860,6 +921,33 @@ func TestUpdateFollowerProgressCompactsOnlyDurableFollowerPrefix(t *testing.T) {
 	}
 	if flushed != 1 || compacted.BaseOffset() != 2 || compacted.Size() != int64(len(second)) {
 		t.Fatalf("follower segment after compaction = flushed=%d base=%d size=%d", flushed, compacted.BaseOffset(), compacted.Size())
+	}
+}
+
+func TestUpdateFollowerProgressKeepsPrefixUntilIndexIsRefreshed(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatal(err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	seg, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "follower-active"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.activeSegment = seg
+	ps.mu.Unlock()
+	batch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("zero")}, {Offset: 1, Value: []byte("one")}})
+	if err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{batch}); err != nil {
+		t.Fatal(err)
+	}
+
+	pm.UpdateFollowerProgress("topic", 0, 1, 2, 1)
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.activeSegment.BaseOffset() != 0 || ps.activeSegment.Size() == 0 {
+		t.Fatal("follower discarded a prefix before its sealed index was available")
 	}
 }
 
