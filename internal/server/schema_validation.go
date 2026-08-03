@@ -73,11 +73,7 @@ func jsonPathValue(root map[string]any, path string) (any, bool) {
 }
 
 func validTimestamp(v any) bool {
-	s, ok := v.(string)
-	if !ok {
-		return false
-	}
-	_, err := time.Parse(time.RFC3339Nano, s)
+	_, err := parseTimestamp(v)
 	return err == nil
 }
 
@@ -118,13 +114,23 @@ func asBool(v any) (bool, error) {
 	}
 	return b, nil
 }
-func asTimestamp(v any) (string, error) {
+func parseTimestamp(v any) (time.Time, error) {
 	s, err := asString(v)
 	if err != nil {
-		return "", err
+		return time.Time{}, err
 	}
-	if _, err := time.Parse(time.RFC3339Nano, s); err != nil {
-		return "", err
+	timestamp, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, err
 	}
-	return s, nil
+	// time.Time.UnixNano is only defined within this interval. Reject values
+	// outside it while validating, before they can reach either Parquet export
+	// or the schema DLQ path.
+	min := time.Unix(-9223372037, 145224192).UTC()
+	max := time.Unix(9223372036, 854775807).UTC()
+	timestamp = timestamp.UTC()
+	if timestamp.Before(min) || timestamp.After(max) {
+		return time.Time{}, fmt.Errorf("timestamp outside Unix nanosecond range")
+	}
+	return timestamp, nil
 }

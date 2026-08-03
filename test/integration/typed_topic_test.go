@@ -29,7 +29,6 @@ func TestIntegrationTypedTopicExportSQL(t *testing.T) {
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 	c := env.Client()
@@ -89,7 +88,6 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeFailureDLQ(t *testing.T) {
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 
@@ -196,7 +194,6 @@ func TestIntegrationTypedTopicOpaqueKafkaValidValuePhysicalParquet(t *testing.T)
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 	httpClient := env.Client()
@@ -261,7 +258,6 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 	httpClient := env.Client()

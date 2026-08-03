@@ -64,6 +64,7 @@ MIN_IN_SYNC_REPLICAS=3 \
 TARGET_BYTES="$target_bytes" \
 MESSAGE_BYTES="$message_bytes" \
 PARTITIONS="$partitions" \
+EXPORT_ENABLED="${EXPORT_ENABLED:-true}" \
 OUTPUT="$output" \
   "$repo_dir/scripts/typed-topic-benchmark.sh" &
 benchmark_pid=$!

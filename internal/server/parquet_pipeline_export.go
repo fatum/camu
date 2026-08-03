@@ -161,7 +161,7 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		// leader reassignment must converge on the same immutable source-range
 		// object rather than creating one object per epoch.
 		objectKey = parquetPipelineObjectKey(tc.Name, identity.Partition, ingestTime, valid[0].Offset, valid[len(valid)-1].Offset)
-		data, err := writeParquetChunk(valid, tc.Schema, s.cfg.Maintenance.ParquetExport.TempDirectoryValue())
+		data, err := writeParquetChunk(valid, tc.Schema)
 		if err != nil {
 			result = "encode_error"
 			slog.Warn("parquet_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "records", len(valid), "error", err)

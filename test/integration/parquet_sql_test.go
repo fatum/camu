@@ -75,7 +75,6 @@ func TestIntegrationProduceThenSQLQuery(t *testing.T) {
 			cfg.SQL.Enabled = &enabled
 			cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
 			cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
-			cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 		}),
 	)
 	defer env.Cleanup()
@@ -202,7 +201,6 @@ func TestIntegrationSQLPaginationDrainsMoreThanDefaultLimit(t *testing.T) {
 			cfg.SQL.Enabled = &sqlEnabled
 			cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
 			cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
-			cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 		}),
 	)
 	defer env.Cleanup()
@@ -310,7 +308,6 @@ func TestIntegrationStreamExportRetentionThenQueryRole(t *testing.T) {
 			cfg.SQL.Enabled = &sqlEnabled
 			cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "stream-sql-cache")
 			cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "stream-sql-tmp")
-			cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 			cfg.Segments.MaxAge = "100ms"
 			// These are normal production scheduler settings, shortened to keep
 			// this integration lifecycle bounded without a test-only tick hook.
@@ -421,7 +418,6 @@ func testIntegrationProduceThenExportThenQuery(t *testing.T, topic string, produ
 			cfg.SQL.Enabled = &sqlEnabled
 			cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
 			cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
-			cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 		}),
 	)
 	defer env.Cleanup()
@@ -543,7 +539,6 @@ func TestIntegrationSQLQueryAggregation(t *testing.T) {
 			cfg.SQL.Enabled = &enabled
 			cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
 			cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
-			cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 		}),
 	)
 	defer env.Cleanup()
@@ -646,7 +641,6 @@ func TestIntegrationSQLQueryCompactionRoundTrip(t *testing.T) {
 			cfg.SQL.Enabled = &enabled
 			cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "sql-cache")
 			cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "sql-tmp")
-			cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 		}),
 	)
 	defer env.Cleanup()

@@ -65,6 +65,7 @@ variable "vpc_cidr" {
 }
 
 variable "droplet_size" {
-  type    = string
-  default = "s-2vcpu-4gb"
+  description = "DigitalOcean droplet plan for each benchmark node."
+  type        = string
+  default     = "s-4vcpu-8gb"
 }

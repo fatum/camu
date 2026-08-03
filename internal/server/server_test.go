@@ -28,7 +28,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func newTestServer(t *testing.T) *Server {
+func newTestServer(t testing.TB) *Server {
 	t.Helper()
 
 	s3Client, err := storage.NewS3Client(storage.S3Config{
@@ -2828,7 +2828,7 @@ func TestInitProducer(t *testing.T) {
 	}
 }
 
-func setupTestTopicAndOwnership(t *testing.T, s *Server) {
+func setupTestTopicAndOwnership(t testing.TB, s *Server) {
 	t.Helper()
 	tc := meta.TopicConfig{
 		Name: "test-topic", Partitions: 1, Retention: time.Hour,

@@ -27,9 +27,8 @@ type MaintenanceConfig struct {
 
 // ParquetExportConfig controls the per-partition Parquet export consumer.
 type ParquetExportConfig struct {
-	MaxRecords    int    `yaml:"max_records"`
-	MaxDuration   string `yaml:"max_duration"`
-	TempDirectory string `yaml:"temp_directory"`
+	MaxRecords  int    `yaml:"max_records"`
+	MaxDuration string `yaml:"max_duration"`
 }
 
 func (p ParquetExportConfig) MaxRecordsValue() int {
@@ -44,12 +43,6 @@ func (p ParquetExportConfig) MaxDurationValue() time.Duration {
 		return 30 * time.Second
 	}
 	return d
-}
-func (p ParquetExportConfig) TempDirectoryValue() string {
-	if p.TempDirectory == "" {
-		return "/var/lib/camu/parquet-tmp"
-	}
-	return p.TempDirectory
 }
 
 type SQLConfig struct {

@@ -74,6 +74,25 @@ func TestParseByteSizeRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestLoadConfigExportEnabled(t *testing.T) {
+	t.Setenv("EXPORT_ENABLED", "false")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ExportEnabled {
+		t.Fatal("ExportEnabled = true, want false")
+	}
+}
+
+func TestLoadConfigRejectsSQLWithoutExport(t *testing.T) {
+	t.Setenv("EXPORT_ENABLED", "false")
+	t.Setenv("BENCHMARK_OPERATION", "sql")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig() succeeded, want an error")
+	}
+}
+
 func TestClientRequestUsesRequestTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
