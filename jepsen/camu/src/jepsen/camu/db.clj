@@ -107,8 +107,13 @@
   (reify db/DB
     (setup! [_ test node]
       (info "Setting up camu on" node)
-      (c/exec :mkdir :-p "/opt/camu"
-              (str camu-data "/cache"))
+      ;; start-stop-daemon uses :chdir below, so create the exact working
+      ;; directory explicitly before starting Camu. Creating only its cache
+      ;; child through a multi-argument control command was not reliable in
+      ;; the Docker harness and left the daemon with no working directory.
+      (c/exec :mkdir :-p "/opt/camu")
+      (c/exec :mkdir :-p camu-data)
+      (c/exec :mkdir :-p (str camu-data "/cache"))
       ;; Upload the camu binary and verify the remote file is present before startup.
       (upload-camu-binary! test)
       ;; Write config

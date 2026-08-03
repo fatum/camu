@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -825,5 +826,51 @@ func TestUpdateFollowerProgressDoesNotAdvertiseUnreplicatedOffsets(t *testing.T)
 	defer ps.mu.RUnlock()
 	if ps.followerHW != 100 {
 		t.Fatalf("follower high watermark = %d, want local log end 100", ps.followerHW)
+	}
+}
+
+func TestUpdateFollowerProgressCompactsOnlyDurableFollowerPrefix(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatal(err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	seg, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "follower-active"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.activeSegment = seg
+	ps.mu.Unlock()
+	now := time.Now().UnixMilli()
+	first := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Timestamp: now, Value: []byte("zero")}, {Offset: 1, Timestamp: now, Value: []byte("one")}})
+	second := log.EncodeRecordBatch(2, []log.Message{{Offset: 2, Timestamp: now, Value: []byte("two")}})
+	if err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{first, second}); err != nil {
+		t.Fatal(err)
+	}
+
+	pm.UpdateFollowerProgress("topic", 0, 1, 3, 1)
+	ps.mu.RLock()
+	compacted := ps.activeSegment
+	flushed := ps.flushedOffset
+	ps.mu.RUnlock()
+	if compacted == nil {
+		t.Fatal("follower active segment is nil after compaction")
+	}
+	if flushed != 1 || compacted.BaseOffset() != 2 || compacted.Size() != int64(len(second)) {
+		t.Fatalf("follower segment after compaction = flushed=%d base=%d size=%d", flushed, compacted.BaseOffset(), compacted.Size())
+	}
+}
+
+func TestNewestActiveSegmentBaseOffsetPrefersCompactedTail(t *testing.T) {
+	dir := t.TempDir()
+	for _, offset := range []int64{0, 20} {
+		if err := os.WriteFile(filepath.Join(dir, log.SegmentFilename(offset)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := newestActiveSegmentBaseOffset(dir, 0); got != 20 {
+		t.Fatalf("active segment base = %d, want compacted tail 20", got)
 	}
 }

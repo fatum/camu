@@ -39,12 +39,48 @@ func NewDiskCache(dir string, maxSize int64) (*DiskCache, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("disk cache: create dir %s: %w", dir, err)
 	}
+	// Cache keys are held only in memory, so files from a previous process
+	// cannot be looked up or included in the new LRU. Remove those hashed cache
+	// objects now rather than allowing unreachable files to accumulate forever.
+	// Leave non-cache entries alone: callers may keep durable local state in a
+	// sibling directory under the same cache root.
+	if err := removeStaleCacheFiles(dir); err != nil {
+		return nil, err
+	}
 	return &DiskCache{
 		dir:     dir,
 		maxSize: maxSize,
 		order:   list.New(),
 		index:   make(map[string]*list.Element),
 	}, nil
+}
+
+func removeStaleCacheFiles(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("disk cache: list %s: %w", dir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !isCacheFilename(entry.Name()) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("disk cache: remove stale entry %s: %w", entry.Name(), err)
+		}
+	}
+	return nil
+}
+
+func isCacheFilename(name string) bool {
+	if len(name) != sha256.Size*2 {
+		return false
+	}
+	for _, ch := range name {
+		if !(ch >= '0' && ch <= '9') && !(ch >= 'a' && ch <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // hashKey converts an arbitrary string key into a hex-encoded SHA256 filename.

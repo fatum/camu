@@ -180,6 +180,9 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	if instanceID == "" {
 		instanceID = uuid.NewString()
 	}
+	if err := cleanupSQLFilesystem(cfg.SQL.CacheDirectoryValue(), cfg.SQL.TempDirectoryValue()); err != nil {
+		return nil, fmt.Errorf("clean local SQL filesystem: %w", err)
+	}
 
 	s := &Server{
 		cfg:              cfg,

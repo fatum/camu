@@ -1,6 +1,8 @@
 package log
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -98,5 +100,42 @@ func TestDiskCache_Eviction(t *testing.T) {
 	}
 	if string(got) != string(data2) {
 		t.Errorf("key2 data mismatch after eviction")
+	}
+}
+
+func TestNewDiskCacheRemovesStaleFilesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	stalePath := filepath.Join(dir, hashKey("old-segment"))
+	if err := os.WriteFile(stalePath, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	localDir := filepath.Join(dir, "local")
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(localDir, "active.log")
+	if err := os.WriteFile(localPath, []byte("durable local state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(dir, "do-not-delete")
+	if err := os.WriteFile(markerPath, []byte("marker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := NewDiskCache(dir, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache.Has("old-segment") {
+		t.Fatal("stale cache key was restored into the new process")
+	}
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("stale cache file remains: %v", err)
+	}
+	if _, err := os.Stat(localPath); err != nil {
+		t.Fatalf("local state was removed: %v", err)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("non-cache file was removed: %v", err)
 	}
 }

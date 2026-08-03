@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -101,6 +102,18 @@ func TestParquetChunkCleanupRemovesTemporaryFile(t *testing.T) {
 	chunk.cleanup()
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temporary Parquet file remains after cleanup: %v", err)
+	}
+}
+
+func TestServerEncodeParquetChunkUsesConfiguredTempDirectory(t *testing.T) {
+	s := newTestServer(t)
+	chunk, err := s.encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":1}`)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chunk.cleanup()
+	if filepath.Dir(chunk.file.Name()) != s.cfg.SQL.TempDirectoryValue() {
+		t.Fatalf("chunk directory = %s, want %s", filepath.Dir(chunk.file.Name()), s.cfg.SQL.TempDirectoryValue())
 	}
 }
 

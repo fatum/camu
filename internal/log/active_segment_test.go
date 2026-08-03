@@ -67,6 +67,43 @@ func TestActiveSegment_AppendAndIndex(t *testing.T) {
 	}
 }
 
+func TestActiveSegment_CompactThroughRetainsUndurableTail(t *testing.T) {
+	dir := t.TempDir()
+	seg, err := OpenActiveSegment(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seg.Close()
+	first := EncodeRecordBatch(0, []Message{{Offset: 0, Value: []byte("zero")}, {Offset: 1, Value: []byte("one")}})
+	second := EncodeRecordBatch(2, []Message{{Offset: 2, Value: []byte("two")}, {Offset: 3, Value: []byte("three")}})
+	if err := seg.Append(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := seg.Append(second); err != nil {
+		t.Fatal(err)
+	}
+
+	compacted, changed, err := seg.CompactThrough(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compacted.Close()
+	if !changed || compacted.BaseOffset() != 2 || compacted.Size() != int64(len(second)) {
+		t.Fatalf("compaction = changed=%t base=%d size=%d", changed, compacted.BaseOffset(), compacted.Size())
+	}
+	if _, err := os.Stat(filepath.Join(dir, SegmentFilename(0))); !os.IsNotExist(err) {
+		t.Fatalf("durable prefix file remains: %v", err)
+	}
+	data := make([]byte, len(second))
+	if _, err := compacted.ReadAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeRecordBatch(data)
+	if err != nil || len(decoded) != 2 || decoded[0].Offset != 2 || decoded[1].Offset != 3 {
+		t.Fatalf("compacted records = %+v, err=%v", decoded, err)
+	}
+}
+
 func TestActiveSegment_ReadAt(t *testing.T) {
 	dir := t.TempDir()
 	seg, err := OpenActiveSegment(dir, 0)
@@ -405,9 +442,9 @@ func TestActiveSegmentLookupOffset(t *testing.T) {
 	}
 
 	tests := []struct {
-		offset     int64
-		wantFound  bool
-		wantBase   int64
+		offset    int64
+		wantFound bool
+		wantBase  int64
 	}{
 		{0, true, 0},
 		{1, true, 0},

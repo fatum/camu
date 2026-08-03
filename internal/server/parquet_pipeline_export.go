@@ -126,7 +126,7 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		return
 	}
 
-	chunk, err := encodeParquetChunk(messages, tc.Schema)
+	chunk, err := s.encodeParquetChunk(messages, tc.Schema)
 	if err != nil {
 		result = "encode_error"
 		slog.Warn("parquet_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "records", len(messages), "error", err)

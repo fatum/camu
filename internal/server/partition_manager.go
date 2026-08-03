@@ -56,14 +56,7 @@ func (pm *PartitionManager) ensureActiveSegment(topic string, partitionID int) e
 
 	dir := pm.activeSegmentDir(topic, partitionID)
 	baseOffset := int64(nextOffset)
-	if matches, err := filepath.Glob(filepath.Join(dir, "*.log")); err == nil && len(matches) > 0 {
-		name := filepath.Base(matches[0])
-		if len(name) > len(".log") {
-			if parsed, err := strconv.ParseInt(name[:len(name)-len(".log")], 10, 64); err == nil {
-				baseOffset = parsed
-			}
-		}
-	}
+	baseOffset = newestActiveSegmentBaseOffset(dir, baseOffset)
 
 	seg, err := log.OpenActiveSegment(dir, baseOffset)
 	if err != nil {
@@ -85,6 +78,31 @@ func (pm *PartitionManager) ensureActiveSegment(topic string, partitionID int) e
 		ps.nextOffset = uint64(segNext)
 	}
 	return nil
+}
+
+// newestActiveSegmentBaseOffset selects the newest active tail after an
+// interrupted local compaction. During compaction both the old prefix-bearing
+// file and the newly installed tail can briefly exist; the latter has the
+// higher base offset and is the only one that should be reopened.
+func newestActiveSegmentBaseOffset(dir string, fallback int64) int64 {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil {
+		return fallback
+	}
+	newest := fallback
+	found := false
+	for _, match := range matches {
+		name := filepath.Base(match)
+		if len(name) <= len(".log") {
+			continue
+		}
+		parsed, err := strconv.ParseInt(name[:len(name)-len(".log")], 10, 64)
+		if err == nil && (!found || parsed > newest) {
+			newest = parsed
+			found = true
+		}
+	}
+	return newest
 }
 
 func (pm *PartitionManager) activeSegmentLogEnd(topic string, partitionID int) (uint64, bool) {
@@ -1078,6 +1096,19 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 	}
 	if flushedOffset > ps.flushedOffset {
 		ps.flushedOffset = flushedOffset
+	}
+	// Followers retain only the replicated tail which is not yet durable in the
+	// leader's S3 segment index. They must never invoke the leader flush path:
+	// that would create redundant S3 uploads. Once the leader advertises a
+	// flushed offset, compact the local active file through that durable prefix.
+	if !ps.isLeader && ps.activeSegment != nil && ps.flushedOffset > 0 {
+		compacted, changed, err := ps.activeSegment.CompactThrough(int64(ps.flushedOffset))
+		if err != nil {
+			slog.Warn("follower_active_segment_compaction_failed", "topic", topic, "partition", partitionID, "flushed_offset", ps.flushedOffset, "error", err)
+		} else if changed {
+			ps.activeSegment = compacted
+			slog.Info("follower_active_segment_compacted", "topic", topic, "partition", partitionID, "flushed_offset", ps.flushedOffset, "active_base_offset", compacted.BaseOffset(), "active_size_bytes", compacted.Size())
+		}
 	}
 	ps.mu.Unlock()
 }

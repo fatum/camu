@@ -122,6 +122,10 @@ func writeParquetChunk(messages []log.Message, schema *meta.TopicSchema) ([]byte
 	return data, nil
 }
 
+func (s *Server) encodeParquetChunk(messages []log.Message, schema *meta.TopicSchema) (parquetChunk, error) {
+	return encodeParquetChunkInDir(s.cfg.SQL.TempDirectoryValue(), messages, schema)
+}
+
 // parquetChunk is the result of converting one committed source range. Failed
 // typed records are deliberately kept separate from the Parquet rows: callers
 // must make their DLQ durable before they can checkpoint the source range.
@@ -148,7 +152,16 @@ func (c parquetChunk) cleanup() {
 // not retain a second []log.Message containing every valid record. This keeps
 // the source reader's batch as the only full in-memory source range.
 func encodeParquetChunk(messages []log.Message, schema *meta.TopicSchema) (parquetChunk, error) {
-	file, err := os.CreateTemp("", "camu-parquet-*.parquet")
+	return encodeParquetChunkInDir("", messages, schema)
+}
+
+func encodeParquetChunkInDir(dir string, messages []log.Message, schema *meta.TopicSchema) (parquetChunk, error) {
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return parquetChunk{}, fmt.Errorf("create parquet temp directory: %w", err)
+		}
+	}
+	file, err := os.CreateTemp(dir, "camu-parquet-*.parquet")
 	if err != nil {
 		return parquetChunk{}, fmt.Errorf("create parquet temp file: %w", err)
 	}
