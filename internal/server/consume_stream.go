@@ -2,159 +2,55 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"sort"
 
 	logstore "github.com/maksim/camu/internal/log"
 )
 
-// readMessagesPage reads one bounded page before the HTTP response begins. This
-// keeps failures from an S3 sidecar or range read representable as an HTTP
-// error instead of truncating a started JSON document.
-func (s *Server) readMessagesPage(ctx context.Context, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) ([]consumedMessage, uint64, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+const httpConsumeFetchBytes = 4 << 20
 
-	var readableHW uint64
-	if ps != nil {
-		ps.mu.RLock()
-		hw, ok := readableHighWatermark(ps)
-		ps.mu.RUnlock()
-		if ok {
-			readableHW = hw
-		}
+// readMessagesPage shares the committed raw-batch reader used by Kafka. HTTP
+// only decodes the bounded result into its JSON representation.
+func (s *Server) readMessagesPage(ctx context.Context, topicName string, partitionID int, startOffset uint64, limit int) ([]consumedMessage, uint64, error) {
+	raw, _, err := s.partitionManager.ReadRawBatches(ctx, topicName, partitionID, int64(startOffset), httpConsumeFetchBytes)
+	if err != nil {
+		return nil, startOffset, fmt.Errorf("read committed batches: %w", err)
+	}
+	msgs, err := logstore.ReadSegmentBatchesAsMessages(raw, startOffset, 0)
+	if err != nil {
+		return nil, startOffset, fmt.Errorf("decode committed batches: %w", err)
+	}
+	// A newly active segment can overlap its sealed predecessor after a leader
+	// change. Raw batches preserve that overlap for Kafka; JSON presents one
+	// message per offset, preferring the later (active) batch.
+	byOffset := make(map[uint64]logstore.Message, len(msgs))
+	for _, msg := range msgs {
+		byOffset[msg.Offset] = msg
+	}
+	msgOffsets := make([]uint64, 0, len(byOffset))
+	for offset := range byOffset {
+		msgOffsets = append(msgOffsets, offset)
+	}
+	sort.Slice(msgOffsets, func(i, j int) bool { return msgOffsets[i] < msgOffsets[j] })
+	if len(msgOffsets) > limit {
+		msgOffsets = msgOffsets[:limit]
 	}
 
-	segmentIter := startConsumeIterator(ctx, func(visit func(logstore.Message) bool) error {
-		_, err := s.fetcher.Walk(ctx, index, topicName, partitionID, startOffset, limit, visit)
-		return err
-	})
-
-	// Active segment iterator: reads raw RecordBatch bytes from the in-memory
-	// active segment and decodes them into messages. Data written via
-	// AppendRawBatch lives here until the segment is sealed and flushed to S3.
-	var activeIter *consumeIterator
-	if ps != nil {
-		ps.mu.RLock()
-		activeSeg := ps.activeSegment
-		ps.mu.RUnlock()
-		if activeSeg != nil {
-			activeIter = startConsumeIterator(ctx, func(visit func(logstore.Message) bool) error {
-				offsetIdx := activeSeg.OffsetIndex()
-				for _, entry := range offsetIdx {
-					if readableHW > 0 && uint64(entry.BaseOffset) >= readableHW {
-						break
-					}
-					if uint64(entry.LastOffset) < startOffset {
-						continue
-					}
-					if entry.BatchSize <= 0 || entry.Position < 0 {
-						continue
-					}
-					buf := make([]byte, entry.BatchSize)
-					n, err := activeSeg.ReadAt(buf, entry.Position)
-					if err != nil && n < int(entry.BatchSize) {
-						break
-					}
-					msgs, err := logstore.DecodeRecordBatch(buf[:n])
-					if err != nil {
-						break
-					}
-					for _, m := range msgs {
-						if m.Offset < startOffset {
-							continue
-						}
-						if readableHW > 0 && m.Offset >= readableHW {
-							return nil
-						}
-						if !visit(m) {
-							return nil
-						}
-					}
-				}
-				return nil
-			})
-		}
-	}
-
-	messages := make([]consumedMessage, 0, limit)
-	nextOffset := startOffset
-	writeMsg := func(m logstore.Message) error {
-		messages = append(messages, consumedMessage{
-			Offset:    m.Offset,
-			Timestamp: m.Timestamp,
-			Key:       string(m.Key),
-			Value:     tryString(m.Value),
-			Headers:   m.Headers,
+	result := make([]consumedMessage, 0, len(msgOffsets))
+	for _, offset := range msgOffsets {
+		msg := byOffset[offset]
+		result = append(result, consumedMessage{
+			Offset:    msg.Offset,
+			Timestamp: msg.Timestamp,
+			Key:       string(msg.Key),
+			Value:     tryString(msg.Value),
+			Headers:   msg.Headers,
 		})
-		nextOffset = m.Offset + 1
-		return nil
 	}
-
-	// pickLowest returns the message with the lowest offset from all non-nil
-	// sources, popping the chosen iterator. Returns nil when all are exhausted.
-	pickLowest := func() (*logstore.Message, error) {
-		segMsg, err := segmentIter.peek()
-		if err != nil {
-			return nil, err
-		}
-		var activeMsg *logstore.Message
-		if activeIter != nil {
-			activeMsg, err = activeIter.peek()
-			if err != nil {
-				return nil, err
-			}
-		}
-		// Find the candidate with the lowest offset. When offsets tie,
-		// prefer active > sealed (active data is fresher).
-		type candidate struct {
-			msg  *logstore.Message
-			pop  func()
-			prio int // lower = prefer when offsets tie
-		}
-		candidates := []candidate{
-			{activeMsg, func() { activeIter.pop() }, 0},
-			{segMsg, func() { segmentIter.pop() }, 1},
-		}
-
-		var best *candidate
-		for i := range candidates {
-			c := &candidates[i]
-			if c.msg == nil {
-				continue
-			}
-			if best == nil || c.msg.Offset < best.msg.Offset || (c.msg.Offset == best.msg.Offset && c.prio < best.prio) {
-				best = c
-			}
-		}
-		if best == nil {
-			return nil, nil
-		}
-
-		msg := best.msg
-		chosenOffset := msg.Offset
-		best.pop()
-
-		// Pop duplicates at the same offset from other iterators.
-		for i := range candidates {
-			c := &candidates[i]
-			if c.msg != nil && c.msg.Offset == chosenOffset && c.msg != msg {
-				c.pop()
-			}
-		}
-		return msg, nil
+	nextOffset := startOffset
+	if len(msgOffsets) > 0 {
+		nextOffset = msgOffsets[len(msgOffsets)-1] + 1
 	}
-
-	for len(messages) < limit {
-		msg, err := pickLowest()
-		if err != nil {
-			return nil, startOffset, err
-		}
-		if msg == nil {
-			break
-		}
-		if err := writeMsg(*msg); err != nil {
-			return nil, startOffset, err
-		}
-	}
-
-	return messages, nextOffset, nil
+	return result, nextOffset, nil
 }

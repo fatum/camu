@@ -41,6 +41,24 @@ func TestDiskCache_Miss(t *testing.T) {
 	}
 }
 
+func TestDiskCache_ReadRange(t *testing.T) {
+	cache, err := NewDiskCache(t.TempDir(), 1024*1024)
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+	if err := cache.Put("segment", []byte("0123456789")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	data, err := cache.ReadRange("segment", 3, 4)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if got, want := string(data), "3456"; got != want {
+		t.Errorf("ReadRange = %q, want %q", got, want)
+	}
+}
+
 func TestDiskCache_Eviction(t *testing.T) {
 	dir := t.TempDir()
 	cache, err := NewDiskCache(dir, 100) // 100 byte limit

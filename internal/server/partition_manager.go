@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -1287,48 +1288,18 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 				break
 			}
 
-			// Read sealed segment data from S3/disk cache.
-			segData, err := pm.readSealedSegmentData(ctx, ref)
-			if err != nil {
-				slog.Warn("ReadRawBatches: failed to read sealed segment",
-					"topic", topic, "partition", pid,
-					"segment_key", ref.Key, "error", err)
-				break
-			}
-
-			// Use the sidecar offset index to seek directly to the
-			// approximate position instead of scanning from byte 0.
-			startPos := 0
-			if sidecarData, err := pm.readSealedSegmentSidecar(ctx, ref); err == nil {
-				if entries, _, err := log.ReadSidecar(sidecarData); err == nil {
-					if pos, ok := log.LookupSidecarPosition(entries, currentOffset); ok {
-						startPos = int(pos)
-					}
+			for currentOffset <= int64(ref.EndOffset) && remaining > 0 {
+				nextOffset, err := pm.appendSealedRawBatches(ctx, ref, currentOffset, upperBound, maxBytes, &out)
+				if err != nil {
+					slog.Warn("ReadRawBatches: failed to read sealed segment range",
+						"topic", topic, "partition", pid, "segment_key", ref.Key, "error", err)
+					break
 				}
-			}
-
-			// Sealed segment data IS raw RecordBatch bytes back-to-back.
-			// Slice out batches directly — no decoding or re-encoding needed.
-			rawBatches, err := log.ReadSegmentBatchesFromPosition(segData, startPos, uint64(currentOffset), 0)
-			if err != nil {
-				slog.Warn("ReadRawBatches: failed to parse sealed segment batches",
-					"topic", topic, "partition", pid,
-					"segment_key", ref.Key, "error", err)
-				break
-			}
-
-			for _, batch := range rawBatches {
-				// Always include at least one batch even if it exceeds remaining.
-				if len(out) > 0 && len(out)+len(batch) > maxBytes {
-					goto done
+				if nextOffset <= currentOffset {
+					break
 				}
-				out = append(out, batch...)
+				currentOffset = nextOffset
 				remaining = maxBytes - len(out)
-				// Parse the header to advance currentOffset past this batch.
-				hdr, hErr := log.ReadRecordBatchHeader(batch)
-				if hErr == nil {
-					currentOffset = hdr.LastOffset() + 1
-				}
 			}
 		}
 	}
@@ -1411,8 +1382,96 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 		}
 	}
 
-done:
 	return out, upperBound, nil
+}
+
+const maxSealedSegmentRangeReadBytes = 4 << 20
+
+// appendSealedRawBatches appends complete Kafka RecordBatches from one sealed
+// segment. The sidecar lets us fetch only the requested contiguous range rather
+// than loading the full (up to 64 MiB) object into memory.
+func (pm *PartitionManager) appendSealedRawBatches(ctx context.Context, ref log.SegmentRef, startOffset, upperBound int64, maxBytes int, out *[]byte) (int64, error) {
+	sidecarData, err := pm.readSealedSegmentSidecar(ctx, ref)
+	if err != nil {
+		return startOffset, err
+	}
+	entries, _, err := log.ReadSidecar(sidecarData)
+	if err != nil {
+		return startOffset, err
+	}
+	start := sort.Search(len(entries), func(i int) bool { return entries[i].LastOffset >= startOffset })
+	if start == len(entries) {
+		return int64(ref.EndOffset) + 1, nil
+	}
+
+	end := start
+	rangeBytes := int64(0)
+	for end < len(entries) {
+		entry := entries[end]
+		if entry.BaseOffset >= upperBound || entry.BatchSize <= 0 {
+			break
+		}
+		batchBytes := int64(entry.BatchSize)
+		if end > start && (rangeBytes+batchBytes > maxSealedSegmentRangeReadBytes || len(*out)+int(rangeBytes+batchBytes) > maxBytes) {
+			break
+		}
+		rangeBytes += batchBytes
+		end++
+	}
+	if end == start {
+		return startOffset, nil
+	}
+
+	data, err := pm.readSealedSegmentRange(ctx, ref, entries[start].Position, rangeBytes)
+	if err != nil {
+		return startOffset, err
+	}
+	position := int64(0)
+	nextOffset := startOffset
+	for _, entry := range entries[start:end] {
+		batchSize := int64(entry.BatchSize)
+		if position+batchSize > int64(len(data)) {
+			return startOffset, fmt.Errorf("short segment range: got %d bytes, need %d", len(data), position+batchSize)
+		}
+		batch := data[position : position+batchSize]
+		position += batchSize
+		hdr, err := log.ReadRecordBatchHeader(batch)
+		if err != nil {
+			return startOffset, err
+		}
+		if hdr.LastOffset() < startOffset {
+			continue
+		}
+		if hdr.FirstOffset >= upperBound {
+			break
+		}
+		if len(*out) > 0 && len(*out)+len(batch) > maxBytes {
+			break
+		}
+		*out = append(*out, batch...)
+		nextOffset = hdr.LastOffset() + 1
+	}
+	return nextOffset, nil
+}
+
+func (pm *PartitionManager) readSealedSegmentRange(ctx context.Context, ref log.SegmentRef, offset, length int64) ([]byte, error) {
+	if pm.diskCache != nil {
+		data, err := pm.diskCache.ReadRange(ref.Key, offset, length)
+		if err == nil {
+			return data, nil
+		}
+		if !errors.Is(err, log.ErrCacheMiss) {
+			return nil, err
+		}
+	}
+	if pm.s3Client == nil {
+		return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+	}
+	data, err := pm.s3Client.GetRange(ctx, ref.Key, offset, length)
+	if err != nil {
+		return nil, fmt.Errorf("s3 range get %s: %w", ref.Key, err)
+	}
+	return data, nil
 }
 
 // readSealedSegmentData reads a sealed segment's data from disk cache or S3.

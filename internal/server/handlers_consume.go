@@ -142,7 +142,7 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 		"high_watermark", readableHW,
 	)
 
-	messages, nextOffset, err := s.readMessagesPage(r.Context(), topicName, partitionID, startOffset, limit, index, ps)
+	messages, nextOffset, err := s.readMessagesPage(r.Context(), topicName, partitionID, startOffset, limit)
 	if err != nil {
 		slog.Error("consume_failed", "topic", topicName, "partition", partitionID, "offset", startOffset, "error", err)
 		writeError(w, http.StatusServiceUnavailable, "consume source unavailable")

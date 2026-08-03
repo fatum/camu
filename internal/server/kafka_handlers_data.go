@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -92,7 +93,9 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 	return resp, nil
 }
 
-func (ks *KafkaServer) handleFetch(req *kmsg.FetchRequest) (kmsg.Response, error) {
+const maxKafkaFetchPartitionBytes = 4 << 20
+
+func (ks *KafkaServer) handleFetch(ctx context.Context, req *kmsg.FetchRequest) (kmsg.Response, error) {
 	resp := kmsg.NewPtrFetchResponse()
 	setKafkaResponseVersion(resp, req.GetVersion())
 
@@ -107,7 +110,13 @@ func (ks *KafkaServer) handleFetch(req *kmsg.FetchRequest) (kmsg.Response, error
 
 			errorCode := ks.partitionError(topic.Topic, int(partition.Partition))
 			if errorCode == 0 && ks.cfg.FetchRawBatchesFunc != nil {
-				raw, hw, err := ks.cfg.FetchRawBatchesFunc(context.Background(), topic.Topic, int(partition.Partition), int64(partition.FetchOffset), int(partition.PartitionMaxBytes))
+				maxBytes := int(partition.PartitionMaxBytes)
+				if maxBytes <= 0 || maxBytes > maxKafkaFetchPartitionBytes {
+					maxBytes = maxKafkaFetchPartitionBytes
+				}
+				started := time.Now()
+				raw, hw, err := ks.cfg.FetchRawBatchesFunc(ctx, topic.Topic, int(partition.Partition), int64(partition.FetchOffset), maxBytes)
+				ks.observeKafkaFetch(len(raw), time.Since(started), err)
 				if err != nil {
 					errorCode = mapKafkaError(err)
 				} else {
@@ -138,4 +147,17 @@ func (ks *KafkaServer) handleFetch(req *kmsg.FetchRequest) (kmsg.Response, error
 	}
 
 	return resp, nil
+}
+
+func (ks *KafkaServer) observeKafkaFetch(bytes int, duration time.Duration, err error) {
+	if ks.cfg.Metrics == nil {
+		return
+	}
+	labels := map[string]string{"result": "ok"}
+	if err != nil {
+		labels["result"] = "error"
+		ks.cfg.Metrics.Inc("camu_kafka_fetch_errors_total", "Kafka fetch partition errors", nil)
+	}
+	ks.cfg.Metrics.Add("camu_kafka_fetch_bytes_total", "Kafka fetch bytes returned", labels, float64(bytes))
+	ks.cfg.Metrics.Observe("camu_kafka_fetch_duration", "Kafka fetch partition duration", labels, duration)
 }

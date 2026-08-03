@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +14,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func (ks *KafkaServer) HandleRequest(_ context.Context, req kmsg.Request) (resp kmsg.Response, err error) {
+func (ks *KafkaServer) HandleRequest(ctx context.Context, req kmsg.Request) (resp kmsg.Response, err error) {
 	started := time.Now()
 	defer func() {
 		if ks.cfg.Metrics == nil {
@@ -84,7 +85,7 @@ func (ks *KafkaServer) HandleRequest(_ context.Context, req kmsg.Request) (resp 
 	case *kmsg.ProduceRequest:
 		return ks.handleProduce(req)
 	case *kmsg.FetchRequest:
-		return ks.handleFetch(req)
+		return ks.handleFetch(ctx, req)
 	default:
 		return nil, fmt.Errorf("unsupported API key: %d", req.Key())
 	}
@@ -130,7 +131,9 @@ func (ks *KafkaServer) HandleConn(conn net.Conn, _ net.Listener) {
 			return
 		}
 
-		resp, err := ks.HandleRequest(context.Background(), req)
+		ctx, cancel := context.WithCancel(context.Background())
+		resp, err := ks.HandleRequest(ctx, req)
+		cancel()
 		if err != nil {
 			ks.log.Debug("kafka handle", "key", req.Key(), "error", err)
 			return
@@ -265,16 +268,24 @@ func newKafkaRequest(apiKey, apiVersion int16) (kmsg.Request, error) {
 func writeKafkaResponse(w io.Writer, correlationID int32, req kmsg.Request, resp kmsg.Response) error {
 	setKafkaResponseVersion(resp, req.GetVersion())
 
-	payload := make([]byte, 0, 8+1+len(resp.AppendTo(nil)))
+	// kmsg serialises into the supplied slice, so precomputing its size by
+	// calling AppendTo(nil) would encode every response twice.
+	payload := make([]byte, 0, 256)
 	payload = kbin.AppendInt32(payload, correlationID)
 	if req.IsFlexible() && req.Key() != 18 {
 		payload = append(payload, 0)
 	}
 	payload = resp.AppendTo(payload)
 
-	var frame []byte
-	frame = kbin.AppendInt32(frame, int32(len(payload)))
-	frame = append(frame, payload...)
-	_, err := w.Write(frame)
-	return err
+	var frameLen [4]byte
+	binary.BigEndian.PutUint32(frameLen[:], uint32(len(payload)))
+	buffers := net.Buffers{frameLen[:], payload}
+	n, err := buffers.WriteTo(w)
+	if err != nil {
+		return err
+	}
+	if n != int64(len(frameLen)+len(payload)) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
