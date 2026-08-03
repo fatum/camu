@@ -63,7 +63,12 @@ func EncodeRecordBatch(baseOffset int64, msgs []Message) []byte {
 func EncodeRecordBatchWithMeta(baseOffset int64, batch Batch) []byte {
 	msgs := batch.Messages
 	// 1. Encode individual records.
-	var recordsBuf []byte
+	// The HTTP and Kafka produce paths already have all message sizes available.
+	// Reserve the aggregate payload once and reuse one scratch record buffer;
+	// allocating a separate growing []byte per record used to dominate produce
+	// allocation volume for medium and large batches.
+	recordsBuf := make([]byte, 0, estimateRecordBatchPayloadSize(msgs))
+	var recordScratch []byte
 	var lastOffsetDelta int32
 	var firstTimestamp, maxTimestamp int64
 
@@ -82,9 +87,9 @@ func EncodeRecordBatchWithMeta(baseOffset int64, batch Batch) []byte {
 			}
 		}
 
-		rec := appendKafkaRecord(nil, offsetDelta, tsDelta, msg.Key, msg.Value, msg.Headers)
-		recordsBuf = kbin.AppendVarint(recordsBuf, int32(len(rec)))
-		recordsBuf = append(recordsBuf, rec...)
+		recordScratch = appendKafkaRecord(recordScratch[:0], offsetDelta, tsDelta, msg.Key, msg.Value, msg.Headers)
+		recordsBuf = kbin.AppendVarint(recordsBuf, int32(len(recordScratch)))
+		recordsBuf = append(recordsBuf, recordScratch...)
 	}
 
 	numRecords := int32(len(msgs))
@@ -141,6 +146,20 @@ func EncodeRecordBatchWithMeta(baseOffset int64, batch Batch) []byte {
 	binary.BigEndian.PutUint32(buf[17:21], crc)
 
 	return buf
+}
+
+// estimateRecordBatchPayloadSize deliberately overestimates the Kafka record
+// framing. It avoids repeated aggregate-buffer growth without affecting the
+// encoded bytes on the wire.
+func estimateRecordBatchPayloadSize(msgs []Message) int {
+	size := 0
+	for _, msg := range msgs {
+		size += len(msg.Key) + len(msg.Value) + 32
+		for key, value := range msg.Headers {
+			size += len(key) + len(value) + 10
+		}
+	}
+	return size
 }
 
 // DecodeRecordBatch decodes a complete Kafka v2 RecordBatch and returns the

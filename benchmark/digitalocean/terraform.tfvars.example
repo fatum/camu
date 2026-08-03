@@ -1,4 +1,5 @@
 digitalocean_token = ""
+benchmark_auth_token = ""
 spaces_access_key  = ""
 spaces_secret_key  = ""
 spaces_bucket_name = "replace-with-a-globally-unique-name"

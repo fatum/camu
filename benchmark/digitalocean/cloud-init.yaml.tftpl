@@ -22,6 +22,8 @@ runcmd:
       kafka_port: 9092
       kafka_advertise_address: "$public_ip:9092"
       mode: stream
+      auth_token: "${benchmark_auth_token}"
+      heap_profile_enabled: true
     sql:
       enabled: true
     storage:

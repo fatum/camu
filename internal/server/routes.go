@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"time"
 )
@@ -16,8 +17,11 @@ func (s *Server) publicRoutes() http.Handler {
 func (s *Server) publicAPIHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	if s.cfg.Server.HeapProfileEnabled && s.cfg.Server.AuthToken != "" {
+		mux.Handle("GET /v1/debug/heap", s.requireBearerAuth(http.HandlerFunc(s.handleHeapProfile), "camu-debug"))
+	}
 	if s.cfg.SQL.EnabledValue(s.isQueryMode()) {
-		mux.Handle("POST /v1/sql", s.requireSQLAuth(http.HandlerFunc(s.handleSQLQuery)))
+		mux.Handle("POST /v1/sql", s.requireBearerAuth(http.HandlerFunc(s.handleSQLQuery), "camu-sql"))
 	}
 	if s.isQueryMode() {
 		mux.HandleFunc("GET /v1/ready", s.handleReady)
@@ -45,7 +49,7 @@ func (s *Server) publicAPIHandler() http.Handler {
 	return mux
 }
 
-func (s *Server) requireSQLAuth(next http.Handler) http.Handler {
+func (s *Server) requireBearerAuth(next http.Handler, realm string) http.Handler {
 	token := s.cfg.Server.AuthToken
 	if token == "" {
 		return next
@@ -54,12 +58,21 @@ func (s *Server) requireSQLAuth(next http.Handler) http.Handler {
 		const prefix = "Bearer "
 		auth := r.Header.Get("Authorization")
 		if len(auth) <= len(prefix) || auth[:len(prefix)] != prefix || auth[len(prefix):] != token {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="camu-sql"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+realm+`"`)
 			writeError(w, http.StatusUnauthorized, "valid bearer token required")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleHeapProfile(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="heap.pb.gz"`)
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(w); err != nil {
+		slog.Error("heap_profile_failed", "error", err)
+	}
 }
 
 // PublicHandler returns the server's public API handler.

@@ -3,6 +3,18 @@ variable "digitalocean_token" {
   sensitive = true
 }
 
+variable "benchmark_auth_token" {
+  description = "Bearer token for benchmark SQL and authenticated heap-profile capture."
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._~-]*$", var.benchmark_auth_token))
+    error_message = "benchmark_auth_token may contain only letters, digits, dot, underscore, tilde, or hyphen."
+  }
+}
+
 variable "spaces_access_key" {
   type      = string
   sensitive = true

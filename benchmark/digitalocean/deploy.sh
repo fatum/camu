@@ -11,7 +11,13 @@ if [[ -f .env ]]; then
 fi
 
 ssh_user="${SSH_USER:-root}"
+benchmark_auth_token="${BENCHMARK_AUTH_TOKEN:-${TF_VAR_benchmark_auth_token:-}}"
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+
+if [[ -n "$benchmark_auth_token" && ! "$benchmark_auth_token" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+  echo "BENCHMARK_AUTH_TOKEN must contain only letters, digits, dot, underscore, tilde, or hyphen" >&2
+  exit 2
+fi
 
 wait_for_ssh() {
   local ip="$1"
@@ -40,11 +46,27 @@ wait_for_ready() {
 restart_camu() {
   local ip="$1"
   local image="$2"
+  local auth_token="$3"
   echo "Deploying ${image} to ${ip}..." >&2
   wait_for_ssh "$ip"
-  ssh "${ssh_opts[@]}" "${ssh_user}@${ip}" /bin/sh -s -- "$image" <<'REMOTE'
+  ssh "${ssh_opts[@]}" "${ssh_user}@${ip}" /bin/sh -s -- "$image" "$auth_token" <<'REMOTE'
 set -eu
 image="$1"
+auth_token="$2"
+config=/etc/camu/benchmark.yaml
+config_tmp="$(mktemp)"
+awk -v auth_token="$auth_token" '
+  /^      auth_token:/ { next }
+  /^      heap_profile_enabled:/ { next }
+  {
+    print
+    if ($0 ~ /^      mode: stream$/) {
+      print "      auth_token: \"" auth_token "\""
+      print "      heap_profile_enabled: true"
+    }
+  }
+' "$config" >"$config_tmp"
+mv "$config_tmp" "$config"
 docker pull gcr.io/cadvisor/cadvisor:v0.49.2
 docker rm -f cadvisor 2>/dev/null || true
 docker run -d --name cadvisor --restart unless-stopped --privileged --device=/dev/kmsg -p 8082:8080 \
@@ -71,5 +93,5 @@ echo "Using published image: ${image}" >&2
 terraform init
 ips_json="$(terraform output -json public_ips)"
 while IFS= read -r ip; do
-  restart_camu "$ip" "$image"
+  restart_camu "$ip" "$image" "$benchmark_auth_token"
 done < <(printf '%s' "$ips_json" | jq -r 'to_entries | sort_by(.key) | .[].value')

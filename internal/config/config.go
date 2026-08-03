@@ -94,6 +94,7 @@ type ServerConfig struct {
 	InternalAddress       string `yaml:"internal_address"`
 	InstanceID            string `yaml:"instance_id"`
 	AuthToken             string `yaml:"auth_token"`              // Public API bearer token (optional)
+	HeapProfileEnabled    bool   `yaml:"heap_profile_enabled"`    // Authenticated heap-profile endpoint (disabled by default)
 	ClusterToken          string `yaml:"cluster_token"`           // Internal API shared secret (optional)
 	KafkaPort             int    `yaml:"kafka_port"`              // Kafka protocol port (0 = disabled)
 	KafkaAdvertiseAddress string `yaml:"kafka_advertise_address"` // Public Kafka host:port override (optional)

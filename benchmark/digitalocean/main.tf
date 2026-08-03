@@ -97,15 +97,16 @@ resource "digitalocean_droplet" "camu" {
   ipv6       = true
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tftpl", {
-    node_name          = each.key
-    camu_image         = var.camu_image
-    digitalocean_token = var.digitalocean_token
-    registry_endpoint  = digitalocean_container_registry.benchmark.endpoint
-    bucket_name        = digitalocean_spaces_bucket.benchmark.name
-    vpc_cidr           = var.vpc_cidr
-    spaces_region      = var.spaces_region
-    spaces_access_key  = var.spaces_access_key
-    spaces_secret_key  = var.spaces_secret_key
+    node_name            = each.key
+    camu_image           = var.camu_image
+    digitalocean_token   = var.digitalocean_token
+    benchmark_auth_token = var.benchmark_auth_token
+    registry_endpoint    = digitalocean_container_registry.benchmark.endpoint
+    bucket_name          = digitalocean_spaces_bucket.benchmark.name
+    vpc_cidr             = var.vpc_cidr
+    spaces_region        = var.spaces_region
+    spaces_access_key    = var.spaces_access_key
+    spaces_secret_key    = var.spaces_secret_key
   })
 
   tags = ["camu", "benchmark"]

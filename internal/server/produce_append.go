@@ -18,22 +18,23 @@ import (
 // If the active segment is unavailable, it falls back to the generic native
 // append path that performs the same conversion through log.Batch.
 func (s *Server) appendHTTPMessagesAsRecordBatch(ctx context.Context, ps *partitionState, topic string, partitionID int, msgs []log.Message) ([]uint64, error) {
-	stamped := make([]log.Message, len(msgs))
-	copy(stamped, msgs)
+	// HTTP handlers construct this batch for this append, so it is safe to
+	// stamp it in place. Avoiding a second []log.Message copy is material for
+	// large HTTP requests.
 	now := time.Now().UnixMilli()
-	for i := range stamped {
-		if stamped[i].Timestamp == 0 {
-			stamped[i].Timestamp = now
+	for i := range msgs {
+		if msgs[i].Timestamp == 0 {
+			msgs[i].Timestamp = now
 		}
 	}
-	rawBatch := log.EncodeRecordBatch(0, stamped)
+	rawBatch := log.EncodeRecordBatch(0, msgs)
 
 	if s.isTopicDiskless(ctx, topic) {
 		result, err := s.disklessEngine.Produce(ctx, topic, partitionID, rawBatch)
 		if err != nil {
 			return nil, err
 		}
-		offsets := make([]uint64, len(stamped))
+		offsets := make([]uint64, len(msgs))
 		for i := range offsets {
 			offsets[i] = uint64(result.BaseOffset) + uint64(i)
 		}
@@ -42,7 +43,7 @@ func (s *Server) appendHTTPMessagesAsRecordBatch(ctx context.Context, ps *partit
 
 	baseOffset, err := s.partitionManager.AppendRawBatch(ctx, topic, partitionID, rawBatch)
 	if err == nil {
-		offsets := make([]uint64, len(stamped))
+		offsets := make([]uint64, len(msgs))
 		for i := range offsets {
 			offsets[i] = uint64(baseOffset) + uint64(i)
 		}
@@ -54,7 +55,7 @@ func (s *Server) appendHTTPMessagesAsRecordBatch(ctx context.Context, ps *partit
 	// Active segment not ready — fall back to the standard append path.
 	slog.Debug("produce_active_segment_fallback",
 		"topic", topic, "partition", partitionID, "err", err)
-	return s.partitionManager.appendBatchToPS(ps, topic, partitionID, stamped)
+	return s.partitionManager.appendBatchToPS(ps, topic, partitionID, msgs)
 }
 
 // isRawBatchUnavailable reports whether err indicates that AppendRawBatch

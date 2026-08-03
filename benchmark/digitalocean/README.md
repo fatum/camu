@@ -105,6 +105,17 @@ verification, and the `sql` operation is unavailable.
 `REQUEST_TIMEOUT` bounds every HTTP request (default `30s`); `CONSUME_TIMEOUT`
 bounds the whole consume operation (default `10m`).
 
+## Heap profiles
+
+Set `TF_VAR_benchmark_auth_token` in the ignored `.env`, provision or deploy
+the image, then run with `HEAP_PROFILE=1`. Alternatively, set
+`HEAP_PROFILE_TOKEN` and `CAMU_AUTH_TOKEN` explicitly when running the
+benchmark. `deploy.sh` applies the token and enables the endpoint during its
+rolling restart, without recreating droplets. After the benchmark, `run.sh`
+takes one authenticated heap snapshot from each node and uploads it under
+`telemetry/<run-id>/heap-profiles/` in Spaces. Profiles are binary pprof data
+and may contain retained application strings; keep the bucket private.
+
 Start local benchmark monitoring separately when you need live metrics and
 logs:
 

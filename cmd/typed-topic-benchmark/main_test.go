@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,6 +17,51 @@ func TestTargetRecordCount(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("count(%d,%d)=%d, want %d", tc.target, tc.size, got, tc.want)
 		}
+	}
+}
+
+func TestKafkaConsumeProgressLogsAtBoundedCadence(t *testing.T) {
+	var expected [2]hashState
+	for sequence := int64(0); sequence < 3; sequence++ {
+		expected[0].add(typedValue{Sequence: sequence, PayloadBytes: 1})
+	}
+	for sequence := int64(3); sequence < 5; sequence++ {
+		expected[1].add(typedValue{Sequence: sequence, PayloadBytes: 1})
+	}
+	var lines []string
+	started := time.Date(2026, time.August, 3, 12, 0, 0, 0, time.UTC)
+	reporter := newKafkaConsumeProgress(config{KafkaBrokers: []string{"broker-a:9092", "broker-b:9092"}, Topic: "events", Partitions: 2}, expected[:], 5, started, func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	})
+	reporter.startup()
+	if len(lines) != 3 || !strings.Contains(lines[0], "brokers=broker-a:9092,broker-b:9092") {
+		t.Fatalf("startup lines = %v", lines)
+	}
+
+	reporter.beginPoll()
+	reporter.record(0, 11)
+	reporter.record(0, 12)
+	reporter.poll(started.Add(500*time.Millisecond), 10*time.Millisecond, 2, 2048, []int64{2, 0})
+	if len(lines) != 3 {
+		t.Fatalf("logs before cadence interval = %v", lines)
+	}
+	reporter.beginPoll()
+	reporter.record(0, 11)
+	reporter.record(0, 12)
+	reporter.poll(started.Add(time.Second), 10*time.Millisecond, 2, 2048, []int64{2, 0})
+	if len(lines) != 5 || !strings.Contains(lines[3], "records=2/5 bytes=2048") || !strings.Contains(lines[4], "partition=0") || !strings.Contains(lines[4], "last_offset=12 fetch_records=2") {
+		t.Fatalf("progress lines = %v", lines)
+	}
+	reporter.beginPoll()
+	reporter.poll(started.Add(2*time.Second), 120*time.Millisecond, 2, 2048, []int64{2, 0})
+	if len(lines) != 7 || !strings.Contains(lines[6], "empty poll") {
+		t.Fatalf("empty-poll lines = %v", lines)
+	}
+	reporter.beginPoll()
+	reporter.record(1, 4)
+	reporter.poll(started.Add(3*time.Second), kafkaConsumeSlowPollThreshold, 3, 3072, []int64{2, 1})
+	if len(lines) != 10 || !strings.Contains(lines[9], "slow poll") || !strings.Contains(lines[9], "fetch_records=1") {
+		t.Fatalf("slow-poll lines = %v", lines)
 	}
 }
 

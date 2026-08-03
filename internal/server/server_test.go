@@ -507,6 +507,18 @@ func TestSQLAuthTokenAllowsValidCredential(t *testing.T) {
 	}
 }
 
+func TestHeapProfileRequiresAuth(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.Server.AuthToken = "secret"
+	s.cfg.Server.HeapProfileEnabled = true
+	req := httptest.NewRequest(http.MethodGet, "/v1/debug/heap", nil)
+	rec := httptest.NewRecorder()
+	s.PublicHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing auth status = %d", rec.Code)
+	}
+}
+
 func TestHandleSQLQueryAdmitsScopeResolutionThroughSQLLimiter(t *testing.T) {
 	s := newTestServer(t)
 	s.sqlLimiter = make(chan struct{}, 1)
