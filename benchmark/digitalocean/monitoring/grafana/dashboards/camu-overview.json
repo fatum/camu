@@ -1,0 +1,19 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}, "gridPos": {"h": 7, "w": 6, "x": 0, "y": 0}, "id": 1, "options": {"colorMode": "value", "graphMode": "area", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}, "targets": [{"expr": "sum(up{job=\"camu\"})", "refId": "A"}], "title": "Reachable Camu nodes", "type": "stat"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []}, "gridPos": {"h": 7, "w": 9, "x": 6, "y": 0}, "id": 2, "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}}, "targets": [{"expr": "sum by (instance) (container_memory_working_set_bytes{container_label_io_camu_component=\"server\"})", "legendFormat": "container {{instance}}", "refId": "A"}, {"expr": "camu_runtime_heap_alloc_bytes", "legendFormat": "Go heap {{instance}}", "refId": "B"}], "title": "Camu memory by node", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}, "gridPos": {"h": 7, "w": 9, "x": 15, "y": 0}, "id": 3, "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}}, "targets": [{"expr": "sum by (instance) (rate(container_cpu_usage_seconds_total{container_label_io_camu_component=\"server\"}[1m]))", "legendFormat": "{{instance}}", "refId": "A"}], "title": "Camu CPU cores by node", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7}, "id": 4, "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}}, "targets": [{"expr": "max by (topic, partition, instance) (camu_parquet_export_pipeline_lag_records)", "legendFormat": "{{topic}}/{{partition}} {{instance}}", "refId": "A"}], "title": "Parquet export lag", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7}, "id": 5, "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}}, "targets": [{"expr": "sum by (operation, instance) (rate(camu_s3_operations_total{result=\"error\"}[1m]))", "legendFormat": "S3 {{operation}} {{instance}}", "refId": "A"}, {"expr": "sum by (topic, partition, instance) (rate(camu_parquet_export_pipeline_sink_failures_total[1m]))", "legendFormat": "export {{topic}}/{{partition}} {{instance}}", "refId": "B"}], "title": "S3 and exporter failures / second", "type": "timeseries"},
+    {"datasource": {"type": "loki", "uid": "loki"}, "gridPos": {"h": 10, "w": 24, "x": 0, "y": 15}, "id": 6, "options": {"dedupStrategy": "none", "enableLogDetails": true, "prettifyJSON": false, "showCommonLabels": false, "showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true}, "targets": [{"expr": "{job=~\"camu|kernel|docker-state\"}", "refId": "A"}], "title": "Camu, kernel, and Docker logs from all benchmark nodes", "type": "logs"}
+  ],
+  "schemaVersion": 41,
+  "tags": ["camu", "benchmark"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "title": "Camu benchmark overview",
+  "uid": "camu-benchmark-overview",
+  "version": 1
+}
