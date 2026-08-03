@@ -33,6 +33,29 @@ func (eh *EpochHistory) Append(entry EpochEntry) {
 	eh.Entries = append(eh.Entries, entry)
 }
 
+// Ensure appends entry only when its epoch is not already recorded. Epoch
+// boundaries are immutable: callers receiving an authoritative history must
+// never create a second boundary for the same epoch.
+func (eh *EpochHistory) Ensure(entry EpochEntry) error {
+	for _, existing := range eh.Entries {
+		if existing.Epoch != entry.Epoch {
+			continue
+		}
+		if existing.StartOffset != entry.StartOffset {
+			return fmt.Errorf("epoch %d has conflicting boundaries %d and %d", entry.Epoch, existing.StartOffset, entry.StartOffset)
+		}
+		return nil
+	}
+	if n := len(eh.Entries); n > 0 {
+		previous := eh.Entries[n-1]
+		if entry.Epoch <= previous.Epoch || entry.StartOffset < previous.StartOffset {
+			return fmt.Errorf("epoch boundary %d@%d is not after %d@%d", entry.Epoch, entry.StartOffset, previous.Epoch, previous.StartOffset)
+		}
+	}
+	eh.Entries = append(eh.Entries, entry)
+	return nil
+}
+
 // EpochAt returns the leader epoch containing offset. An epoch begins at its
 // StartOffset and remains current until the next entry begins.
 func (eh *EpochHistory) EpochAt(offset uint64) (uint64, bool) {

@@ -357,7 +357,6 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	ps.isLeader = false
 	ps.leaderID = req.Leader
 	ps.replicaState = nil
-	ps.epoch = req.Epoch
 	localOffset := ps.nextOffset
 	localEpoch := ps.epoch
 	fetchDone := make(chan struct{})

@@ -39,12 +39,12 @@ func newTestServerForBecomeLeader(t *testing.T) (*Server, *PartitionManager) {
 	isrStore := replication.NewISRStore(s3Client)
 
 	srv := &Server{
-		cfg:          cfg,
-		s3Client:     s3Client,
-		topicStore:   topicStore,
-		isrStore:     isrStore,
-		instanceID:   "node-A",
-		myPartitions: make(map[string]map[int]localPartitionAssignment),
+		cfg:              cfg,
+		s3Client:         s3Client,
+		topicStore:       topicStore,
+		isrStore:         isrStore,
+		instanceID:       "node-A",
+		myPartitions:     make(map[string]map[int]localPartitionAssignment),
 		partitionManager: pm,
 	}
 	return srv, pm
@@ -126,6 +126,39 @@ func TestBecomeLeader_SetsPartitionState(t *testing.T) {
 	}
 	if ps.nextOffset < 2 {
 		t.Errorf("nextOffset = %d, want >= 2", ps.nextOffset)
+	}
+}
+
+func TestBecomeLeaderPreservesRecoveredISRLocalTail(t *testing.T) {
+	srv, pm := newTestServerForBecomeLeader(t)
+	topic := "orders"
+	tc := meta.TopicConfig{Name: topic, Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1}
+	ctx := context.Background()
+	if err := srv.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	if err := pm.ensureActiveSegment(topic, 0); err != nil {
+		t.Fatalf("ensure active: %v", err)
+	}
+	ps := pm.GetPartitionState(topic, 0)
+	if err := ps.activeSegment.Append(log.EncodeRecordBatch(0, []log.Message{{Offset: 0}, {Offset: 1}, {Offset: 2}})); err != nil {
+		t.Fatalf("append tail: %v", err)
+	}
+	ps.nextOffset = 3
+	req := pushAssignmentRequest{Topic: topic, Partition: 0, Leader: "node-A", Epoch: 2, HW: 1, Replicas: []string{"node-A"}, EpochHistory: []coordination.EpochEntry{{Epoch: 1, StartOffset: 0}, {Epoch: 2, StartOffset: 1}}}
+	if err := srv.becomeLeader(ctx, topic, 0, req); err != nil {
+		t.Fatalf("becomeLeader: %v", err)
+	}
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.nextOffset != 3 || ps.index.HighWatermark() != 3 {
+		t.Fatalf("next/HW = %d/%d, want 3/3", ps.nextOffset, ps.index.HighWatermark())
+	}
+	if got := ps.epochHistory.Entries; len(got) != 2 || got[1].Epoch != 2 || got[1].StartOffset != 1 {
+		t.Fatalf("epoch history = %+v, want controller boundaries", got)
 	}
 }
 

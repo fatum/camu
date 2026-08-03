@@ -51,8 +51,8 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	// 4. Recover the true local log end from native storage.
 	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
 
-	// 5. Set HW from controller's pushed value, ensuring it doesn't fall
-	// below what is already locally visible.
+	// 5. Recover the most advanced local ISR tail. The persisted controller HW
+	// is asynchronous and can lag acknowledged replicated writes.
 	recoveredHW := req.HW
 	ps.mu.RLock()
 	indexNext := ps.index.NextOffset()
@@ -69,8 +69,20 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	for _, entry := range req.EpochHistory {
 		eh.Append(replication.EpochEntry{Epoch: entry.Epoch, StartOffset: entry.StartOffset})
 	}
-	// Append this epoch's entry.
-	eh.Append(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd})
+	// Controller history usually already records this epoch. Do not create a
+	// duplicate boundary when it does.
+	hasCurrentEpoch := false
+	for _, entry := range eh.Entries {
+		if entry.Epoch == req.Epoch {
+			hasCurrentEpoch = true
+			break
+		}
+	}
+	if !hasCurrentEpoch {
+		if err := eh.Ensure(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd}); err != nil {
+			return fmt.Errorf("validate controller epoch history: %w", err)
+		}
+	}
 
 	// 7. Final state update under ps.mu.Lock.
 	ps.mu.Lock()

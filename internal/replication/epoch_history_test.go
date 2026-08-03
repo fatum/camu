@@ -52,6 +52,22 @@ func TestEpochHistory_EpochAt(t *testing.T) {
 	}
 }
 
+func TestEpochHistoryEnsureRejectsConflictingOrOutOfOrderEntries(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{{Epoch: 1, StartOffset: 0}}}
+	if err := eh.Ensure(EpochEntry{Epoch: 1, StartOffset: 0}); err != nil {
+		t.Fatalf("Ensure same boundary: %v", err)
+	}
+	if err := eh.Ensure(EpochEntry{Epoch: 1, StartOffset: 1}); err == nil {
+		t.Fatal("expected conflicting boundary error")
+	}
+	if err := eh.Ensure(EpochEntry{Epoch: 2, StartOffset: 10}); err != nil {
+		t.Fatalf("Ensure next boundary: %v", err)
+	}
+	if err := eh.Ensure(EpochEntry{Epoch: 3, StartOffset: 9}); err == nil {
+		t.Fatal("expected out-of-order boundary error")
+	}
+}
+
 // TestEpochHistory_NoDivergence verifies that a follower at epoch 5, offset
 // 150 is NOT detected as diverged (150 < 200, the start of epoch 6).
 func TestEpochHistory_NoDivergence(t *testing.T) {

@@ -306,6 +306,50 @@ func TestFollowerFetcher_TruncationAdoptsEpochAtBoundary(t *testing.T) {
 	}
 }
 
+func TestFollowerFetcher_TruncationCanLowerEpoch(t *testing.T) {
+	requestEpochs := make(chan string, 2)
+	doneCh := make(chan struct{})
+	var requests int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		reqNum := requests
+		mu.Unlock()
+		requestEpochs <- r.Header.Get("X-Replica-Epoch")
+		if reqNum == 1 {
+			w.Header().Set("X-Truncate-To", "0")
+			w.Header().Set("X-Leader-Epoch", "2")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case doneCh <- struct{}{}:
+		default:
+		}
+		w.Header().Set("X-Leader-Epoch", "2")
+		w.WriteHeader(http.StatusOK)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	pm := &mockPartitionManager{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil).Run(ctx, "topic", 0, srv.Listener.Addr().String(), 4, 9, "node", pm)
+
+	select {
+	case <-doneCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for second fetch")
+	}
+	cancel()
+	if first, second := <-requestEpochs, <-requestEpochs; first != "9" || second != "2" {
+		t.Fatalf("request epochs = %q, %q, want 9, 2", first, second)
+	}
+}
+
 func TestFollowerFetcher_AppliesRawRecordBatches(t *testing.T) {
 	raw := log.EncodeRecordBatch(10, []log.Message{
 		{Offset: 10, Value: []byte("hello")},

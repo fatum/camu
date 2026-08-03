@@ -26,12 +26,13 @@ type PartitionManager interface {
 
 // FetchResponse holds parsed response from leader.
 type FetchResponse struct {
-	TruncateTo    uint64
-	HasTruncate   bool
-	HighWatermark uint64
-	LeaderEpoch   uint64
-	FlushedOffset uint64
-	ActiveBase    uint64
+	TruncateTo     uint64
+	HasTruncate    bool
+	HighWatermark  uint64
+	LeaderEpoch    uint64
+	HasLeaderEpoch bool
+	FlushedOffset  uint64
+	ActiveBase     uint64
 }
 
 // fetchedBatches is the outcome of one fetch. Batches are appended while the
@@ -159,7 +160,10 @@ func (f *FollowerFetcher) Run(
 					"topic", topic, "pid", pid, "truncateTo", resp.TruncateTo, "err", err)
 			}
 			localOffset = resp.TruncateTo
-			if resp.LeaderEpoch > localEpoch {
+			if resp.HasLeaderEpoch {
+				// The leader chose this exact epoch for the truncation boundary.
+				// It may be lower when a follower reports an epoch unknown to the
+				// leader, so this is deliberately not a monotonic update.
 				localEpoch = resp.LeaderEpoch
 			}
 			pm.UpdateFollowerProgress(topic, pid, localEpoch, resp.HighWatermark, resp.FlushedOffset)
@@ -247,6 +251,7 @@ func (f *FollowerFetcher) fetchFromLeader(
 		if err != nil {
 			return nil, fmt.Errorf("fetcher: parse X-Leader-Epoch: %w", err)
 		}
+		fr.HasLeaderEpoch = true
 	}
 	if v := httpResp.Header.Get("X-Flushed-Offset"); v != "" {
 		fr.FlushedOffset, err = strconv.ParseUint(v, 10, 64)

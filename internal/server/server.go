@@ -1224,7 +1224,19 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 			}
 		}
 	}
-	eh.Append(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd})
+	hasCurrentEpoch := false
+	for _, entry := range eh.Entries {
+		if entry.Epoch == pa.LeaderEpoch {
+			hasCurrentEpoch = true
+			break
+		}
+	}
+	if !hasCurrentEpoch {
+		if err := eh.Ensure(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
+			slog.Error("initPartitionAsLeader: invalid epoch history", "topic", topic, "partition", pid, "error", err)
+			return
+		}
+	}
 	ps.mu.Lock()
 	// TOCTOU re-check: another goroutine may have promoted this partition
 	// while we were doing heavy work (local recovery, index refresh).
@@ -1251,8 +1263,6 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	// HW recovery:
 	// rf=1: everything in the local log is committed, so HW = log end.
 	// rf>1: recover from the most advanced local/persisted view, capped at log end.
-	// Persisted HW metadata can lag a follower's local tail on reassignment; if we drop
-	// back to the stale persisted value, the next flush truncates a safe prefix.
 	recoveredHW := logEnd
 	if topicCfg.ReplicationFactor > 1 {
 		ps.mu.RLock()

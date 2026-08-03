@@ -548,8 +548,17 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 		_ = os.RemoveAll(pm.activeSegmentDir(topic, partitionID))
 	}
 
-	// 3. Write current epoch to sidecar file.
-	if err := fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", epoch)), 0o644); err != nil {
+	// Followers do not own a lease, so their requested epoch is zero. Preserve
+	// the epoch recorded with a recovered active tail: it is the epoch the
+	// follower must report to its new leader for a precise divergence check.
+	// Resetting it to zero fences the entire unflushed tail on every restart.
+	localEpoch := epoch
+	if localEpoch == 0 && prevEpoch > 0 {
+		localEpoch = prevEpoch
+	}
+
+	// 3. Write the effective local epoch to the sidecar file.
+	if err := fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", localEpoch)), 0o644); err != nil {
 		return nil, fmt.Errorf("write epoch sidecar: %w", err)
 	}
 
@@ -573,7 +582,7 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 	return &partitionState{
 		index:         idx,
 		nextOffset:    nextOffset,
-		epoch:         epoch,
+		epoch:         localEpoch,
 		flushedOffset: flushedOffset,
 		producerSeqs:  make(map[uint64]*producerPartitionState),
 	}, nil

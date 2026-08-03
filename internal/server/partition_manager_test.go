@@ -707,6 +707,32 @@ func TestSyncFollowerSealedPrefixAdvancesLocalOffsetFromIndex(t *testing.T) {
 	}
 }
 
+func TestInitPartitionPreservesRecoveredFollowerEpoch(t *testing.T) {
+	pm := newTestPartitionManager(t)
+	partitionDir := pm.localPartitionDir("topic", 0)
+	if err := os.MkdirAll(partitionDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(partitionDir, "epoch"), []byte("4"), 0o644); err != nil {
+		t.Fatalf("write epoch sidecar: %v", err)
+	}
+
+	ps, err := pm.initPartition(context.Background(), "topic", 0, 0)
+	if err != nil {
+		t.Fatalf("initPartition: %v", err)
+	}
+	if ps.epoch != 4 {
+		t.Fatalf("epoch = %d, want recovered follower epoch 4", ps.epoch)
+	}
+	epochData, err := os.ReadFile(filepath.Join(partitionDir, "epoch"))
+	if err != nil {
+		t.Fatalf("read epoch sidecar: %v", err)
+	}
+	if string(epochData) != "4" {
+		t.Fatalf("epoch sidecar = %q, want 4", epochData)
+	}
+}
+
 func TestReadRawBatches_UnknownTopicReturnsError(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
