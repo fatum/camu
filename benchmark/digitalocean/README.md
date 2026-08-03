@@ -38,11 +38,22 @@ Provision the registry, build and push the image, then create the five nodes:
 ./provision.sh
 ```
 
-Each provisioning run publishes a unique timestamped image tag and applies
-that exact tag to the droplets, preventing stale or deleted registry tags from
-being reused. Set `IMAGE_TAG` to choose a specific tag.
+Each provisioning run publishes a unique timestamped image tag and creates the
+nodes with that exact tag, preventing stale or deleted registry tags from being
+reused. Set `IMAGE_TAG` to choose a specific tag.
 
-To build and publish another image after provisioning (`doctl` is optional):
+To publish a new image and roll it across existing nodes without applying
+Terraform, use:
+
+```bash
+./deploy.sh
+```
+
+`deploy.sh` updates nodes sequentially, waiting for `/v1/ready` before
+restarting the next node. Set `IMAGE_TAG` to choose a specific tag or
+`SSH_USER` to change the deployment user.
+
+To build and publish an image without deploying it (`doctl` is optional):
 
 ```bash
 IMAGE_TAG=benchmark-next ./build-image.sh
@@ -60,13 +71,54 @@ ordered public benchmark URLs are available as `terraform output -json benchmark
 ## Run and destroy
 
 ```bash
-./run.sh 1GiB
+TOPIC=benchmark-typed-demo ./run.sh produce 1GiB
+TOPIC=benchmark-typed-demo ./run.sh consume 1GiB
+TOPIC=benchmark-typed-demo ./run.sh sql 1GiB
 ./destroy.sh
 ```
 
-The run script waits for all five nodes, uses their public HTTP addresses, and
-writes the report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT`
-is set. `TARGET_BYTES` and `MESSAGE_BYTES` can override the workload.
+The benchmark has separate `produce`, `consume`, and `sql` operations. Use the
+same `TOPIC`, target size, and message size for each operation. The script
+waits for all five nodes, uses their public HTTP addresses, and writes the
+report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT` is set. A
+topic is retained by default; set `CLEANUP=1` only when the final operation may
+delete it. Each invocation without `TOPIC` creates a unique topic, which is
+appropriate for a standalone `produce` run but not a later consume or SQL run.
+Repeated `produce` runs with the same `TOPIC` append to that topic; the
+benchmark resumes sequence and key numbering from its committed offsets.
+`TARGET_BYTES`, `MESSAGE_BYTES`, and `PARTITIONS` can override the workload.
+The default is four partitions. Byte values accept a positive byte count or a
+binary unit such as `1GiB`, `512MiB`, or `64KiB`.
+`REQUEST_TIMEOUT` bounds every HTTP request (default `30s`); `CONSUME_TIMEOUT`
+bounds the whole consume operation (default `10m`).
+
+Start local benchmark monitoring separately when you need live metrics and
+logs:
+
+```bash
+./monitor.sh start
+# run one or more ./run.sh commands
+./monitor.sh stop
+```
+
+`run.sh` never starts or stops monitoring. The stack runs Prometheus, Loki, and
+Grafana locally. Prometheus scrapes Camu on port 8080 and cAdvisor on port 8082
+from every benchmark node; the local collector follows each node's Camu
+container log and sends it to Loki. It also follows each node's kernel log and
+records Docker container state every five seconds, so OOM kills and restart
+loops appear in the same Grafana log view. Grafana is available while the stack
+is running at <http://localhost:3000> (`admin` / `admin`). The dashboard
+provides the per-node CPU/memory, export-lag, S3/export error, and combined-log
+view needed to correlate a failure across the cluster.
+
+`consume` reads partition `p` through node `p`, rather than concentrating every
+partition on the first public endpoint. It logs the page offset, response size,
+and per-partition progress. `sql` logs every visibility poll and its error or
+row-count progress. Use `all` only for the legacy sequential flow:
+
+```bash
+TOPIC=benchmark-typed-demo ./run.sh all 1GiB
+```
 During the run it scrapes each node's internal metrics endpoint every five
 seconds and writes raw samples to `/tmp/camu-digitalocean-telemetry.jsonl`
 unless `TELEMETRY_OUTPUT` is set.
@@ -78,8 +130,10 @@ The default producer/consumer API is HTTP. To benchmark the Kafka protocol,
 open port 9092 from `benchmark_cidr`, apply the firewall update, and run:
 
 ```bash
-BENCHMARK_API=kafka ./run.sh 1GiB
+TOPIC=benchmark-typed-demo BENCHMARK_API=kafka ./run.sh produce 1GiB
 ```
 
 Kafka brokers default to all five public droplet addresses on port 9092. Set
-`KAFKA_BROKERS` to override them.
+`KAFKA_BROKERS` to override them. The Kafka benchmark requests up to 16 MiB per
+partition and 64 MiB per Fetch response; Camu enforces the 16 MiB per-partition
+ceiling.

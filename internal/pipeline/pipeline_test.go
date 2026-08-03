@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -241,10 +242,23 @@ func TestReaderStopsAtCommittedHighWatermark(t *testing.T) {
 	}
 	key := "events/0/0-4.segment"
 	var data []byte
+	entries := make([]log.IndexEntry, 0, 5)
 	for i := 0; i < 5; i++ {
-		data = append(data, log.EncodeRecordBatch(int64(i), []log.Message{{Offset: uint64(i), Value: []byte{byte(i)}}})...)
+		batch := log.EncodeRecordBatch(int64(i), []log.Message{{Offset: uint64(i), Value: []byte{byte(i)}}})
+		entries = append(entries, log.IndexEntry{BaseOffset: int64(i), LastOffset: int64(i), Position: int64(len(data)), BatchSize: int32(len(batch))})
+		data = append(data, batch...)
 	}
 	if err := cache.Put(key, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := obj.Put(context.Background(), key, data, storage.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	var sidecar bytes.Buffer
+	if err := log.WriteSidecar(&sidecar, entries, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Put(log.SegmentOffsetIndexKey(key), sidecar.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	idx := log.NewIndex()

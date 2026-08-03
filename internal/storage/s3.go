@@ -292,7 +292,12 @@ func newS3Backend(cfg S3Config) (*awsS3Backend, error) {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
-	var s3Opts []func(*s3.Options)
+	s3Opts := []func(*s3.Options){func(o *s3.Options) {
+		// DigitalOcean Spaces does not return the optional x-amz-checksum-* response
+		// headers. The SDK still validates responses when those headers exist; this
+		// only suppresses one warning for every otherwise-successful GET.
+		o.DisableLogOutputChecksumValidationSkipped = true
+	}}
 	if cfg.Endpoint != "" {
 		ep := cfg.Endpoint
 		s3Opts = append(s3Opts, func(o *s3.Options) {
@@ -409,8 +414,7 @@ func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []by
 		Body:   bytes.NewReader(data),
 	}
 	if etag != "" {
-		quoted := `"` + etag + `"`
-		input.IfMatch = aws.String(quoted)
+		input.IfMatch = aws.String(etag)
 	} else {
 		// Create-if-not-exists: fail if object already exists.
 		input.IfNoneMatch = aws.String("*")

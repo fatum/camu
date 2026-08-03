@@ -2,175 +2,107 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"strconv"
+	"fmt"
+	"sort"
 
 	logstore "github.com/maksim/camu/internal/log"
 )
 
-func (s *Server) streamMessagesJSON(ctx context.Context, w http.ResponseWriter, topicName string, partitionID int, startOffset uint64, limit int, index *logstore.Index, ps *partitionState) (int, uint64, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+const httpConsumeFetchBytes = 4 << 20
 
-	var readableHW uint64
-	if ps != nil {
-		ps.mu.RLock()
-		hw, ok := readableHighWatermark(ps)
-		ps.mu.RUnlock()
-		if ok {
-			readableHW = hw
-		}
+// readMessagesPage shares the committed raw-batch reader used by Kafka. HTTP
+// only decodes the bounded result into its JSON representation.
+func (s *Server) readMessagesPage(ctx context.Context, topicName string, partitionID int, startOffset uint64, limit int) ([]consumedMessage, uint64, error) {
+	raw, _, err := s.partitionManager.ReadRawBatches(ctx, topicName, partitionID, int64(startOffset), httpConsumeFetchBytes)
+	if err != nil {
+		return nil, startOffset, fmt.Errorf("read committed batches: %w", err)
 	}
-
-	segmentIter := startConsumeIterator(ctx, func(visit func(logstore.Message) bool) error {
-		_, err := s.fetcher.Walk(ctx, index, topicName, partitionID, startOffset, limit, visit)
-		return err
-	})
-
-	// Active segment iterator: reads raw RecordBatch bytes from the in-memory
-	// active segment and decodes them into messages. Data written via
-	// AppendRawBatch lives here until the segment is sealed and flushed to S3.
-	var activeIter *consumeIterator
-	if ps != nil {
-		ps.mu.RLock()
-		activeSeg := ps.activeSegment
-		ps.mu.RUnlock()
-		if activeSeg != nil {
-			activeIter = startConsumeIterator(ctx, func(visit func(logstore.Message) bool) error {
-				offsetIdx := activeSeg.OffsetIndex()
-				for _, entry := range offsetIdx {
-					if readableHW > 0 && uint64(entry.BaseOffset) >= readableHW {
-						break
-					}
-					if uint64(entry.LastOffset) < startOffset {
-						continue
-					}
-					if entry.BatchSize <= 0 || entry.Position < 0 {
-						continue
-					}
-					buf := make([]byte, entry.BatchSize)
-					n, err := activeSeg.ReadAt(buf, entry.Position)
-					if err != nil && n < int(entry.BatchSize) {
-						break
-					}
-					msgs, err := logstore.DecodeRecordBatch(buf[:n])
-					if err != nil {
-						break
-					}
-					for _, m := range msgs {
-						if m.Offset < startOffset {
-							continue
-						}
-						if readableHW > 0 && m.Offset >= readableHW {
-							return nil
-						}
-						if !visit(m) {
-							return nil
-						}
-					}
-				}
-				return nil
-			})
-		}
+	// Decode the bounded raw page before applying the message limit. A later
+	// active batch can replace offsets from an earlier sealed batch, so stopping
+	// after the first N batches could return stale values.
+	msgs, err := decodeCommittedPage(raw, startOffset, limit)
+	if err != nil {
+		return nil, startOffset, fmt.Errorf("decode committed batches: %w", err)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"messages":[`))
-	enc := json.NewEncoder(w)
-
-	written := 0
+	result := make([]consumedMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		result = append(result, consumedMessage{
+			Offset:    msg.Offset,
+			Timestamp: msg.Timestamp,
+			Key:       string(msg.Key),
+			Value:     tryString(msg.Value),
+			Headers:   msg.Headers,
+		})
+	}
 	nextOffset := startOffset
-	writeMsg := func(m logstore.Message) error {
-		if written > 0 {
-			if _, err := w.Write([]byte(",")); err != nil {
-				return err
-			}
-		}
-		if err := enc.Encode(consumedMessage{
-			Offset:    m.Offset,
-			Timestamp: m.Timestamp,
-			Key:       string(m.Key),
-			Value:     tryString(m.Value),
-			Headers:   m.Headers,
-		}); err != nil {
-			return err
-		}
-		written++
-		nextOffset = m.Offset + 1
-		return nil
+	if len(msgs) > 0 {
+		nextOffset = msgs[len(msgs)-1].Offset + 1
 	}
+	return result, nextOffset, nil
+}
 
-	// pickLowest returns the message with the lowest offset from all non-nil
-	// sources, popping the chosen iterator. Returns nil when all are exhausted.
-	pickLowest := func() (*logstore.Message, error) {
-		segMsg, err := segmentIter.peek()
+// decodeCommittedPage decodes one RecordBatch at a time and retains only the
+// lowest requested offsets. Later active batches may overwrite values from a
+// sealed predecessor without requiring all decoded messages to remain live.
+func decodeCommittedPage(raw []byte, startOffset uint64, limit int) ([]logstore.Message, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	byOffset := make(map[uint64]logstore.Message, limit)
+	var largestOffset uint64
+	hasLargestOffset := false
+	for position := 0; position < len(raw); {
+		header, err := logstore.ReadRecordBatchHeader(raw[position:])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read record batch header: %w", err)
 		}
-		var activeMsg *logstore.Message
-		if activeIter != nil {
-			activeMsg, err = activeIter.peek()
-			if err != nil {
-				return nil, err
-			}
+		batchSize := int(header.RecordBatchSize())
+		if batchSize <= 0 || batchSize > len(raw)-position {
+			return nil, fmt.Errorf("invalid record batch size %d", batchSize)
 		}
-		// Find the candidate with the lowest offset. When offsets tie,
-		// prefer active > sealed (active data is fresher).
-		type candidate struct {
-			msg  *logstore.Message
-			pop  func()
-			prio int // lower = prefer when offsets tie
+		batch, err := logstore.DecodeRecordBatch(raw[position : position+batchSize])
+		if err != nil {
+			return nil, fmt.Errorf("decode record batch: %w", err)
 		}
-		candidates := []candidate{
-			{activeMsg, func() { activeIter.pop() }, 0},
-			{segMsg, func() { segmentIter.pop() }, 1},
-		}
-
-		var best *candidate
-		for i := range candidates {
-			c := &candidates[i]
-			if c.msg == nil {
+		for _, msg := range batch {
+			if msg.Offset < startOffset {
 				continue
 			}
-			if best == nil || c.msg.Offset < best.msg.Offset || (c.msg.Offset == best.msg.Offset && c.prio < best.prio) {
-				best = c
+			if _, exists := byOffset[msg.Offset]; exists {
+				byOffset[msg.Offset] = msg
+				continue
+			}
+			if len(byOffset) < limit {
+				byOffset[msg.Offset] = msg
+				if !hasLargestOffset || msg.Offset > largestOffset {
+					largestOffset = msg.Offset
+					hasLargestOffset = true
+				}
+				continue
+			}
+			if msg.Offset < largestOffset {
+				delete(byOffset, largestOffset)
+				byOffset[msg.Offset] = msg
+				hasLargestOffset = false
+				for offset := range byOffset {
+					if !hasLargestOffset || offset > largestOffset {
+						largestOffset = offset
+						hasLargestOffset = true
+					}
+				}
 			}
 		}
-		if best == nil {
-			return nil, nil
-		}
-
-		msg := best.msg
-		chosenOffset := msg.Offset
-		best.pop()
-
-		// Pop duplicates at the same offset from other iterators.
-		for i := range candidates {
-			c := &candidates[i]
-			if c.msg != nil && c.msg.Offset == chosenOffset && c.msg != msg {
-				c.pop()
-			}
-		}
-		return msg, nil
+		position += batchSize
 	}
 
-	for written < limit {
-		msg, err := pickLowest()
-		if err != nil {
-			return written, nextOffset, err
-		}
-		if msg == nil {
-			break
-		}
-		if err := writeMsg(*msg); err != nil {
-			return written, nextOffset, err
-		}
+	offsets := make([]uint64, 0, len(byOffset))
+	for offset := range byOffset {
+		offsets = append(offsets, offset)
 	}
-
-	_, _ = w.Write([]byte(`],"next_offset":`))
-	_, _ = w.Write([]byte(strconv.FormatUint(nextOffset, 10)))
-	_, _ = w.Write([]byte("}"))
-	return written, nextOffset, nil
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+	messages := make([]logstore.Message, 0, len(offsets))
+	for _, offset := range offsets {
+		messages = append(messages, byOffset[offset])
+	}
+	return messages, nil
 }

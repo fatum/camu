@@ -176,8 +176,8 @@ func TestKafkaFetch(t *testing.T) {
 		FetchFunc: func(topic string, partition int, startOffset uint64, maxBytes int32) (KafkaFetchResult, error) {
 			if topic == "test-topic" && partition == 0 && startOffset == 100 {
 				return KafkaFetchResult{
-					RecordBatches:   []byte("test-records"),
-					HighWatermark:   123,
+					RecordBatches:    []byte("test-records"),
+					HighWatermark:    123,
 					LastStableOffset: 123,
 				}, nil
 			}
@@ -217,6 +217,37 @@ func TestKafkaFetch(t *testing.T) {
 	assert.Equal(t, []byte("test-records"), partResp.RecordBatches)
 	assert.Equal(t, int64(123), partResp.HighWatermark)
 	assert.Equal(t, int64(123), partResp.LastStableOffset)
+}
+
+func TestKafkaFetchRawBatchesCapsPartitionBytesAndPropagatesContext(t *testing.T) {
+	assert.Equal(t, 16<<20, maxKafkaFetchPartitionBytes)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var gotContext context.Context
+	var gotMaxBytes int
+	ks := NewKafkaServer(&KafkaServerCfg{
+		PartitionGetter: &mockPartitionGetter{partitions: map[string]map[int]*PartitionInfo{
+			"test-topic": {0: {Leader: 1, Replicas: []int32{1}, ISR: []int32{1}}},
+		}},
+		TopicLister: &mockTopicLister{},
+		BrokerID:    1,
+		FetchRawBatchesFunc: func(fetchCtx context.Context, _ string, _ int, _ int64, maxBytes int) ([]byte, int64, error) {
+			gotContext = fetchCtx
+			gotMaxBytes = maxBytes
+			return []byte("raw"), 3, nil
+		},
+	})
+
+	resp, err := ks.HandleRequest(ctx, &kmsg.FetchRequest{Topics: []kmsg.FetchRequestTopic{{
+		Topic: "test-topic",
+		Partitions: []kmsg.FetchRequestTopicPartition{{
+			Partition: 0, PartitionMaxBytes: maxKafkaFetchPartitionBytes + 1,
+		}},
+	}}})
+	require.NoError(t, err)
+	assert.Same(t, ctx, gotContext)
+	assert.Equal(t, maxKafkaFetchPartitionBytes, gotMaxBytes)
+	assert.Equal(t, []byte("raw"), resp.(*kmsg.FetchResponse).Topics[0].Partitions[0].RecordBatches)
 }
 
 func TestKafkaListOffsetsMapsInvalidRequestError(t *testing.T) {

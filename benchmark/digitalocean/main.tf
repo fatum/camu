@@ -60,6 +60,12 @@ resource "digitalocean_firewall" "benchmark" {
     source_addresses = var.benchmark_cidr
   }
 
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "8082"
+    source_addresses = var.benchmark_cidr
+  }
+
   outbound_rule {
     protocol              = "tcp"
     port_range            = "1-65535"

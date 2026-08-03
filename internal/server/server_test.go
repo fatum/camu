@@ -54,6 +54,25 @@ func newTestServer(t *testing.T) *Server {
 	return s
 }
 
+func putConsumeTestSegment(t *testing.T, s *Server, key string, batch []byte, firstOffset, lastOffset uint64) {
+	t.Helper()
+	if err := s.s3Client.Put(context.Background(), key, batch, storage.PutOpts{}); err != nil {
+		t.Fatalf("put segment: %v", err)
+	}
+	var sidecar bytes.Buffer
+	if err := log.WriteSidecar(&sidecar, []log.IndexEntry{{
+		BaseOffset: int64(firstOffset),
+		LastOffset: int64(lastOffset),
+		Position:   0,
+		BatchSize:  int32(len(batch)),
+	}}, nil); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	if err := s.s3Client.Put(context.Background(), log.SegmentOffsetIndexKey(key), sidecar.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatalf("put sidecar: %v", err)
+	}
+}
+
 func newQueryTestServer(t *testing.T) *Server {
 	t.Helper()
 
@@ -2426,6 +2445,7 @@ func TestHandleConsumeLowLevel_MergesOverlappingSegmentAndActiveData(t *testing.
 	if err := s.partitionManager.GetDiskCache().Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
 	}
+	putConsumeTestSegment(t, s, segKey, segData, 0, 19)
 	ps.index.Add(log.SegmentRef{
 		BaseOffset: 0,
 		EndOffset:  19,
@@ -2535,6 +2555,7 @@ func TestHandleConsumeLowLevel_MergesActiveDataBeforeApplyingLimit(t *testing.T)
 	if err := s.partitionManager.GetDiskCache().Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
 	}
+	putConsumeTestSegment(t, s, segKey, segData, 0, 9)
 	ps.index.Add(log.SegmentRef{
 		BaseOffset: 0,
 		EndOffset:  9,
@@ -2631,9 +2652,7 @@ func TestHandleConsumeLowLevel_ReturnsReadableFollowerActiveSuffix(t *testing.T)
 	if err := s.partitionManager.GetDiskCache().Put(segKey, segData); err != nil {
 		t.Fatalf("diskCache.Put() error = %v", err)
 	}
-	if err := s.s3Client.Put(context.Background(), segKey, segData, storage.PutOpts{}); err != nil {
-		t.Fatalf("s3Client.Put() error = %v", err)
-	}
+	putConsumeTestSegment(t, s, segKey, segData, 0, 16)
 	ps.index.Add(log.SegmentRef{
 		BaseOffset: 0,
 		EndOffset:  16,

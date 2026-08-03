@@ -22,6 +22,12 @@
          #"only supports leader read-mode"
          (camu/validate-opts! {:api :kafka :workload :mixed :read-mode :replica})))))
 
+(deftest leader-read-mode-checks-only-leader-visibility
+  (is (true? (camu/leader-read-mode? {})))
+  (is (true? (camu/leader-read-mode? {:read-mode :leader})))
+  (is (false? (camu/leader-read-mode? {:read-mode :replica})))
+  (is (false? (camu/leader-read-mode? {:read-mode :any}))))
+
 (deftest retention-checker-is-lifecycle-only
   (is (contains? (camu/sql-checkers {:workload :sql}) :sql-visibility))
   (is (not (contains? (camu/sql-checkers {:workload :sql}) :retention-export)))

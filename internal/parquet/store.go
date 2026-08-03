@@ -41,8 +41,47 @@ func (NoFencer) TopicDeletionPending(context.Context, string) bool { return fals
 // Store is the Parquet metadata layer. It is safe to use from multiple
 // goroutines as long as the underlying ObjectStore is.
 type Store struct {
-	objects ObjectStore
-	fencer  Fencer
+	objects          ObjectStore
+	fencer           Fencer
+	manifestRetry    manifestCASRetryPolicy
+	conflictObserver func(ManifestConflict)
+	publishFence     func(context.Context) error
+}
+
+// ManifestConflict describes a failed conditional manifest write. It is
+// intentionally metadata-only: callers can log the backend error, but should
+// not use it as a metric label.
+type ManifestConflict struct {
+	Key         string
+	Attempt     int
+	MaxAttempts int
+	Err         error
+}
+
+// ManifestCASConflictError is returned after bounded retries of a manifest
+// conditional write are exhausted. It still matches ErrConflict.
+type ManifestCASConflictError struct {
+	Key      string
+	Attempts int
+	LastErr  error
+}
+
+func (e *ManifestCASConflictError) Error() string {
+	return fmt.Sprintf("replace parquet manifest %q: CAS conflict after %d attempts", e.Key, e.Attempts)
+}
+
+func (e *ManifestCASConflictError) Unwrap() error { return ErrConflict }
+
+type manifestCASRetryPolicy struct {
+	attempts int
+	initial  time.Duration
+	max      time.Duration
+}
+
+var defaultManifestCASRetryPolicy = manifestCASRetryPolicy{
+	attempts: 6,
+	initial:  25 * time.Millisecond,
+	max:      400 * time.Millisecond,
 }
 
 // NewStore constructs a Store. If fencer is nil, a NoFencer is used.
@@ -50,7 +89,31 @@ func NewStore(objects ObjectStore, fencer Fencer) *Store {
 	if fencer == nil {
 		fencer = NoFencer{}
 	}
-	return &Store{objects: objects, fencer: fencer}
+	return &Store{objects: objects, fencer: fencer, manifestRetry: defaultManifestCASRetryPolicy}
+}
+
+// SetManifestConflictObserver configures an optional observer for manifest
+// CAS conflicts. Configure it before using the Store concurrently.
+func (s *Store) SetManifestConflictObserver(observer func(ManifestConflict)) {
+	s.conflictObserver = observer
+}
+
+// SetManifestPublishFence configures an optional caller-owned fence that is
+// evaluated immediately before every manifest read and conditional write.
+// Exporters use it to stop an old partition epoch from publishing after a CAS
+// conflict. Configure it before using the Store concurrently.
+func (s *Store) SetManifestPublishFence(fence func(context.Context) error) {
+	s.publishFence = fence
+}
+
+func (s *Store) checkManifestPublishFence(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.publishFence != nil {
+		return s.publishFence(ctx)
+	}
+	return nil
 }
 
 func (s *Store) canPublish(ctx context.Context, topic string) error {
@@ -237,8 +300,9 @@ func (s *Store) CompactBucket(ctx context.Context, topic string, partition int, 
 // used when a newer authoritative native segment supersedes a divergent
 // export that used the same offsets. Non-overlapping entries are preserved.
 //
-// Repeating the same replacement is idempotent. A bounded CAS retry handles
-// concurrent manifest updates without ever publishing a partial target set.
+// Repeating the same replacement is idempotent. A bounded exponential-backoff
+// CAS retry handles concurrent manifest updates without ever publishing a
+// partial target set.
 func (s *Store) ReplaceOverlappingEntries(ctx context.Context, topic string, partition int, date, hour string, addEntries []Entry) (Manifest, error) {
 	if err := validateEntrySources(addEntries); err != nil {
 		return Manifest{}, err
@@ -254,8 +318,14 @@ func (s *Store) ReplaceOverlappingEntries(ctx context.Context, topic string, par
 	}
 
 	key := ManifestKeyForBucket(topic, partition, date, hour)
-	const attempts = 3
-	for i := 0; i < attempts; i++ {
+	policy := s.manifestRetry
+	if policy.attempts < 1 {
+		policy = defaultManifestCASRetryPolicy
+	}
+	for i := 0; i < policy.attempts; i++ {
+		if err := s.checkManifestPublishFence(ctx); err != nil {
+			return Manifest{}, fmt.Errorf("fence parquet manifest %q: %w", key, err)
+		}
 		currentData, currentETag, err := s.objects.GetWithETag(ctx, key)
 		var current Manifest
 		switch {
@@ -302,15 +372,59 @@ func (s *Store) ReplaceOverlappingEntries(ctx context.Context, topic string, par
 		if err != nil {
 			return Manifest{}, fmt.Errorf("marshal parquet manifest %q: %w", key, err)
 		}
+		if err := s.checkManifestPublishFence(ctx); err != nil {
+			return Manifest{}, fmt.Errorf("fence parquet manifest %q: %w", key, err)
+		}
 		if _, err := s.objects.ConditionalPut(ctx, key, data, currentETag); err != nil {
 			if errors.Is(err, ErrConflict) {
+				s.observeManifestConflict(ManifestConflict{Key: key, Attempt: i + 1, MaxAttempts: policy.attempts, Err: err})
+				if i+1 == policy.attempts {
+					return Manifest{}, &ManifestCASConflictError{Key: key, Attempts: policy.attempts, LastErr: err}
+				}
+				if err := waitManifestCASRetry(ctx, policy.delay(i)); err != nil {
+					return Manifest{}, fmt.Errorf("retry parquet manifest %q: %w", key, err)
+				}
 				continue
 			}
 			return Manifest{}, fmt.Errorf("conditional put parquet manifest %q: %w", key, err)
 		}
 		return next, nil
 	}
-	return Manifest{}, fmt.Errorf("replace parquet manifest %q: CAS conflict after %d attempts", key, attempts)
+	panic("unreachable")
+}
+
+func (s *Store) observeManifestConflict(conflict ManifestConflict) {
+	if s.conflictObserver != nil {
+		s.conflictObserver(conflict)
+	}
+}
+
+func (p manifestCASRetryPolicy) delay(retry int) time.Duration {
+	delay := p.initial
+	for i := 0; i < retry && delay < p.max; i++ {
+		delay *= 2
+	}
+	if delay > p.max {
+		return p.max
+	}
+	return delay
+}
+
+func waitManifestCASRetry(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // ListTopicManifests enumerates manifests for a topic whose buckets

@@ -52,14 +52,11 @@ Camu also supports a separate runtime role:
 - no topic creation or produce/consume surface
 - no Kafka listener
 - no registry/assignment participation
-- exposes only:
-- `POST /v1/sql`
+- exposes `POST /v1/sql`, `GET /v1/ready`, and `GET /v1/cluster/status`
 
 When `server.auth_token` is configured, SQL requests require
 `Authorization: Bearer <token>`; missing or invalid credentials return 401.
 TLS is terminated by the deployment proxy and is not provided by Camu.
-  - `GET /v1/ready`
-  - `GET /v1/cluster/status`
 
 Query nodes require `sql.enabled: true`. They do not bind `internal_address`
 or `kafka_port`; those settings can be omitted from a query-role configuration.
@@ -158,6 +155,8 @@ curl -N \
 Notes:
 
 - polling returns JSON with `messages` and `next_offset`
+- the endpoint accepts up to 20,000 messages, but returns at most 1,000 per
+  response so the complete JSON page is read before the response begins
 - SSE uses `id: {offset}`
 - resume uses `Last-Event-ID + 1`
 
@@ -381,6 +380,10 @@ Main supported APIs include:
 - `InitProducerID`
 - ACL operations
 
+Fetch returns native Kafka `RecordBatch` bytes. Camu clamps each partition's
+`PartitionMaxBytes` to 16 MiB. Consumers should also set a total fetch budget;
+the bundled benchmark uses 16 MiB per partition and 64 MiB per Fetch response.
+
 Example with `kcat`:
 
 ```bash
@@ -405,8 +408,9 @@ Ack semantics:
 
 Important behavior:
 
-- flush to object storage is asynchronous
-- cross-instance visibility follows flush timing for non-replica reads
+- sealing and object-store persistence are asynchronous and do not block produce
+- a sealed segment remains available to follower replication while it is pending publication
+- `rf=1` does not survive permanent loss of its only owner before object-store persistence
 - reads are capped by readable high watermark for replicated topics
 
 ## Where To Check Exact Support

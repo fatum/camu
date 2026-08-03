@@ -29,6 +29,7 @@ import (
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/metrics"
+	"github.com/maksim/camu/internal/parquet"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -110,6 +111,9 @@ type Server struct {
 	parquetFetchGroup singleflight.Group
 	parquetCacheMu    sync.Mutex
 	parquetCachePins  map[string]int
+	// parquetStoreFactory is an internal test seam for faulting manifest
+	// publication independently from immutable Parquet object uploads.
+	parquetStoreFactory func() *parquet.Store
 
 	// One local consumer runs for each partition led by this instance. Its
 	// ownership is fenced by Camu's partition epoch, not a Kafka group.
@@ -236,6 +240,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	s.partitionManager = pm
 	s.fetcher = consumer.NewFetcher(s3Client, pm.GetDiskCache())
+	s.fetcher.SetMetrics(s.metrics)
 	s.offsetStore = storage.NewOffsetStore(s3Client)
 	s.aclStore = storage.NewACLStore(s3Client)
 	s.groupCoord = newKafkaGroupCoordinator(s3Client, instanceID)

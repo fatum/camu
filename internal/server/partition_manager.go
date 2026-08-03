@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -185,6 +186,18 @@ type partitionState struct {
 	globalID      int                                // cached batcher partition ID, set on first append
 	globalIDSet   bool                               // true once globalID has been resolved
 	producerSeqs  map[uint64]*producerPartitionState // producerID -> sequence state
+	pendingFlush  *sealedSegment                     // sealed locally; retry this exact segment until uploaded
+}
+
+// sealedSegment is immutable upload work. Once a segment is sealed, retries
+// must publish this object rather than sealing whichever segment is active next.
+type sealedSegment struct {
+	topic, segmentPath, sidecarPath string
+	partitionID                     int
+	ref                             log.SegmentRef
+	highWatermark                   uint64
+	stateData                       []byte
+	producerCheckpoint              []byte
 }
 
 func (ps *partitionState) checkAndAdvanceSeq(producerID, sequence uint64, batchSize int) error {
@@ -365,10 +378,15 @@ func NewPartitionManager(cfg *config.Config, s3Client *storage.S3Client) (*Parti
 		maxSize64 = 8 * 1024 * 1024 // 8 MB default
 	}
 
+	highWaterMark := maxSize64 * 8
+	if highWaterMark < 64*1024*1024 {
+		highWaterMark = 64 * 1024 * 1024
+	}
 	pm.batcher = producer.NewBatcher(producer.BatcherConfig{
-		MaxSize: maxSize64,
-		MaxAge:  maxAge,
-		OnFlush: pm.onFlushDispatch,
+		MaxSize:       maxSize64,
+		MaxAge:        maxAge,
+		OnFlush:       pm.onFlushDispatch,
+		HighWaterMark: highWaterMark,
 	})
 
 	return pm, nil
@@ -858,7 +876,14 @@ func (pm *PartitionManager) RefreshIndex(ctx context.Context, topic string, part
 	if stateData, err := pm.s3Client.Get(ctx, stateKey); err == nil {
 		var state log.PartitionState
 		if err := state.Unmarshal(stateData); err == nil {
-			idx.SetHighWatermark(state.HighWatermark)
+			// state.json is published with each sealed segment. It must not make
+			// an S3-backed reader believe records are readable beyond the segment
+			// objects currently present in the refreshed index.
+			highWatermark := state.HighWatermark
+			if indexedEnd := idx.NextOffset(); indexedEnd < highWatermark {
+				highWatermark = indexedEnd
+			}
+			idx.SetHighWatermark(highWatermark)
 			idx.SetEpochHistory(state.EpochHistory)
 		}
 	}
@@ -1040,8 +1065,16 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 	if leaderEpoch > ps.epoch {
 		ps.epoch = leaderEpoch
 	}
-	if highWatermark > ps.followerHW {
-		ps.followerHW = highWatermark
+	// A leader can advertise a high watermark beyond the batches carried by
+	// this fetch response. Never expose that remote position to local readers:
+	// they may otherwise receive an empty response at an offset which this
+	// follower has not replicated yet.
+	localReadable := highWatermark
+	if localReadable > ps.nextOffset {
+		localReadable = ps.nextOffset
+	}
+	if localReadable > ps.followerHW {
+		ps.followerHW = localReadable
 	}
 	if flushedOffset > ps.flushedOffset {
 		ps.flushedOffset = flushedOffset
@@ -1221,6 +1254,7 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 	nextOff := ps.nextOffset
 	activeSeg := ps.activeSegment
 	index := ps.index
+	pendingFlush := ps.pendingFlush
 	ps.mu.RUnlock()
 
 	upperBound := int64(nextOff)
@@ -1254,50 +1288,54 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 				break
 			}
 
-			// Read sealed segment data from S3/disk cache.
-			segData, err := pm.readSealedSegmentData(ctx, ref)
-			if err != nil {
-				slog.Warn("ReadRawBatches: failed to read sealed segment",
-					"topic", topic, "partition", pid,
-					"segment_key", ref.Key, "error", err)
-				break
+			for currentOffset <= int64(ref.EndOffset) && remaining > 0 {
+				nextOffset, err := pm.appendSealedRawBatches(ctx, ref, currentOffset, upperBound, maxBytes, &out)
+				if err != nil {
+					return nil, upperBound, fmt.Errorf("read sealed segment %s: %w", ref.Key, err)
+				}
+				if nextOffset <= currentOffset {
+					break
+				}
+				currentOffset = nextOffset
+				remaining = maxBytes - len(out)
 			}
+		}
+	}
 
-			// Use the sidecar offset index to seek directly to the
-			// approximate position instead of scanning from byte 0.
-			startPos := 0
-			if sidecarData, err := pm.readSealedSegmentSidecar(ctx, ref); err == nil {
-				if entries, _, err := log.ReadSidecar(sidecarData); err == nil {
-					if pos, ok := log.LookupSidecarPosition(entries, currentOffset); ok {
-						startPos = int(pos)
+	// A segment is sealed before it is published to S3. Keep it readable from
+	// its local files while that asynchronous publish is in flight so followers
+	// can still replicate the leader's tail.
+	if pendingFlush != nil && remaining > 0 && currentOffset >= int64(pendingFlush.ref.BaseOffset) && currentOffset <= int64(pendingFlush.ref.EndOffset) {
+		ps.mu.RLock()
+		if ps.pendingFlush == pendingFlush {
+			segData, err := os.ReadFile(pendingFlush.segmentPath)
+			if err == nil {
+				startPos := 0
+				if sidecarData, sidecarErr := os.ReadFile(pendingFlush.sidecarPath); sidecarErr == nil {
+					if entries, _, readErr := log.ReadSidecar(sidecarData); readErr == nil {
+						if pos, ok := log.LookupSidecarPosition(entries, currentOffset); ok {
+							startPos = int(pos)
+						}
+					}
+				}
+				rawBatches, readErr := log.ReadSegmentBatchesFromPosition(segData, startPos, uint64(currentOffset), 0)
+				if readErr == nil {
+					for _, batch := range rawBatches {
+						hdr, headerErr := log.ReadRecordBatchHeader(batch)
+						if headerErr != nil || hdr.FirstOffset >= upperBound {
+							break
+						}
+						if len(out) > 0 && len(out)+len(batch) > maxBytes {
+							break
+						}
+						out = append(out, batch...)
+						remaining = maxBytes - len(out)
+						currentOffset = hdr.LastOffset() + 1
 					}
 				}
 			}
-
-			// Sealed segment data IS raw RecordBatch bytes back-to-back.
-			// Slice out batches directly — no decoding or re-encoding needed.
-			rawBatches, err := log.ReadSegmentBatchesFromPosition(segData, startPos, uint64(currentOffset), 0)
-			if err != nil {
-				slog.Warn("ReadRawBatches: failed to parse sealed segment batches",
-					"topic", topic, "partition", pid,
-					"segment_key", ref.Key, "error", err)
-				break
-			}
-
-			for _, batch := range rawBatches {
-				// Always include at least one batch even if it exceeds remaining.
-				if len(out) > 0 && len(out)+len(batch) > maxBytes {
-					goto done
-				}
-				out = append(out, batch...)
-				remaining = maxBytes - len(out)
-				// Parse the header to advance currentOffset past this batch.
-				hdr, hErr := log.ReadRecordBatchHeader(batch)
-				if hErr == nil {
-					currentOffset = hdr.LastOffset() + 1
-				}
-			}
 		}
+		ps.mu.RUnlock()
 	}
 
 	// Phase 2: Active segment.
@@ -1342,34 +1380,138 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 		}
 	}
 
-done:
 	return out, upperBound, nil
 }
 
-// readSealedSegmentData reads a sealed segment's data from disk cache or S3.
-func (pm *PartitionManager) readSealedSegmentData(ctx context.Context, ref log.SegmentRef) ([]byte, error) {
-	// Try disk cache first.
+const maxSealedSegmentRangeReadBytes = 4 << 20
+
+const (
+	sealedSegmentRangeReadAttempts  = 5
+	sealedSegmentRangeRetryInterval = 50 * time.Millisecond
+)
+
+// appendSealedRawBatches appends complete Kafka RecordBatches from one sealed
+// segment. The sidecar lets us fetch only the requested contiguous range rather
+// than loading the full (up to 64 MiB) object into memory.
+func (pm *PartitionManager) appendSealedRawBatches(ctx context.Context, ref log.SegmentRef, startOffset, upperBound int64, maxBytes int, out *[]byte) (int64, error) {
+	sidecarData, err := pm.readSealedSegmentSidecar(ctx, ref)
+	if err != nil {
+		return startOffset, err
+	}
+	entries, _, err := log.ReadSidecar(sidecarData)
+	if err != nil {
+		return startOffset, err
+	}
+	start := sort.Search(len(entries), func(i int) bool { return entries[i].LastOffset >= startOffset })
+	if start == len(entries) {
+		return int64(ref.EndOffset) + 1, nil
+	}
+
+	end := start
+	rangeBytes := int64(0)
+	for end < len(entries) {
+		entry := entries[end]
+		if entry.BaseOffset >= upperBound || entry.BatchSize <= 0 {
+			break
+		}
+		batchBytes := int64(entry.BatchSize)
+		if end > start && (rangeBytes+batchBytes > maxSealedSegmentRangeReadBytes || len(*out)+int(rangeBytes+batchBytes) > maxBytes) {
+			break
+		}
+		rangeBytes += batchBytes
+		end++
+	}
+	if end == start {
+		return startOffset, nil
+	}
+
+	data, err := pm.readSealedSegmentRange(ctx, ref, entries[start].Position, rangeBytes)
+	if err != nil {
+		return startOffset, err
+	}
+	position := int64(0)
+	nextOffset := startOffset
+	for _, entry := range entries[start:end] {
+		batchSize := int64(entry.BatchSize)
+		if position+batchSize > int64(len(data)) {
+			return startOffset, fmt.Errorf("short segment range: got %d bytes, need %d", len(data), position+batchSize)
+		}
+		batch := data[position : position+batchSize]
+		position += batchSize
+		hdr, err := log.ReadRecordBatchHeader(batch)
+		if err != nil {
+			return startOffset, err
+		}
+		if hdr.LastOffset() < startOffset {
+			continue
+		}
+		if hdr.FirstOffset >= upperBound {
+			break
+		}
+		if len(*out) > 0 && len(*out)+len(batch) > maxBytes {
+			break
+		}
+		*out = append(*out, batch...)
+		nextOffset = hdr.LastOffset() + 1
+	}
+	return nextOffset, nil
+}
+
+func (pm *PartitionManager) readSealedSegmentRange(ctx context.Context, ref log.SegmentRef, offset, length int64) ([]byte, error) {
 	if pm.diskCache != nil {
-		data, err := pm.diskCache.Get(ref.Key)
-		if err == nil && len(data) > 0 {
+		data, err := pm.diskCache.ReadRange(ref.Key, offset, length)
+		if err == nil {
 			return data, nil
 		}
-	}
-
-	// Fall back to S3.
-	if pm.s3Client != nil {
-		data, err := pm.s3Client.Get(ctx, ref.Key)
-		if err != nil {
-			return nil, fmt.Errorf("s3 get %s: %w", ref.Key, err)
+		if !errors.Is(err, log.ErrCacheMiss) {
+			return nil, err
 		}
-		// Populate disk cache for next time.
-		if pm.diskCache != nil {
-			_ = pm.diskCache.Put(ref.Key, data)
-		}
-		return data, nil
 	}
+	if pm.s3Client == nil {
+		return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+	}
+	data, err := pm.getS3WithRetry(ctx, func() ([]byte, error) {
+		return pm.s3Client.GetRange(ctx, ref.Key, offset, length)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("s3 range get %s: %w", ref.Key, err)
+	}
+	return data, nil
+}
 
-	return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+func (pm *PartitionManager) getS3WithRetry(ctx context.Context, get func() ([]byte, error)) ([]byte, error) {
+	var err error
+	for attempt := 0; attempt < sealedSegmentRangeReadAttempts; attempt++ {
+		data, getErr := get()
+		if getErr == nil {
+			return data, nil
+		}
+		err = getErr
+		if errors.Is(err, storage.ErrNotFound) || attempt == sealedSegmentRangeReadAttempts-1 {
+			break
+		}
+		timer := time.NewTimer(sealedSegmentRangeRetryInterval << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, err
+}
+
+// readSealedSegmentData reads a full sealed segment for maintenance work. The
+// normal consume path uses bounded range reads and never caches segment data.
+func (pm *PartitionManager) readSealedSegmentData(ctx context.Context, ref log.SegmentRef) ([]byte, error) {
+	if pm.s3Client == nil {
+		return nil, fmt.Errorf("no storage backend available for segment %s", ref.Key)
+	}
+	data, err := pm.s3Client.Get(ctx, ref.Key)
+	if err != nil {
+		return nil, fmt.Errorf("s3 get %s: %w", ref.Key, err)
+	}
+	return data, nil
 }
 
 // readSealedSegmentSidecar reads the CIDX sidecar for a sealed segment from
@@ -1387,7 +1529,9 @@ func (pm *PartitionManager) readSealedSegmentSidecar(ctx context.Context, ref lo
 		}
 	}
 	if pm.s3Client != nil {
-		data, err := pm.s3Client.Get(ctx, key)
+		data, err := pm.getS3WithRetry(ctx, func() ([]byte, error) {
+			return pm.s3Client.Get(ctx, key)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("s3 get %s: %w", key, err)
 		}
@@ -1441,8 +1585,8 @@ func (pm *PartitionManager) onFlushDispatch(globalPartitionID int) error {
 	return pm.onFlushActiveSegment(topic, partitionID)
 }
 
-// onFlushActiveSegment seals the active segment, opens a new one, uploads
-// the sealed segment and its sidecar to S3, and updates the partition index.
+// onFlushActiveSegment seals the active segment then publishes it outside the
+// producer path. A failed publish is retried using the same sealed files.
 func (pm *PartitionManager) onFlushActiveSegment(topic string, partitionID int) error {
 	// Check lease validity before flushing.
 	if pm.leaseChecker != nil && !pm.leaseChecker(topic, partitionID) {
@@ -1465,53 +1609,47 @@ func (pm *PartitionManager) onFlushActiveSegment(topic string, partitionID int) 
 	pm.mu.RUnlock()
 
 	ps.mu.Lock()
+	task := ps.pendingFlush
+	if task == nil {
+		var err error
+		task, err = pm.sealActiveSegmentLocked(ps, topic, partitionID)
+		if err != nil {
+			ps.mu.Unlock()
+			return err
+		}
+		if task == nil {
+			ps.mu.Unlock()
+			return nil
+		}
+		ps.pendingFlush = task
+	}
+	ps.mu.Unlock()
+
+	return pm.publishSealedSegment(ps, task)
+}
+
+// sealActiveSegmentLocked seals the current segment and records all immutable
+// metadata required to retry publishing it. ps.mu must be held.
+func (pm *PartitionManager) sealActiveSegmentLocked(ps *partitionState, topic string, partitionID int) (*sealedSegment, error) {
 	oldSeg := ps.activeSegment
 	if oldSeg == nil {
-		ps.mu.Unlock()
-		return nil // nothing to flush
+		return nil, nil
 	}
 	offsetIdx := oldSeg.OffsetIndex()
 	if len(offsetIdx) == 0 {
-		ps.mu.Unlock()
-		return nil // empty segment, nothing to seal
+		return nil, nil
 	}
 
-	// Seal the current active segment (sync + close + write sidecar).
 	segmentPath, sidecarPath, err := oldSeg.Seal()
 	if err != nil {
-		ps.mu.Unlock()
-		return fmt.Errorf("seal active segment: %w", err)
+		return nil, fmt.Errorf("seal active segment: %w", err)
 	}
-
-	// Open a fresh active segment starting at nextOffset.
 	newSeg, err := log.OpenActiveSegment(oldSeg.Dir(), int64(ps.nextOffset))
 	if err != nil {
-		ps.mu.Unlock()
-		return fmt.Errorf("open new active segment: %w", err)
+		return nil, fmt.Errorf("open new active segment: %w", err)
 	}
 	ps.activeSegment = newSeg
-	epoch := ps.epoch
-	hw := ps.index.HighWatermark()
-	if ps.replicaState != nil {
-		hw = ps.replicaState.HighWatermark()
-	}
-	snap := ps.snapshotProducerSeqs()
-	ps.mu.Unlock()
 
-	// --- Everything below is outside the lock ---
-
-	// Read sealed segment file and sidecar from disk.
-	segData, err := os.ReadFile(segmentPath)
-	if err != nil {
-		return fmt.Errorf("read sealed segment: %w", err)
-	}
-	sidecarData, err := os.ReadFile(sidecarPath)
-	if err != nil {
-		return fmt.Errorf("read sealed sidecar: %w", err)
-	}
-
-	baseOffset := oldSeg.BaseOffset()
-	endOffset := offsetIdx[len(offsetIdx)-1].LastOffset
 	minTimestamp := offsetIdx[0].FirstTimestamp
 	maxTimestamp := offsetIdx[0].MaxTimestamp
 	for _, entry := range offsetIdx {
@@ -1522,99 +1660,93 @@ func (pm *PartitionManager) onFlushActiveSegment(topic string, partitionID int) 
 			maxTimestamp = entry.MaxTimestamp
 		}
 	}
-
-	segKey := log.FormatSegmentKey(topic, partitionID, uint64(baseOffset), uint64(endOffset), epoch)
-	sidecarKey := log.SegmentOffsetIndexKey(segKey)
-	metaKey := log.SegmentMetadataKey(segKey)
-
-	segRef := log.SegmentRef{
-		BaseOffset:     uint64(baseOffset),
-		EndOffset:      uint64(endOffset),
-		MinTimestamp:   minTimestamp,
-		MaxTimestamp:   maxTimestamp,
-		Epoch:          epoch,
-		Key:            segKey,
-		OffsetIndexKey: sidecarKey,
-		MetaKey:        metaKey,
-		CreatedAt:      time.Now(),
+	endOffset := offsetIdx[len(offsetIdx)-1].LastOffset
+	baseOffset := oldSeg.BaseOffset()
+	segKey := log.FormatSegmentKey(topic, partitionID, uint64(baseOffset), uint64(endOffset), ps.epoch)
+	ref := log.SegmentRef{
+		BaseOffset: uint64(baseOffset), EndOffset: uint64(endOffset),
+		MinTimestamp: minTimestamp, MaxTimestamp: maxTimestamp, Epoch: ps.epoch,
+		Key: segKey, OffsetIndexKey: log.SegmentOffsetIndexKey(segKey), MetaKey: log.SegmentMetadataKey(segKey), CreatedAt: time.Now(),
 	}
-	metaData, err := log.BuildSegmentMetadata(segRef, int(endOffset-baseOffset+1), int64(len(segData)), pm.segmentsCfg.Compression)
+	hw := ps.index.HighWatermark()
+	if ps.replicaState != nil {
+		hw = ps.replicaState.HighWatermark()
+	}
+	// This state is published with ref. Do not advertise records from a
+	// later active or pending segment before their objects are durable in S3.
+	if durableEnd := ref.EndOffset + 1; hw > durableEnd {
+		hw = durableEnd
+	}
+	partState := log.PartitionState{HighWatermark: hw}
+	if ps.epochHistory != nil {
+		for _, e := range ps.epochHistory.Entries {
+			partState.EpochHistory = append(partState.EpochHistory, log.EpochEntry{Epoch: e.Epoch, StartOffset: e.StartOffset})
+		}
+	}
+	stateData, err := partState.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("marshal state: %w", err)
+	}
+	var cpBuf bytes.Buffer
+	for producerID, st := range ps.snapshotProducerSeqs() {
+		line, err := json.Marshal(producerCheckpointEntry{ProducerID: producerID, NextSeq: st.NextSeq, LastOffset: st.LastOffset})
+		if err != nil {
+			return nil, fmt.Errorf("marshal producers checkpoint: %w", err)
+		}
+		cpBuf.Write(line)
+		cpBuf.WriteByte('\n')
+	}
+	return &sealedSegment{topic: topic, partitionID: partitionID, segmentPath: segmentPath, sidecarPath: sidecarPath, ref: ref, highWatermark: hw, stateData: stateData, producerCheckpoint: cpBuf.Bytes()}, nil
+}
+
+func (pm *PartitionManager) publishSealedSegment(ps *partitionState, task *sealedSegment) error {
+	segData, err := os.ReadFile(task.segmentPath)
+	if err != nil {
+		return fmt.Errorf("read sealed segment: %w", err)
+	}
+	sidecarData, err := os.ReadFile(task.sidecarPath)
+	if err != nil {
+		return fmt.Errorf("read sealed sidecar: %w", err)
+	}
+	metaData, err := log.BuildSegmentMetadata(task.ref, int(task.ref.EndOffset-task.ref.BaseOffset+1), int64(len(segData)), pm.segmentsCfg.Compression)
 	if err != nil {
 		return fmt.Errorf("build segment metadata: %w", err)
 	}
-
 	ctx := context.Background()
-	if err := pm.s3Client.Put(ctx, segKey, segData, storage.PutOpts{}); err != nil {
+	if err := pm.s3Client.Put(ctx, task.ref.Key, segData, storage.PutOpts{}); err != nil {
 		return fmt.Errorf("upload sealed segment: %w", err)
 	}
-	if err := pm.s3Client.Put(ctx, sidecarKey, sidecarData, storage.PutOpts{}); err != nil {
+	if err := pm.s3Client.Put(ctx, task.ref.OffsetIndexKey, sidecarData, storage.PutOpts{}); err != nil {
 		return fmt.Errorf("upload sealed sidecar: %w", err)
 	}
-	if err := pm.s3Client.Put(ctx, metaKey, metaData, storage.PutOpts{}); err != nil {
+	if err := pm.s3Client.Put(ctx, task.ref.MetaKey, metaData, storage.PutOpts{}); err != nil {
 		return fmt.Errorf("upload segment metadata: %w", err)
 	}
-
-	if pm.diskCache != nil {
-		_ = pm.diskCache.Put(segKey, segData)
-		_ = pm.diskCache.Put(sidecarKey, sidecarData)
-		_ = pm.diskCache.Put(metaKey, metaData)
-	}
-
-	partState := log.PartitionState{HighWatermark: hw}
-	ps.mu.RLock()
-	if ps.epochHistory != nil {
-		for _, e := range ps.epochHistory.Entries {
-			partState.EpochHistory = append(partState.EpochHistory, log.EpochEntry{
-				Epoch:       e.Epoch,
-				StartOffset: e.StartOffset,
-			})
-		}
-	}
-	ps.mu.RUnlock()
-	stateData, err := partState.Marshal()
-	if err != nil {
-		return fmt.Errorf("marshal state: %w", err)
-	}
-	if err := pm.s3Client.Put(ctx, log.StateKey(topic, partitionID), stateData, storage.PutOpts{}); err != nil {
+	if err := pm.s3Client.Put(ctx, log.StateKey(task.topic, task.partitionID), task.stateData, storage.PutOpts{}); err != nil {
 		return fmt.Errorf("upload state.json: %w", err)
 	}
-
-	if len(snap) > 0 {
-		var cpBuf bytes.Buffer
-		for producerID, st := range snap {
-			line, err := json.Marshal(producerCheckpointEntry{
-				ProducerID: producerID,
-				NextSeq:    st.NextSeq,
-				LastOffset: st.LastOffset,
-			})
-			if err != nil {
-				return fmt.Errorf("marshal producers checkpoint: %w", err)
-			}
-			cpBuf.Write(line)
-			cpBuf.WriteByte('\n')
-		}
-		if err := pm.s3Client.Put(ctx, fmt.Sprintf("%s/%d/producers.checkpoint", topic, partitionID), cpBuf.Bytes(), storage.PutOpts{}); err != nil {
+	if len(task.producerCheckpoint) > 0 {
+		if err := pm.s3Client.Put(ctx, fmt.Sprintf("%s/%d/producers.checkpoint", task.topic, task.partitionID), task.producerCheckpoint, storage.PutOpts{}); err != nil {
 			return fmt.Errorf("upload producers checkpoint: %w", err)
 		}
 	}
-
+	if pm.diskCache != nil {
+		_ = pm.diskCache.Put(task.ref.Key, segData)
+		_ = pm.diskCache.Put(task.ref.OffsetIndexKey, sidecarData)
+		_ = pm.diskCache.Put(task.ref.MetaKey, metaData)
+	}
 	ps.mu.Lock()
-	ps.index.Add(segRef)
-	ps.index.SetHighWatermark(hw)
-	ps.flushedOffset = uint64(endOffset)
+	if ps.pendingFlush != task {
+		ps.mu.Unlock()
+		return fmt.Errorf("sealed segment changed while publishing %s", task.ref.Key)
+	}
+	ps.index.Add(task.ref)
+	ps.index.SetHighWatermark(task.highWatermark)
+	ps.flushedOffset = task.ref.EndOffset
+	ps.pendingFlush = nil
 	ps.mu.Unlock()
-
-	// Clean up local files now that they are safely in S3.
-	_ = os.Remove(segmentPath)
-	_ = os.Remove(sidecarPath)
-
-	slog.Info("active_segment_flushed",
-		"topic", topic,
-		"partition", partitionID,
-		"base_offset", baseOffset,
-		"end_offset", endOffset,
-		"size_bytes", len(segData),
-	)
-
+	_ = os.Remove(task.segmentPath)
+	_ = os.Remove(task.sidecarPath)
+	slog.Info("active_segment_flushed", "topic", task.topic, "partition", task.partitionID, "base_offset", task.ref.BaseOffset, "end_offset", task.ref.EndOffset, "size_bytes", len(segData))
 	return nil
 }

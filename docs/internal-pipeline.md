@@ -10,8 +10,13 @@ sink write but before the checkpoint, the batch is retried. Sink writes must
 therefore be deterministic and idempotent. Checkpoints are generation fenced
 and owner epoch fenced, so a former partition leader cannot advance progress.
 
-The current implementation includes a raw-byte-preserving DLQ sink. The same
-`Reader`, `CheckpointStore`, `Batch`, and `Sink` contracts are intended for
-future Parquet, materialized-topic, and Iceberg sinks. Those sinks must keep
-the output-before-checkpoint rule and provide their own durable commit or
+The current implementation uses these contracts for two paths:
+
+- schema-failure DLQ delivery, which preserves raw bytes and uses normal topic
+  produce/replication semantics; and
+- Parquet export, which reads committed ranges, writes deterministic Parquet
+  objects and manifests, then publishes the source checkpoint.
+
+Future materialized-topic or Iceberg sinks must keep the same
+output-before-checkpoint rule and provide their own durable commit or
 replication acknowledgement.

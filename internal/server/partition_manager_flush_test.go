@@ -84,6 +84,11 @@ func TestOnFlushActiveSegment(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pm.AppendRawBatch(ctx, topic, pid, batch2)
 	require.NoError(t, err)
+	// Simulate a later active tail. The state published with this segment must
+	// still expose only the durable prefix covered by the segment itself.
+	ps.mu.Lock()
+	ps.index.SetHighWatermark(100)
+	ps.mu.Unlock()
 
 	// Flush the active segment directly.
 	require.NoError(t, pm.onFlushActiveSegment(topic, pid))
@@ -104,6 +109,12 @@ func TestOnFlushActiveSegment(t *testing.T) {
 	metaData, err := s3Client.Get(ctx, metaKey)
 	require.NoError(t, err, "segment metadata must be in S3")
 	require.NotEmpty(t, metaData)
+
+	stateData, err := s3Client.Get(ctx, log.StateKey(topic, pid))
+	require.NoError(t, err)
+	var state log.PartitionState
+	require.NoError(t, state.Unmarshal(stateData))
+	require.Equal(t, uint64(3), state.HighWatermark, "state must not advertise an unuploaded tail")
 
 	// --- Verify: new active segment opened ---
 	ps.mu.RLock()

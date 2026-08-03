@@ -22,6 +22,12 @@ func newKafkaClient(cfg config, consumer bool) (*kgo.Client, error) {
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	}
 	if consumer {
+		// Keep the client and server fetch budgets aligned: the server returns at
+		// most 16 MiB per partition, and this client can receive four such pages.
+		opts = append(opts,
+			kgo.FetchMaxPartitionBytes(16<<20),
+			kgo.FetchMaxBytes(64<<20),
+		)
 		partitions := make(map[int32]kgo.Offset, cfg.Partitions)
 		for partition := 0; partition < cfg.Partitions; partition++ {
 			partitions[int32(partition)] = kgo.NewOffset().At(0)
@@ -57,9 +63,9 @@ func produceKafka(ctx context.Context, cfg config, count int64, expected []hashS
 		go func() {
 			defer wg.Done()
 			for partition := range jobs {
-				for first := int64(partition); first < count; first += int64(cfg.Partitions * cfg.BatchMessages) {
+				for first := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
 					records := make([]*kgo.Record, 0, cfg.BatchMessages)
-					for sequence := first; sequence < count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
+					for sequence := first; sequence < cfg.SequenceStart+count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
 						value := typedValue{ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
 						key := strconv.FormatInt(sequence, 10)
 						valueBytes := mustJSON(value)

@@ -72,7 +72,14 @@ func (r *Reader) Read(ctx context.Context, index *log.Index, topic string, parti
 	if uint64(limit) > available {
 		limit = int(available)
 	}
-	msgs, next, err := r.fetcher.Fetch(ctx, index, topic, partition, start, limit)
+	// Walk reads bounded RecordBatch ranges. Fetch materializes whole sealed
+	// segments (and may prefetch several of them), which is inappropriate for
+	// an exporter that only needs one checkpoint-sized batch.
+	msgs := make([]log.Message, 0, limit)
+	next, err := r.fetcher.Walk(ctx, index, topic, partition, start, limit, func(msg log.Message) bool {
+		msgs = append(msgs, msg)
+		return true
+	})
 	if err != nil {
 		return nil, start, err
 	}

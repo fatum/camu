@@ -136,6 +136,48 @@ func (c *DiskCache) Get(key string) ([]byte, error) {
 	return data, nil
 }
 
+// ReadRange retrieves a bounded byte range without materialising the cached
+// object in memory. A successful read promotes the entry to most-recently-used.
+func (c *DiskCache) ReadRange(key string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length < 0 {
+		return nil, fmt.Errorf("disk cache: invalid range offset=%d length=%d", offset, length)
+	}
+
+	c.mu.Lock()
+	elem, ok := c.index[key]
+	if !ok {
+		c.mu.Unlock()
+		return nil, ErrCacheMiss
+	}
+	entry := elem.Value.(*cacheEntry)
+	path := filepath.Join(c.dir, entry.filename)
+	c.order.MoveToFront(elem)
+	c.mu.Unlock()
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			c.Delete(key)
+			return nil, ErrCacheMiss
+		}
+		return nil, fmt.Errorf("disk cache: open %s: %w", key, err)
+	}
+	defer file.Close()
+
+	if offset >= entry.size {
+		return []byte{}, nil
+	}
+	if length > entry.size-offset {
+		length = entry.size - offset
+	}
+	data := make([]byte, length)
+	n, err := file.ReadAt(data, offset)
+	if err != nil && n != len(data) {
+		return nil, fmt.Errorf("disk cache: read %s: %w", key, err)
+	}
+	return data[:n], nil
+}
+
 // Has reports whether key is present in the cache without reading its data.
 func (c *DiskCache) Has(key string) bool {
 	c.mu.Lock()
