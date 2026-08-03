@@ -34,7 +34,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ps := s.partitionManager.GetPartitionState(topic, pid)
-	if ps == nil || ps.replicaState == nil {
+	if ps == nil {
 		slog.Debug("replica_fetch: partition not found or not replicated",
 			"topic", topic, "pid", pid, "replica", replicaID)
 		writeError(w, http.StatusNotFound, "partition not found or not replicated")
@@ -44,7 +44,15 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	// Check epoch divergence and implicit ack under ps.mu.Lock
 	// because UpdateFollower mutates replica state.
 	ps.mu.Lock()
-	truncateTo, diverged := ps.replicaState.CheckDivergence(replicaEpoch, replicaOffset)
+	if !ps.isLeader || ps.replicaState == nil {
+		ps.mu.Unlock()
+		slog.Debug("replica_fetch: partition is no longer local leader",
+			"topic", topic, "pid", pid, "replica", replicaID)
+		writeError(w, http.StatusNotFound, "partition is no longer local leader")
+		return
+	}
+	replicaState := ps.replicaState
+	truncateTo, diverged := replicaState.CheckDivergence(replicaEpoch, replicaOffset)
 	if diverged {
 		epoch := ps.epoch
 		// A follower which is asked to truncate must continue at the epoch
@@ -68,7 +76,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Implicit ack
-	ps.replicaState.UpdateFollower(replicaID, replicaOffset)
+	replicaState.UpdateFollower(replicaID, replicaOffset)
 
 	activeBase := replicaActiveBase(ps)
 	dataAvailable := fromOffset >= activeBase && fromOffset < ps.nextOffset
@@ -97,7 +105,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	// Long-poll if still no data (waiting for new writes)
 	// WaitForData uses its own internal signalling — don't hold ps.mu.
 	if len(rawBytes) == 0 && !behindSealedPrefix {
-		if ps.replicaState.WaitForData(500 * time.Millisecond) {
+		if replicaState.WaitForData(500 * time.Millisecond) {
 			rawBytes, err = readBatches()
 			if err != nil {
 				slog.Error("replica_fetch: ReadRawBatches after wait failed",
@@ -106,9 +114,19 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Snapshot state under lock for response headers.
+	// Snapshot state under lock for response headers. A concurrent reassignment
+	// can demote this partition while the long-poll above is waiting. Do not
+	// serve data from the former leader, and never dereference replicaState
+	// after it has been cleared by that transition.
 	ps.mu.RLock()
-	respHW := ps.replicaState.HighWatermark()
+	if !ps.isLeader || ps.replicaState != replicaState {
+		ps.mu.RUnlock()
+		slog.Debug("replica_fetch: partition demoted during fetch",
+			"topic", topic, "pid", pid, "replica", replicaID)
+		writeError(w, http.StatusNotFound, "partition is no longer local leader")
+		return
+	}
+	respHW := replicaState.HighWatermark()
 	respEpoch := ps.epoch
 	respFlushed := ps.flushedOffset
 	respActiveBase := replicaActiveBase(ps)

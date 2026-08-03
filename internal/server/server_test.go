@@ -431,6 +431,7 @@ func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
 	}
 	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
 	ps.mu.Lock()
+	ps.isLeader = true
 	ps.epoch = 3
 	ps.epochHistory = &replication.EpochHistory{Entries: []replication.EpochEntry{
 		{Epoch: 1, StartOffset: 0},
@@ -461,6 +462,72 @@ func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
 	}
 }
 
+func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) {
+	s := newTestServer(t)
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 2,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.isLeader = true
+	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
+	ps.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=0", nil)
+	req.SetPathValue("topic", tc.Name)
+	req.SetPathValue("pid", "0")
+	req.Header.Set("X-Replica-ID", "n2")
+	req.Header.Set("X-Replica-Offset", "0")
+	req.Header.Set("X-Replica-Epoch", "1")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.handleReplicaFetch(rec, req)
+		close(done)
+	}()
+
+	// Let the request enter its long-poll, then reproduce a leader demotion.
+	time.Sleep(25 * time.Millisecond)
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.replicaState = nil
+	ps.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("replica fetch remained blocked after demotion")
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d after demotion", rec.Code, http.StatusNotFound)
+	}
+
+	// The former panic occurred while holding this read lock. Verify it is not
+	// leaked, so later assignment application can take the write lock.
+	locked := make(chan struct{})
+	go func() {
+		ps.mu.Lock()
+		ps.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("partition lock leaked by replica fetch after demotion")
+	}
+}
+
 func TestHandleReplicaFetch_DuplicateEpochBoundaryServesRealTail(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
@@ -487,6 +554,7 @@ func TestHandleReplicaFetch_DuplicateEpochBoundaryServesRealTail(t *testing.T) {
 	// transition, so an epoch-1 follower must be allowed to fetch the tail.
 	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
 	ps.mu.Lock()
+	ps.isLeader = true
 	ps.epoch = 1
 	ps.epochHistory = &replication.EpochHistory{Entries: []replication.EpochEntry{
 		{Epoch: 1, StartOffset: 0},
