@@ -1374,9 +1374,9 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		return // not yet initialized
 	}
 
-	ps.mu.RLock()
-	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader {
-		ps.mu.RUnlock()
+	ps.mu.Lock()
+	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader && ps.epoch >= pa.LeaderEpoch {
+		ps.mu.Unlock()
 		return
 	}
 	localNextOffset := ps.nextOffset
@@ -1385,7 +1385,11 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	indexHW := ps.index.HighWatermark()
 	existingCancel := ps.fetchCancel
 	existingDone := ps.fetchDone
-	ps.mu.RUnlock()
+	ps.fetchGeneration++
+	generation := ps.fetchGeneration
+	ps.fetchCancel = nil
+	ps.fetchDone = nil
+	ps.mu.Unlock()
 
 	// If fetchCancel is nil but we're supposed to be a follower, the previous
 	// fetch loop may have exited (leader-down or error). Re-init.
@@ -1424,13 +1428,18 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		}
 	}
 
-	// Start follower fetch loop.
+	// Start follower fetch loop. Read the offset only after the old loop has
+	// stopped: it may have just applied a truncation from the new leader.
 	ps.mu.Lock()
+	if ps.fetchGeneration != generation || ps.isLeader {
+		ps.mu.Unlock()
+		return
+	}
 	ps.isLeader = false
 	ps.leaderID = pa.Leader
 	ps.replicaState = nil
 	localOffset := ps.nextOffset
-	fetchEpoch := localEpoch
+	fetchEpoch := ps.epoch
 	fetchDone := make(chan struct{})
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel

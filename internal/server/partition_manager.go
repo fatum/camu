@@ -201,6 +201,7 @@ type partitionState struct {
 	epochHistory  *replication.EpochHistory
 	fetchCancel   context.CancelFunc                 // cancel follower fetch goroutine
 	fetchDone     chan struct{}                      // closed when fetch goroutine exits
+	fetchGeneration uint64                           // fences concurrent follower reconfigurations
 	globalID      int                                // cached batcher partition ID, set on first append
 	globalIDSet   bool                               // true once globalID has been resolved
 	producerSeqs  map[uint64]*producerPartitionState // producerID -> sequence state

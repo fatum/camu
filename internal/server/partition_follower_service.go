@@ -327,8 +327,8 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	existingDone := ps.fetchDone
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
-	localOffset := ps.nextOffset
-	localEpoch := ps.epoch
+	ps.fetchGeneration++
+	generation := ps.fetchGeneration
 	ps.mu.Unlock()
 
 	if existingCancel != nil {
@@ -350,10 +350,16 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	leaderAddr := routablePeerAddress(req.Leader, addr)
 
 	ps.mu.Lock()
+	if ps.fetchGeneration != generation || ps.isLeader {
+		ps.mu.Unlock()
+		return
+	}
 	ps.isLeader = false
 	ps.leaderID = req.Leader
 	ps.replicaState = nil
 	ps.epoch = req.Epoch
+	localOffset := ps.nextOffset
+	localEpoch := ps.epoch
 	fetchDone := make(chan struct{})
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel
