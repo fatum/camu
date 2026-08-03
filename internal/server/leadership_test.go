@@ -47,6 +47,38 @@ func TestReconfigureFollowerPreservesLocalTailEpoch(t *testing.T) {
 	}
 }
 
+func TestReconfigureFollowerDemotesFormerLeader(t *testing.T) {
+	s := newTestServer(t)
+	tc := meta.TopicConfig{Name: "topic", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 2, MinInsyncReplicas: 1}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.isLeader = true
+	ps.epoch = 3
+	ps.mu.Unlock()
+
+	remote := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.1:8080", "127.0.0.1:1", "", time.Minute)
+	if err := remote.Register(context.Background()); err != nil {
+		t.Fatalf("register leader: %v", err)
+	}
+	s.reconfigureFollower(context.Background(), pushAssignmentRequest{Topic: tc.Name, Partition: 0, Leader: "n2", Epoch: 4})
+	defer s.partitionManager.CancelAllFetchLoops()
+
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.isLeader {
+		t.Fatal("former leader remained leader instead of starting follower replication")
+	}
+	if ps.fetchCancel == nil || ps.fetchAssignmentEpoch != 4 {
+		t.Fatalf("follower fetch state = cancel:%t epoch:%d, want active epoch 4", ps.fetchCancel != nil, ps.fetchAssignmentEpoch)
+	}
+}
+
 func TestInitPartitionAsLeader_PassesEpochHistoryToReplicaState(t *testing.T) {
 	s := newTestServer(t)
 

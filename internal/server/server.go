@@ -1400,6 +1400,11 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	generation := ps.fetchGeneration
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
+	// Demote before resolving the new leader. The later isLeader check fences a
+	// concurrent promotion; leaving this true here made former leaders return
+	// without ever starting their follower fetcher.
+	ps.isLeader = false
+	ps.replicaState = nil
 	ps.mu.Unlock()
 
 	// If fetchCancel is nil but we're supposed to be a follower, the previous
@@ -1446,9 +1451,7 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		ps.mu.Unlock()
 		return
 	}
-	ps.isLeader = false
 	ps.leaderID = pa.Leader
-	ps.replicaState = nil
 	ps.fetchAssignmentEpoch = pa.LeaderEpoch
 	localOffset := ps.nextOffset
 	fetchEpoch := ps.epoch

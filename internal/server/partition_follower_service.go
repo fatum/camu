@@ -330,6 +330,8 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	ps.fetchDone = nil
 	ps.fetchGeneration++
 	generation := ps.fetchGeneration
+	ps.isLeader = false
+	ps.replicaState = nil
 	ps.mu.Unlock()
 
 	if existingCancel != nil {
@@ -355,9 +357,7 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 		ps.mu.Unlock()
 		return
 	}
-	ps.isLeader = false
 	ps.leaderID = req.Leader
-	ps.replicaState = nil
 	ps.fetchAssignmentEpoch = req.Epoch
 	localOffset := ps.nextOffset
 	localEpoch := ps.epoch
