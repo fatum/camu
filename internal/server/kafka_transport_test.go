@@ -220,6 +220,7 @@ func TestKafkaFetch(t *testing.T) {
 }
 
 func TestKafkaFetchRawBatchesCapsPartitionBytesAndPropagatesContext(t *testing.T) {
+	assert.Equal(t, 16<<20, maxKafkaFetchPartitionBytes)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var gotContext context.Context

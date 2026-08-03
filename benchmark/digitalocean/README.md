@@ -84,20 +84,32 @@ report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT` is set. A
 topic is retained by default; set `CLEANUP=1` only when the final operation may
 delete it. Each invocation without `TOPIC` creates a unique topic, which is
 appropriate for a standalone `produce` run but not a later consume or SQL run.
+Repeated `produce` runs with the same `TOPIC` append to that topic; the
+benchmark resumes sequence and key numbering from its committed offsets.
 `TARGET_BYTES`, `MESSAGE_BYTES`, and `PARTITIONS` can override the workload.
 The default is four partitions. Byte values accept a positive byte count or a
 binary unit such as `1GiB`, `512MiB`, or `64KiB`.
+`REQUEST_TIMEOUT` bounds every HTTP request (default `30s`); `CONSUME_TIMEOUT`
+bounds the whole consume operation (default `10m`).
 
-Each benchmark invocation starts a local Prometheus, Loki, and Grafana stack.
-Prometheus scrapes Camu on port 8080 and cAdvisor on port 8082 from every
-benchmark node; the local collector follows each node's Camu container log and
-sends it to Loki. It also follows each node's kernel log and records Docker
-container state every five seconds, so OOM kills and restart loops appear in
-the same Grafana log view. Grafana is available during the run at
-<http://localhost:3000> (`admin` / `admin`) and is removed when the command
-exits. The dashboard provides the per-node CPU/memory, export-lag, S3/export
-error, and combined-log view needed to correlate a failure across the cluster.
-Set `BENCHMARK_MONITORING=0` to disable it.
+Start local benchmark monitoring separately when you need live metrics and
+logs:
+
+```bash
+./monitor.sh start
+# run one or more ./run.sh commands
+./monitor.sh stop
+```
+
+`run.sh` never starts or stops monitoring. The stack runs Prometheus, Loki, and
+Grafana locally. Prometheus scrapes Camu on port 8080 and cAdvisor on port 8082
+from every benchmark node; the local collector follows each node's Camu
+container log and sends it to Loki. It also follows each node's kernel log and
+records Docker container state every five seconds, so OOM kills and restart
+loops appear in the same Grafana log view. Grafana is available while the stack
+is running at <http://localhost:3000> (`admin` / `admin`). The dashboard
+provides the per-node CPU/memory, export-lag, S3/export error, and combined-log
+view needed to correlate a failure across the cluster.
 
 `consume` reads partition `p` through node `p`, rather than concentrating every
 partition on the first public endpoint. It logs the page offset, response size,
@@ -122,4 +134,6 @@ TOPIC=benchmark-typed-demo BENCHMARK_API=kafka ./run.sh produce 1GiB
 ```
 
 Kafka brokers default to all five public droplet addresses on port 9092. Set
-`KAFKA_BROKERS` to override them.
+`KAFKA_BROKERS` to override them. The Kafka benchmark requests up to 16 MiB per
+partition and 64 MiB per Fetch response; Camu enforces the 16 MiB per-partition
+ceiling.

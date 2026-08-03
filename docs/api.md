@@ -155,6 +155,8 @@ curl -N \
 Notes:
 
 - polling returns JSON with `messages` and `next_offset`
+- the endpoint accepts up to 20,000 messages, but returns at most 1,000 per
+  response so the complete JSON page is read before the response begins
 - SSE uses `id: {offset}`
 - resume uses `Last-Event-ID + 1`
 
@@ -377,6 +379,10 @@ Main supported APIs include:
 - `ApiVersions`
 - `InitProducerID`
 - ACL operations
+
+Fetch returns native Kafka `RecordBatch` bytes. Camu clamps each partition's
+`PartitionMaxBytes` to 16 MiB. Consumers should also set a total fetch budget;
+the bundled benchmark uses 16 MiB per partition and 64 MiB per Fetch response.
 
 Example with `kcat`:
 

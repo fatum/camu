@@ -53,18 +53,6 @@ done
 
 echo "Running benchmark topic: $topic" >&2
 
-monitoring_started=0
-stop_monitoring() {
-  if [[ "$monitoring_started" == 1 ]]; then
-    "$script_dir/monitor.sh" stop >&2 || true
-  fi
-}
-if [[ "${BENCHMARK_MONITORING:-1}" == "1" ]]; then
-  "$script_dir/monitor.sh" start
-  monitoring_started=1
-  trap stop_monitoring EXIT
-fi
-
 CAMU_URL="http://${ips[0]}:8080" \
 NODE_URLS="${node_urls%,}" \
 TOPIC="$topic" \

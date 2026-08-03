@@ -93,7 +93,10 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 	return resp, nil
 }
 
-const maxKafkaFetchPartitionBytes = 4 << 20
+// maxKafkaFetchPartitionBytes bounds the raw RecordBatch bytes returned for a
+// partition in one Fetch response. Kafka reads avoid HTTP's JSON expansion, so
+// a larger page is safe while remaining bounded per partition.
+const maxKafkaFetchPartitionBytes = 16 << 20
 
 func (ks *KafkaServer) handleFetch(ctx context.Context, req *kmsg.FetchRequest) (kmsg.Response, error) {
 	resp := kmsg.NewPtrFetchResponse()

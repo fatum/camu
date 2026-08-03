@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestTargetRecordCount(t *testing.T) {
@@ -67,5 +71,30 @@ func TestParseByteSizeRejectsInvalidValue(t *testing.T) {
 				t.Fatalf("parseByteSize(%q) succeeded", raw)
 			}
 		})
+	}
+}
+
+func TestClientRequestUsesRequestTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: 20 * time.Millisecond}
+	started := time.Now()
+	err := c.request(context.Background(), http.MethodGet, "/", nil, nil)
+	if err == nil {
+		t.Fatal("request succeeded, want timeout")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("request timeout took %s", elapsed)
+	}
+}
+
+func TestFirstSequenceForPartitionContinuesAnAppend(t *testing.T) {
+	for partition, want := range []int64{8, 9, 10, 7} {
+		if got := firstSequenceForPartition(7, partition, 4); got != want {
+			t.Fatalf("partition %d first sequence = %d, want %d", partition, got, want)
+		}
 	}
 }

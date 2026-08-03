@@ -34,6 +34,8 @@ type config struct {
 	BatchMessages, ProducerConcurrency               int
 	QueryInterval                                    time.Duration
 	ConsumeTimeout                                   time.Duration
+	RequestTimeout                                   time.Duration
+	SequenceStart                                    int64
 }
 
 type result struct {
@@ -194,6 +196,10 @@ func loadConfig() (config, error) {
 	if err != nil || consumeTimeout <= 0 {
 		return config{}, fmt.Errorf("CONSUME_TIMEOUT must be a positive duration")
 	}
+	requestTimeout, err := time.ParseDuration(env("REQUEST_TIMEOUT", "30s"))
+	if err != nil || requestTimeout <= 0 {
+		return config{}, fmt.Errorf("REQUEST_TIMEOUT must be a positive duration")
+	}
 	nodeURLs := []string{}
 	if raw := env("NODE_URLS", ""); raw != "" {
 		for _, nodeURL := range strings.Split(raw, ",") {
@@ -247,27 +253,39 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, QueryInterval: d, ConsumeTimeout: consumeTimeout}, nil
+	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout}, nil
 }
 
 type client struct {
-	base  string
-	http  *http.Client
-	token string
+	base           string
+	http           *http.Client
+	token          string
+	requestTimeout time.Duration
 }
 
 func (c client) request(ctx context.Context, method, path string, body any, out any) error {
+	_, err := c.requestHeaders(ctx, method, path, body, out)
+	return err
+}
+
+func (c client) requestHeaders(ctx context.Context, method, path string, body any, out any) (http.Header, error) {
+	timeout := c.requestTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		r = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.token != "" {
@@ -275,17 +293,19 @@ func (c client) request(ctx context.Context, method, path string, body any, out 
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return resp.Header, nil
 }
 
 func (c client) clusterStatus(ctx context.Context) (clusterStatus, error) {
@@ -335,6 +355,55 @@ func (c client) create(ctx context.Context, cfg config) error {
 		return err
 	}
 	return c.waitForReplication(ctx, cfg)
+}
+
+type benchmarkTopic struct {
+	Partitions int `json:"partitions"`
+}
+
+func (c client) ensureTopic(ctx context.Context, cfg config) (bool, error) {
+	var topic benchmarkTopic
+	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
+	if err != nil {
+		if !strings.Contains(err.Error(), "404") {
+			return false, err
+		}
+		if err := c.create(ctx, cfg); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if topic.Partitions != cfg.Partitions {
+		return false, fmt.Errorf("existing topic has %d partitions, benchmark requires %d", topic.Partitions, cfg.Partitions)
+	}
+	if err := c.waitForReplication(ctx, cfg); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c client) committedRecordCount(ctx context.Context, cfg config) (int64, error) {
+	var total uint64
+	for partition := 0; partition < cfg.Partitions; partition++ {
+		partitionClient := c
+		if len(cfg.NodeURLs) > 0 {
+			partitionClient.base = cfg.NodeURLs[partition%len(cfg.NodeURLs)]
+		}
+		var page consumeResponse
+		headers, err := partitionClient.requestHeaders(ctx, http.MethodGet, fmt.Sprintf("/v1/topics/%s/partitions/%d/messages?offset=0&limit=1", url.PathEscape(cfg.Topic), partition), nil, &page)
+		if err != nil {
+			return 0, fmt.Errorf("read partition %d high watermark: %w", partition, err)
+		}
+		hw, err := strconv.ParseUint(headers.Get("X-High-Watermark"), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("read partition %d high watermark: missing or invalid response header", partition)
+		}
+		if total > math.MaxInt64-hw {
+			return 0, errors.New("committed record count exceeds int64")
+		}
+		total += hw
+	}
+	return int64(total), nil
 }
 
 func (c client) waitForReplication(ctx context.Context, cfg config) error {
@@ -426,9 +495,9 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				for first := int64(p); first < count; first += int64(cfg.Partitions * cfg.BatchMessages) {
+				for first := firstSequenceForPartition(cfg.SequenceStart, p, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
 					batch := make([]map[string]any, 0, cfg.BatchMessages)
-					for i := first; i < count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
+					for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
 						v := typedValue{ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
 						batch = append(batch, map[string]any{"key": strconv.FormatInt(i, 10), "value": string(mustJSON(v))})
 						expected[p].add(v)
@@ -475,6 +544,10 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 	}
 	d := time.Since(start)
 	return phaseResult{Records: total, Bytes: total * cfg.MessageBytes, SerializedBytes: serialized, DurationSeconds: d.Seconds(), RecordsPerSecond: float64(total) / d.Seconds(), BytesPerSecond: float64(total*cfg.MessageBytes) / d.Seconds()}, nil
+}
+
+func firstSequenceForPartition(start int64, partition, partitions int) int64 {
+	return start + int64((partition-int(start%int64(partitions))+partitions)%partitions)
 }
 func mustJSON(v any) []byte {
 	b, err := json.Marshal(v)
@@ -690,11 +763,21 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 	}
 	switch cfg.Operation {
 	case "produce":
-		benchmarkLog("creating topic %q", cfg.Topic)
-		if err := c.create(ctx, cfg); err != nil {
-			res.Integrity.Error = "create topic: " + err.Error()
-			benchmarkLog("topic creation failed: %v", err)
+		benchmarkLog("creating or reusing topic %q", cfg.Topic)
+		existing, err := c.ensureTopic(ctx, cfg)
+		if err != nil {
+			res.Integrity.Error = "ensure topic: " + err.Error()
+			benchmarkLog("topic setup failed: %v", err)
 			return
+		}
+		if existing {
+			cfg.SequenceStart, err = c.committedRecordCount(ctx, cfg)
+			if err != nil {
+				res.Integrity.Error = "read existing topic: " + err.Error()
+				benchmarkLog("read existing topic failed: %v", err)
+				return
+			}
+			benchmarkLog("appending to topic %q at sequence=%d", cfg.Topic, cfg.SequenceStart)
 		}
 		var produced int64
 		pr, err := produce(ctx, cfg, count, expected, func(n int64) {
@@ -749,7 +832,7 @@ func main() {
 		os.Exit(2)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	c := client{base: cfg.BaseURL, http: &http.Client{Timeout: 2 * time.Minute}, token: os.Getenv("CAMU_AUTH_TOKEN")}
+	c := client{base: cfg.BaseURL, http: &http.Client{}, token: os.Getenv("CAMU_AUTH_TOKEN"), requestTimeout: cfg.RequestTimeout}
 	res := result{Topic: cfg.Topic, Operation: cfg.Operation}
 	cleanup := env("CLEANUP", "0") == "1"
 	var queryDone chan struct{}
@@ -760,7 +843,9 @@ func main() {
 	defer func() {
 		res.Cluster.Lost = readinessLost.Load()
 		if readinessDone != nil {
-			status, err := c.clusterStatus(context.Background())
+			statusCtx, statusCancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.RequestTimeout)
+			status, err := c.clusterStatus(statusCtx)
+			statusCancel()
 			sample := clusterStatusSample{At: time.Now(), Status: status}
 			if err != nil {
 				sample.Error = err.Error()
@@ -780,7 +865,10 @@ func main() {
 		}
 		if cleanup {
 			benchmarkLog("cleanup: deleting topic %q", cfg.Topic)
-			if err := c.deleteAndWait(context.Background(), cfg.Topic); err == nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			err := c.deleteAndWait(cleanupCtx, cfg.Topic)
+			cleanupCancel()
+			if err == nil {
 				res.Cleanup = true
 				benchmarkLog("cleanup: topic %q deleted", cfg.Topic)
 			} else if res.Integrity.Error == "" {
