@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,6 +179,34 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	}
 	if len(flushed) == 0 || flushed[0] != 0 {
 		t.Fatalf("expected follower progress with flushed offset 0, got %v", flushed)
+	}
+}
+
+func TestFollowerFetcher_CaughtUpDoesNotBusyLoop(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("X-High-Watermark", "0")
+		w.Header().Set("X-Leader-Epoch", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	pm := &mockPartitionManager{}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NewFollowerFetcher(&http.Client{Timeout: time.Second}, nil).Run(
+			ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm,
+		)
+	}()
+	<-done
+
+	if got := requests.Load(); got > 4 {
+		t.Fatalf("caught-up follower made %d fetches in 250ms; want bounded polling", got)
 	}
 }
 
