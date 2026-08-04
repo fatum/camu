@@ -10,11 +10,22 @@ import (
 	"sync"
 )
 
+// ReplicaFetchResult is the outcome of a replication fetch handler call.
+// When BatchReader is non-nil, the server will write the response header and
+// then stream BatchReader to the connection (via io.Copy which triggers
+// sendfile when the reader is backed by a file). When BatchReader is nil,
+// BatchData is used (for small responses or error responses).
+type ReplicaFetchResult struct {
+	Resp        *ReplicaFetchResponse
+	BatchReader io.Reader // optional: streamed after header (sendfile path)
+	BatchLen    int32     // length of BatchReader data; must match when set
+}
+
 // ReplicaFetchHandler processes a replication fetch request and returns the
-// response. The handler is called from the server's connection goroutine and
+// result. The handler is called from the server's connection goroutine and
 // may block for long-polling. The context is cancelled when the connection
 // closes.
-type ReplicaFetchHandler func(ctx context.Context, req *ReplicaFetchRequest) (*ReplicaFetchResponse, error)
+type ReplicaFetchHandler func(ctx context.Context, req *ReplicaFetchRequest) (*ReplicaFetchResult, error)
 
 // ReplicationServer is the leader-side TCP server for the raw replication
 // protocol. It accepts persistent connections from followers and processes
@@ -106,19 +117,21 @@ func (rs *ReplicationServer) handleConn(conn net.Conn) {
 			return
 		}
 
-		resp, err := rs.handler(ctx, req)
+		result, err := rs.handler(ctx, req)
 		if err != nil {
 			rs.log.Debug("replication: handler error",
 				"remote", conn.RemoteAddr(),
 				"topic", req.Topic, "pid", req.PartitionID,
 				"error", err)
-			resp = &ReplicaFetchResponse{
-				CorrelationID: req.CorrelationID,
-				ErrorCode:     ReplicaErrInternal,
+			result = &ReplicaFetchResult{
+				Resp: &ReplicaFetchResponse{
+					CorrelationID: req.CorrelationID,
+					ErrorCode:     ReplicaErrInternal,
+				},
 			}
 		}
 
-		if err := rs.writeResponse(conn, resp); err != nil {
+		if err := rs.writeResult(conn, result); err != nil {
 			rs.log.Debug("replication: write response",
 				"remote", conn.RemoteAddr(), "error", err)
 			return
@@ -126,12 +139,45 @@ func (rs *ReplicationServer) handleConn(conn net.Conn) {
 	}
 }
 
-// writeResponse writes a replication response frame using net.Buffers for
-// zero-copy writev when batch data is present.
-func (rs *ReplicationServer) writeResponse(conn net.Conn, resp *ReplicaFetchResponse) error {
-	header := EncodeResponseHeader(resp)
-	totalPayload := len(header) + len(resp.BatchData)
+// writeResult writes a replication response frame. When result.BatchReader is
+// non-nil, the header is written first (with BatchLen in the data-length
+// field), then the batch data is streamed via io.Copy. When the reader is an
+// io.ReaderAt (e.g. io.NewSectionReader over *os.File), Go's net.TCPConn
+// ReadFrom triggers sendfile for zero-copy file→socket transfer.
+func (rs *ReplicationServer) writeResult(conn net.Conn, result *ReplicaFetchResult) error {
+	resp := result.Resp
+	if result.BatchReader != nil {
+		resp.BatchDataLen = result.BatchLen
+		resp.BatchData = nil
+	} else if resp.BatchData != nil {
+		resp.BatchDataLen = int32(len(resp.BatchData))
+	}
 
+	header := EncodeResponseHeader(resp)
+	headerLen := len(header)
+
+	if result.BatchReader != nil {
+		totalPayload := int32(headerLen) + result.BatchLen
+		var frameLen [4]byte
+		binary.BigEndian.PutUint32(frameLen[:], uint32(totalPayload))
+
+		// Write frame length + header.
+		if _, err := conn.Write(frameLen[:]); err != nil {
+			return err
+		}
+		if _, err := conn.Write(header); err != nil {
+			return err
+		}
+		// Stream batch data. io.Copy with a *net.TCPConn uses ReadFrom,
+		// which invokes sendfile when the reader is file-backed.
+		if _, err := io.Copy(conn, result.BatchReader); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Non-streaming path: BatchData is nil or empty.
+	totalPayload := int32(headerLen)
 	var frameLen [4]byte
 	binary.BigEndian.PutUint32(frameLen[:], uint32(totalPayload))
 
@@ -141,7 +187,7 @@ func (rs *ReplicationServer) writeResponse(conn net.Conn, resp *ReplicaFetchResp
 		if err != nil {
 			return err
 		}
-		if n != int64(len(frameLen)+len(header)+len(resp.BatchData)) {
+		if n != int64(len(frameLen)+headerLen+len(resp.BatchData)) {
 			return io.ErrShortWrite
 		}
 		return nil
@@ -152,7 +198,7 @@ func (rs *ReplicationServer) writeResponse(conn net.Conn, resp *ReplicaFetchResp
 	if err != nil {
 		return err
 	}
-	if n != int64(len(frameLen)+len(header)) {
+	if n != int64(len(frameLen)+headerLen) {
 		return io.ErrShortWrite
 	}
 	return nil

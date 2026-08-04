@@ -212,16 +212,16 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 		"index_next", indexNext, "index_hw", currentIndexHW)
 
 	ehPath := p.server.partitionManager.EpochHistoryPath(topic, pid)
+	s3eh, _ := p.server.isrStore.ReadEpochHistory(ctx, topic, pid)
 	ps.mu.RLock()
 	eh := ps.epochHistory
 	ps.mu.RUnlock()
-	if eh == nil {
-		eh, _ = p.server.isrStore.ReadEpochHistory(ctx, topic, pid)
-		if eh == nil || len(eh.Entries) == 0 {
-			eh, _ = replication.LoadEpochHistory(ehPath)
-			if eh == nil {
-				eh = &replication.EpochHistory{}
-			}
+	if s3eh != nil && len(s3eh.Entries) > 0 {
+		eh = s3eh
+	} else if eh == nil {
+		eh, _ = replication.LoadEpochHistory(ehPath)
+		if eh == nil {
+			eh = &replication.EpochHistory{}
 		}
 	}
 	eh.Append(replication.EpochEntry{Epoch: newEpoch, StartOffset: logEnd})

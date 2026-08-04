@@ -1,7 +1,6 @@
 package replication
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,7 +21,7 @@ var ErrPartitionNotReady = errors.New("partition not ready on leader")
 
 // PartitionManager is the interface the fetcher needs from the server.
 type PartitionManager interface {
-	AppendReplicatedRawBatch(ctx context.Context, topic string, pid int, batch []byte) error
+	AppendReplicatedBatchStream(topic string, pid int, hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error
 	TruncateLogFrom(topic string, pid int, offset uint64) error
 	SyncFollowerSealedPrefix(ctx context.Context, topic string, pid int, activeBase uint64) uint64
 	UpdateFollowerProgress(topic string, pid int, leaderEpoch, highWatermark, flushedOffset uint64)
@@ -53,12 +52,21 @@ type OnLeaderDown func(topic string, pid int)
 // raw TCP connection and applies them to the local PartitionManager.
 type FollowerFetcher struct {
 	onLeaderDown OnLeaderDown
+	readTimeout  time.Duration
 }
 
-// NewFollowerFetcher creates a FollowerFetcher with a leader-down callback.
-func NewFollowerFetcher(onLeaderDown OnLeaderDown) *FollowerFetcher {
+// NewFollowerFetcher creates a FollowerFetcher with a leader-down callback
+// and a read timeout applied to each fetch cycle. The timeout covers the
+// leader's long-polling window plus network RTT; if the leader stops
+// responding mid-fetch the connection is closed and the error counts toward
+// leader-down detection.
+func NewFollowerFetcher(onLeaderDown OnLeaderDown, readTimeout time.Duration) *FollowerFetcher {
+	if readTimeout <= 0 {
+		readTimeout = 30 * time.Second
+	}
 	return &FollowerFetcher{
 		onLeaderDown: onLeaderDown,
+		readTimeout:  readTimeout,
 	}
 }
 
@@ -127,9 +135,19 @@ func (f *FollowerFetcher) Run(
 			"epoch", localEpoch, "leader", leaderAddr)
 
 		correlationID++
-		result, err := f.fetchFromLeader(conn, correlationID, topic, pid, localOffset, localEpoch, instanceID, func(batch []byte) error {
-			return pm.AppendReplicatedRawBatch(ctx, topic, pid, batch)
-		})
+		if err := conn.SetReadDeadline(time.Now().Add(f.readTimeout)); err != nil {
+			conn.Close()
+			conn = nil
+			consecutiveErrors++
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		result, err := f.fetchFromLeader(conn, correlationID, topic, pid, localOffset, localEpoch, instanceID, pm)
+		conn.SetReadDeadline(time.Time{})
 
 		if result != nil && result.hasBatches {
 			localOffset = result.lastOffset + 1
@@ -214,7 +232,8 @@ func (f *FollowerFetcher) declareLeaderDown(topic string, pid int, errors int) {
 }
 
 // fetchFromLeader sends a ReplicaFetchRequest over the persistent TCP
-// connection and parses the response.
+// connection and streams the response batches directly to the partition
+// manager, avoiding materializing the full response in memory.
 func (f *FollowerFetcher) fetchFromLeader(
 	conn net.Conn,
 	correlationID int32,
@@ -223,7 +242,7 @@ func (f *FollowerFetcher) fetchFromLeader(
 	offset uint64,
 	epoch uint64,
 	instanceID string,
-	appendBatch func([]byte) error,
+	pm PartitionManager,
 ) (*fetchedBatches, error) {
 	req := &ReplicaFetchRequest{
 		CorrelationID: correlationID,
@@ -240,15 +259,17 @@ func (f *FollowerFetcher) fetchFromLeader(
 		return nil, fmt.Errorf("fetcher: write request: %w", err)
 	}
 
-	resp, err := ReadResponse(conn)
+	resp, batchLen, err := ReadResponseHeader(conn)
 	if err != nil {
 		return nil, fmt.Errorf("fetcher: read response: %w", err)
 	}
 
 	if resp.ErrorCode == ReplicaErrNotFound {
+		drainBatchData(conn, batchLen)
 		return nil, ErrPartitionNotReady
 	}
 	if resp.ErrorCode == ReplicaErrTruncate {
+		drainBatchData(conn, batchLen)
 		var result fetchedBatches
 		fr := &result.response
 		fr.TruncateTo = resp.TruncateTo
@@ -259,6 +280,7 @@ func (f *FollowerFetcher) fetchFromLeader(
 		return &result, nil
 	}
 	if resp.ErrorCode != ReplicaErrOK {
+		drainBatchData(conn, batchLen)
 		return nil, fmt.Errorf("fetcher: leader returned error code %d", resp.ErrorCode)
 	}
 
@@ -270,12 +292,12 @@ func (f *FollowerFetcher) fetchFromLeader(
 	fr.FlushedOffset = resp.FlushedOffset
 	fr.ActiveBase = resp.ActiveBase
 
-	if len(resp.BatchData) > 0 {
-		if err := readReplicaBatches(bytes.NewReader(resp.BatchData), offset, func(batch []byte, header log.RecordBatchHeader) error {
-			if err := appendBatch(batch); err != nil {
+	if batchLen > 0 {
+		if err := streamReplicaBatches(conn, batchLen, offset, func(hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
+			if err := pm.AppendReplicatedBatchStream(topic, pid, hdr, headerBytes, body, bodySize); err != nil {
 				return err
 			}
-			result.lastOffset = uint64(header.LastOffset())
+			result.lastOffset = uint64(hdr.LastOffset())
 			result.hasBatches = true
 			return nil
 		}); err != nil {
@@ -286,39 +308,59 @@ func (f *FollowerFetcher) fetchFromLeader(
 	return &result, nil
 }
 
+// drainBatchData reads and discards batchLen bytes from r so the connection
+// remains in a clean state for the next request.
+func drainBatchData(r io.Reader, batchLen int32) {
+	if batchLen <= 0 {
+		return
+	}
+	_, _ = io.CopyN(io.Discard, r, int64(batchLen))
+}
+
 const maxReplicaBatchBytes = 16 << 20
 
-// readReplicaBatches reads the concatenated RecordBatch stream one batch at a
-// time. The protocol is self-framing: each batch has its total length in the
-// first 12 bytes, so no response-sized buffer is needed.
-func readReplicaBatches(r io.Reader, requestedOffset uint64, appendBatch func([]byte, log.RecordBatchHeader) error) error {
-	for {
+// streamReplicaBatches reads self-framing RecordBatches from r, streaming
+// each batch body directly to the append callback without materializing the
+// full batch in memory. totalLen is the total remaining bytes to read.
+func streamReplicaBatches(r io.Reader, totalLen int32, requestedOffset uint64, appendBatch func(hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error) error {
+	remaining := totalLen
+	for remaining > 0 {
 		var headerBytes [log.RecordBatchHeaderSize]byte
-		_, err := io.ReadFull(r, headerBytes[:])
-		if err == io.EOF {
-			return nil
+		if int32(log.RecordBatchHeaderSize) > remaining {
+			return fmt.Errorf("fetcher: batch header exceeds remaining data: %d > %d", log.RecordBatchHeaderSize, remaining)
 		}
-		if err != nil {
+		if _, err := io.ReadFull(r, headerBytes[:]); err != nil {
 			return fmt.Errorf("fetcher: read batch header: %w", err)
 		}
+		remaining -= int32(log.RecordBatchHeaderSize)
+
 		header, err := log.ReadRecordBatchHeader(headerBytes[:])
 		if err != nil {
 			return fmt.Errorf("fetcher: parse batch header: %w", err)
 		}
-		batchSize := int(header.RecordBatchSize())
+		batchSize := int32(header.RecordBatchSize())
 		if batchSize < log.RecordBatchHeaderSize || batchSize > maxReplicaBatchBytes {
 			return fmt.Errorf("fetcher: invalid replica batch size %d", batchSize)
 		}
-		batch := make([]byte, batchSize)
-		copy(batch, headerBytes[:])
-		if _, err := io.ReadFull(r, batch[log.RecordBatchHeaderSize:]); err != nil {
-			return fmt.Errorf("fetcher: read batch body: %w", err)
+		bodySize := int64(batchSize - log.RecordBatchHeaderSize)
+		if bodySize > int64(remaining) {
+			return fmt.Errorf("fetcher: batch body exceeds remaining data: %d > %d", bodySize, remaining)
 		}
+
+		// Skip batches before the requested offset.
 		if uint64(header.LastOffset()) < requestedOffset {
+			if _, err := io.CopyN(io.Discard, r, bodySize); err != nil {
+				return fmt.Errorf("fetcher: skip batch body: %w", err)
+			}
+			remaining -= int32(bodySize)
 			continue
 		}
-		if err := appendBatch(batch, header); err != nil {
+
+		bodyReader := io.LimitReader(r, bodySize)
+		if err := appendBatch(header, headerBytes[:], bodyReader, bodySize); err != nil {
 			return fmt.Errorf("fetcher: append raw batch: %w", err)
 		}
+		remaining -= int32(bodySize)
 	}
+	return nil
 }

@@ -2,13 +2,14 @@ package server
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"time"
 
 	"github.com/maksim/camu/internal/replication"
 )
 
-func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.ReplicaFetchRequest) (*replication.ReplicaFetchResponse, error) {
+func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.ReplicaFetchRequest) (*replication.ReplicaFetchResult, error) {
 	topic := req.Topic
 	pid := int(req.PartitionID)
 	fromOffset := req.FromOffset
@@ -20,9 +21,11 @@ func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.Rep
 	if ps == nil {
 		slog.Debug("replica_fetch: partition not found or not replicated",
 			"topic", topic, "pid", pid, "replica", replicaID)
-		return &replication.ReplicaFetchResponse{
-			CorrelationID: req.CorrelationID,
-			ErrorCode:     replication.ReplicaErrNotFound,
+		return &replication.ReplicaFetchResult{
+			Resp: &replication.ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     replication.ReplicaErrNotFound,
+			},
 		}, nil
 	}
 
@@ -31,9 +34,11 @@ func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.Rep
 		ps.mu.Unlock()
 		slog.Debug("replica_fetch: partition is no longer local leader",
 			"topic", topic, "pid", pid, "replica", replicaID)
-		return &replication.ReplicaFetchResponse{
-			CorrelationID: req.CorrelationID,
-			ErrorCode:     replication.ReplicaErrNotFound,
+		return &replication.ReplicaFetchResult{
+			Resp: &replication.ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     replication.ReplicaErrNotFound,
+			},
 		}, nil
 	}
 	replicaState := ps.replicaState
@@ -50,19 +55,20 @@ func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.Rep
 			"topic", topic, "pid", pid, "replica", replicaID,
 			"replica_epoch", replicaEpoch, "replica_offset", replicaOffset,
 			"truncate_to", truncateTo)
-		return &replication.ReplicaFetchResponse{
-			CorrelationID: req.CorrelationID,
-			ErrorCode:     replication.ReplicaErrTruncate,
-			TruncateTo:    truncateTo,
-			LeaderEpoch:   epoch,
-			HighWatermark: replicaState.HighWatermark(),
+		return &replication.ReplicaFetchResult{
+			Resp: &replication.ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     replication.ReplicaErrTruncate,
+				TruncateTo:    truncateTo,
+				LeaderEpoch:   epoch,
+				HighWatermark: replicaState.HighWatermark(),
+			},
 		}, nil
 	}
 
 	replicaState.UpdateFollower(replicaID, replicaOffset)
 
 	activeBase := replicaActiveBase(ps)
-	dataAvailable := fromOffset >= activeBase && fromOffset < ps.nextOffset
 	behindSealedPrefix := fromOffset < activeBase
 	ps.mu.Unlock()
 
@@ -71,30 +77,28 @@ func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.Rep
 		maxBytes = 1 << 20
 	}
 
-	readBatches := func() ([]byte, error) {
-		bytes, _, err := s.partitionManager.ReadReplicaRawBatches(ctx, topic, pid, int64(fromOffset), maxBytes)
-		return bytes, err
-	}
-	var rawBytes []byte
-	var readErr error
-	if dataAvailable {
-		rawBytes, readErr = readBatches()
-		if readErr != nil {
-			slog.Error("replica_fetch: ReadRawBatches failed",
-				"topic", topic, "pid", pid, "from_offset", fromOffset, "error", readErr)
-			return &replication.ReplicaFetchResponse{
-				CorrelationID: req.CorrelationID,
-				ErrorCode:     replication.ReplicaErrInternal,
-			}, nil
-		}
+	fetchRange := func() (ReplicaBatchRange, error) {
+		return s.partitionManager.ReadReplicaBatchRange(topic, pid, int64(fromOffset), maxBytes)
 	}
 
-	if len(rawBytes) == 0 && !behindSealedPrefix {
+	batchRange, err := fetchRange()
+	if err != nil {
+		slog.Error("replica_fetch: ReadReplicaBatchRange failed",
+			"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
+		return &replication.ReplicaFetchResult{
+			Resp: &replication.ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     replication.ReplicaErrInternal,
+			},
+		}, nil
+	}
+
+	if batchRange.Length == 0 && !behindSealedPrefix {
 		if replicaState.WaitForData(500 * time.Millisecond) {
-			rawBytes, readErr = readBatches()
-			if readErr != nil {
-				slog.Error("replica_fetch: ReadRawBatches after wait failed",
-					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", readErr)
+			batchRange, err = fetchRange()
+			if err != nil {
+				slog.Error("replica_fetch: ReadReplicaBatchRange after wait failed",
+					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
 			}
 		}
 	}
@@ -104,9 +108,11 @@ func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.Rep
 		ps.mu.RUnlock()
 		slog.Debug("replica_fetch: partition demoted during fetch",
 			"topic", topic, "pid", pid, "replica", replicaID)
-		return &replication.ReplicaFetchResponse{
-			CorrelationID: req.CorrelationID,
-			ErrorCode:     replication.ReplicaErrNotFound,
+		return &replication.ReplicaFetchResult{
+			Resp: &replication.ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     replication.ReplicaErrNotFound,
+			},
 		}, nil
 	}
 	respHW := replicaState.HighWatermark()
@@ -117,18 +123,27 @@ func (s *Server) handleReplicaFetchTCP(ctx context.Context, req *replication.Rep
 
 	slog.Debug("replica_fetch: serving",
 		"topic", topic, "pid", pid, "replica", replicaID,
-		"from_offset", fromOffset, "bytes", len(rawBytes),
+		"from_offset", fromOffset, "bytes", batchRange.Length,
 		"hw", respHW, "epoch", respEpoch)
 
-	return &replication.ReplicaFetchResponse{
+	resp := &replication.ReplicaFetchResponse{
 		CorrelationID: req.CorrelationID,
 		ErrorCode:     replication.ReplicaErrOK,
 		LeaderEpoch:   respEpoch,
 		HighWatermark: respHW,
 		FlushedOffset: respFlushed,
 		ActiveBase:    respActiveBase,
-		BatchData:     rawBytes,
-	}, nil
+	}
+
+	if batchRange.Length > 0 && batchRange.File != nil {
+		return &replication.ReplicaFetchResult{
+			Resp:        resp,
+			BatchReader: io.NewSectionReader(batchRange.File, batchRange.FileOffset, batchRange.Length),
+			BatchLen:    int32(batchRange.Length),
+		}, nil
+	}
+
+	return &replication.ReplicaFetchResult{Resp: resp}, nil
 }
 
 // replicaActiveBase is the offset where the leader's local tail begins. The

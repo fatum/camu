@@ -263,7 +263,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	s.internalClient = replication.NewH2CClient(replicationTimeout)
 	s.assignmentPusher = NewAssignmentPusher(s.internalClient)
-	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown)
+	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown, replicationTimeout)
 
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
@@ -1248,18 +1248,18 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
 
 	// Load epoch history from S3 (authoritative), fall back to local file,
-	// or use existing epochHistory if already set.
+	// or use existing epochHistory if S3 is unavailable.
+	ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
+	s3eh, _ := s.isrStore.ReadEpochHistory(ctx, topic, pid)
 	ps.mu.RLock()
 	eh := ps.epochHistory
 	ps.mu.RUnlock()
-	if eh == nil {
-		ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
-		eh, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
-		if eh == nil || len(eh.Entries) == 0 {
-			eh, _ = replication.LoadEpochHistory(ehPath)
-			if eh == nil {
-				eh = &replication.EpochHistory{}
-			}
+	if s3eh != nil && len(s3eh.Entries) > 0 {
+		eh = s3eh
+	} else if eh == nil {
+		eh, _ = replication.LoadEpochHistory(ehPath)
+		if eh == nil {
+			eh = &replication.EpochHistory{}
 		}
 	}
 	hasCurrentEpoch := false
@@ -1269,6 +1269,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 			break
 		}
 	}
+	ehChanged := !hasCurrentEpoch
 	if !hasCurrentEpoch {
 		if err := eh.Ensure(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
 			slog.Error("initPartitionAsLeader: invalid epoch history", "topic", topic, "partition", pid, "error", err)
@@ -1289,7 +1290,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	ps.nextOffset = logEnd
 	ps.epochHistory = eh
 	ps.mu.Unlock()
-	if eh != prevEpochHistory {
+	if ehChanged || eh != prevEpochHistory {
 		if err := eh.SaveToFile(s.partitionManager.EpochHistoryPath(topic, pid)); err != nil {
 			slog.Warn("initPartitionAsLeader: save epoch history locally", "topic", topic, "partition", pid, "error", err)
 		}

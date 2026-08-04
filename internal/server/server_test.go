@@ -443,10 +443,11 @@ func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
 		ReplicaOffset: 15,
 		ReplicaEpoch:  1,
 	}
-	resp, err := s.handleReplicaFetchTCP(context.Background(), req)
+	result, err := s.handleReplicaFetchTCP(context.Background(), req)
 	if err != nil {
 		t.Fatalf("handleReplicaFetchTCP() error = %v", err)
 	}
+	resp := result.Resp
 	if resp.ErrorCode != replication.ReplicaErrTruncate {
 		t.Fatalf("ErrorCode = %d, want %d (truncate)", resp.ErrorCode, replication.ReplicaErrTruncate)
 	}
@@ -489,9 +490,9 @@ func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) 
 		ReplicaEpoch:  1,
 	}
 	done := make(chan struct{})
-	var resp *replication.ReplicaFetchResponse
+	var result *replication.ReplicaFetchResult
 	go func() {
-		resp, _ = s.handleReplicaFetchTCP(context.Background(), req)
+		result, _ = s.handleReplicaFetchTCP(context.Background(), req)
 		close(done)
 	}()
 
@@ -507,8 +508,8 @@ func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("replica fetch remained blocked after demotion")
 	}
-	if resp.ErrorCode != replication.ReplicaErrNotFound {
-		t.Fatalf("ErrorCode = %d, want %d (not found)", resp.ErrorCode, replication.ReplicaErrNotFound)
+	if result.Resp.ErrorCode != replication.ReplicaErrNotFound {
+		t.Fatalf("ErrorCode = %d, want %d (not found)", result.Resp.ErrorCode, replication.ReplicaErrNotFound)
 	}
 
 	// The former panic occurred while holding this read lock. Verify it is not
@@ -575,18 +576,26 @@ func TestHandleReplicaFetch_DuplicateEpochBoundaryServesRealTail(t *testing.T) {
 		ReplicaOffset: 11,
 		ReplicaEpoch:  1,
 	}
-	resp, err := s.handleReplicaFetchTCP(ctx, req)
+	result, err := s.handleReplicaFetchTCP(ctx, req)
 	if err != nil {
 		t.Fatalf("handleReplicaFetchTCP() error = %v", err)
 	}
+	resp := result.Resp
 	if resp.ErrorCode != replication.ReplicaErrOK {
 		t.Fatalf("ErrorCode = %d, want %d (ok)", resp.ErrorCode, replication.ReplicaErrOK)
 	}
 	if resp.TruncateTo != 0 {
 		t.Fatalf("TruncateTo = %d, want 0 (no truncation)", resp.TruncateTo)
 	}
-	if !bytes.Equal(resp.BatchData, raw) {
-		t.Fatalf("replica response = %x, want raw RecordBatch %x", resp.BatchData, raw)
+	if result.BatchReader == nil {
+		t.Fatal("expected BatchReader for active tail data, got nil")
+	}
+	batchData, err := io.ReadAll(result.BatchReader)
+	if err != nil {
+		t.Fatalf("read BatchReader: %v", err)
+	}
+	if !bytes.Equal(batchData, raw) {
+		t.Fatalf("replica response = %x, want raw RecordBatch %x", batchData, raw)
 	}
 }
 

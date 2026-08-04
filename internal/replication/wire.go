@@ -34,9 +34,9 @@ type ReplicaFetchRequest struct {
 }
 
 // ReplicaFetchResponse is the leader→follower replication fetch response.
-// When ErrorCode is 0 and TruncateTo > 0, the follower must truncate and
+// When ErrorCode is ReplicaErrTruncate, the follower must truncate and
 // resume from TruncateTo with the given LeaderEpoch. BatchData contains raw
-// concatenated Kafka v2 RecordBatch bytes (may be nil/empty).
+// concatenated Kafka v2 RecordBatch bytes (may be nil/empty for streaming).
 type ReplicaFetchResponse struct {
 	CorrelationID int32
 	ErrorCode     int16
@@ -45,7 +45,8 @@ type ReplicaFetchResponse struct {
 	HighWatermark uint64
 	FlushedOffset uint64
 	ActiveBase    uint64
-	BatchData     []byte
+	BatchData     []byte // nil when using streaming (BatchDataLen > 0 with io.Reader)
+	BatchDataLen  int32  // length of batch data that follows the header on the wire
 }
 
 // EncodeRequest encodes a ReplicaFetchRequest into a length-prefixed frame
@@ -199,31 +200,52 @@ func EncodeResponseHeader(resp *ReplicaFetchResponse) []byte {
 	off += 8
 	binary.BigEndian.PutUint64(buf[off:], resp.ActiveBase)
 	off += 8
-	binary.BigEndian.PutUint32(buf[off:], uint32(len(resp.BatchData)))
+	dataLen := resp.BatchDataLen
+	if dataLen == 0 && len(resp.BatchData) > 0 {
+		dataLen = int32(len(resp.BatchData))
+	}
+	binary.BigEndian.PutUint32(buf[off:], uint32(dataLen))
 	off += 4
 	return buf
 }
 
 // ReadResponse reads a single ReplicaFetchResponse from r, including the
-// batch data payload. The caller passes the expected correlation ID for
-// validation (not strictly necessary on a dedicated connection, but catches
-// protocol corruption early).
+// batch data payload materialized into BatchData. Use ReadResponseHeader for
+// zero-copy streaming of batch data.
 func ReadResponse(r io.Reader) (*ReplicaFetchResponse, error) {
+	resp, batchLen, err := ReadResponseHeader(r)
+	if err != nil {
+		return resp, err
+	}
+	if batchLen > 0 {
+		resp.BatchData = make([]byte, batchLen)
+		if _, err := io.ReadFull(r, resp.BatchData); err != nil {
+			return resp, err
+		}
+	}
+	return resp, nil
+}
+
+// ReadResponseHeader reads the fixed-size response header and returns the
+// response metadata along with the number of batch-data bytes that follow on
+// the wire. The caller is responsible for reading exactly batchLen bytes from
+// r before decoding the next response.
+func ReadResponseHeader(r io.Reader) (resp *ReplicaFetchResponse, batchLen int32, err error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	frameLen := int32(binary.BigEndian.Uint32(lenBuf[:]))
 	if frameLen < replicaFetchRespHeaderSize || frameLen > (1<<30) {
-		return nil, fmt.Errorf("replication: invalid response frame length %d", frameLen)
+		return nil, 0, fmt.Errorf("replication: invalid response frame length %d", frameLen)
 	}
 
-	header := make([]byte, replicaFetchRespHeaderSize)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, err
+	var header [replicaFetchRespHeaderSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, 0, err
 	}
 
-	resp := &ReplicaFetchResponse{
+	resp = &ReplicaFetchResponse{
 		CorrelationID: int32(binary.BigEndian.Uint32(header[0:4])),
 		ErrorCode:     int16(binary.BigEndian.Uint16(header[4:6])),
 		TruncateTo:    binary.BigEndian.Uint64(header[6:14]),
@@ -233,19 +255,12 @@ func ReadResponse(r io.Reader) (*ReplicaFetchResponse, error) {
 		ActiveBase:    binary.BigEndian.Uint64(header[38:46]),
 	}
 
-	batchLen := int32(binary.BigEndian.Uint32(header[46:50]))
+	batchLen = int32(binary.BigEndian.Uint32(header[46:50]))
 	if batchLen < 0 || batchLen > (1<<28) {
-		return resp, fmt.Errorf("replication: invalid batch data length %d", batchLen)
+		return resp, batchLen, fmt.Errorf("replication: invalid batch data length %d", batchLen)
 	}
-
-	if batchLen > 0 {
-		resp.BatchData = make([]byte, batchLen)
-		if _, err := io.ReadFull(r, resp.BatchData); err != nil {
-			return resp, err
-		}
-	}
-
-	return resp, nil
+	resp.BatchDataLen = batchLen
+	return resp, batchLen, nil
 }
 
 func readString(buf []byte, off int) (string, int, error) {

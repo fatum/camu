@@ -103,6 +103,61 @@ func (s *ActiveSegment) Append(batch []byte) error {
 	return nil
 }
 
+// AppendFromReader appends a single RecordBatch whose header has already been
+// parsed and whose body (batch[HeaderSize:]) is streamed from body. This
+// avoids materializing the full batch in memory: only the 61-byte header is
+// buffered, the body flows directly from the reader to the file via io.Copy.
+// bodySize is the number of bytes after the header (total batch size minus
+// RecordBatchHeaderSize).
+func (s *ActiveSegment) AppendFromReader(hdr RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	position := s.size
+
+	if _, err := s.file.Write(headerBytes); err != nil {
+		s.size = position
+		_ = s.file.Truncate(position)
+		_, _ = s.file.Seek(position, io.SeekStart)
+		return fmt.Errorf("active_segment: write header: %w", err)
+	}
+	s.size += int64(len(headerBytes))
+
+	if bodySize > 0 {
+		n, err := io.Copy(s.file, io.LimitReader(body, bodySize))
+		if err != nil || n != bodySize {
+			s.size = position
+			_ = s.file.Truncate(position)
+			_, _ = s.file.Seek(position, io.SeekStart)
+			if err != nil {
+				return fmt.Errorf("active_segment: stream body: %w", err)
+			}
+			return fmt.Errorf("active_segment: short body stream: wrote %d of %d", n, bodySize)
+		}
+		s.size += bodySize
+	}
+
+	totalSize := int32(len(headerBytes)) + int32(bodySize)
+	s.offsetIdx = append(s.offsetIdx, IndexEntry{
+		BaseOffset:     hdr.FirstOffset,
+		LastOffset:     hdr.LastOffset(),
+		Position:       position,
+		BatchSize:      totalSize,
+		FirstTimestamp: hdr.FirstTimestamp,
+		MaxTimestamp:   hdr.MaxTimestamp,
+	})
+
+	if hdr.MaxTimestamp > s.largestTS {
+		s.timeIdx = append(s.timeIdx, TimestampIndexEntry{
+			Timestamp:  hdr.MaxTimestamp,
+			BaseOffset: hdr.FirstOffset,
+		})
+		s.largestTS = hdr.MaxTimestamp
+	}
+
+	return nil
+}
+
 // CompactThrough drops complete RecordBatches through offset and returns a new
 // active segment containing only the remaining tail. Callers must use this
 // only after the dropped range is durable elsewhere. It never publishes data.
@@ -283,6 +338,22 @@ func (s *ActiveSegment) Close() error {
 // Path returns the absolute path of the segment log file.
 func (s *ActiveSegment) Path() string {
 	return filepath.Join(s.dir, SegmentFilename(s.baseOffset))
+}
+
+// File returns the underlying segment file. Callers may use it for zero-copy
+// operations such as sendfile (via io.Copy with io.NewSectionReader). The
+// file remains valid until Close is called.
+func (s *ActiveSegment) File() *os.File {
+	return s.file
+}
+
+// WithOffsetIndex calls fn with the live offset index slice while holding a
+// read lock. This avoids the copy that OffsetIndex() performs. The slice must
+// not be retained after fn returns.
+func (s *ActiveSegment) WithOffsetIndex(fn func([]IndexEntry)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s.offsetIdx)
 }
 
 // SidecarPath returns the absolute path of the segment index (sidecar) file.

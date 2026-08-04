@@ -3,7 +3,7 @@ package replication
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -22,12 +22,20 @@ type mockPartitionManager struct {
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedRawBatch(_ context.Context, _ string, _ int, batch []byte) error {
+func (m *mockPartitionManager) AppendReplicatedBatchStream(_ string, _ int, hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := make([]byte, len(batch))
-	copy(cp, batch)
-	m.appendedRaw = append(m.appendedRaw, cp)
+	// Reconstruct the full batch for test verification.
+	batch := make([]byte, len(headerBytes), len(headerBytes)+int(bodySize))
+	copy(batch, headerBytes)
+	if bodySize > 0 {
+		rest := make([]byte, bodySize)
+		if _, err := io.ReadFull(body, rest); err != nil {
+			return err
+		}
+		batch = append(batch, rest...)
+	}
+	m.appendedRaw = append(m.appendedRaw, batch)
 	return nil
 }
 
@@ -74,72 +82,51 @@ func (m *mockPartitionManager) progress() ([]uint64, []uint64) {
 // when to respond.
 func startReplicationTestServer(t *testing.T, handler func(req *ReplicaFetchRequest) *ReplicaFetchResponse) (addr string, cleanup func()) {
 	t.Helper()
+	srv := NewReplicationServer(func(_ context.Context, req *ReplicaFetchRequest) (*ReplicaFetchResult, error) {
+		resp := handler(req)
+		result := &ReplicaFetchResult{Resp: resp}
+		if len(resp.BatchData) > 0 {
+			result.BatchReader = bytes.NewReader(resp.BatchData)
+			result.BatchLen = int32(len(resp.BatchData))
+			resp.BatchData = nil
+		}
+		return result, nil
+	}, nil)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	var conns sync.WaitGroup
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			conns.Add(1)
-			go func(conn net.Conn) {
-				defer conns.Done()
-				defer conn.Close()
-				for {
-					req, err := DecodeRequest(conn)
-					if err != nil {
-						return
-					}
-					resp := handler(req)
-					writeTestResponse(t, conn, resp)
-				}
-			}(conn)
-		}
-	}()
+	go srv.Serve(ln)
 	return ln.Addr().String(), func() {
 		ln.Close()
-		conns.Wait()
 	}
 }
 
-func writeTestResponse(t *testing.T, conn net.Conn, resp *ReplicaFetchResponse) {
-	t.Helper()
-	header := EncodeResponseHeader(resp)
-	totalPayload := len(header) + len(resp.BatchData)
-	var frameLen [4]byte
-	binary.BigEndian.PutUint32(frameLen[:], uint32(totalPayload))
-	if len(resp.BatchData) > 0 {
-		if _, err := (&net.Buffers{frameLen[:], header, resp.BatchData}).WriteTo(conn); err != nil {
-			return
-		}
-	} else {
-		if _, err := (&net.Buffers{frameLen[:], header}).WriteTo(conn); err != nil {
-			return
-		}
-	}
-}
-
-func TestReadReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
+func TestStreamReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
 	first := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("first")}})
 	second := log.EncodeRecordBatch(1, []log.Message{{Offset: 1, Value: []byte("second")}})
+	concatenated := append(first, second...)
 
 	var got [][]byte
-	err := readReplicaBatches(bytes.NewReader(append(first, second...)), 0, func(batch []byte, header log.RecordBatchHeader) error {
-		if len(got) == 0 && header.FirstOffset != 0 {
-			t.Fatalf("first callback offset = %d, want 0", header.FirstOffset)
+	err := streamReplicaBatches(bytes.NewReader(concatenated), int32(len(concatenated)), 0, func(hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
+		if len(got) == 0 && hdr.FirstOffset != 0 {
+			t.Fatalf("first callback offset = %d, want 0", hdr.FirstOffset)
 		}
-		if len(got) == 1 && header.FirstOffset != 1 {
-			t.Fatalf("second callback offset = %d, want 1", header.FirstOffset)
+		if len(got) == 1 && hdr.FirstOffset != 1 {
+			t.Fatalf("second callback offset = %d, want 1", hdr.FirstOffset)
 		}
-		got = append(got, append([]byte(nil), batch...))
+		batch := make([]byte, len(headerBytes), len(headerBytes)+int(bodySize))
+		copy(batch, headerBytes)
+		if bodySize > 0 {
+			rest := make([]byte, bodySize)
+			io.ReadFull(body, rest)
+			batch = append(batch, rest...)
+		}
+		got = append(got, batch)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("readReplicaBatches() error = %v", err)
+		t.Fatalf("streamReplicaBatches() error = %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("callback count = %d, want 2", len(got))
@@ -149,15 +136,16 @@ func TestReadReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
 	}
 }
 
-func TestReadReplicaBatchesRejectsTruncatedBatch(t *testing.T) {
+func TestStreamReplicaBatchesRejectsTruncatedBatch(t *testing.T) {
 	batch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("value")}})
+	truncated := batch[:len(batch)-1]
 	called := false
-	err := readReplicaBatches(bytes.NewReader(batch[:len(batch)-1]), 0, func([]byte, log.RecordBatchHeader) error {
+	err := streamReplicaBatches(bytes.NewReader(truncated), int32(len(truncated)), 0, func(hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
 		called = true
 		return nil
 	})
 	if err == nil {
-		t.Fatal("readReplicaBatches() error = nil, want truncated-body error")
+		t.Fatal("streamReplicaBatches() error = nil, want truncated-body error")
 	}
 	if called {
 		t.Fatal("callback was called for a truncated batch")
@@ -209,7 +197,7 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, addr, 0, 1, "test-node", pm)
@@ -262,7 +250,7 @@ func TestFollowerFetcher_CaughtUpDoesNotBusyLoop(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		NewFollowerFetcher(nil).Run(
+		NewFollowerFetcher(nil, 10*time.Second).Run(
 			ctx, "test-topic", 0, addr, 0, 1, "test-node", pm,
 		)
 	}()
@@ -311,7 +299,7 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, addr, 10, 1, "test-node", pm)
@@ -381,7 +369,7 @@ func TestFollowerFetcher_TruncationAdoptsEpochAtBoundary(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, addr, 20, 1, "test-node", pm)
 	}()
@@ -446,7 +434,7 @@ func TestFollowerFetcher_TruncationCanLowerEpoch(t *testing.T) {
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go NewFollowerFetcher(nil).Run(ctx, "topic", 0, addr, 4, 9, "node", pm)
+	go NewFollowerFetcher(nil, 10*time.Second).Run(ctx, "topic", 0, addr, 4, 9, "node", pm)
 
 	select {
 	case <-doneCh:
@@ -503,7 +491,7 @@ func TestFollowerFetcher_AppliesRawRecordBatches(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 	go func() {
 		fetcher.Run(ctx, "test-topic", 0, addr, 10, 1, "test-node", pm)
 	}()
@@ -542,7 +530,7 @@ func TestFollowerFetcher_PartitionNotReadyRetries(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		NewFollowerFetcher(nil).Run(ctx, "topic", 0, addr, 0, 1, "node", pm)
+		NewFollowerFetcher(nil, 10*time.Second).Run(ctx, "topic", 0, addr, 0, 1, "node", pm)
 	}()
 	<-done
 

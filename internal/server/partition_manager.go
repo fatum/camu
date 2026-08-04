@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -950,6 +951,32 @@ func (pm *PartitionManager) AppendReplicatedRawBatch(ctx context.Context, topic 
 	return nil
 }
 
+// AppendReplicatedBatchStream appends a single RecordBatch by streaming its
+// body from r, avoiding materializing the full batch in memory. The 61-byte
+// header has already been read and parsed by the caller; bodySize is the
+// remaining bytes after the header.
+func (pm *PartitionManager) AppendReplicatedBatchStream(topic string, partitionID int, hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
+	pm.mu.RLock()
+	ps, ok := pm.partitions[topic][partitionID]
+	pm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("partition %s/%d not found", topic, partitionID)
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.activeSegment == nil {
+		return fmt.Errorf("no active segment")
+	}
+	if err := ps.activeSegment.AppendFromReader(hdr, headerBytes, body, bodySize); err != nil {
+		return fmt.Errorf("AppendReplicatedBatchStream: %w", err)
+	}
+	end := uint64(hdr.LastOffset()) + 1
+	if end > ps.nextOffset {
+		ps.nextOffset = end
+	}
+	return nil
+}
+
 func appendReplicatedRawBatchLocked(ps *partitionState, batch []byte) error {
 	h, err := log.ReadRecordBatchHeader(batch)
 	if err != nil {
@@ -1382,20 +1409,32 @@ func (pm *PartitionManager) ReadRawBatches(ctx context.Context, topic string, pi
 	return pm.readRawBatchesWithUpperBound(ctx, topic, pid, startOffset, maxBytes, false)
 }
 
-// ReadReplicaRawBatches reads only the leader's unsealed active tail. Sealed
-// segments are shared through S3 and are intentionally excluded from the
-// replication transport.
-func (pm *PartitionManager) ReadReplicaRawBatches(ctx context.Context, topic string, pid int, startOffset int64, maxBytes int) ([]byte, int64, error) {
+// ReplicaBatchRange describes a contiguous byte range in the leader's active
+// segment file that contains the batches to replicate. The caller can use
+// File with io.NewSectionReader to sendfile the range directly to a socket,
+// avoiding all user-space copies.
+type ReplicaBatchRange struct {
+	File       *os.File
+	FileOffset int64
+	Length     int64
+	UpperBound int64
+}
+
+// ReadReplicaBatchRange returns the file, byte offset, and length of the
+// contiguous batch range starting at startOffset, up to maxBytes. It replaces
+// ReadReplicaRawBatches for the zero-copy replication path: no batch data is
+// read into user space. Returns Length=0 when no data is available.
+func (pm *PartitionManager) ReadReplicaBatchRange(topic string, pid int, startOffset int64, maxBytes int) (ReplicaBatchRange, error) {
 	pm.mu.RLock()
 	tp, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, 0, fmt.Errorf("%w: topic %q", errKafkaUnknownTopicPartition, topic)
+		return ReplicaBatchRange{}, fmt.Errorf("%w: topic %q", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := tp[pid]
 	pm.mu.RUnlock()
 	if !ok {
-		return nil, 0, fmt.Errorf("%w: partition %d for topic %q", errKafkaUnknownTopicPartition, pid, topic)
+		return ReplicaBatchRange{}, fmt.Errorf("%w: partition %d for topic %q", errKafkaUnknownTopicPartition, pid, topic)
 	}
 
 	ps.mu.RLock()
@@ -1403,40 +1442,49 @@ func (pm *PartitionManager) ReadReplicaRawBatches(ctx context.Context, topic str
 	activeSeg := ps.activeSegment
 	ps.mu.RUnlock()
 	if activeSeg == nil || startOffset < activeSeg.BaseOffset() || startOffset >= upperBound {
-		return nil, upperBound, nil
+		return ReplicaBatchRange{UpperBound: upperBound}, nil
 	}
 	if maxBytes <= 0 {
 		maxBytes = 1 << 20
 	}
 
-	offsetIdx := activeSeg.OffsetIndex()
-	startIdx := sort.Search(len(offsetIdx), func(i int) bool {
-		return offsetIdx[i].LastOffset >= startOffset
+	var result ReplicaBatchRange
+	activeSeg.WithOffsetIndex(func(idx []log.IndexEntry) {
+		startIdx := sort.Search(len(idx), func(i int) bool {
+			return idx[i].LastOffset >= startOffset
+		})
+		if startIdx >= len(idx) {
+			return
+		}
+		startPos := idx[startIdx].Position
+		endIdx := startIdx
+		accumulated := 0
+		for i := startIdx; i < len(idx); i++ {
+			entry := idx[i]
+			if entry.BaseOffset >= upperBound {
+				break
+			}
+			if entry.BatchSize <= 0 || entry.Position < 0 {
+				continue
+			}
+			if accumulated > 0 && accumulated+int(entry.BatchSize) > maxBytes {
+				break
+			}
+			accumulated += int(entry.BatchSize)
+			endIdx = i + 1
+		}
+		if endIdx <= startIdx {
+			return
+		}
+		endEntry := idx[endIdx-1]
+		result = ReplicaBatchRange{
+			File:       activeSeg.File(),
+			FileOffset: startPos,
+			Length:     endEntry.Position + int64(endEntry.BatchSize) - startPos,
+			UpperBound: upperBound,
+		}
 	})
-	var out []byte
-	for i := startIdx; i < len(offsetIdx); i++ {
-		entry := offsetIdx[i]
-		if entry.BaseOffset >= upperBound {
-			break
-		}
-		if entry.BatchSize <= 0 || entry.Position < 0 {
-			continue
-		}
-		batch := make([]byte, entry.BatchSize)
-		n, err := activeSeg.ReadAt(batch, entry.Position)
-		if err != nil && n < int(entry.BatchSize) {
-			break
-		}
-		batch = batch[:n]
-		if len(out) > 0 && len(out)+len(batch) > maxBytes {
-			break
-		}
-		out = append(out, batch...)
-		if len(out) >= maxBytes {
-			break
-		}
-	}
-	return out, upperBound, nil
+	return result, nil
 }
 
 // SyncFollowerSealedPrefix refreshes a follower's index when the leader has

@@ -19,7 +19,7 @@ type StorageClient interface {
 
 // checkpointDoc is the JSON envelope for a serialized ControllerState.
 type checkpointDoc struct {
-	Version uint64                        `json:"version"`
+	Version uint64                               `json:"version"`
 	Topics  map[string]map[string]*PartitionMeta `json:"topics"`
 }
 

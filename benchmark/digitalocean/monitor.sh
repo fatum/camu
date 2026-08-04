@@ -21,7 +21,7 @@ case "${1:-}" in
       printf '%s\n' '  - job_name: camu' '    static_configs:' '      - targets:'
       for ip in "${ips[@]}"; do printf '          - "%s:8080"\n' "$ip"; done
       printf '%s\n' '  - job_name: cadvisor' '    static_configs:' '      - targets:'
-      for ip in "${ips[@]}"; do printf '          - "%s:8082"\n' "$ip"; done
+      for ip in "${ips[@]}"; do printf '          - "%s:8083"\n' "$ip"; done
     } >"$script_dir/monitoring/runtime/prometheus.yml"
     {
       printf '%s\n' 'server:' '  http_listen_port: 9080' '  grpc_listen_port: 0' '' 'positions:' '  filename: /tmp/positions.yaml' '' 'clients:' '  - url: http://loki:3100/loki/api/v1/push' '' 'scrape_configs:'

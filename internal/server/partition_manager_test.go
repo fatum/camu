@@ -1017,7 +1017,7 @@ func TestReadRawBatches_ActiveSegment(t *testing.T) {
 	}
 }
 
-func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
+func TestReadReplicaBatchRange_ReadsPastHighWatermark(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
@@ -1047,30 +1047,25 @@ func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
 	ps.mu.Lock()
 	ps.activeSegment = as
 	ps.nextOffset = 2
-	ps.replicaState = replication.NewReplicaState("leader", 1, 1, 1000) // readable HW=1, log end=2
+	ps.replicaState = replication.NewReplicaState("leader", 1, 1, 1000)
 	ps.mu.Unlock()
 
-	data, hw, err := pm.ReadRawBatches(context.Background(), "topic", 0, 1, 1<<20)
+	br, err := pm.ReadReplicaBatchRange("topic", 0, 1, 1<<20)
 	if err != nil {
-		t.Fatalf("ReadRawBatches() error = %v", err)
+		t.Fatalf("ReadReplicaBatchRange() error = %v", err)
 	}
-	if hw != 1 {
-		t.Fatalf("ReadRawBatches() hw = %d, want 1", hw)
+	if br.UpperBound != 2 {
+		t.Fatalf("ReadReplicaBatchRange() upper bound = %d, want 2", br.UpperBound)
 	}
-	if len(data) != 0 {
-		t.Fatalf("ReadRawBatches() returned %d bytes, want 0 beyond readable HW", len(data))
+	if br.Length == 0 {
+		t.Fatal("ReadReplicaBatchRange() returned no data, want uncommitted tail batch")
 	}
-
-	replicaData, leo, err := pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 1, 1<<20)
-	if err != nil {
-		t.Fatalf("ReadReplicaRawBatches() error = %v", err)
+	replicaData := make([]byte, br.Length)
+	n, err := br.File.ReadAt(replicaData, br.FileOffset)
+	if err != nil && n < int(br.Length) {
+		t.Fatalf("ReadAt() error = %v, n = %d", err, n)
 	}
-	if leo != 2 {
-		t.Fatalf("ReadReplicaRawBatches() upper bound = %d, want 2", leo)
-	}
-	if len(replicaData) == 0 {
-		t.Fatal("ReadReplicaRawBatches() returned no data, want uncommitted tail batch")
-	}
+	replicaData = replicaData[:n]
 	decoded, err := log.DecodeRecordBatch(replicaData)
 	if err != nil {
 		t.Fatalf("DecodeRecordBatch() error = %v", err)
@@ -1080,7 +1075,7 @@ func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
 	}
 }
 
-func TestReadReplicaRawBatchesDoesNotServeSealedPrefix(t *testing.T) {
+func TestReadReplicaBatchRangeDoesNotServeSealedPrefix(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
@@ -1101,21 +1096,30 @@ func TestReadReplicaRawBatchesDoesNotServeSealedPrefix(t *testing.T) {
 	ps.nextOffset = 11
 	ps.mu.Unlock()
 
-	data, logEnd, err := pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 0, 1<<20)
+	br, err := pm.ReadReplicaBatchRange("topic", 0, 0, 1<<20)
 	if err != nil {
-		t.Fatalf("ReadReplicaRawBatches() error = %v", err)
+		t.Fatalf("ReadReplicaBatchRange() error = %v", err)
 	}
-	if logEnd != 11 {
-		t.Fatalf("log end = %d, want 11", logEnd)
+	if br.UpperBound != 11 {
+		t.Fatalf("upper bound = %d, want 11", br.UpperBound)
 	}
-	if len(data) != 0 {
-		t.Fatalf("sealed-prefix read returned %d bytes, want none", len(data))
+	if br.Length != 0 {
+		t.Fatalf("sealed-prefix read returned %d bytes, want none", br.Length)
 	}
 
-	data, _, err = pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 10, 1<<20)
+	br, err = pm.ReadReplicaBatchRange("topic", 0, 10, 1<<20)
 	if err != nil {
-		t.Fatalf("ReadReplicaRawBatches(active tail) error = %v", err)
+		t.Fatalf("ReadReplicaBatchRange(active tail) error = %v", err)
 	}
+	if br.Length == 0 {
+		t.Fatal("expected active tail data, got none")
+	}
+	data := make([]byte, br.Length)
+	n, err := br.File.ReadAt(data, br.FileOffset)
+	if err != nil && n < int(br.Length) {
+		t.Fatalf("ReadAt() error = %v, n = %d", err, n)
+	}
+	data = data[:n]
 	if !bytes.Equal(data, batch) {
 		t.Fatal("active tail bytes differ from appended batch")
 	}
