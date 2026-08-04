@@ -1316,7 +1316,15 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	ps.isLeader = true
 	ps.leaderID = ""
 	ps.epoch = pa.LeaderEpoch
+	// The leader can produce and read beyond its local active tail: sealed
+	// segments in the refreshed index are served from object storage. A
+	// promoted replica whose local tail is empty (or short) must continue at
+	// the index's next offset, or the recovery HW below gets capped to the
+	// stale local log end and committed S3 records become unreadable.
 	ps.nextOffset = logEnd
+	if indexNext := ps.index.NextOffset(); indexNext > ps.nextOffset {
+		ps.nextOffset = indexNext
+	}
 	ps.epochHistory = eh
 	ps.mu.Unlock()
 	if ehChanged || eh != prevEpochHistory {
