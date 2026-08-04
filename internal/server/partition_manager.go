@@ -1548,7 +1548,7 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 	hw, hwOK := readableHighWatermark(ps)
 	nextOff := ps.nextOffset
 	activeSeg := ps.activeSegment
-	index := ps.index
+	index := ps.index.Clone()
 	pendingFlush := ps.pendingFlush
 	ps.mu.RUnlock()
 
@@ -1580,6 +1580,13 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 		segments := index.SegmentsFrom(uint64(currentOffset), 0)
 		for _, ref := range segments {
 			if remaining <= 0 || currentOffset >= activeBase {
+				break
+			}
+			// A hole in the index must never serve a later segment's records:
+			// that would silently relabel a distant offset range as the
+			// requested one. Stop at the first missing segment and return only
+			// the contiguous prefix.
+			if currentOffset < int64(ref.BaseOffset) {
 				break
 			}
 
