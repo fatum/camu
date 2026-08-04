@@ -112,7 +112,7 @@ well. That service owns:
 
 Leader failover works through:
 
-1. **Detection**: Followers and controller detect leader failure via missed heartbeats or lease expiry.
+1. **Detection**: Followers detect a hard leader death quickly (connection errors on the fetch loop) and a paused or unresponsive leader once the fetch read deadline (`coordination.replication_read_timeout`, default `10s`) elapses across consecutive fetch attempts. The controller also detects via missed heartbeats or lease expiry.
 2. **Reassignment**: The controller publishes a new assignment with a higher epoch (or a follower self-promotes with a CAS bump).
 3. **Index refresh**: The promoted leader refreshes its segment index from object storage and continues at `max(local log end, index next offset)`, so an empty local tail still serves committed S3 records.
 4. **Local recovery**: The promoted leader recovers its active segment, truncating any divergent tail using epoch history. Promotions persist the new leader epoch to the local `epoch` sidecar, so a later demotion reports the correct epoch of the active tail.
