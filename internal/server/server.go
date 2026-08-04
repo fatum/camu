@@ -59,7 +59,9 @@ type Server struct {
 	leaderElection  *coordination.LeaderElection
 	assignmentStore *coordination.AssignmentStore
 	isrStore        *replication.ISRStore
-	leaderLease     coordination.LeaderLease
+	// leaderLease is atomic because renewLeases replaces it while Kafka
+	// metadata/offset handlers read it concurrently.
+	leaderLease     atomic.Pointer[coordination.LeaderLease]
 	readAssignments func(ctx context.Context, topic string) (coordination.TopicAssignments, error)
 
 	controllerState  atomic.Pointer[coordination.ControllerState]
@@ -960,7 +962,11 @@ func (s *Server) getOwnedEpochs(topic string) map[int]uint64 {
 
 // amLeader returns true if this instance currently holds a valid leader lease.
 func (s *Server) amLeader() bool {
-	return s.leaderLease.InstanceID == s.instanceID && time.Now().Before(s.leaderLease.ExpiresAt)
+	lease := s.leaderLease.Load()
+	if lease == nil {
+		return false
+	}
+	return lease.InstanceID == s.instanceID && time.Now().Before(lease.ExpiresAt)
 }
 
 // initialCoordination runs leader election and assignment on startup.
@@ -972,7 +978,7 @@ func (s *Server) initialCoordination() {
 	if err != nil {
 		slog.Warn("initialCoordination: leader election failed", "error", err)
 	} else if acquired {
-		s.leaderLease = lease
+		s.leaderLease.Store(&lease)
 		slog.Info("initialCoordination: became leader", "instance", s.instanceID)
 	} else {
 		slog.Info("initialCoordination: not leader", "instance", s.instanceID, "leader", lease.InstanceID)
@@ -1593,22 +1599,26 @@ func (s *Server) renewLeases() {
 
 	// Try to become/stay leader.
 	if s.amLeader() {
-		renewed, err := s.leaderElection.Renew(ctx, s.leaderLease)
+		cur := s.leaderLease.Load()
+		if cur == nil {
+			cur = &coordination.LeaderLease{}
+		}
+		renewed, err := s.leaderElection.Renew(ctx, *cur)
 		if err != nil {
 			slog.Warn("renewLeases: lost leadership", "error", err)
-			s.leaderLease = coordination.LeaderLease{} // zero out
+			s.leaderLease.Store(&coordination.LeaderLease{}) // zero out
 			if s.controllerState.Load() != nil {
 				s.stopController()
 			}
 		} else {
-			s.leaderLease = renewed
+			s.leaderLease.Store(&renewed)
 		}
 	} else {
 		lease, acquired, err := s.leaderElection.TryAcquire(ctx)
 		if err != nil {
 			slog.Debug("renewLeases: leader election failed", "error", err)
 		} else if acquired {
-			s.leaderLease = lease
+			s.leaderLease.Store(&lease)
 			slog.Info("renewLeases: became leader", "instance", s.instanceID)
 		}
 	}

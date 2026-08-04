@@ -1208,6 +1208,19 @@ func (pm *PartitionManager) RemoveTopic(topic string) {
 	_ = os.RemoveAll(filepath.Join(pm.localDir, topic))
 }
 
+// PersistLocalEpoch writes the given leader epoch to the local epoch sidecar
+// file. The file records the epoch under which the local active tail was
+// written. A promoted leader must persist it: loadPartitionState derives the
+// follower's reported epoch from this file, and a stale value makes the next
+// leader's divergence check fence a demoted leader that actually holds
+// committed tail data.
+func (pm *PartitionManager) PersistLocalEpoch(topic string, pid int, epoch uint64) {
+	epochFile := filepath.Join(pm.localPartitionDir(topic, pid), "epoch")
+	if err := fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", epoch)), 0o644); err != nil {
+		slog.Warn("persist_local_epoch", "topic", topic, "partition", pid, "epoch", epoch, "error", err)
+	}
+}
+
 // UpdateFollowerProgress records the latest leader-advertised epoch, readable
 // high-watermark, and flushed offset for a follower partition.
 func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int, leaderEpoch, highWatermark, flushedOffset uint64) {

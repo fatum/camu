@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -288,5 +291,57 @@ func TestContainsString(t *testing.T) {
 	}
 	if containsString(nil, "a") {
 		t.Error("expected false for nil slice")
+	}
+}
+
+func TestBecomeLeader_PersistsLeaderEpochSidecar(t *testing.T) {
+	srv, pm := newTestServerForBecomeLeader(t)
+
+	topic := "orders"
+	tc := meta.TopicConfig{
+		Name:              topic,
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	ctx := context.Background()
+	if err := srv.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+
+	// Simulate the stale epoch sidecar a follower leaves behind: the node
+	// observed leader epoch 2, then got promoted to epoch 5. Before the fix,
+	// promotion never rewrote the sidecar, so a later state reload reported
+	// epoch 2 with the node's epoch-5 tail and the next leader's divergence
+	// check fenced it, truncating committed data.
+	pm.PersistLocalEpoch(topic, 0, 2)
+
+	if err := srv.becomeLeader(ctx, topic, 0, pushAssignmentRequest{
+		Topic:     topic,
+		Partition: 0,
+		Leader:    "node-A",
+		Epoch:     5,
+		Replicas:  []string{"node-A"},
+		ISR:       []string{"node-A"},
+		HW:        0,
+		EpochHistory: []coordination.EpochEntry{
+			{Epoch: 1, StartOffset: 0},
+		},
+	}); err != nil {
+		t.Fatalf("becomeLeader: %v", err)
+	}
+
+	epochFile := filepath.Join(pm.localPartitionDir(topic, 0), "epoch")
+	data, err := os.ReadFile(epochFile)
+	if err != nil {
+		t.Fatalf("read epoch sidecar: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(data)), "5"; got != want {
+		t.Fatalf("epoch sidecar = %q, want %q (promotion must persist the leader epoch)", got, want)
 	}
 }

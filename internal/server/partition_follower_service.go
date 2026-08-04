@@ -232,6 +232,7 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 	ps.epoch = newEpoch
 	ps.index.SetHighWatermark(recoveredHW)
 	ps.mu.Unlock()
+	p.server.partitionManager.PersistLocalEpoch(topic, pid, newEpoch)
 	if err := p.server.partitionManager.ensureActiveSegment(topic, pid); err != nil {
 		slog.Warn("attemptPartitionLeadership: ensure active segment", "topic", topic, "pid", pid, "error", err)
 	}
