@@ -2,7 +2,10 @@ package diskless
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/storage"
@@ -131,5 +134,128 @@ func TestWriter_FlushMultiPartition(t *testing.T) {
 	}
 	if refs0[0].ByteOffset == refs1[0].ByteOffset {
 		t.Fatal("expected different byte offsets")
+	}
+}
+
+// flakyMetaStore wraps a MetaStore and fails a configurable number of
+// RegisterSegment calls, modeling a transient segment-catalog write failure.
+type flakyMetaStore struct {
+	MetaStore
+	registerFails atomic.Int32
+}
+
+func (m *flakyMetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) error {
+	if m.registerFails.Add(1) == 1 {
+		return errors.New("transient register error")
+	}
+	return m.MetaStore.RegisterSegment(ctx, seg)
+}
+
+// TestWriter_Flush_RetriesTransientPutFailure verifies that a transient S3 PUT
+// failure does not strand the allocated offsets as a gap: the flush retries
+// idempotently with the same file key and succeeds.
+func TestWriter_Flush_RetriesTransientPutFailure(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := NewMemoryMetaStore()
+	var puts atomic.Int32
+	s3.SetFaultInjector(func(op string) error {
+		if op == "put" && puts.Add(1) == 1 {
+			return errors.New("transient s3 error")
+		}
+		return nil
+	})
+	defer s3.SetFaultInjector(nil)
+
+	w := NewWriter(s3, meta, "node1")
+	ctx := context.Background()
+
+	batch := makeTestBatch(t, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
+	done := make(chan FlushResult, 1)
+	entries := []BufferEntry{{Topic: "t1", Partition: 0, Batch: batch, Done: done}}
+
+	if err := w.Flush(ctx, entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// No gap: the head advanced and the segment is registered with its data.
+	head, err := meta.GetPartitionHead(ctx, "t1", 0)
+	if err != nil {
+		t.Fatalf("get head: %v", err)
+	}
+	if head != 1 {
+		t.Fatalf("head = %d, want 1 (no gap from the failed put)", head)
+	}
+	refs, err := meta.QuerySegments(ctx, "t1", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("refs = %d, want 1", len(refs))
+	}
+	if _, err := s3.Get(ctx, refs[0].FileKey); err != nil {
+		t.Fatalf("retried put did not persist the file: %v", err)
+	}
+}
+
+// TestWriter_Flush_RetriesTransientRegisterFailure verifies that a transient
+// segment-registration failure after a successful PUT is retried rather than
+// orphaning the materialized offsets.
+func TestWriter_Flush_RetriesTransientRegisterFailure(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := &flakyMetaStore{MetaStore: NewMemoryMetaStore()}
+	w := NewWriter(s3, meta, "node1")
+	ctx := context.Background()
+
+	batch := makeTestBatch(t, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
+	done := make(chan FlushResult, 1)
+	entries := []BufferEntry{{Topic: "t1", Partition: 0, Batch: batch, Done: done}}
+
+	if err := w.Flush(ctx, entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	head, err := meta.GetPartitionHead(ctx, "t1", 0)
+	if err != nil {
+		t.Fatalf("get head: %v", err)
+	}
+	if head != 1 {
+		t.Fatalf("head = %d, want 1", head)
+	}
+	refs, err := meta.QuerySegments(ctx, "t1", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("refs = %d, want 1 (register retried)", len(refs))
+	}
+}
+
+// TestWriter_Flush_FailsAfterPersistentPutError verifies that a persistent
+// object-store failure surfaces to the caller once the retry budget (the
+// context) is exhausted, instead of blocking forever.
+func TestWriter_Flush_FailsAfterPersistentPutError(t *testing.T) {
+	s3 := testS3Client(t)
+	s3.SetFaultInjector(func(op string) error {
+		if op == "put" {
+			return errors.New("s3 down")
+		}
+		return nil
+	})
+	defer s3.SetFaultInjector(nil)
+
+	w := NewWriter(s3, NewMemoryMetaStore(), "node1")
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	batch := makeTestBatch(t, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
+	done := make(chan FlushResult, 1)
+	entries := []BufferEntry{{Topic: "t1", Partition: 0, Batch: batch, Done: done}}
+
+	if err := w.Flush(ctx, entries); err == nil {
+		t.Fatal("expected flush to fail after persistent put errors")
+	}
+	result := <-done
+	if result.Err == nil {
+		t.Fatal("expected the produce result to carry the flush error")
 	}
 }
