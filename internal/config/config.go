@@ -60,7 +60,7 @@ type SQLConfig struct {
 type DisklessConfig struct {
 	LingerMs      int            `yaml:"linger_ms"`       // Max buffer time before flush (default 250)
 	MaxBatchBytes int64          `yaml:"max_batch_bytes"` // Max buffer size before flush (default 8MiB)
-	MetaStore     string         `yaml:"metastore"`       // "memory" (default) or "dynamodb"
+	MetaStore     string         `yaml:"metastore"`       // "memory" (default), "s3", or "dynamodb"
 	DynamoDB      DynamoDBConfig `yaml:"dynamodb"`
 }
 
