@@ -93,8 +93,10 @@ well. That service owns:
 
 - resolving and proxying to the current partition leader
 - reconfiguring follower fetch loops after controller pushes
-- attempting self-promotion when the leader is detected as down and controller
-  reporting fails
+- self-promotion as the **primary** failover path: on leader-down detection a
+  caught-up ISR member CAS-promotes itself on the assignment store without a
+  controller round trip; the controller is the backstop for cases
+  self-promotion cannot resolve and reconciles on its periodic publish
 
 ## Failover Sequence
 
