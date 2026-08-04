@@ -63,6 +63,7 @@ if [[ -z "${CAMU_URL:-}" ]]; then
 server:
   address: "camu-$node:8080"
   internal_address: "camu-$node:8081"
+  replication_address: "camu-$node:8082"
   instance_id: "benchmark-$node"
   kafka_port: 9092
   mode: stream

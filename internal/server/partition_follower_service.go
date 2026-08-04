@@ -346,11 +346,7 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 		slog.Warn("reconfigureFollower: resolve leader", "leader", req.Leader, "error", err)
 		return
 	}
-	addr := leaderInfo.InternalAddress
-	if addr == "" {
-		addr = leaderInfo.Address
-	}
-	leaderAddr := routablePeerAddress(req.Leader, addr)
+	leaderAddr := routableReplicationAddress(req.Leader, leaderInfo.ReplicationAddress)
 
 	ps.mu.Lock()
 	if ps.fetchGeneration != generation || ps.isLeader {

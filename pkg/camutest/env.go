@@ -64,9 +64,10 @@ func New(t testing.TB, opts ...Option) *Env {
 		cacheDir := t.TempDir()
 		cfg := &config.Config{
 			Server: config.ServerConfig{
-				Address:         "127.0.0.1:0",
-				InternalAddress: "127.0.0.1:0",
-				InstanceID:      instanceID,
+				Address:            "127.0.0.1:0",
+				InternalAddress:    "127.0.0.1:0",
+				ReplicationAddress: "127.0.0.1:0",
+				InstanceID:         instanceID,
 			},
 			Storage: config.StorageConfig{
 				Bucket:   "test-bucket",
@@ -194,9 +195,10 @@ func (e *Env) RestartInstance(idx int) {
 	// local recovery and replication routing behave like a restarted node.
 	cfg := &config.Config{
 		Server: config.ServerConfig{
-			Address:         "127.0.0.1:0", // new random port
-			InternalAddress: "127.0.0.1:0",
-			InstanceID:      ic.cfg.Server.InstanceID,
+			Address:            "127.0.0.1:0", // new random port
+			InternalAddress:    "127.0.0.1:0",
+			ReplicationAddress: "127.0.0.1:0",
+			InstanceID:         ic.cfg.Server.InstanceID,
 		},
 		Storage: config.StorageConfig{
 			Bucket:   ic.cfg.Storage.Bucket,

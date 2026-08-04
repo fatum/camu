@@ -177,7 +177,7 @@ func TestTopicDeletionGCResumesFromMarkerAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWithS3Client() restart error = %v", err)
 	}
-	s2.registry = coordination.NewRegistry(s1.s3Client, s1.cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", time.Minute)
+	s2.registry = coordination.NewRegistry(s1.s3Client, s1.cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", "", time.Minute)
 	s2.disklessMeta = ms
 
 	s2.gcPendingTopicDeletions(ctx)

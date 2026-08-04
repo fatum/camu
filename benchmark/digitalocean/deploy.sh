@@ -69,7 +69,7 @@ awk -v auth_token="$auth_token" '
 mv "$config_tmp" "$config"
 docker pull gcr.io/cadvisor/cadvisor:v0.49.2
 docker rm -f cadvisor 2>/dev/null || true
-docker run -d --name cadvisor --restart unless-stopped --privileged --device=/dev/kmsg -p 8082:8080 \
+docker run -d --name cadvisor --restart unless-stopped --privileged --device=/dev/kmsg -p 8083:8080 \
   -v /:/rootfs:ro -v /var/run:/var/run:ro -v /sys:/sys:ro \
   -v /var/lib/docker:/var/lib/docker:ro \
   gcr.io/cadvisor/cadvisor:v0.49.2
@@ -77,7 +77,7 @@ docker pull "$image"
 docker rm -f camu 2>/dev/null || true
 docker run -d --name camu --restart unless-stopped --network host \
   --label=io.camu.component=server \
-  -e CAMU_LOG_LEVEL=info -e CAMU_REQUEST_LOG=0 \
+  -e CAMU_LOG_LEVEL=info -e CAMU_REQUEST_LOG=0 -e GOMEMLIMIT=6GiB \
   -v /etc/camu/benchmark.yaml:/etc/camu.yaml:ro \
   -v /var/lib/camu:/var/lib/camu \
   "$image" serve --config /etc/camu.yaml

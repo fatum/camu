@@ -51,7 +51,7 @@ func newTestServer(t testing.TB) *Server {
 	if err != nil {
 		t.Fatalf("NewWithS3Client() error = %v", err)
 	}
-	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", time.Minute)
+	s.registry = coordination.NewRegistry(s3Client, cfg.Server.InstanceID, "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082", "", time.Minute)
 	return s
 }
 
@@ -404,13 +404,6 @@ func TestInternalRoutes_QueryModeOnlyReady(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /v1/ready status = %d, want %d", rec.Code, http.StatusOK)
 	}
-
-	req = httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("GET internal replicate status = %d, want %d in query mode", rec.Code, http.StatusNotFound)
-	}
 }
 
 func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
@@ -442,23 +435,26 @@ func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
 	ps.replicaState.SetEpochHistory(ps.epochHistory)
 	ps.mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=15", nil)
-	req.SetPathValue("topic", tc.Name)
-	req.SetPathValue("pid", "0")
-	req.Header.Set("X-Replica-ID", "n2")
-	req.Header.Set("X-Replica-Offset", "15")
-	req.Header.Set("X-Replica-Epoch", "1")
-	rec := httptest.NewRecorder()
-	s.handleReplicaFetch(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	req := &replication.ReplicaFetchRequest{
+		Topic:         tc.Name,
+		PartitionID:   0,
+		FromOffset:    15,
+		ReplicaID:     "n2",
+		ReplicaOffset: 15,
+		ReplicaEpoch:  1,
 	}
-	if got := rec.Header().Get("X-Truncate-To"); got != "10" {
-		t.Errorf("X-Truncate-To = %q, want 10", got)
+	resp, err := s.handleReplicaFetchTCP(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleReplicaFetchTCP() error = %v", err)
 	}
-	if got := rec.Header().Get("X-Leader-Epoch"); got != "2" {
-		t.Errorf("X-Leader-Epoch = %q, want 2", got)
+	if resp.ErrorCode != replication.ReplicaErrTruncate {
+		t.Fatalf("ErrorCode = %d, want %d (truncate)", resp.ErrorCode, replication.ReplicaErrTruncate)
+	}
+	if resp.TruncateTo != 10 {
+		t.Errorf("TruncateTo = %d, want 10", resp.TruncateTo)
+	}
+	if resp.LeaderEpoch != 2 {
+		t.Errorf("LeaderEpoch = %d, want 2", resp.LeaderEpoch)
 	}
 }
 
@@ -484,16 +480,18 @@ func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) 
 	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
 	ps.mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=0", nil)
-	req.SetPathValue("topic", tc.Name)
-	req.SetPathValue("pid", "0")
-	req.Header.Set("X-Replica-ID", "n2")
-	req.Header.Set("X-Replica-Offset", "0")
-	req.Header.Set("X-Replica-Epoch", "1")
-	rec := httptest.NewRecorder()
+	req := &replication.ReplicaFetchRequest{
+		Topic:         tc.Name,
+		PartitionID:   0,
+		FromOffset:    0,
+		ReplicaID:     "n2",
+		ReplicaOffset: 0,
+		ReplicaEpoch:  1,
+	}
 	done := make(chan struct{})
+	var resp *replication.ReplicaFetchResponse
 	go func() {
-		s.handleReplicaFetch(rec, req)
+		resp, _ = s.handleReplicaFetchTCP(context.Background(), req)
 		close(done)
 	}()
 
@@ -509,8 +507,8 @@ func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("replica fetch remained blocked after demotion")
 	}
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d after demotion", rec.Code, http.StatusNotFound)
+	if resp.ErrorCode != replication.ReplicaErrNotFound {
+		t.Fatalf("ErrorCode = %d, want %d (not found)", resp.ErrorCode, replication.ReplicaErrNotFound)
 	}
 
 	// The former panic occurred while holding this read lock. Verify it is not
@@ -569,23 +567,26 @@ func TestHandleReplicaFetch_DuplicateEpochBoundaryServesRealTail(t *testing.T) {
 		t.Fatalf("AppendReplicatedRawBatch: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=10", nil)
-	req.SetPathValue("topic", tc.Name)
-	req.SetPathValue("pid", "0")
-	req.Header.Set("X-Replica-ID", "n2")
-	req.Header.Set("X-Replica-Offset", "11")
-	req.Header.Set("X-Replica-Epoch", "1")
-	rec := httptest.NewRecorder()
-	s.handleReplicaFetch(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	req := &replication.ReplicaFetchRequest{
+		Topic:         tc.Name,
+		PartitionID:   0,
+		FromOffset:    10,
+		ReplicaID:     "n2",
+		ReplicaOffset: 11,
+		ReplicaEpoch:  1,
 	}
-	if got := rec.Header().Get("X-Truncate-To"); got != "" {
-		t.Fatalf("X-Truncate-To = %q, want no truncation", got)
+	resp, err := s.handleReplicaFetchTCP(ctx, req)
+	if err != nil {
+		t.Fatalf("handleReplicaFetchTCP() error = %v", err)
 	}
-	if got := rec.Body.Bytes(); !bytes.Equal(got, raw) {
-		t.Fatalf("replica response = %x, want raw RecordBatch %x", got, raw)
+	if resp.ErrorCode != replication.ReplicaErrOK {
+		t.Fatalf("ErrorCode = %d, want %d (ok)", resp.ErrorCode, replication.ReplicaErrOK)
+	}
+	if resp.TruncateTo != 0 {
+		t.Fatalf("TruncateTo = %d, want 0 (no truncation)", resp.TruncateTo)
+	}
+	if !bytes.Equal(resp.BatchData, raw) {
+		t.Fatalf("replica response = %x, want raw RecordBatch %x", resp.BatchData, raw)
 	}
 }
 
@@ -644,6 +645,12 @@ func TestStartWithListener_QueryModeSkipsClusterStartup(t *testing.T) {
 	}
 	if s.internalListener != nil {
 		t.Fatalf("internalListener = %#v, want nil in query mode", s.internalListener)
+	}
+	if s.replicationListener != nil {
+		t.Fatalf("replicationListener = %#v, want nil in query mode", s.replicationListener)
+	}
+	if s.replicationServer != nil {
+		t.Fatalf("replicationServer = %#v, want nil in query mode", s.replicationServer)
 	}
 	if s.partitionManager != nil {
 		t.Fatalf("partitionManager = %#v, want nil in query mode", s.partitionManager)
@@ -2004,12 +2011,12 @@ func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *
 
 func TestKafkaControllerBrokerUsesLeaderLease(t *testing.T) {
 	s := newTestServer(t)
-	s.registry = coordination.NewRegistry(s.s3Client, "n1", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:19092", time.Minute)
+	s.registry = coordination.NewRegistry(s.s3Client, "n1", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082", "127.0.0.1:19092", time.Minute)
 	if err := s.registry.Register(context.Background()); err != nil {
 		t.Fatalf("registry.Register() error = %v", err)
 	}
 
-	peerRegistry := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.2:8080", "127.0.0.2:8081", "127.0.0.2:29092", time.Minute)
+	peerRegistry := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.2:8080", "127.0.0.2:8081", "127.0.0.2:8082", "127.0.0.2:29092", time.Minute)
 	if err := peerRegistry.Register(context.Background()); err != nil {
 		t.Fatalf("peer registry.Register() error = %v", err)
 	}
@@ -2035,12 +2042,12 @@ func TestKafkaControllerBrokerUsesLeaderLease(t *testing.T) {
 
 func TestKafkaControllerBrokerPrefersCurrentController(t *testing.T) {
 	s := newTestServer(t)
-	s.registry = coordination.NewRegistry(s.s3Client, "n1", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:19092", time.Minute)
+	s.registry = coordination.NewRegistry(s.s3Client, "n1", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082", "127.0.0.1:19092", time.Minute)
 	if err := s.registry.Register(context.Background()); err != nil {
 		t.Fatalf("registry.Register() error = %v", err)
 	}
 
-	peerRegistry := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.2:8080", "127.0.0.2:8081", "127.0.0.2:29092", time.Minute)
+	peerRegistry := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.2:8080", "127.0.0.2:8081", "127.0.0.2:8082", "127.0.0.2:29092", time.Minute)
 	if err := peerRegistry.Register(context.Background()); err != nil {
 		t.Fatalf("peer registry.Register() error = %v", err)
 	}
@@ -2068,12 +2075,12 @@ func TestKafkaControllerBrokerPrefersCurrentController(t *testing.T) {
 func TestIsLocalKafkaCoordinatorFollowsControllerLease(t *testing.T) {
 	s := newTestServer(t)
 	s.instanceID = "n1"
-	s.registry = coordination.NewRegistry(s.s3Client, "n1", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:19092", time.Minute)
+	s.registry = coordination.NewRegistry(s.s3Client, "n1", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8082", "127.0.0.1:19092", time.Minute)
 	if err := s.registry.Register(context.Background()); err != nil {
 		t.Fatalf("registry.Register() error = %v", err)
 	}
 
-	peerRegistry := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.2:8080", "127.0.0.2:8081", "127.0.0.2:29092", time.Minute)
+	peerRegistry := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.2:8080", "127.0.0.2:8081", "127.0.0.2:8082", "127.0.0.2:29092", time.Minute)
 	if err := peerRegistry.Register(context.Background()); err != nil {
 		t.Fatalf("peer registry.Register() error = %v", err)
 	}

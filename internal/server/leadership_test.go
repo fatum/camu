@@ -34,7 +34,7 @@ func TestReconfigureFollowerPreservesLocalTailEpoch(t *testing.T) {
 	ps.nextOffset = 12
 	ps.mu.Unlock()
 
-	remote := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.1:8080", "127.0.0.1:1", "", time.Minute)
+	remote := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.1:8080", "127.0.0.1:1", "", "", time.Minute)
 	if err := remote.Register(context.Background()); err != nil {
 		t.Fatalf("register leader: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestReconfigureFollowerDemotesFormerLeader(t *testing.T) {
 	ps.epoch = 3
 	ps.mu.Unlock()
 
-	remote := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.1:8080", "127.0.0.1:1", "", time.Minute)
+	remote := coordination.NewRegistry(s.s3Client, "n2", "127.0.0.1:8080", "127.0.0.1:1", "", "", time.Minute)
 	if err := remote.Register(context.Background()); err != nil {
 		t.Fatalf("register leader: %v", err)
 	}
