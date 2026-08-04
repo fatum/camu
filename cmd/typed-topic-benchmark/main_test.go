@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -211,6 +212,24 @@ func TestHTTPConsumeRejectsOffsetAdvancePastRecords(t *testing.T) {
 	}
 }
 
+func TestHTTPConsumeIgnoresRecordsAppendedAfterSnapshot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messages":[{"offset":0,"value":"{\"id\":0,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":0}"},{"offset":1,"value":"{\"id\":1,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":1}"}],"next_offset":2}`))
+	}))
+	defer server.Close()
+	cfg := config{BaseURL: server.URL, Topic: "events", Partitions: 1, MessageBytes: 1, ConsumeTimeout: time.Second, RequestTimeout: time.Second}
+	expected := expectedStatesFor(cfg, 1)
+	actual := make([]hashState, 1)
+	result, err := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}.consume(context.Background(), cfg, expected, actual, 1, func(int64) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Records != 1 || actual[0].recordsSnapshot() != 1 {
+		t.Fatalf("consumed records = %d/%d, want 1/1", result.Records, actual[0].recordsSnapshot())
+	}
+}
+
 func TestCommittedRecordCountUsesEachPartitionHighWatermark(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -232,5 +251,46 @@ func TestCommittedRecordCountUsesEachPartitionHighWatermark(t *testing.T) {
 	}
 	if got != 5 {
 		t.Fatalf("committedRecordCount() = %d, want 5", got)
+	}
+}
+
+func TestExpectedStatesForPartitionOffsets(t *testing.T) {
+	cfg := config{Partitions: 4, SequenceStart: 0, MessageBytes: 1}
+	states, err := expectedStatesForPartitionOffsets(cfg, []int64{3, 2, 3, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for partition, want := range []int64{3, 2, 3, 2} {
+		if got := states[partition].recordsSnapshot(); got != want {
+			t.Fatalf("partition %d expected records = %d, want %d", partition, got, want)
+		}
+	}
+}
+
+func TestRetryProduceRetriesTransientFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attempts := 0
+	err := retryProduce(ctx, "test produce", func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("POST /messages: 503 Service Unavailable")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestRetryProduceRejectsPermanentFailure(t *testing.T) {
+	err := retryProduce(context.Background(), "test produce", func() error {
+		return errors.New("POST /messages: 400 Bad Request")
+	})
+	if err == nil || !strings.Contains(err.Error(), "400 Bad Request") {
+		t.Fatalf("retryProduce error = %v, want bad request", err)
 	}
 }

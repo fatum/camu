@@ -74,12 +74,16 @@ func produceKafka(ctx context.Context, cfg config, count int64, expected []hashS
 						expected[partition].add(value)
 						atomic.AddInt64(&serialized, int64(len(key)+len(valueBytes)))
 					}
-					results := client.ProduceSync(ctx, records...)
-					for _, result := range results {
-						if result.Err != nil {
-							errs <- fmt.Errorf("produce partition %d: %w", partition, result.Err)
-							return
+					if err := retryProduce(ctx, fmt.Sprintf("produce Kafka partition %d sequence %d", partition, first), func() error {
+						for _, result := range client.ProduceSync(ctx, records...) {
+							if result.Err != nil {
+								return result.Err
+							}
 						}
+						return nil
+					}); err != nil {
+						errs <- err
+						return
 					}
 					atomic.AddInt64(&total, int64(len(records)))
 					progress(int64(len(records)))
@@ -151,7 +155,9 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 				return
 			}
 			if partitionRecords[partition] >= partitionExpected[partition] {
-				err = fmt.Errorf("consume Kafka: partition %d received record at offset %d after expected end offset %d", partition, record.Offset, partitionExpected[partition])
+				// The end offsets are snapshotted before consumption. A live topic
+				// may append more records while a fetch is in flight; those records
+				// are outside this verification run.
 				return
 			}
 			if validationErr := validateKafkaRecord(cfg, partition, partitionRecords[partition], record.Offset, value); validationErr != nil {
