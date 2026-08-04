@@ -46,7 +46,7 @@ docker run --rm \
   -v camu-jepsen-gomodcache:/go/pkg/mod \
   -w /src \
   golang:1.25.6-bookworm \
-  go build -o jepsen/camu/camu ./cmd/camu/
+  go build -buildvcs=false -o jepsen/camu/camu ./cmd/camu/
 cd jepsen/camu
 
 echo "Cleaning previous Docker Compose state..."
