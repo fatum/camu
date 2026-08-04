@@ -165,6 +165,13 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 					s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 					return
 				}
+			} else if !s.verifyPartitionFence(r.Context(), topicName, partitionID, ps.epoch) {
+				// rf=1 has no ISR quorum to fence on: re-verify ownership against
+				// the authoritative assignment store (amortized by fenceInterval)
+				// so a fenced leader stops acknowledging.
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
+				return
 			}
 		}
 
@@ -278,6 +285,12 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusServiceUnavailable, "partition not ready for replicated writes")
 				return
 			}
+		} else if !s.verifyPartitionFence(r.Context(), topicName, partitionID, ps.epoch) {
+			// rf=1 has no ISR quorum to fence on: re-verify ownership against the
+			// authoritative assignment store (amortized by fenceInterval) so a
+			// fenced leader stops acknowledging.
+			s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
+			return
 		}
 	}
 

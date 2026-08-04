@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 	"github.com/maksim/camu/internal/metrics"
 )
@@ -23,6 +24,24 @@ var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("conflict: etag mismatch")
 )
+
+// ConflictError is returned when an S3 conditional write fails its
+// precondition. It wraps ErrConflict so errors.Is(err, ErrConflict) remains
+// true, and preserves the underlying cause for typed detection across
+// providers.
+type ConflictError struct {
+	Key   string
+	Cause error
+}
+
+func (e *ConflictError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("conflict on %q: %v", e.Key, e.Cause)
+	}
+	return fmt.Sprintf("conflict on %q", e.Key)
+}
+
+func (e *ConflictError) Unwrap() error { return ErrConflict }
 
 // S3Config holds configuration for the S3 client.
 type S3Config struct {
@@ -503,8 +522,8 @@ func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []by
 	}
 	out, err := b.client.PutObject(ctx, input)
 	if err != nil {
-		if isS3Conflict(err) {
-			return "", ErrConflict
+		if cause := conflictCause(err); cause != nil {
+			return "", &ConflictError{Key: key, Cause: cause}
 		}
 		return "", fmt.Errorf("s3 ConditionalPut %q: %w", key, err)
 	}
@@ -527,8 +546,8 @@ func (b *awsS3Backend) conditionalPutFile(ctx context.Context, key string, file 
 	}
 	out, err := b.client.PutObject(ctx, input)
 	if err != nil {
-		if isS3Conflict(err) {
-			return "", ErrConflict
+		if cause := conflictCause(err); cause != nil {
+			return "", &ConflictError{Key: key, Cause: cause}
 		}
 		return "", fmt.Errorf("s3 ConditionalPutFile %q: %w", key, err)
 	}
@@ -593,8 +612,21 @@ func isS3NotFound(err error) bool {
 	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "StatusCode: 404")
 }
 
-// isS3Conflict checks if an AWS error is a 412 Precondition Failed.
-func isS3Conflict(err error) bool {
+// conflictCause reports whether err is a conditional-write precondition failure
+// (HTTP 412) and returns a non-nil cause when it is. AWS SDK v2 surfaces these
+// as typed API errors; MinIO and other S3-compatible stores may only provide a
+// status line.
+func conflictCause(err error) error {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "PreconditionFailed", "IfMatchFailed", "IfNoneMatchFailed":
+			return err
+		}
+	}
 	msg := err.Error()
-	return strings.Contains(msg, "PreconditionFailed") || strings.Contains(msg, "StatusCode: 412")
+	if strings.Contains(msg, "PreconditionFailed") || strings.Contains(msg, "StatusCode: 412") {
+		return err
+	}
+	return nil
 }

@@ -259,14 +259,14 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 		ps.mu.Unlock()
 	}
 
-	if err := p.server.isrStore.Write(ctx, topic, replication.ISRState{
-		Partition:     pid,
-		ISR:           []string{p.server.instanceID},
-		Leader:        p.server.instanceID,
-		LeaderEpoch:   newEpoch,
-		HighWatermark: recoveredHW,
-	}, ""); err != nil {
-		slog.Warn("attemptPartitionLeadership: write ISR", "topic", topic, "pid", pid, "error", err)
+	if err := p.server.isrStore.Update(ctx, topic, pid, newEpoch, func(_ replication.ISRState) (replication.ISRState, error) {
+		return replication.ISRState{
+			ISR:           []string{p.server.instanceID},
+			Leader:        p.server.instanceID,
+			HighWatermark: recoveredHW,
+		}, nil
+	}); err != nil {
+		p.server.onISRWriteError(topic, pid, err)
 	}
 
 	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)

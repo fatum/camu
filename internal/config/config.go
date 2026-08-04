@@ -180,6 +180,7 @@ type CoordinationConfig struct {
 	ISRExpansionThreshold     int    `yaml:"isr_expansion_threshold"`
 	ReplicationTimeout        string `yaml:"replication_timeout"`
 	MaintenanceMaxConcurrency int    `yaml:"maintenance_max_concurrency"`
+	FenceInterval             string `yaml:"fence_interval"`
 }
 
 const (
@@ -189,6 +190,7 @@ const (
 	defaultISRExpansionThreshold     = 1000
 	defaultReplicationTimeout        = 30 * time.Second
 	defaultMaintenanceMaxConcurrency = 4
+	defaultFenceInterval             = 2 * time.Second
 )
 
 func parseDurationOrDefault(raw string, fallback time.Duration) (time.Duration, error) {
@@ -237,6 +239,14 @@ func (c CoordinationConfig) MaintenanceMaxConcurrencyValue() int {
 		return defaultMaintenanceMaxConcurrency
 	}
 	return c.MaintenanceMaxConcurrency
+}
+
+// FenceIntervalDuration returns how often the rf=1 produce path re-verifies
+// partition ownership against the assignment store before acknowledging. A
+// shorter interval narrows the window in which a fenced leader can ack writes
+// it will later lose, at the cost of more assignment-store reads.
+func (c CoordinationConfig) FenceIntervalDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.FenceInterval, defaultFenceInterval)
 }
 
 func (s SQLConfig) CacheMaxSizeValue() int64 {
@@ -339,6 +349,7 @@ func defaults() *Config {
 			HeartbeatInterval:         defaultHeartbeatInterval.String(),
 			RebalanceDelay:            defaultRebalanceDelay.String(),
 			MaintenanceMaxConcurrency: defaultMaintenanceMaxConcurrency,
+			FenceInterval:             defaultFenceInterval.String(),
 		},
 	}
 }

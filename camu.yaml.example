@@ -40,6 +40,10 @@ coordination:
   maintenance_max_concurrency: 4
   isr_expansion_threshold: 1000
   replication_timeout: "30s"
+  # How often rf=1 produce re-verifies partition ownership against the
+  # assignment store before acknowledging. A shorter interval narrows the
+  # window in which a fenced leader can ack writes it will later lose.
+  fence_interval: "2s"
 maintenance:
   parquet_export:
     # Requires unclean_leader_election: false on every topic.
