@@ -481,7 +481,7 @@
    [nil "--num-partitions N" "Number of partitions in the Jepsen topic"
     :default default-partitions
     :parse-fn #(Integer/parseInt %)]
-   [nil "--faults FAULTS" "Comma-separated fault types: kill,partition,partition-ring,pause,leader-kill"
+   [nil "--faults FAULTS" "Comma-separated fault types: kill,partition,partition-ring,pause,leader-kill,leader-pause-then-ack"
     :default #{:kill}
     :parse-fn (fn [s] (set (map keyword (clojure.string/split s #","))))]
    [nil "--replication-factor N" "Topic replication factor"
