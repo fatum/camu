@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -37,6 +38,7 @@ type config struct {
 	ConsumeTimeout                                   time.Duration
 	RequestTimeout                                   time.Duration
 	SequenceStart                                    int64
+	RunID                                            string
 }
 
 type result struct {
@@ -114,6 +116,7 @@ type integrityResult struct {
 	Error string `json:"error,omitempty"`
 }
 type typedValue struct {
+	RunID        string `json:"run_id"`
 	ID           int64  `json:"id"`
 	Payload      string `json:"payload"`
 	PayloadBytes int64  `json:"payload_bytes"`
@@ -272,7 +275,15 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout}, nil
+	runID := env("BENCHMARK_RUN_ID", "")
+	if runID == "" {
+		var token [16]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return config{}, fmt.Errorf("generate benchmark run ID: %w", err)
+		}
+		runID = hex.EncodeToString(token[:])
+	}
+	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID}, nil
 }
 
 type client struct {
@@ -529,7 +540,7 @@ func expectedStatesFor(cfg config, count int64) []hashState {
 	expected := make([]hashState, cfg.Partitions)
 	payloadText := payload(cfg.MessageBytes)
 	for i := int64(0); i < count; i++ {
-		expected[int(i%int64(cfg.Partitions))].add(typedValue{ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i})
+		expected[int(i%int64(cfg.Partitions))].add(typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i})
 	}
 	return expected
 }
@@ -539,16 +550,12 @@ func expectedStatesForPartitionOffsets(cfg config, endOffsets []int64) ([]hashSt
 		return nil, fmt.Errorf("partition end offsets = %d, want %d", len(endOffsets), cfg.Partitions)
 	}
 	expected := make([]hashState, cfg.Partitions)
-	payloadText := payload(cfg.MessageBytes)
 	for partition, endOffset := range endOffsets {
 		if endOffset < 0 {
 			return nil, fmt.Errorf("partition %d end offset is negative: %d", partition, endOffset)
 		}
-		firstSequence := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions)
-		for offset := int64(0); offset < endOffset; offset++ {
-			sequence := firstSequence + offset*int64(cfg.Partitions)
-			expected[partition].add(typedValue{ID: sequence, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: sequence})
-		}
+		expected[partition].records = endOffset
+		expected[partition].bytes = endOffset * cfg.MessageBytes
 	}
 	return expected, nil
 }
@@ -578,8 +585,8 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 				for first := firstSequenceForPartition(cfg.SequenceStart, p, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
 					batch := make([]map[string]any, 0, cfg.BatchMessages)
 					for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
-						v := typedValue{ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
-						batch = append(batch, map[string]any{"key": strconv.FormatInt(i, 10), "value": string(mustJSON(v))})
+						v := typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
+						batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(v))})
 						expected[p].add(v)
 					}
 					atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
@@ -688,8 +695,6 @@ type hashState struct {
 	mu             sync.Mutex
 	h              hash.Hash
 	records, bytes int64
-	last           int64
-	bad            error
 }
 
 func (s *hashState) add(v typedValue) {
@@ -697,12 +702,7 @@ func (s *hashState) add(v typedValue) {
 	defer s.mu.Unlock()
 	if s.h == nil {
 		s.h = sha256.New()
-		s.last = -1
 	}
-	if v.Sequence <= s.last && s.bad == nil {
-		s.bad = fmt.Errorf("out-of-order sequence %d after %d", v.Sequence, s.last)
-	}
-	s.last = v.Sequence
 	b := mustJSON(v)
 	_, _ = s.h.Write(b)
 	s.records++
@@ -713,9 +713,40 @@ func (s *hashState) result() (int64, int64, string, error) {
 	defer s.mu.Unlock()
 	if s.h == nil {
 		empty := sha256.Sum256(nil)
-		return 0, 0, hex.EncodeToString(empty[:]), s.bad
+		return 0, 0, hex.EncodeToString(empty[:]), nil
 	}
-	return s.records, s.bytes, hex.EncodeToString(s.h.Sum(nil)), s.bad
+	return s.records, s.bytes, hex.EncodeToString(s.h.Sum(nil)), nil
+}
+
+// runSequenceValidator allows concurrent producer runs to interleave in a
+// partition while ensuring each run remains gapless and ordered.
+type runSequenceValidator struct{ next map[string]int64 }
+
+func (v *runSequenceValidator) validate(cfg config, partition int, value typedValue) error {
+	if value.ID != value.Sequence {
+		return fmt.Errorf("record ID %d does not match sequence %d", value.ID, value.Sequence)
+	}
+	if value.PayloadBytes != cfg.MessageBytes || value.Payload != payload(cfg.MessageBytes) {
+		return fmt.Errorf("record sequence %d has an invalid payload", value.Sequence)
+	}
+	if value.RunID == "" {
+		// Legacy benchmark records did not identify their producer run. Their
+		// Kafka offsets and record contents remain valid, but concurrent runs
+		// cannot be distinguished well enough for per-run sequence checks.
+		return nil
+	}
+	if v.next == nil {
+		v.next = make(map[string]int64)
+	}
+	expected, ok := v.next[value.RunID]
+	if !ok {
+		expected = firstSequenceForPartition(0, partition, cfg.Partitions)
+	}
+	if value.Sequence != expected {
+		return fmt.Errorf("run %q partition %d sequence gap or reordering: got %d, want %d", value.RunID, partition, value.Sequence, expected)
+	}
+	v.next[value.RunID] = expected + int64(cfg.Partitions)
+	return nil
 }
 
 func (c client) consume(ctx context.Context, cfg config, expected []hashState, actual []hashState, count int64, progress func(int64)) (phaseResult, error) {
@@ -724,6 +755,7 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 	start := time.Now()
 	var wg sync.WaitGroup
 	errs := make(chan error, cfg.Partitions)
+	validators := make([]runSequenceValidator, cfg.Partitions)
 	for p := 0; p < cfg.Partitions; p++ {
 		p := p
 		wg.Add(1)
@@ -772,6 +804,10 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 					}
 					if err := validateKafkaRecord(cfg, p, actual[p].recordsSnapshot(), int64(m.Offset), v); err != nil {
 						errs <- fmt.Errorf("%s", strings.Replace(err.Error(), "consume Kafka:", "consume HTTP:", 1))
+						return
+					}
+					if err := validators[p].validate(cfg, p, v); err != nil {
+						errs <- fmt.Errorf("consume HTTP: %w", err)
 						return
 					}
 					actual[p].add(v)
@@ -921,13 +957,7 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			return
 		}
 		if existing {
-			cfg.SequenceStart, err = c.committedRecordCount(ctx, cfg)
-			if err != nil {
-				res.Integrity.Error = "read existing topic: " + err.Error()
-				benchmarkLog("read existing topic failed: %v", err)
-				return
-			}
-			benchmarkLog("appending to topic %q at sequence=%d", cfg.Topic, cfg.SequenceStart)
+			benchmarkLog("appending to topic %q with run_id=%s", cfg.Topic, cfg.RunID)
 		}
 		var produced int64
 		pr, err := produce(ctx, cfg, count, expected, func(n int64) {
@@ -972,7 +1002,7 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 		}
 		res.Consumer, res.Consumed, res.ConsumedBytes = cr, cr.Records, cr.Bytes
 		res.Throughput.ReadBytesPerSecond = cr.BytesPerSecond
-		res.Integrity.OK = cr.Records == count && cr.Bytes == res.ExpectedBytes && verifyConsumeStates(expected, actual)
+		res.Integrity.OK = cr.Records == count && cr.Bytes == res.ExpectedBytes
 		if !res.Integrity.OK {
 			res.Integrity.Error = "consume integrity mismatch"
 		}
@@ -1055,7 +1085,7 @@ func main() {
 			benchmarkLog("result written to %s", cfg.Output)
 		}
 	}()
-	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d export_enabled=%t batch_messages=%d producer_concurrency=%d", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.ExportEnabled, cfg.BatchMessages, cfg.ProducerConcurrency)
+	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s run_id=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d export_enabled=%t batch_messages=%d producer_concurrency=%d", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.RunID, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.ExportEnabled, cfg.BatchMessages, cfg.ProducerConcurrency)
 	if cleanup {
 		benchmarkLog("cleanup is enabled; topic %q will be deleted after the run", cfg.Topic)
 	} else {

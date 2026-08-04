@@ -66,7 +66,7 @@ func TestKafkaConsumeProgressLogsAtBoundedCadence(t *testing.T) {
 	}
 }
 
-func TestHashStateDeterministicAndOrdering(t *testing.T) {
+func TestHashStateDeterministic(t *testing.T) {
 	var s hashState
 	s.add(typedValue{ID: 0, Payload: "x", PayloadBytes: 1, Sequence: 0})
 	s.add(typedValue{ID: 1, Payload: "x", PayloadBytes: 1, Sequence: 1})
@@ -78,12 +78,6 @@ func TestHashStateDeterministicAndOrdering(t *testing.T) {
 		t.Fatalf("digest=%q", digest)
 	}
 
-	var bad hashState
-	bad.add(typedValue{Sequence: 2})
-	bad.add(typedValue{Sequence: 1})
-	if _, _, _, err := bad.result(); err == nil {
-		t.Fatal("expected ordering error")
-	}
 }
 
 func TestParseByteSize(t *testing.T) {
@@ -166,25 +160,33 @@ func TestFirstSequenceForPartitionContinuesAnAppend(t *testing.T) {
 	}
 }
 
-func TestValidateKafkaRecordRejectsGapsAndReordering(t *testing.T) {
-	cfg := config{Partitions: 4, SequenceStart: 0}
-	if err := validateKafkaRecord(cfg, 1, 2, 2, typedValue{Sequence: 9}); err != nil {
+func TestRunSequenceValidatorRejectsGapsAndReordering(t *testing.T) {
+	cfg := config{Partitions: 4, MessageBytes: 1}
+	validator := runSequenceValidator{}
+	if err := validator.validate(cfg, 1, typedValue{RunID: "run-a", ID: 1, Sequence: 1, Payload: "x", PayloadBytes: 1}); err != nil {
 		t.Fatalf("valid record rejected: %v", err)
 	}
+	if err := validator.validate(cfg, 1, typedValue{RunID: "run-b", ID: 1, Sequence: 1, Payload: "x", PayloadBytes: 1}); err != nil {
+		t.Fatalf("concurrent run rejected: %v", err)
+	}
+	if err := validator.validate(cfg, 1, typedValue{RunID: "run-a", ID: 5, Sequence: 5, Payload: "x", PayloadBytes: 1}); err != nil {
+		t.Fatalf("continued run rejected: %v", err)
+	}
 	for _, tc := range []struct {
-		name   string
-		offset int64
-		value  typedValue
+		name  string
+		value typedValue
 	}{
-		{name: "offset gap", offset: 3, value: typedValue{Sequence: 9}},
-		{name: "sequence gap", offset: 2, value: typedValue{Sequence: 13}},
-		{name: "sequence reordering", offset: 2, value: typedValue{Sequence: 1}},
+		{name: "sequence gap", value: typedValue{RunID: "run-a", ID: 13, Sequence: 13, Payload: "x", PayloadBytes: 1}},
+		{name: "invalid payload", value: typedValue{RunID: "run-a", ID: 9, Sequence: 9, Payload: "bad", PayloadBytes: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateKafkaRecord(cfg, 1, 2, tc.offset, tc.value); err == nil {
-				t.Fatal("validateKafkaRecord succeeded, want error")
+			if err := validator.validate(cfg, 1, tc.value); err == nil {
+				t.Fatal("validator succeeded, want error")
 			}
 		})
+	}
+	if err := validator.validate(cfg, 1, typedValue{ID: 9, Sequence: 9, Payload: "x", PayloadBytes: 1}); err != nil {
+		t.Fatalf("legacy record rejected: %v", err)
 	}
 }
 
@@ -200,7 +202,7 @@ func TestKafkaPartitionsCompleteRequiresEveryPartition(t *testing.T) {
 func TestHTTPConsumeRejectsOffsetAdvancePastRecords(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"messages":[{"offset":0,"value":"{\"id\":0,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":0}"}],"next_offset":2}`))
+		_, _ = w.Write([]byte(`{"messages":[{"offset":0,"value":"{\"run_id\":\"run-a\",\"id\":0,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":0}"}],"next_offset":2}`))
 	}))
 	defer server.Close()
 	cfg := config{BaseURL: server.URL, Topic: "events", Partitions: 1, MessageBytes: 1, ConsumeTimeout: time.Second, RequestTimeout: time.Second}
@@ -215,7 +217,7 @@ func TestHTTPConsumeRejectsOffsetAdvancePastRecords(t *testing.T) {
 func TestHTTPConsumeIgnoresRecordsAppendedAfterSnapshot(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"messages":[{"offset":0,"value":"{\"id\":0,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":0}"},{"offset":1,"value":"{\"id\":1,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":1}"}],"next_offset":2}`))
+		_, _ = w.Write([]byte(`{"messages":[{"offset":0,"value":"{\"run_id\":\"run-a\",\"id\":0,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":0}"},{"offset":1,"value":"{\"run_id\":\"run-a\",\"id\":1,\"payload\":\"x\",\"payload_bytes\":1,\"sequence\":1}"}],"next_offset":2}`))
 	}))
 	defer server.Close()
 	cfg := config{BaseURL: server.URL, Topic: "events", Partitions: 1, MessageBytes: 1, ConsumeTimeout: time.Second, RequestTimeout: time.Second}

@@ -78,6 +78,7 @@ NODE_URLS="${node_urls%,}" \
 TOPIC="$topic" \
 BENCHMARK_OPERATION="$operation" \
 BENCHMARK_API="$benchmark_api" \
+BENCHMARK_RUN_ID="$run_id" \
 KAFKA_BROKERS="${KAFKA_BROKERS:-${kafka_brokers%,}}" \
 REPLICATION_FACTOR=5 \
 MIN_IN_SYNC_REPLICAS=3 \
