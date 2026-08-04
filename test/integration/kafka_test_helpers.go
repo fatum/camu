@@ -420,7 +420,12 @@ func produceWithKgoUntilSuccess(ctx context.Context, client *kgo.Client, topic, 
 	deadline := time.Now().Add(40 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		results := client.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte(value)})
+		// A stale broker connection can leave one ProduceSync waiting until the
+		// caller's overall recovery deadline. Bound each attempt so metadata can
+		// be refreshed and the client can retry a newly elected leader.
+		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		results := client.ProduceSync(attemptCtx, &kgo.Record{Topic: topic, Value: []byte(value)})
+		cancel()
 		if err := results.FirstErr(); err == nil {
 			return nil
 		} else {
