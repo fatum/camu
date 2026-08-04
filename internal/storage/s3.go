@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -80,24 +81,28 @@ type s3Backend interface {
 type S3Client struct {
 	cfg     S3Config
 	backend s3Backend
-	metrics *metrics.Registry
+	// metrics is atomic because a shared client (e.g. the camutest harness)
+	// can be re-pointed at a new server's registry while the previous server's
+	// goroutines are still draining.
+	metrics atomic.Pointer[metrics.Registry]
 }
 
-func (c *S3Client) SetMetrics(registry *metrics.Registry) { c.metrics = registry }
+func (c *S3Client) SetMetrics(registry *metrics.Registry) { c.metrics.Store(registry) }
 
 func (c *S3Client) observe(op string, started time.Time, bytes int64, err error) {
-	if c.metrics == nil {
+	m := c.metrics.Load()
+	if m == nil {
 		return
 	}
 	labels := map[string]string{"operation": op, "result": "ok"}
 	if err != nil {
 		labels["result"] = "error"
 	}
-	c.metrics.Inc("camu_s3_operations_total", "S3 operations", labels)
+	m.Inc("camu_s3_operations_total", "S3 operations", labels)
 	if bytes > 0 {
-		c.metrics.Add("camu_s3_bytes_total", "S3 payload bytes", map[string]string{"operation": op, "direction": direction(op)}, float64(bytes))
+		m.Add("camu_s3_bytes_total", "S3 payload bytes", map[string]string{"operation": op, "direction": direction(op)}, float64(bytes))
 	}
-	c.metrics.Observe("camu_s3_operation_duration", "S3 operation duration", map[string]string{"operation": op}, time.Since(started))
+	m.Observe("camu_s3_operation_duration", "S3 operation duration", map[string]string{"operation": op}, time.Since(started))
 }
 
 func direction(op string) string {

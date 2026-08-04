@@ -93,6 +93,26 @@ Pass `--faults` as a comma-separated list or use `run.sh <faults> <seconds>`.
 | `s3-partition` | Block MinIO access on one node | Object-store isolation handling |
 | `clock-skew` | Inject clock drift | Lease timing assumptions |
 | `leader-kill` | Kill the active leader for busy partitions | Promoted-leader recovery and readable failover |
+| `leader-pause-then-ack` | Pause the active leader past lease expiry, let a new leader be elected, then resume the stale leader | Stale-leader fencing: a resumed leader must not acknowledge a write the current ISR quorum does not hold |
+
+## Kafka API Status
+
+The `--api kafka` path uses an `acks=all` + idempotent Java producer and the
+same checker suite (minus the HTTP-only `single-leader` checker). The existing
+HTTP matrix above is HTTP-API only.
+
+- `leader-pause-then-ack` (Kafka, `rf=3`, `minISR=2`): **Pass** — 390 acked, 0
+  lost. This verifies the Kafka produce path waits for the ISR quorum: a stale
+  leader resumed after lease expiry does not acknowledge uncommitted writes.
+- `leader-kill` (Kafka, `rf=3`, `minISR=2`): **Known failure (pre-existing)** —
+  committed-durability loses the leader's unflushed tail (35 of 254 acked
+  records in the latest run). The same fault passes on the HTTP API. The base
+  branch (before the coordination-hardening work) loses 81 records under the
+  identical run, so this is a failover/recovery bug that predates the Kafka
+  ack fix; the stricter ack path reduces but does not eliminate it. Root cause
+  is under investigation: sealed-but-unpublished segments or follower
+  truncation can drop committed tail records during rapid leader handoff. See
+  `store/camu-kafka/` for the failing runs.
 
 ## Checkers
 

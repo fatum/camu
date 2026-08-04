@@ -377,16 +377,57 @@
                 (c/on-nodes test [node] (fn [_ _] (start-camu!)))
                 (catch Exception _)))))))))
 
+(defn leader-pause-then-ack-nemesis
+  "A nemesis that pauses the partition leader past lease expiry, lets the
+   cluster elect a new leader, then resumes the stale leader. Produces that
+   route to the resumed node during the window stress the stale-leader fencing
+   guarantee: the node must never acknowledge a write the current ISR quorum
+   does not hold. Any such ack surfaces as a committed-durability violation in
+   the final drain."
+  []
+  (let [paused (atom #{})]
+    (reify nemesis/Nemesis
+      (setup! [this test] this)
+      (invoke! [this test op]
+        (case (:value op)
+          :start
+          (let [topic  (:topic test)
+                target (or (find-leader-node (:nodes test) topic)
+                           (rand-nth (:nodes test)))]
+            (info "Leader-pause-then-ack nemesis: pausing leader" target)
+            (c/on-nodes test [target] (fn [_ _] (pause-camu!)))
+            (swap! paused conj target)
+            ;; Hold the leader paused well past the 6s lease TTL so a new
+            ;; leader is elected and the paused leader's lease expires.
+            (Thread/sleep 15000)
+            (info "Leader-pause-then-ack nemesis: resuming stale leader" target)
+            (c/on-nodes test [target] (fn [_ _] (resume-camu!)))
+            (assoc op :value [:leader-paused-resumed target]))
+          :stop
+          (let [to-resume (vec @paused)]
+            (reset! paused #{})
+            (doseq [node to-resume]
+              (c/on-nodes test [node] (fn [_ _] (resume-camu!))))
+            (assoc op :value [:resumed to-resume]))))
+      (teardown! [this test]
+        (let [to-resume (vec @paused)]
+          (when (seq to-resume)
+            (doseq [node to-resume]
+              (c/on-nodes test [node] (fn [_ _] (resume-camu!))))))))))
+
 (defn composed-nemesis
   "Returns a nemesis that composes fault types specified in the faults set.
    Supported fault keys: :kill :partition :pause :rejoin :leave :membership
                          :s3-partition :clock-skew :leader-kill :partition-ring
+                         :leader-pause-then-ack
 
    For :kill — start = SIGKILL process, stop = restart process
    For :leave — start = graceful SIGTERM (deregister), stop = restart (rejoin)
    For :membership — start = full leave/wait/rejoin cycle, stop = no-op
    For :partition — start = partition network, stop = heal network
-   For :pause — start = SIGSTOP, stop = SIGCONT"
+   For :pause — start = SIGSTOP, stop = SIGCONT
+   For :leader-pause-then-ack — start = pause leader past lease TTL, resume stale
+   leader; stop = ensure all resumed"
   ([] (composed-nemesis #{:kill :partition :pause}))
   ([faults]
    (nemesis/compose
@@ -419,7 +460,10 @@
       (assoc #{:clock-skew} (clock-skew-nemesis))
 
       (:leader-kill faults)
-      (assoc #{:leader-kill} (leader-kill-nemesis))))))
+      (assoc #{:leader-kill} (leader-kill-nemesis))
+
+      (:leader-pause-then-ack faults)
+      (assoc #{:leader-pause-then-ack} (leader-pause-then-ack-nemesis))))))
 
 (defn fault-cycle
   "Returns a gen/cycle for a single fault type with appropriate timing.
@@ -442,6 +486,11 @@
                    {:type :info :f fault :value :start}
                    (gen/sleep 20)
                    {:type :info :f fault :value :stop}])
+    :leader-pause-then-ack (gen/cycle
+                            [(gen/sleep 8)
+                             {:type :info :f fault :value :start}
+                             (gen/sleep 15)
+                             {:type :info :f fault :value :stop}])
     ;; Default: 5s quiet, inject fault, 10s active, stop fault
     (gen/cycle
      [(gen/sleep 5)
