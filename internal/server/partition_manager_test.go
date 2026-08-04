@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/config"
+	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/producer"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -46,6 +48,19 @@ func newTestPartitionManagerWithSegmentMaxSize(t *testing.T, maxSize int64) *Par
 	if err != nil {
 		t.Fatalf("NewPartitionManager() error = %v", err)
 	}
+	// Tests use tiny MaxSize to force fast flushes, which yields a negligible
+	// per-partition high-water mark (maxSize*8) that would spuriously reject
+	// normal batches. Disable backpressure here; it is exercised directly
+	// against the batcher in its own package.
+	maxAge, err := cfg.Segments.MaxAgeDuration()
+	if err != nil {
+		t.Fatalf("MaxAgeDuration() error = %v", err)
+	}
+	pm.batcher = producer.NewBatcher(producer.BatcherConfig{
+		MaxSize: maxSize,
+		MaxAge:  maxAge,
+		OnFlush: pm.onFlushDispatch,
+	})
 	return pm
 }
 
@@ -544,6 +559,189 @@ func TestAppendRawBatch_DuplicateSequenceReturnsPriorOffset(t *testing.T) {
 	}
 }
 
+func TestDuplicateBaseOffset_EvictedProducerDoesNotPanic(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+
+	// Seed the producer's batch metadata.
+	ps.mu.Lock()
+	ps.checkAndAdvanceSeq(7, 0, 2)
+	ps.recordAppendedBatch(7, 0, 2, 0, 1)
+	ps.mu.Unlock()
+
+	// Simulate eviction concurrent with a duplicate retry: the map entry is
+	// removed before duplicateBaseOffset looks it up. This must not panic and
+	// must report "not a known duplicate" (false) instead of confirming.
+	ps.mu.Lock()
+	delete(ps.producerSeqs, 7)
+	ps.mu.Unlock()
+
+	// A retried duplicate arriving after eviction must be handled gracefully.
+	prior, ok := pm.duplicateBaseOffset(ps, 7, 0, 2)
+	if ok {
+		t.Fatalf("duplicateBaseOffset ok = true, want false after eviction (prior=%d)", prior)
+	}
+}
+
+func TestDuplicateBaseOffset_ConcurrentAppendNoDataRace(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+
+	// Seed the producer's sequence state.
+	ps.mu.Lock()
+	ps.checkAndAdvanceSeq(99, 0, 2)
+	ps.recordAppendedBatch(99, 0, 2, 0, 1)
+	ps.mu.Unlock()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writer: replace LastBatch under the partition lock, simulating appends.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		seq := uint64(2)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ps.mu.Lock()
+			ps.recordAppendedBatch(99, seq, 2, int64(seq), uint64(seq)+1)
+			ps.mu.Unlock()
+			seq += 2
+			runtime.Gosched()
+		}
+	}()
+
+	// Reader: concurrent duplicate resolution must read LastBatch safely.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			pm.duplicateBaseOffset(ps, 99, 0, 2)
+			runtime.Gosched()
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+func TestAppendRawBatch_DuplicateOfEarlierSequenceRangeIsRejected(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	// Batch A: producer 7, sequence 0, 2 records -> offsets 0,1 (NextSeq=2).
+	batchA := log.EncodeRecordBatchWithMeta(0, log.Batch{
+		ProducerID: 7,
+		Sequence:   0,
+		Messages: []log.Message{
+			{Key: []byte("a1"), Value: []byte("v1"), Timestamp: now},
+			{Key: []byte("a2"), Value: []byte("v2"), Timestamp: now + 1},
+		},
+	})
+	if _, err := pm.AppendRawBatch(context.Background(), "topic", 0, batchA); err != nil {
+		t.Fatalf("AppendRawBatch(A) error = %v", err)
+	}
+
+	// Batch B: producer 7, sequence 2, 1 record -> offset 2 (NextSeq=3).
+	batchB := log.EncodeRecordBatchWithMeta(2, log.Batch{
+		ProducerID: 7,
+		Sequence:   2,
+		Messages: []log.Message{
+			{Key: []byte("b1"), Value: []byte("v3"), Timestamp: now + 2},
+		},
+	})
+	if _, err := pm.AppendRawBatch(context.Background(), "topic", 0, batchB); err != nil {
+		t.Fatalf("AppendRawBatch(B) error = %v", err)
+	}
+
+	// Exact retry of batch A (sequence 0, 2 records) is NOT an exact match of
+	// the most recent batch (batch B: sequence 2, 1 record). It must not be
+	// acknowledged with batch B's offset; it must surface the duplicate error
+	// rather than silently confirming an overlapping range.
+	_, err = pm.AppendRawBatch(context.Background(), "topic", 0, batchA)
+	if err == nil {
+		t.Fatal("expected error for overlapping non-identical duplicate, got success")
+	}
+	if !errors.Is(err, idempotency.ErrDuplicateSequence) {
+		t.Fatalf("AppendRawBatch() error = %v, want ErrDuplicateSequence", err)
+	}
+
+	// The log must not have advanced: still offsets 0,1,2.
+	ps.mu.RLock()
+	nextOff := ps.nextOffset
+	ps.mu.RUnlock()
+	if nextOff != 3 {
+		t.Fatalf("nextOffset after rejected overlap = %d, want 3", nextOff)
+	}
+
+	// An exact retry of batch B (the most recent batch) must confirm with B's
+	// own base offset (2), not be rejected.
+	prior, err := pm.AppendRawBatch(context.Background(), "topic", 0, batchB)
+	if err != nil {
+		t.Fatalf("AppendRawBatch(B retry) error = %v, want success", err)
+	}
+	if prior != 2 {
+		t.Fatalf("B retry baseOffset = %d, want 2", prior)
+	}
+}
+
 func TestOnFlushActiveSegment_OpenReplacementFailureKeepsOldSegmentUsable(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
@@ -597,6 +795,72 @@ func TestOnFlushActiveSegment_OpenReplacementFailureKeepsOldSegmentUsable(t *tes
 	}
 	if err := as.Append(log.EncodeRecordBatch(1, []log.Message{{Key: []byte("k2"), Value: []byte("v2"), Timestamp: 2}})); err != nil {
 		t.Fatalf("old segment no longer writable after failed flush: %v", err)
+	}
+}
+
+func TestOnFlushActiveSegment_SealFailureCleansUpReplacementSegment(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	if err := as.Append(log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.nextOffset = 1
+	ps.mu.Unlock()
+
+	// Make Seal fail at sidecar creation (after sync+close succeed) by putting
+	// a directory at the sidecar path. The replacement segment opens BEFORE
+	// Seal at a different path, so it succeeds; only the sidecar create fails.
+	if err := os.Mkdir(filepath.Join(segDir, log.SidecarFilename(0)), 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+
+	err = pm.onFlushActiveSegment("topic", 0)
+	if err == nil {
+		t.Fatal("expected seal failure error")
+	}
+	if !strings.Contains(err.Error(), "seal active segment") {
+		t.Fatalf("err = %v, want seal failure", err)
+	}
+
+	// The replacement segment's orphan .log file must have been removed: the
+	// only .log file in the dir is the original at base offset 0.
+	if _, err := os.Stat(filepath.Join(segDir, log.SegmentFilename(0))); err != nil {
+		t.Fatalf("original segment file missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(segDir, log.SegmentFilename(1))); err == nil {
+		t.Fatal("replacement segment file leaked after failed seal; want it removed")
+	}
+
+	// The old segment must have been reopened (self-heal) and remain writable.
+	ps.mu.RLock()
+	got := ps.activeSegment
+	ps.mu.RUnlock()
+	if got == nil {
+		t.Fatal("ps.activeSegment is nil after failed seal")
+	}
+	if err := got.Append(log.EncodeRecordBatch(1, []log.Message{{Key: []byte("k2"), Value: []byte("v2"), Timestamp: 2}})); err != nil {
+		t.Fatalf("reopened segment not writable after failed seal: %v", err)
 	}
 }
 
