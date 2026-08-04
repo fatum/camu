@@ -381,6 +381,8 @@ func (s *Server) startWithListener(ln net.Listener) error {
 		return fmt.Errorf("init existing topics: %w", err)
 	}
 	switch s.cfg.Diskless.MetaStore {
+	case "s3":
+		s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
 	case "dynamodb":
 		dms, err := diskless.NewDynamoMetaStore(context.Background(), diskless.DynamoMetaStoreConfig{
 			TablePrefix: s.cfg.Diskless.DynamoDB.TablePrefix,

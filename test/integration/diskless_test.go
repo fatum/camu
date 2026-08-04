@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/pkg/camutest"
 )
 
@@ -132,8 +133,7 @@ func TestDiskless_HTTPProduceAndConsume(t *testing.T) {
 	createDisklessTopic(t, client, topic, 1)
 	waitForPartitionProduceReady(t, client, topic, 0)
 
-	// waitForPartitionProduceReady produced a warmup message at offset 0.
-	// Our messages will start at offset 1.
+	// waitForPartitionProduceReady produced a warmup message at offset 0.	// Our messages will start at offset 1.
 	msgs := []camutest.ProduceMessage{
 		{Key: "k1", Value: "v1"},
 		{Key: "k2", Value: "v2"},
@@ -170,6 +170,50 @@ func TestDiskless_HTTPProduceAndConsume(t *testing.T) {
 	}
 	if resp.Messages[2].Key != "k3" || resp.Messages[2].Value != "v3" {
 		t.Errorf("message[2] = %q/%q, want k3/v3", resp.Messages[2].Key, resp.Messages[2].Value)
+	}
+}
+
+// TestDiskless_S3MetaStoreProduceConsume runs the full diskless HTTP path with
+// the S3-backed metastore, verifying offset allocation and segment catalog
+// queries work against object storage without DynamoDB.
+func TestDiskless_S3MetaStoreProduceConsume(t *testing.T) {
+	env := camutest.New(t,
+		camutest.WithInstances(1),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			cfg.Diskless.MetaStore = "s3"
+		}),
+	)
+	defer env.Cleanup()
+
+	client := env.Client()
+	const topic = "diskless-s3-metastore"
+	createDisklessTopic(t, client, topic, 1)
+	waitForPartitionProduceReady(t, client, topic, 0)
+
+	// waitForPartitionProduceReady produced a warmup message at offset 0.
+	msgs := []camutest.ProduceMessage{
+		{Key: "k1", Value: "v1"},
+		{Key: "k2", Value: "v2"},
+	}
+	if _, err := client.ProduceToPartition(topic, 0, msgs); err != nil {
+		t.Fatalf("ProduceToPartition: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	resp, err := client.Consume(topic, 0, 0, 100)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if len(resp.Messages) != 3 {
+		t.Fatalf("got %d messages, want 3 (warmup + 2)", len(resp.Messages))
+	}
+	for i, msg := range resp.Messages {
+		if msg.Offset != uint64(i) {
+			t.Errorf("message[%d].Offset = %d, want %d (contiguous)", i, msg.Offset, i)
+		}
+	}
+	if resp.Messages[1].Key != "k1" || resp.Messages[2].Key != "k2" {
+		t.Errorf("messages = %q, want [warmup k1 k2]", []string{resp.Messages[0].Key, resp.Messages[1].Key, resp.Messages[2].Key})
 	}
 }
 

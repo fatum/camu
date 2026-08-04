@@ -49,6 +49,12 @@ coordination:
   # assignment store before acknowledging. A shorter interval narrows the
   # window in which a fenced leader can ack writes it will later lose.
   fence_interval: "2s"
+diskless:
+  linger_ms: 250
+  max_batch_bytes: 8388608
+  # "memory" (default, single-node dev), "s3" (offsets and segment catalog
+  # backed by the same object store; no DynamoDB required), or "dynamodb".
+  metastore: "memory"
 maintenance:
   parquet_export:
     # Requires unclean_leader_election: false on every topic.

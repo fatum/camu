@@ -38,6 +38,16 @@ Create mode over Kafka:
 
 - `camu.storage.mode=diskless`
 
+Diskless coordination:
+
+- `diskless.metastore` selects the offset/segment-catalog backend:
+  `memory` (default, single-node dev), `s3` (backed by the same object store,
+  so diskless topics run on any S3-compatible service without DynamoDB), or
+  `dynamodb`.
+- With `s3`, offset allocation uses a per-partition head object and
+  conditional-write CAS, and the segment catalog is immutable per-batch-ref
+  objects; both work against any S3-compatible store.
+
 ## Query Mode
 
 Camu also supports a separate runtime role:
