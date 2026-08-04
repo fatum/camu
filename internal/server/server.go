@@ -429,8 +429,13 @@ func (s *Server) startKafkaServer(port int) {
 		BrokerAddr:                  brokerAddr,
 	})
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("kafka_server_start", "address", addr, "error", err)
+		return
+	}
 	go func() {
-		if err := s.kafkaServer.StartListener(addr); err != nil {
+		if err := s.kafkaServer.serveListener(ln); err != nil {
 			slog.Error("kafka_server_start", "address", addr, "error", err)
 		}
 	}()

@@ -74,6 +74,10 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	// Cap reads at the readable high watermark for replicated partitions.
 	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
 	owned := s.isOwnedPartition(topicName, partitionID)
+	if r.URL.Query().Get("consistency") == "leader" && !owned {
+		writeError(w, http.StatusMisdirectedRequest, "not partition leader")
+		return
+	}
 	var readableHW uint64
 	var hasReadableHW bool
 	if ps != nil {

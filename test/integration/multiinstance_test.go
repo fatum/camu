@@ -221,12 +221,16 @@ func TestMultiInstance_ProduceConsumeAcrossInstances(t *testing.T) {
 	// Consume from all partitions via both instances.
 	total := 0
 	for p := 0; p < 4; p++ {
-		resp, err := client0.Consume("cross-test", p, 0, 100)
-		if err != nil {
-			resp, err = client1.Consume("cross-test", p, 0, 100)
+		resp0, err0 := client0.Consume("cross-test", p, 0, 100)
+		resp1, err1 := client1.Consume("cross-test", p, 0, 100)
+		if err0 != nil && err1 != nil {
+			t.Errorf("consume partition %d failed on both instances: %v; %v", p, err0, err1)
+			continue
 		}
-		if err == nil {
-			total += len(resp.Messages)
+		if err0 == nil && (err1 != nil || len(resp0.Messages) >= len(resp1.Messages)) {
+			total += len(resp0.Messages)
+		} else {
+			total += len(resp1.Messages)
 		}
 	}
 
