@@ -42,7 +42,7 @@ Camu is an S3-native event log that stores native Kafka `RecordBatch` bytes as i
 2. **Encode**: HTTP writes are translated into Kafka `RecordBatch` bytes at the API boundary. Kafka protocol writes pass through as zero-copy raw batches.
 3. **Append**: The partition leader appends batch bytes to a local active segment.
 4. **Replicate**: For replicated topics, followers fetch raw batches from the leader over the internal h2c listener. The leader advances the high watermark when ISR followers confirm progress.
-5. **Acknowledge**: The produce response is sent only after the ISR quorum has confirmed the write.
+5. **Acknowledge**: The produce response is sent only after the ISR quorum has confirmed the write. The HTTP path and the Kafka path (any `acks != 0`) both wait on the replication purgatory; Kafka `acks=0` requests are fire-and-forget. For `rf=1` topics the ack additionally re-verifies ownership against the assignment store on an amortized `coordination.fence_interval` cadence.
 6. **Persist**: A background flusher seals active segments and publishes their
    immutable files, sidecars, state, and producer checkpoint to object storage.
    This work is not on the produce request path.
@@ -126,6 +126,10 @@ Each partition keeps:
 - in-memory offset and timestamp indexes for the active segment
 - per-partition producer-sequence state for idempotent produce
 - replication state when the topic uses `replication_factor > 1`
+- a local `epoch` sidecar recording the last epoch this node wrote the active
+  tail under. Promotions (`become_leader`, self-promotion) persist it so a
+  demoted leader reports the correct epoch on a later state reload; without it
+  the next leader's divergence check could fence committed tail data.
 
 The local active segment is the only mutable log file. Recovery truncates partial tail data by scanning RecordBatch boundaries and CRCs.
 
@@ -135,7 +139,10 @@ The local active segment is the only mutable log file. Recovery truncates partia
 - Followers fetch raw RecordBatch bytes from the leader over h2c
 - Followers append those bytes without re-encoding (zero-copy replication)
 - The leader advances the high watermark when ISR followers confirm progress
-- Produce responses wait in a purgatory until the high watermark passes the written offset
+- Produce responses wait in a purgatory until the high watermark passes the written offset, on both the HTTP and Kafka paths
+- A promoted leader continues at `max(local log end, index next offset)`, so a
+  replica promoted with an empty or short local tail still serves committed
+  records already published to object storage
 
 ## Flush
 

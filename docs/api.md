@@ -403,8 +403,13 @@ Kafka admin notes:
 
 Ack semantics:
 
-- `rf=1`, `minISR=1`: durable in the local active segment on the owner
+- `rf=1`, `minISR=1`: durable in the local active segment on the owner, and the
+  ack re-verifies ownership against the assignment store on an amortized
+  `coordination.fence_interval` cadence (default `2s`)
 - `rf>1`: durable on the leader and acknowledged only after ISR quorum confirms
+  (HTTP and Kafka alike)
+- Kafka `acks=0` requests are fire-and-forget and return without waiting for a
+  quorum
 
 Important behavior:
 

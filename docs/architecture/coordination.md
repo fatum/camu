@@ -32,9 +32,9 @@ Camu uses object storage as its coordination backend. There is no separate conse
 
 | Object | Purpose | Write pattern |
 |--------|---------|---------------|
-| `_coordination/leader.json` | Cluster controller lease | Conditional write with TTL |
-| `_coordination/assignments/{topic}.json` | Partition leader and replica mapping | Controller-only writes |
-| `_coordination/isr/{topic}/{partition}.json` | ISR membership and high watermark | Leader-only conditional writes |
+| `_coordination/leader.json` | Cluster controller lease with monotonic `lease_epoch` | Conditional write with TTL; renew is a CAS bump of `lease_epoch` |
+| `_coordination/assignments/{topic}.json` | Partition leader and replica mapping | Controller-only CAS writes |
+| `_coordination/isr/{topic}/{partition}.json` | ISR membership and high watermark | Leader-only conditional writes, guarded by the leader epoch |
 | `_coordination/instances/{instanceID}.json` | Instance heartbeat and advertised addresses | Self-registration with TTL |
 | `_coordination/epochs/{topic}/{partition}.json` | Epoch history for divergence detection | Controller appends on reassignment |
 | `_coordination/kafka-groups/{group}.json` | Kafka consumer group coordination | CAS with ETag-based versioning |
@@ -71,6 +71,9 @@ Each partition leader is responsible for:
 - Persisting idempotent producer checkpoints during flush
 - Executing retention through durable partition jobs
 - Fencing itself if the local epoch falls behind the assignment epoch
+- For `rf=1` topics, re-verifying ownership against the assignment store on an
+  amortized `coordination.fence_interval` cadence before acknowledging, so a
+  fenced owner stops acking instead of losing acknowledged writes
 
 Retention jobs are expected to survive both restart and reassignment. If an
 owner loses leadership mid-job, the stale owner stops. The new owner
@@ -108,12 +111,12 @@ well. That service owns:
 Leader failover works through:
 
 1. **Detection**: Followers and controller detect leader failure via missed heartbeats or lease expiry.
-2. **Reassignment**: The controller publishes a new assignment with a higher epoch.
-3. **Index refresh**: The promoted leader refreshes its segment index from object storage.
-4. **Local recovery**: The promoted leader recovers its active segment, truncating any divergent tail using epoch history.
+2. **Reassignment**: The controller publishes a new assignment with a higher epoch (or a follower self-promotes with a CAS bump).
+3. **Index refresh**: The promoted leader refreshes its segment index from object storage and continues at `max(local log end, index next offset)`, so an empty local tail still serves committed S3 records.
+4. **Local recovery**: The promoted leader recovers its active segment, truncating any divergent tail using epoch history. Promotions persist the new leader epoch to the local `epoch` sidecar, so a later demotion reports the correct epoch of the active tail.
 5. **Resume**: Replication and reads resume under the new leader. The high watermark advances once the ISR re-forms.
 
-Epoch history is used to fence stale leaders and to instruct followers to truncate divergent tails when required.
+Epoch history is used to fence stale leaders and to instruct followers to truncate divergent tails when required. The local `epoch` sidecar keeps the follower's reported epoch accurate across demotions; without it a stale epoch made the divergence check fence a demoted leader that actually held committed tail data.
 
 ## Consumer Groups
 
@@ -131,7 +134,10 @@ Kafka consumer-group coordination is controller-centric:
 The system relies on:
 
 - **Single active controller** through a lease with conditional-write acquisition
-- **Conditional writes** for ownership changes where races matter (assignments, ISR, group state)
+- **Monotonic lease epochs** as the controller fencing token: renew bumps a
+  counter via CAS, so a skewed-clock stale leader is fenced by epoch comparison
+  rather than wall-clock expiry alone
+- **Conditional writes** for ownership changes where races matter (assignments, ISR, group state); ISR mutations are additionally guarded by the leader epoch
 - **Epoch fencing** to reject stale leaders and detect divergence
 - **Immutable sealed segments** for shared log history (once written, never modified)
 - **Local active segments** for the mutable tail (single-writer per partition)
