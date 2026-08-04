@@ -67,13 +67,18 @@ func (p partitionFollowerService) proxyToLeader(w http.ResponseWriter, r *http.R
 }
 
 func (p partitionFollowerService) handleLeaderDown(topic string, pid int) {
-	slog.Warn("leader down detected, reporting to controller", "topic", topic, "pid", pid)
-	if err := p.server.reportFailureToController(topic, pid); err != nil {
-		slog.Error("report failure to controller failed, falling back to self-election",
+	// Self-promotion is the primary failover path: a caught-up ISR member can
+	// claim leadership with a CAS bump on the assignment store without waiting
+	// for a controller round trip. The controller remains the backstop for the
+	// cases self-promotion cannot resolve (no eligible ISR member, or a CAS
+	// race lost to another follower) and reconciles on its periodic publish.
+	slog.Warn("leader down detected, attempting self-promotion", "topic", topic, "pid", pid)
+	if err := p.attemptPartitionLeadership(topic, pid); err != nil {
+		slog.Warn("self-promotion failed, reporting to controller",
 			"topic", topic, "pid", pid, "err", err)
-		if err := p.attemptPartitionLeadership(topic, pid); err != nil {
-			slog.Error("fallback self-election also failed",
-				"topic", topic, "pid", pid, "err", err)
+		if rErr := p.server.reportFailureToController(topic, pid); rErr != nil {
+			slog.Error("report failure to controller failed",
+				"topic", topic, "pid", pid, "err", rErr)
 		}
 	}
 }
