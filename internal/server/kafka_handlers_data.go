@@ -8,7 +8,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, error) {
+func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceRequest) (kmsg.Response, error) {
 	resp := kmsg.NewPtrProduceResponse()
 	setKafkaResponseVersion(resp, req.GetVersion())
 
@@ -21,15 +21,17 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 			partResp.Partition = partition.Partition
 			partResp.BaseOffset = -1
 
+			var firstOffset int64 = -1
+			var lastOffset uint64
+
 			errorCode := ks.partitionError(topic.Topic, int(partition.Partition))
 			if errorCode == 0 {
 				if ks.cfg.AppendRawBatchFunc != nil {
 					// Zero-copy path: pass raw RecordBatch bytes directly.
 					rawBatches, err := extractRawRecordBatches(partition.Records)
 					if err == nil && len(rawBatches) > 0 {
-						var firstOffset int64 = -1
 						for _, rb := range rawBatches {
-							baseOff, appendErr := ks.cfg.AppendRawBatchFunc(context.Background(), topic.Topic, int(partition.Partition), rb)
+							baseOff, appendErr := ks.cfg.AppendRawBatchFunc(ctx, topic.Topic, int(partition.Partition), rb)
 							if appendErr != nil {
 								errorCode = mapKafkaError(appendErr)
 								break
@@ -37,9 +39,10 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 							if firstOffset < 0 {
 								firstOffset = baseOff
 							}
-						}
-						if firstOffset >= 0 {
-							partResp.BaseOffset = firstOffset
+							lastOffset = uint64(baseOff)
+							if hdr, hErr := log.ReadRecordBatchHeader(rb); hErr == nil {
+								lastOffset += uint64(hdr.LastOffsetDelta)
+							}
 						}
 					} else if err != nil {
 						errorCode = kafkaErrorCorruptMessage
@@ -47,7 +50,6 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 				} else if ks.cfg.AppendBatchFunc != nil {
 					batches, err := decodeKafkaProduceBatches(partition.Records)
 					if err == nil {
-						var firstOffset int64 = -1
 						for _, batch := range batches {
 							offsets, appendErr := ks.cfg.AppendBatchFunc(topic.Topic, int(partition.Partition), batch)
 							if appendErr != nil {
@@ -57,9 +59,9 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 							if firstOffset < 0 && len(offsets) > 0 {
 								firstOffset = int64(offsets[0])
 							}
-						}
-						if firstOffset >= 0 {
-							partResp.BaseOffset = firstOffset
+							if len(offsets) > 0 {
+								lastOffset = offsets[len(offsets)-1]
+							}
 						}
 					} else if ks.cfg.AppendFunc != nil {
 						msgs := []log.Message{{Value: partition.Records}}
@@ -67,7 +69,8 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 						if appendErr != nil {
 							errorCode = mapKafkaError(appendErr)
 						} else if len(offsets) > 0 {
-							partResp.BaseOffset = int64(offsets[0])
+							firstOffset = int64(offsets[0])
+							lastOffset = offsets[len(offsets)-1]
 						}
 					}
 				} else if ks.cfg.AppendFunc != nil {
@@ -79,9 +82,22 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 					if err != nil {
 						errorCode = mapKafkaError(err)
 					} else if len(offsets) > 0 {
-						partResp.BaseOffset = int64(offsets[0])
+						firstOffset = int64(offsets[0])
+						lastOffset = offsets[len(offsets)-1]
 					}
 				}
+			}
+
+			// Replicated topics must not acknowledge a produce before the ISR
+			// quorum holds the data. acks=0 is fire-and-forget and returns
+			// immediately; every other ack level waits for the high watermark.
+			if errorCode == 0 && firstOffset >= 0 && req.Acks != 0 && ks.cfg.WaitForReplicatedFunc != nil {
+				if err := ks.cfg.WaitForReplicatedFunc(ctx, topic.Topic, int(partition.Partition), lastOffset); err != nil {
+					errorCode = kafkaErrorUnknownServer
+				}
+			}
+			if firstOffset >= 0 {
+				partResp.BaseOffset = firstOffset
 			}
 			partResp.ErrorCode = errorCode
 			topicResp.Partitions = append(topicResp.Partitions, partResp)

@@ -135,14 +135,15 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 		ps.mu.Unlock()
 
 		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
-		if err := s.isrStore.Write(ctx, topic, replication.ISRState{
-			Partition:     pid,
-			ISR:           []string{s.instanceID},
-			Leader:        s.instanceID,
-			LeaderEpoch:   req.Epoch,
-			HighWatermark: recoveredHW,
-		}, ""); err != nil {
-			slog.Warn("becomeLeader: write ISR", "topic", topic, "partition", pid, "error", err)
+		// The guarded update refuses to clobber a higher-epoch leader's state.
+		if err := s.isrStore.Update(ctx, topic, pid, req.Epoch, func(_ replication.ISRState) (replication.ISRState, error) {
+			return replication.ISRState{
+				ISR:           []string{s.instanceID},
+				Leader:        s.instanceID,
+				HighWatermark: recoveredHW,
+			}, nil
+		}); err != nil {
+			s.onISRWriteError(topic, pid, err)
 		}
 	}
 
