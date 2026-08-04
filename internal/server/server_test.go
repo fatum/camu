@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -28,7 +29,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-func newTestServer(t *testing.T) *Server {
+func newTestServer(t testing.TB) *Server {
 	t.Helper()
 
 	s3Client, err := storage.NewS3Client(storage.S3Config{
@@ -139,6 +140,22 @@ func TestInitPartitionAsLeader_RF1SkipsReplicaState(t *testing.T) {
 
 	if ps.replicaState != nil {
 		t.Fatal("expected nil replicaState for rf=1 leader")
+	}
+}
+
+func TestFollowerFetchMatchesAssignment_UsesConfiguredAssignmentEpoch(t *testing.T) {
+	ps := &partitionState{
+		leaderID:             "n2",
+		fetchCancel:          func() {},
+		fetchAssignmentEpoch: 4,
+		epoch:                3,
+	}
+
+	if !followerFetchMatchesAssignment(ps, "n2", 4) {
+		t.Fatal("expected fetcher configured for assignment epoch 4 to be reused")
+	}
+	if followerFetchMatchesAssignment(ps, "n2", 5) {
+		t.Fatal("expected newer assignment epoch to reconfigure the fetcher")
 	}
 }
 
@@ -396,6 +413,182 @@ func TestInternalRoutes_QueryModeOnlyReady(t *testing.T) {
 	}
 }
 
+func TestHandleReplicaFetch_DivergenceReturnsEpochAtTruncate(t *testing.T) {
+	s := newTestServer(t)
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 2,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.isLeader = true
+	ps.epoch = 3
+	ps.epochHistory = &replication.EpochHistory{Entries: []replication.EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 2, StartOffset: 10},
+		{Epoch: 3, StartOffset: 20},
+	}}
+	ps.replicaState = replication.NewReplicaState("n1", 20, 1, 1000)
+	ps.replicaState.SetEpochHistory(ps.epochHistory)
+	ps.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=15", nil)
+	req.SetPathValue("topic", tc.Name)
+	req.SetPathValue("pid", "0")
+	req.Header.Set("X-Replica-ID", "n2")
+	req.Header.Set("X-Replica-Offset", "15")
+	req.Header.Set("X-Replica-Epoch", "1")
+	rec := httptest.NewRecorder()
+	s.handleReplicaFetch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Header().Get("X-Truncate-To"); got != "10" {
+		t.Errorf("X-Truncate-To = %q, want 10", got)
+	}
+	if got := rec.Header().Get("X-Leader-Epoch"); got != "2" {
+		t.Errorf("X-Leader-Epoch = %q, want 2", got)
+	}
+}
+
+func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) {
+	s := newTestServer(t)
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 2,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.isLeader = true
+	ps.replicaState = replication.NewReplicaState("n1", 0, 1, 1000)
+	ps.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=0", nil)
+	req.SetPathValue("topic", tc.Name)
+	req.SetPathValue("pid", "0")
+	req.Header.Set("X-Replica-ID", "n2")
+	req.Header.Set("X-Replica-Offset", "0")
+	req.Header.Set("X-Replica-Epoch", "1")
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.handleReplicaFetch(rec, req)
+		close(done)
+	}()
+
+	// Let the request enter its long-poll, then reproduce a leader demotion.
+	time.Sleep(25 * time.Millisecond)
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.replicaState = nil
+	ps.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("replica fetch remained blocked after demotion")
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d after demotion", rec.Code, http.StatusNotFound)
+	}
+
+	// The former panic occurred while holding this read lock. Verify it is not
+	// leaked, so later assignment application can take the write lock.
+	locked := make(chan struct{})
+	go func() {
+		ps.mu.Lock()
+		ps.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("partition lock leaked by replica fetch after demotion")
+	}
+}
+
+func TestHandleReplicaFetch_DuplicateEpochBoundaryServesRealTail(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 2,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	if err := s.partitionManager.ensureActiveSegment(tc.Name, 0); err != nil {
+		t.Fatalf("ensureActiveSegment: %v", err)
+	}
+
+	// This is the epoch history recovered from S3 after the old restart bug:
+	// two boundaries claim to be epoch 1. The second is not a real leadership
+	// transition, so an epoch-1 follower must be allowed to fetch the tail.
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.isLeader = true
+	ps.epoch = 1
+	ps.epochHistory = &replication.EpochHistory{Entries: []replication.EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 1, StartOffset: 10},
+	}}
+	ps.replicaState = replication.NewReplicaState("n1", 10, 1, 1000)
+	ps.replicaState.SetEpochHistory(ps.epochHistory)
+	ps.mu.Unlock()
+
+	raw := log.EncodeRecordBatch(10, []log.Message{{Offset: 10, Value: []byte("recovered-tail")}})
+	if err := s.partitionManager.AppendReplicatedRawBatch(ctx, tc.Name, 0, raw); err != nil {
+		t.Fatalf("AppendReplicatedRawBatch: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/internal/replicate/topic/0?from_offset=10", nil)
+	req.SetPathValue("topic", tc.Name)
+	req.SetPathValue("pid", "0")
+	req.Header.Set("X-Replica-ID", "n2")
+	req.Header.Set("X-Replica-Offset", "11")
+	req.Header.Set("X-Replica-Epoch", "1")
+	rec := httptest.NewRecorder()
+	s.handleReplicaFetch(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Truncate-To"); got != "" {
+		t.Fatalf("X-Truncate-To = %q, want no truncation", got)
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, raw) {
+		t.Fatalf("replica response = %x, want raw RecordBatch %x", got, raw)
+	}
+}
+
 func TestInternalReadinessReportsInitializedPartitions(t *testing.T) {
 	s := newTestServer(t)
 	s.ready.Store(true)
@@ -504,6 +697,18 @@ func TestSQLAuthTokenAllowsValidCredential(t *testing.T) {
 	s.PublicHandler().ServeHTTP(rec, req)
 	if rec.Code == http.StatusUnauthorized {
 		t.Fatal("valid auth was rejected")
+	}
+}
+
+func TestHeapProfileRequiresAuth(t *testing.T) {
+	s := newTestServer(t)
+	s.cfg.Server.AuthToken = "secret"
+	s.cfg.Server.HeapProfileEnabled = true
+	req := httptest.NewRequest(http.MethodGet, "/v1/debug/heap", nil)
+	rec := httptest.NewRecorder()
+	s.PublicHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing auth status = %d", rec.Code)
 	}
 }
 
@@ -1956,6 +2161,13 @@ func TestHandleProduceLowLevel_FencesStaleLeaderAfterReassignment(t *testing.T) 
 	if rec.Code != http.StatusMisdirectedRequest {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusMisdirectedRequest, rec.Body.String())
 	}
+	forwarded, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read forwarded body: %v", err)
+	}
+	if got, want := string(forwarded), `[{"key":"k","value":"v"}]`; got != want {
+		t.Fatalf("forwarded body = %q, want %q", got, want)
+	}
 }
 
 func TestApplyAssignmentsForTopic_ReadErrorRevokesOwnership(t *testing.T) {
@@ -2828,7 +3040,7 @@ func TestInitProducer(t *testing.T) {
 	}
 }
 
-func setupTestTopicAndOwnership(t *testing.T, s *Server) {
+func setupTestTopicAndOwnership(t testing.TB, s *Server) {
 	t.Helper()
 	tc := meta.TopicConfig{
 		Name: "test-topic", Partitions: 1, Retention: time.Hour,

@@ -103,6 +103,74 @@ func (s *ActiveSegment) Append(batch []byte) error {
 	return nil
 }
 
+// CompactThrough drops complete RecordBatches through offset and returns a new
+// active segment containing only the remaining tail. Callers must use this
+// only after the dropped range is durable elsewhere. It never publishes data.
+func (s *ActiveSegment) CompactThrough(offset int64) (*ActiveSegment, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	retain := 0
+	for retain < len(s.offsetIdx) && s.offsetIdx[retain].LastOffset <= offset {
+		retain++
+	}
+	if retain == 0 {
+		return s, false, nil
+	}
+
+	nextBase := s.baseOffset
+	start := s.size
+	if retain < len(s.offsetIdx) {
+		nextBase = s.offsetIdx[retain].BaseOffset
+		start = s.offsetIdx[retain].Position
+	} else if len(s.offsetIdx) > 0 {
+		nextBase = s.offsetIdx[len(s.offsetIdx)-1].LastOffset + 1
+	}
+
+	temporary, err := os.CreateTemp(s.dir, ".compact-*.log")
+	if err != nil {
+		return s, false, fmt.Errorf("active_segment: create compact file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	cleanupTemporary := func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}
+	if start < s.size {
+		if _, err := io.Copy(temporary, io.NewSectionReader(s.file, start, s.size-start)); err != nil {
+			cleanupTemporary()
+			return s, false, fmt.Errorf("active_segment: copy compact tail: %w", err)
+		}
+	}
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return s, false, fmt.Errorf("active_segment: close compact file: %w", err)
+	}
+
+	newPath := filepath.Join(s.dir, SegmentFilename(nextBase))
+	if err := os.Rename(temporaryPath, newPath); err != nil {
+		_ = os.Remove(temporaryPath)
+		return s, false, fmt.Errorf("active_segment: install compact file: %w", err)
+	}
+	oldPath := filepath.Join(s.dir, SegmentFilename(s.baseOffset))
+	if err := s.file.Close(); err != nil {
+		return s, false, fmt.Errorf("active_segment: close compact source: %w", err)
+	}
+	if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+		return s, false, fmt.Errorf("active_segment: remove compact source: %w", err)
+	}
+
+	compacted, err := OpenActiveSegment(s.dir, nextBase)
+	if err != nil {
+		return s, false, err
+	}
+	if err := compacted.Recover(); err != nil {
+		_ = compacted.Close()
+		return s, false, fmt.Errorf("active_segment: recover compact tail: %w", err)
+	}
+	return compacted, true, nil
+}
+
 // ReadAt reads len(buf) bytes from the segment file starting at byte offset off.
 // It delegates directly to os.File.ReadAt, which is safe for concurrent use.
 func (s *ActiveSegment) ReadAt(buf []byte, off int64) (int, error) {

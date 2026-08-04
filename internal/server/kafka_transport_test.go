@@ -389,12 +389,12 @@ func TestKafkaWireRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	defer ln.Close()
 
-	var receivedReq kmsg.Request
+	receivedReq := make(chan kmsg.Request, 1)
 	ks := NewKafkaServer(&KafkaServerCfg{
 		PartitionGetter: &mockPartitionGetter{},
 		TopicLister:     &mockTopicLister{},
 		RequestHandler: func(req kmsg.Request) (kmsg.Response, error) {
-			receivedReq = req
+			receivedReq <- req
 			return &kmsg.ApiVersionsResponse{
 				ApiKeys: []kmsg.ApiVersionsResponseApiKey{
 					{ApiKey: 18, MinVersion: 0, MaxVersion: 0},
@@ -448,7 +448,12 @@ func TestKafkaWireRoundTrip(t *testing.T) {
 	_, err = io.ReadFull(client, respBody)
 	require.NoError(t, err)
 
-	assert.NotNil(t, receivedReq, "server should receive request")
+	select {
+	case req := <-receivedReq:
+		assert.NotNil(t, req, "server should receive request")
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive request")
+	}
 }
 
 func TestKafkaHandleConn_ClosesOnDecodeError(t *testing.T) {

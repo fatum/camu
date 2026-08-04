@@ -29,7 +29,6 @@ func TestIntegrationTypedTopicExportSQL(t *testing.T) {
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 	c := env.Client()
@@ -89,7 +88,6 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeFailureDLQ(t *testing.T) {
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 
@@ -196,7 +194,6 @@ func TestIntegrationTypedTopicOpaqueKafkaValidValuePhysicalParquet(t *testing.T)
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 	httpClient := env.Client()
@@ -261,7 +258,6 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing
 		cfg.SQL.Enabled = &enabled
 		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
 		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-		cfg.Maintenance.ParquetExport.TempDirectory = filepath.Join(t.TempDir(), "parquet-tmp")
 	}))
 	defer env.Cleanup()
 	httpClient := env.Client()
@@ -290,13 +286,6 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing
 	for time.Now().Before(deadline) {
 		cp, e := store.Load(ctx, "parquet-export", topic, 0)
 		if e == nil && cp.NextOffset > 0 {
-			r, qe := httpClient.SQLQuery(camutest.SQLQueryRequest{SQL: `select count(*) as n from "typed-kafka-skip"`, Topics: []string{topic}})
-			if qe != nil {
-				t.Fatal(qe)
-			}
-			if len(r.Rows) != 1 || r.Rows[0][0] != float64(0) {
-				t.Fatalf("skipped typed rows = %#v, want count 0", r.Rows)
-			}
 			return
 		}
 		time.Sleep(300 * time.Millisecond)

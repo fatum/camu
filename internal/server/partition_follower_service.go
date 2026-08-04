@@ -156,6 +156,7 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 	existingDone := ps.fetchDone
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
+	ps.fetchAssignmentEpoch = 0
 	ps.mu.Unlock()
 	if existingCancel != nil {
 		existingCancel()
@@ -319,7 +320,7 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	}
 
 	ps.mu.Lock()
-	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == req.Leader && ps.epoch >= req.Epoch {
+	if followerFetchMatchesAssignment(ps, req.Leader, req.Epoch) {
 		ps.mu.Unlock()
 		return
 	}
@@ -327,8 +328,10 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	existingDone := ps.fetchDone
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
-	localOffset := ps.nextOffset
-	localEpoch := ps.epoch
+	ps.fetchGeneration++
+	generation := ps.fetchGeneration
+	ps.isLeader = false
+	ps.replicaState = nil
 	ps.mu.Unlock()
 
 	if existingCancel != nil {
@@ -350,10 +353,14 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 	leaderAddr := routablePeerAddress(req.Leader, addr)
 
 	ps.mu.Lock()
-	ps.isLeader = false
+	if ps.fetchGeneration != generation || ps.isLeader {
+		ps.mu.Unlock()
+		return
+	}
 	ps.leaderID = req.Leader
-	ps.replicaState = nil
-	ps.epoch = req.Epoch
+	ps.fetchAssignmentEpoch = req.Epoch
+	localOffset := ps.nextOffset
+	localEpoch := ps.epoch
 	fetchDone := make(chan struct{})
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel
@@ -366,7 +373,16 @@ func (p partitionFollowerService) reconfigureFollower(ctx context.Context, req p
 		"local_offset", localOffset, "epoch", localEpoch)
 
 	go func() {
-		defer close(fetchDone)
+		defer func() {
+			close(fetchDone)
+			ps.mu.Lock()
+			if ps.fetchGeneration == generation {
+				ps.fetchCancel = nil
+				ps.fetchDone = nil
+				ps.fetchAssignmentEpoch = 0
+			}
+			ps.mu.Unlock()
+		}()
 		p.server.followerFetcher.Run(fetchCtx, req.Topic, req.Partition, leaderAddr, localOffset, localEpoch, p.server.instanceID, p.server.partitionManager)
 	}()
 }

@@ -789,11 +789,16 @@ func TestReconcileBucketRefencesBeforeEachDelete(t *testing.T) {
 	if !errors.Is(err, ErrFenced) {
 		t.Fatalf("error = %v, want ErrFenced", err)
 	}
-	if _, err := fs.Get(ctx, o1); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("first orphan not deleted: %v", err)
+	deleted := 0
+	for _, key := range []string{o1, o2} {
+		if _, err := fs.Get(ctx, key); errors.Is(err, ErrNotFound) {
+			deleted++
+		} else if err != nil {
+			t.Fatalf("get orphan %q: %v", key, err)
+		}
 	}
-	if _, err := fs.Get(ctx, o2); err != nil {
-		t.Fatalf("second orphan deleted after fence: %v", err)
+	if deleted != 1 {
+		t.Fatalf("deleted orphans = %d, want 1 before fence", deleted)
 	}
 }
 

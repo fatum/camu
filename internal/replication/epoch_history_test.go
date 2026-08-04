@@ -25,6 +25,49 @@ func TestEpochHistory_DivergencePoint(t *testing.T) {
 	}
 }
 
+func TestEpochHistory_EpochAt(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{
+		{Epoch: 5, StartOffset: 100},
+		{Epoch: 6, StartOffset: 200},
+		{Epoch: 7, StartOffset: 300},
+	}}
+
+	tests := []struct {
+		offset uint64
+		epoch  uint64
+		found  bool
+	}{
+		{offset: 99},
+		{offset: 100, epoch: 5, found: true},
+		{offset: 199, epoch: 5, found: true},
+		{offset: 200, epoch: 6, found: true},
+		{offset: 299, epoch: 6, found: true},
+		{offset: 300, epoch: 7, found: true},
+	}
+	for _, tt := range tests {
+		got, found := eh.EpochAt(tt.offset)
+		if got != tt.epoch || found != tt.found {
+			t.Errorf("EpochAt(%d) = (%d, %t), want (%d, %t)", tt.offset, got, found, tt.epoch, tt.found)
+		}
+	}
+}
+
+func TestEpochHistoryEnsureRejectsConflictingOrOutOfOrderEntries(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{{Epoch: 1, StartOffset: 0}}}
+	if err := eh.Ensure(EpochEntry{Epoch: 1, StartOffset: 0}); err != nil {
+		t.Fatalf("Ensure same boundary: %v", err)
+	}
+	if err := eh.Ensure(EpochEntry{Epoch: 1, StartOffset: 1}); err == nil {
+		t.Fatal("expected conflicting boundary error")
+	}
+	if err := eh.Ensure(EpochEntry{Epoch: 2, StartOffset: 10}); err != nil {
+		t.Fatalf("Ensure next boundary: %v", err)
+	}
+	if err := eh.Ensure(EpochEntry{Epoch: 3, StartOffset: 9}); err == nil {
+		t.Fatal("expected out-of-order boundary error")
+	}
+}
+
 // TestEpochHistory_NoDivergence verifies that a follower at epoch 5, offset
 // 150 is NOT detected as diverged (150 < 200, the start of epoch 6).
 func TestEpochHistory_NoDivergence(t *testing.T) {
@@ -74,6 +117,24 @@ func TestEpochHistory_DivergenceOneOffBoundary(t *testing.T) {
 	}
 	if truncateTo != 200 {
 		t.Fatalf("expected truncateTo=200, got %d", truncateTo)
+	}
+}
+
+// Partition 0 in the live bench2 bucket contained this history after a node
+// restart. Duplicate boundaries for epoch 1 are corrupt metadata, not leader
+// changes; treating them as transitions causes a follower to truncate and
+// re-fetch the same tail forever.
+func TestEpochHistory_LiveDuplicateEpochBoundariesDoNotDiverge(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 1, StartOffset: 262144},
+		{Epoch: 1, StartOffset: 262644},
+		{Epoch: 1, StartOffset: 262644},
+		{Epoch: 1, StartOffset: 262644},
+	}}
+
+	if truncateTo, diverged := eh.CheckDivergence(1, 263644); diverged {
+		t.Fatalf("duplicate epoch history requested truncation to %d", truncateTo)
 	}
 }
 

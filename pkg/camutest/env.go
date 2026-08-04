@@ -3,6 +3,7 @@ package camutest
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -79,6 +80,10 @@ func New(t testing.TB, opts ...Option) *Env {
 			Cache: config.CacheConfig{
 				Directory: cacheDir,
 				MaxSize:   104857600, // 100 MB for tests
+			},
+			SQL: config.SQLConfig{
+				CacheDirectory: filepath.Join(cacheDir, "sql-cache"),
+				TempDirectory:  filepath.Join(cacheDir, "sql-tmp"),
 			},
 			Coordination: config.CoordinationConfig{
 				LeaseTTL:          "6s",
@@ -202,6 +207,7 @@ func (e *Env) RestartInstance(idx int) {
 			Directory: ic.cacheDir,
 			MaxSize:   ic.cfg.Cache.MaxSize,
 		},
+		SQL:          ic.cfg.SQL,
 		Coordination: ic.cfg.Coordination,
 	}
 

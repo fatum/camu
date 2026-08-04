@@ -5,3 +5,5 @@ terraform.tfstate
 terraform.tfstate.*
 *.json
 crash.log
+typed-topic-benchmark.errors.log
+typed-topic-benchmark.log

@@ -3,7 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +17,150 @@ import (
 	"github.com/maksim/camu/internal/pipeline"
 	"github.com/maksim/camu/internal/storage"
 )
+
+func TestWriteParquetChunkIsReadableByDuckDB(t *testing.T) {
+	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{
+		{Name: "name", Type: "string", Path: "$.name"},
+		{Name: "count", Type: "int64", Path: "$.count"},
+		{Name: "ratio", Type: "float64", Path: "$.ratio"},
+		{Name: "enabled", Type: "bool", Path: "$.enabled"},
+		{Name: "occurred_at", Type: "timestamp", Path: "$.occurred_at"},
+		{Name: "optional_at", Type: "timestamp", Path: "$.optional_at", Nullable: true},
+		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
+	}}
+	chunk, err := encodeParquetChunk([]log.Message{
+		{Offset: 7, Timestamp: time.Date(2026, time.August, 3, 12, 0, 0, 0, time.UTC).UnixMilli(), Key: []byte("key-7"), Value: []byte(`{"name":"alpha","count":7,"ratio":1.5,"enabled":true,"occurred_at":"2026-08-03T14:30:00+02:30","optional_at":"2026-08-03T12:30:00Z"}`)},
+		{Offset: 8, Timestamp: time.Date(2026, time.August, 3, 12, 1, 0, 0, time.UTC).UnixMilli(), Key: []byte("key-8"), Value: []byte(`{"name":"beta","count":8,"ratio":2.5,"enabled":false,"occurred_at":"2026-08-03T14:31:00+02:30"}`)},
+	}, schema)
+	if err != nil {
+		t.Fatalf("encodeParquetChunk() error = %v", err)
+	}
+	defer chunk.cleanup()
+	path := chunk.file.Name()
+	if chunk.size == 0 {
+		t.Fatal("temporary Parquet file is empty")
+	}
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("sql.Open(duckdb) error = %v", err)
+	}
+	defer db.Close()
+
+	var records, offset, count, occurredAtNanos, optionalAtNanos int64
+	var name string
+	var ratio float64
+	var enabled, missingOptionalAt bool
+	var note *string
+	err = db.QueryRow(`SELECT count(*), min(record_offset), min(name), min("count"), min(ratio), bool_and(enabled), max(note), min(epoch_ns(occurred_at)), min(epoch_ns(optional_at)), bool_or(optional_at IS NULL) FROM read_parquet(?)`, path).Scan(&records, &offset, &name, &count, &ratio, &enabled, &note, &occurredAtNanos, &optionalAtNanos, &missingOptionalAt)
+	if err != nil {
+		t.Fatalf("read native parquet with DuckDB: %v", err)
+	}
+	if records != 2 || offset != 7 || name != "alpha" || count != 7 || ratio != 1.5 || enabled || note != nil {
+		t.Fatalf("read parquet values = records=%d offset=%d name=%q count=%d ratio=%v enabled=%v note=%v", records, offset, name, count, ratio, enabled, note)
+	}
+	wantOccurredAt, err := time.Parse(time.RFC3339Nano, "2026-08-03T14:30:00+02:30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOptionalAt, err := time.Parse(time.RFC3339Nano, "2026-08-03T12:30:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if occurredAtNanos != wantOccurredAt.UTC().UnixNano() || optionalAtNanos != wantOptionalAt.UTC().UnixNano() || !missingOptionalAt {
+		t.Fatalf("timestamp values = occurred_at=%d optional_at=%d missing_optional=%v", occurredAtNanos, optionalAtNanos, missingOptionalAt)
+	}
+}
+
+func TestEncodeParquetChunkSeparatesSchemaFailuresFromValidRange(t *testing.T) {
+	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
+	chunk, err := encodeParquetChunk([]log.Message{
+		{Offset: 10, Timestamp: 10, Value: []byte(`{"id":10}`)},
+		{Offset: 11, Timestamp: 11, Value: []byte(`{"id":"invalid"}`)},
+		{Offset: 12, Timestamp: 12, Value: []byte(`{"id":12}`)},
+	}, schema)
+	if err != nil {
+		t.Fatalf("encodeParquetChunk() error = %v", err)
+	}
+	defer chunk.cleanup()
+	if chunk.records != 2 || chunk.start != 10 || chunk.end != 12 || chunk.startTS != 10 {
+		t.Fatalf("encoded range = records=%d start=%d end=%d startTS=%d", chunk.records, chunk.start, chunk.end, chunk.startTS)
+	}
+	if len(chunk.failures) != 1 || chunk.failures[0].message.Offset != 11 {
+		t.Fatalf("schema failures = %+v", chunk.failures)
+	}
+	if chunk.size == 0 {
+		t.Fatal("encoded Parquet data is empty")
+	}
+}
+
+func TestParquetChunkCleanupRemovesTemporaryFile(t *testing.T) {
+	chunk, err := encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":1}`)}}, nil)
+	if err != nil {
+		t.Fatalf("encodeParquetChunk() error = %v", err)
+	}
+	path := chunk.file.Name()
+	chunk.cleanup()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary Parquet file remains after cleanup: %v", err)
+	}
+}
+
+func TestServerEncodeParquetChunkUsesConfiguredTempDirectory(t *testing.T) {
+	s := newTestServer(t)
+	chunk, err := s.encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":1}`)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chunk.cleanup()
+	if filepath.Dir(chunk.file.Name()) != s.cfg.SQL.TempDirectoryValue() {
+		t.Fatalf("chunk directory = %s, want %s", filepath.Dir(chunk.file.Name()), s.cfg.SQL.TempDirectoryValue())
+	}
+}
+
+func TestPutImmutableParquetFileAcceptsEqualConflictAndRejectsDifferentFile(t *testing.T) {
+	client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":"first"}`)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.cleanup()
+	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", first.file, first.size); err != nil {
+		t.Fatalf("put immutable first file: %v", err)
+	}
+	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", first.file, first.size); err != nil {
+		t.Fatalf("put immutable equal retry: %v", err)
+	}
+	different, err := encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":"different"}`)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer different.cleanup()
+	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", different.file, different.size); err == nil {
+		t.Fatal("put immutable different retry succeeded")
+	}
+}
+
+func TestParquetExportDLQFailureDoesNotAdvanceCheckpoint(t *testing.T) {
+	s, tc, identity, cp, _ := setupParquetExportPass(t)
+	tc.Schema = &meta.TopicSchema{
+		Encoding:        "json",
+		DeadLetterTopic: "missing-dlq",
+		Fields:          []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}},
+	}
+
+	// The source record has no id, so conversion creates a schema failure. Its
+	// DLQ cannot be loaded; the Parquet checkpoint must remain untouched.
+	s.runParquetExportPass(context.Background(), tc, identity, cp)
+	if cp.NextOffset != 0 || cp.Generation != 0 {
+		t.Fatalf("checkpoint advanced after DLQ failure: %+v", *cp)
+	}
+	if _, err := s.s3Client.Get(context.Background(), pipeline.CheckpointKey(parquetPipelineName, tc.Name, identity.Partition)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("checkpoint was persisted after DLQ failure: %v", err)
+	}
+}
 
 type manifestConflictObjectStore struct {
 	parquet.ObjectStore
@@ -42,7 +189,6 @@ func (s *manifestConflictObjectStore) putCount() int {
 func setupParquetExportPass(t *testing.T) (*Server, meta.TopicConfig, PartitionIdentity, *pipeline.Checkpoint, time.Time) {
 	t.Helper()
 	s := newTestServer(t)
-	s.cfg.Maintenance.ParquetExport.TempDirectory = t.TempDir()
 	tc := meta.TopicConfig{Name: "events", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, ExportEnabled: true}
 	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)

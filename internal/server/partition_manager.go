@@ -56,14 +56,7 @@ func (pm *PartitionManager) ensureActiveSegment(topic string, partitionID int) e
 
 	dir := pm.activeSegmentDir(topic, partitionID)
 	baseOffset := int64(nextOffset)
-	if matches, err := filepath.Glob(filepath.Join(dir, "*.log")); err == nil && len(matches) > 0 {
-		name := filepath.Base(matches[0])
-		if len(name) > len(".log") {
-			if parsed, err := strconv.ParseInt(name[:len(name)-len(".log")], 10, 64); err == nil {
-				baseOffset = parsed
-			}
-		}
-	}
+	baseOffset = newestActiveSegmentBaseOffset(dir, baseOffset)
 
 	seg, err := log.OpenActiveSegment(dir, baseOffset)
 	if err != nil {
@@ -85,6 +78,31 @@ func (pm *PartitionManager) ensureActiveSegment(topic string, partitionID int) e
 		ps.nextOffset = uint64(segNext)
 	}
 	return nil
+}
+
+// newestActiveSegmentBaseOffset selects the newest active tail after an
+// interrupted local compaction. During compaction both the old prefix-bearing
+// file and the newly installed tail can briefly exist; the latter has the
+// higher base offset and is the only one that should be reopened.
+func newestActiveSegmentBaseOffset(dir string, fallback int64) int64 {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil {
+		return fallback
+	}
+	newest := fallback
+	found := false
+	for _, match := range matches {
+		name := filepath.Base(match)
+		if len(name) <= len(".log") {
+			continue
+		}
+		parsed, err := strconv.ParseInt(name[:len(name)-len(".log")], 10, 64)
+		if err == nil && (!found || parsed > newest) {
+			newest = parsed
+			found = true
+		}
+	}
+	return newest
 }
 
 func (pm *PartitionManager) activeSegmentLogEnd(topic string, partitionID int) (uint64, bool) {
@@ -170,23 +188,25 @@ type producerCheckpointEntry struct {
 
 // partitionState holds per-partition runtime state.
 type partitionState struct {
-	mu            sync.RWMutex       // unified per-partition lock for all read/write access
-	activeSegment *log.ActiveSegment // zero-copy RecordBatch storage (nil until wired)
-	index         *log.Index
-	nextOffset    uint64
-	epoch         uint64                    // always 0 in single-instance mode
-	replicaState  *replication.ReplicaState // nil for rf=1
-	isLeader      bool
-	leaderID      string // current leader for follower fetch state; empty when local leader
-	flushedOffset uint64 // highest offset flushed to S3
-	followerHW    uint64 // leader-advertised readable HW for follower reads
-	epochHistory  *replication.EpochHistory
-	fetchCancel   context.CancelFunc                 // cancel follower fetch goroutine
-	fetchDone     chan struct{}                      // closed when fetch goroutine exits
-	globalID      int                                // cached batcher partition ID, set on first append
-	globalIDSet   bool                               // true once globalID has been resolved
-	producerSeqs  map[uint64]*producerPartitionState // producerID -> sequence state
-	pendingFlush  *sealedSegment                     // sealed locally; retry this exact segment until uploaded
+	mu                   sync.RWMutex       // unified per-partition lock for all read/write access
+	activeSegment        *log.ActiveSegment // zero-copy RecordBatch storage (nil until wired)
+	index                *log.Index
+	nextOffset           uint64
+	epoch                uint64                    // always 0 in single-instance mode
+	replicaState         *replication.ReplicaState // nil for rf=1
+	isLeader             bool
+	leaderID             string // current leader for follower fetch state; empty when local leader
+	flushedOffset        uint64 // highest offset flushed to S3
+	followerHW           uint64 // leader-advertised readable HW for follower reads
+	epochHistory         *replication.EpochHistory
+	fetchCancel          context.CancelFunc                 // cancel follower fetch goroutine
+	fetchDone            chan struct{}                      // closed when fetch goroutine exits
+	fetchGeneration      uint64                             // fences concurrent follower reconfigurations
+	fetchAssignmentEpoch uint64                             // assignment epoch the active fetch is configured to follow
+	globalID             int                                // cached batcher partition ID, set on first append
+	globalIDSet          bool                               // true once globalID has been resolved
+	producerSeqs         map[uint64]*producerPartitionState // producerID -> sequence state
+	pendingFlush         *sealedSegment                     // sealed locally; retry this exact segment until uploaded
 }
 
 // sealedSegment is immutable upload work. Once a segment is sealed, retries
@@ -529,8 +549,17 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 		_ = os.RemoveAll(pm.activeSegmentDir(topic, partitionID))
 	}
 
-	// 3. Write current epoch to sidecar file.
-	if err := fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", epoch)), 0o644); err != nil {
+	// Followers do not own a lease, so their requested epoch is zero. Preserve
+	// the epoch recorded with a recovered active tail: it is the epoch the
+	// follower must report to its new leader for a precise divergence check.
+	// Resetting it to zero fences the entire unflushed tail on every restart.
+	localEpoch := epoch
+	if localEpoch == 0 && prevEpoch > 0 {
+		localEpoch = prevEpoch
+	}
+
+	// 3. Write the effective local epoch to the sidecar file.
+	if err := fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", localEpoch)), 0o644); err != nil {
 		return nil, fmt.Errorf("write epoch sidecar: %w", err)
 	}
 
@@ -554,7 +583,7 @@ func (pm *PartitionManager) initPartition(ctx context.Context, topic string, par
 	return &partitionState{
 		index:         idx,
 		nextOffset:    nextOffset,
-		epoch:         epoch,
+		epoch:         localEpoch,
 		flushedOffset: flushedOffset,
 		producerSeqs:  make(map[uint64]*producerPartitionState),
 	}, nil
@@ -814,20 +843,45 @@ func (pm *PartitionManager) AppendReplicatedRawBatches(ctx context.Context, topi
 	defer ps.mu.Unlock()
 
 	for _, batch := range batches {
-		h, err := log.ReadRecordBatchHeader(batch)
-		if err != nil {
-			return fmt.Errorf("AppendReplicatedRawBatches: read header: %w", err)
+		if err := appendReplicatedRawBatchLocked(ps, batch); err != nil {
+			return fmt.Errorf("AppendReplicatedRawBatches: %w", err)
 		}
-		if ps.activeSegment == nil {
-			return fmt.Errorf("AppendReplicatedRawBatches: partition %s/%d has no active segment", topic, partitionID)
-		}
-		if err := ps.activeSegment.Append(batch); err != nil {
-			return fmt.Errorf("AppendReplicatedRawBatches: append: %w", err)
-		}
-		end := uint64(h.FirstOffset+int64(h.LastOffsetDelta)) + 1
-		if end > ps.nextOffset {
-			ps.nextOffset = end
-		}
+	}
+	return nil
+}
+
+// AppendReplicatedRawBatch appends one RecordBatch received from the leader.
+// The fetcher calls this directly while streaming the HTTP response, avoiding
+// a one-element slice allocation for every replicated batch.
+func (pm *PartitionManager) AppendReplicatedRawBatch(ctx context.Context, topic string, partitionID int, batch []byte) error {
+	pm.mu.RLock()
+	ps, ok := pm.partitions[topic][partitionID]
+	pm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("partition %s/%d not found", topic, partitionID)
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if err := appendReplicatedRawBatchLocked(ps, batch); err != nil {
+		return fmt.Errorf("AppendReplicatedRawBatch: %w", err)
+	}
+	return nil
+}
+
+func appendReplicatedRawBatchLocked(ps *partitionState, batch []byte) error {
+	h, err := log.ReadRecordBatchHeader(batch)
+	if err != nil {
+		return fmt.Errorf("read header: %w", err)
+	}
+	if ps.activeSegment == nil {
+		return fmt.Errorf("no active segment")
+	}
+	if err := ps.activeSegment.Append(batch); err != nil {
+		return fmt.Errorf("append: %w", err)
+	}
+	end := uint64(h.LastOffset()) + 1
+	if end > ps.nextOffset {
+		ps.nextOffset = end
 	}
 	return nil
 }
@@ -1079,6 +1133,20 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 	if flushedOffset > ps.flushedOffset {
 		ps.flushedOffset = flushedOffset
 	}
+	// Followers retain only the replicated tail which is not yet durable in the
+	// local S3 index. A leader's flushed offset is not sufficient evidence: a
+	// follower may observe the header before its index refresh sees the segment.
+	// Never drop the local prefix until the object is locally readable.
+	durablePrefix := ps.index != nil && ps.index.NextOffset() > ps.flushedOffset
+	if !ps.isLeader && ps.activeSegment != nil && ps.flushedOffset > 0 && durablePrefix {
+		compacted, changed, err := ps.activeSegment.CompactThrough(int64(ps.flushedOffset))
+		if err != nil {
+			slog.Warn("follower_active_segment_compaction_failed", "topic", topic, "partition", partitionID, "flushed_offset", ps.flushedOffset, "error", err)
+		} else if changed {
+			ps.activeSegment = compacted
+			slog.Info("follower_active_segment_compacted", "topic", topic, "partition", partitionID, "flushed_offset", ps.flushedOffset, "active_base_offset", compacted.BaseOffset(), "active_size_bytes", compacted.Size())
+		}
+	}
 	ps.mu.Unlock()
 }
 
@@ -1111,10 +1179,14 @@ func (pm *PartitionManager) CancelAllFetchLoops() {
 	var doneChans []chan struct{}
 	for _, parts := range pm.partitions {
 		for _, ps := range parts {
-			if ps.fetchCancel != nil {
-				ps.fetchCancel()
-				if ps.fetchDone != nil {
-					doneChans = append(doneChans, ps.fetchDone)
+			ps.mu.RLock()
+			cancel := ps.fetchCancel
+			done := ps.fetchDone
+			ps.mu.RUnlock()
+			if cancel != nil {
+				cancel()
+				if done != nil {
+					doneChans = append(doneChans, done)
 				}
 			}
 		}
@@ -1228,11 +1300,97 @@ func (pm *PartitionManager) ReadRawBatches(ctx context.Context, topic string, pi
 	return pm.readRawBatchesWithUpperBound(ctx, topic, pid, startOffset, maxBytes, false)
 }
 
-// ReadReplicaRawBatches reads raw RecordBatch bytes for follower replication.
-// Unlike ReadRawBatches, it is bounded by the partition log end rather than the
-// readable high watermark, so followers can catch up on uncommitted tail data.
+// ReadReplicaRawBatches reads only the leader's unsealed active tail. Sealed
+// segments are shared through S3 and are intentionally excluded from the
+// replication transport.
 func (pm *PartitionManager) ReadReplicaRawBatches(ctx context.Context, topic string, pid int, startOffset int64, maxBytes int) ([]byte, int64, error) {
-	return pm.readRawBatchesWithUpperBound(ctx, topic, pid, startOffset, maxBytes, true)
+	pm.mu.RLock()
+	tp, ok := pm.partitions[topic]
+	if !ok {
+		pm.mu.RUnlock()
+		return nil, 0, fmt.Errorf("%w: topic %q", errKafkaUnknownTopicPartition, topic)
+	}
+	ps, ok := tp[pid]
+	pm.mu.RUnlock()
+	if !ok {
+		return nil, 0, fmt.Errorf("%w: partition %d for topic %q", errKafkaUnknownTopicPartition, pid, topic)
+	}
+
+	ps.mu.RLock()
+	upperBound := int64(ps.nextOffset)
+	activeSeg := ps.activeSegment
+	ps.mu.RUnlock()
+	if activeSeg == nil || startOffset < activeSeg.BaseOffset() || startOffset >= upperBound {
+		return nil, upperBound, nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+
+	offsetIdx := activeSeg.OffsetIndex()
+	startIdx := sort.Search(len(offsetIdx), func(i int) bool {
+		return offsetIdx[i].LastOffset >= startOffset
+	})
+	var out []byte
+	for i := startIdx; i < len(offsetIdx); i++ {
+		entry := offsetIdx[i]
+		if entry.BaseOffset >= upperBound {
+			break
+		}
+		if entry.BatchSize <= 0 || entry.Position < 0 {
+			continue
+		}
+		batch := make([]byte, entry.BatchSize)
+		n, err := activeSeg.ReadAt(batch, entry.Position)
+		if err != nil && n < int(entry.BatchSize) {
+			break
+		}
+		batch = batch[:n]
+		if len(out) > 0 && len(out)+len(batch) > maxBytes {
+			break
+		}
+		out = append(out, batch...)
+		if len(out) >= maxBytes {
+			break
+		}
+	}
+	return out, upperBound, nil
+}
+
+// SyncFollowerSealedPrefix refreshes a follower's index when the leader has
+// sealed data before its active segment. Sealed data is shared through S3;
+// copying it through the replication connection is unnecessary.
+func (pm *PartitionManager) SyncFollowerSealedPrefix(ctx context.Context, topic string, pid int, activeBase uint64) uint64 {
+	ps := pm.GetPartitionState(topic, pid)
+	if ps == nil {
+		return 0
+	}
+	ps.mu.RLock()
+	indexedNext := uint64(0)
+	if ps.index != nil {
+		indexedNext = ps.index.NextOffset()
+	}
+	ps.mu.RUnlock()
+	if indexedNext < activeBase {
+		pm.RefreshIndex(ctx, topic, pid)
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	// activeBase is the first offset in the leader's active tail. The S3
+	// prefix may advance a follower only through a range that is both present
+	// in its index and published as durable in state.json. A segment object can
+	// contain an uncommitted tail from a previous leader, so its end offset is
+	// not itself a replication checkpoint.
+	if ps.index != nil {
+		durableEnd := ps.index.HighWatermark()
+		if durableEnd > activeBase {
+			durableEnd = activeBase
+		}
+		if ps.nextOffset < durableEnd && ps.index.NextOffset() >= durableEnd {
+			ps.nextOffset = durableEnd
+		}
+	}
+	return ps.nextOffset
 }
 
 func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, topic string, pid int, startOffset int64, maxBytes int, useLogEnd bool) ([]byte, int64, error) {
@@ -1339,7 +1497,10 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 	}
 
 	// Phase 2: Active segment.
-	if activeSeg != nil && remaining > 0 {
+	// A page may stop within the sealed prefix. Do not append the active tail
+	// unless the requested range reached its base offset: Kafka records must be
+	// contiguous, never a sealed page followed by a distant active batch.
+	if activeSeg != nil && remaining > 0 && currentOffset >= activeBase {
 		offsetIdx := activeSeg.OffsetIndex()
 		if len(offsetIdx) > 0 {
 			// Binary search for the first batch containing currentOffset.

@@ -180,6 +180,9 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	if instanceID == "" {
 		instanceID = uuid.NewString()
 	}
+	if err := cleanupSQLFilesystem(cfg.SQL.CacheDirectoryValue(), cfg.SQL.TempDirectoryValue()); err != nil {
+		return nil, fmt.Errorf("clean local SQL filesystem: %w", err)
+	}
 
 	s := &Server{
 		cfg:              cfg,
@@ -426,8 +429,13 @@ func (s *Server) startKafkaServer(port int) {
 		BrokerAddr:                  brokerAddr,
 	})
 
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("kafka_server_start", "address", addr, "error", err)
+		return
+	}
 	go func() {
-		if err := s.kafkaServer.StartListener(addr); err != nil {
+		if err := s.kafkaServer.serveListener(ln); err != nil {
 			slog.Error("kafka_server_start", "address", addr, "error", err)
 		}
 	}()
@@ -1186,6 +1194,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	existingDone := ps.fetchDone
 	ps.fetchCancel = nil
 	ps.fetchDone = nil
+	ps.fetchAssignmentEpoch = 0
 	ps.mu.Unlock()
 	if existingCancel != nil {
 		existingCancel()
@@ -1221,7 +1230,19 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 			}
 		}
 	}
-	eh.Append(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd})
+	hasCurrentEpoch := false
+	for _, entry := range eh.Entries {
+		if entry.Epoch == pa.LeaderEpoch {
+			hasCurrentEpoch = true
+			break
+		}
+	}
+	if !hasCurrentEpoch {
+		if err := eh.Ensure(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
+			slog.Error("initPartitionAsLeader: invalid epoch history", "topic", topic, "partition", pid, "error", err)
+			return
+		}
+	}
 	ps.mu.Lock()
 	// TOCTOU re-check: another goroutine may have promoted this partition
 	// while we were doing heavy work (local recovery, index refresh).
@@ -1248,8 +1269,6 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	// HW recovery:
 	// rf=1: everything in the local log is committed, so HW = log end.
 	// rf>1: recover from the most advanced local/persisted view, capped at log end.
-	// Persisted HW metadata can lag a follower's local tail on reassignment; if we drop
-	// back to the stale persisted value, the next flush truncates a safe prefix.
 	recoveredHW := logEnd
 	if topicCfg.ReplicationFactor > 1 {
 		ps.mu.RLock()
@@ -1371,9 +1390,9 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		return // not yet initialized
 	}
 
-	ps.mu.RLock()
-	if !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == pa.Leader {
-		ps.mu.RUnlock()
+	ps.mu.Lock()
+	if followerFetchMatchesAssignment(ps, pa.Leader, pa.LeaderEpoch) {
+		ps.mu.Unlock()
 		return
 	}
 	localNextOffset := ps.nextOffset
@@ -1382,7 +1401,16 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 	indexHW := ps.index.HighWatermark()
 	existingCancel := ps.fetchCancel
 	existingDone := ps.fetchDone
-	ps.mu.RUnlock()
+	ps.fetchGeneration++
+	generation := ps.fetchGeneration
+	ps.fetchCancel = nil
+	ps.fetchDone = nil
+	// Demote before resolving the new leader. The later isLeader check fences a
+	// concurrent promotion; leaving this true here made former leaders return
+	// without ever starting their follower fetcher.
+	ps.isLeader = false
+	ps.replicaState = nil
+	ps.mu.Unlock()
 
 	// If fetchCancel is nil but we're supposed to be a follower, the previous
 	// fetch loop may have exited (leader-down or error). Re-init.
@@ -1421,13 +1449,17 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		}
 	}
 
-	// Start follower fetch loop.
+	// Start follower fetch loop. Read the offset only after the old loop has
+	// stopped: it may have just applied a truncation from the new leader.
 	ps.mu.Lock()
-	ps.isLeader = false
+	if ps.fetchGeneration != generation || ps.isLeader {
+		ps.mu.Unlock()
+		return
+	}
 	ps.leaderID = pa.Leader
-	ps.replicaState = nil
+	ps.fetchAssignmentEpoch = pa.LeaderEpoch
 	localOffset := ps.nextOffset
-	fetchEpoch := localEpoch
+	fetchEpoch := ps.epoch
 	fetchDone := make(chan struct{})
 	fetchCtx, cancel := context.WithCancel(context.Background())
 	ps.fetchCancel = cancel
@@ -1441,9 +1473,24 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		"leader", pa.Leader, "leader_addr", leaderAddr,
 		"local_offset", localOffset, "epoch", fetchEpoch)
 	go func() {
-		defer close(fetchDone)
+		defer func() {
+			close(fetchDone)
+			ps.mu.Lock()
+			if ps.fetchGeneration == generation {
+				ps.fetchCancel = nil
+				ps.fetchDone = nil
+				ps.fetchAssignmentEpoch = 0
+			}
+			ps.mu.Unlock()
+		}()
 		s.followerFetcher.Run(fetchCtx, topic, pid, leaderAddr, localOffset, fetchEpoch, s.instanceID, s.partitionManager)
 	}()
+}
+
+// followerFetchMatchesAssignment reports whether an active fetcher already
+// follows the supplied assignment. Callers must hold ps.mu.
+func followerFetchMatchesAssignment(ps *partitionState, leader string, epoch uint64) bool {
+	return !ps.isLeader && ps.fetchCancel != nil && ps.leaderID == leader && ps.fetchAssignmentEpoch >= epoch
 }
 
 // startLeaseRenewal starts a background goroutine that renews owned leases.

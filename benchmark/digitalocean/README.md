@@ -38,9 +38,19 @@ Provision the registry, build and push the image, then create the five nodes:
 ./provision.sh
 ```
 
+DigitalOcean intermittently returns `401 mTLS verification failed` from
+registry and droplet API calls. `provision.sh` retries its registry-only step,
+which cannot modify droplets. `destroy.sh` retries deletion polling. Both retry
+that specific transient failure up to five times; set
+`TERRAFORM_RETRY_ATTEMPTS` to change the limit.
+
 Each provisioning run publishes a unique timestamped image tag and creates the
 nodes with that exact tag, preventing stale or deleted registry tags from being
 reused. Set `IMAGE_TAG` to choose a specific tag.
+
+Benchmark nodes default to `s-4vcpu-8gb` so replication, export, and SQL can
+run together without the 4 GiB memory pressure of the previous default. Set
+`droplet_size` in `terraform.tfvars` to select a different plan.
 
 To publish a new image and roll it across existing nodes without applying
 Terraform, use:
@@ -89,8 +99,22 @@ benchmark resumes sequence and key numbering from its committed offsets.
 `TARGET_BYTES`, `MESSAGE_BYTES`, and `PARTITIONS` can override the workload.
 The default is four partitions. Byte values accept a positive byte count or a
 binary unit such as `1GiB`, `512MiB`, or `64KiB`.
+Set `EXPORT_ENABLED=false` to create a non-exporting topic. This isolates the
+native produce/consume path; the `all` operation skips SQL sampling and SQL
+verification, and the `sql` operation is unavailable.
 `REQUEST_TIMEOUT` bounds every HTTP request (default `30s`); `CONSUME_TIMEOUT`
 bounds the whole consume operation (default `10m`).
+
+## Heap profiles
+
+Set `TF_VAR_benchmark_auth_token` in the ignored `.env`, provision or deploy
+the image, then run with `HEAP_PROFILE=1`. Alternatively, set
+`HEAP_PROFILE_TOKEN` and `CAMU_AUTH_TOKEN` explicitly when running the
+benchmark. `deploy.sh` applies the token and enables the endpoint during its
+rolling restart, without recreating droplets. After the benchmark, `run.sh`
+takes one authenticated heap snapshot from each node and uploads it under
+`telemetry/<run-id>/heap-profiles/` in Spaces. Profiles are binary pprof data
+and may contain retained application strings; keep the bucket private.
 
 Start local benchmark monitoring separately when you need live metrics and
 logs:

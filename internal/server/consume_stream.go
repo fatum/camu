@@ -48,7 +48,11 @@ func decodeCommittedPage(raw []byte, startOffset uint64, limit int) ([]logstore.
 	if limit <= 0 {
 		return nil, nil
 	}
-	byOffset := make(map[uint64]logstore.Message, limit)
+	// Batches are normally ordered and non-overlapping. Keep that hot path in a
+	// compact slice; a map and sort are only needed for the uncommon case where
+	// an active batch replaces offsets from an earlier sealed batch.
+	messages := make([]logstore.Message, 0, limit)
+	var byOffset map[uint64]logstore.Message
 	var largestOffset uint64
 	hasLargestOffset := false
 	for position := 0; position < len(raw); {
@@ -67,6 +71,23 @@ func decodeCommittedPage(raw []byte, startOffset uint64, limit int) ([]logstore.
 		for _, msg := range batch {
 			if msg.Offset < startOffset {
 				continue
+			}
+			if byOffset == nil {
+				if len(messages) == 0 || msg.Offset > messages[len(messages)-1].Offset {
+					if len(messages) < limit {
+						messages = append(messages, msg)
+					}
+					continue
+				}
+				// Preserve every already selected message before handling the
+				// overlapping record through the general replacement path.
+				byOffset = make(map[uint64]logstore.Message, limit)
+				for _, selected := range messages {
+					byOffset[selected.Offset] = selected
+				}
+				largestOffset = messages[len(messages)-1].Offset
+				hasLargestOffset = len(messages) > 0
+				messages = nil
 			}
 			if _, exists := byOffset[msg.Offset]; exists {
 				byOffset[msg.Offset] = msg
@@ -94,13 +115,16 @@ func decodeCommittedPage(raw []byte, startOffset uint64, limit int) ([]logstore.
 		}
 		position += batchSize
 	}
+	if byOffset == nil {
+		return messages, nil
+	}
 
 	offsets := make([]uint64, 0, len(byOffset))
 	for offset := range byOffset {
 		offsets = append(offsets, offset)
 	}
 	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
-	messages := make([]logstore.Message, 0, len(offsets))
+	messages = make([]logstore.Message, 0, len(offsets))
 	for _, offset := range offsets {
 		messages = append(messages, byOffset[offset])
 	}

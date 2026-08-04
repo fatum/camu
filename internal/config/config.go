@@ -27,9 +27,8 @@ type MaintenanceConfig struct {
 
 // ParquetExportConfig controls the per-partition Parquet export consumer.
 type ParquetExportConfig struct {
-	MaxRecords    int    `yaml:"max_records"`
-	MaxDuration   string `yaml:"max_duration"`
-	TempDirectory string `yaml:"temp_directory"`
+	MaxRecords  int    `yaml:"max_records"`
+	MaxDuration string `yaml:"max_duration"`
 }
 
 func (p ParquetExportConfig) MaxRecordsValue() int {
@@ -44,12 +43,6 @@ func (p ParquetExportConfig) MaxDurationValue() time.Duration {
 		return 30 * time.Second
 	}
 	return d
-}
-func (p ParquetExportConfig) TempDirectoryValue() string {
-	if p.TempDirectory == "" {
-		return "/var/lib/camu/parquet-tmp"
-	}
-	return p.TempDirectory
 }
 
 type SQLConfig struct {
@@ -101,6 +94,7 @@ type ServerConfig struct {
 	InternalAddress       string `yaml:"internal_address"`
 	InstanceID            string `yaml:"instance_id"`
 	AuthToken             string `yaml:"auth_token"`              // Public API bearer token (optional)
+	HeapProfileEnabled    bool   `yaml:"heap_profile_enabled"`    // Authenticated heap-profile endpoint (disabled by default)
 	ClusterToken          string `yaml:"cluster_token"`           // Internal API shared secret (optional)
 	KafkaPort             int    `yaml:"kafka_port"`              // Kafka protocol port (0 = disabled)
 	KafkaAdvertiseAddress string `yaml:"kafka_advertise_address"` // Public Kafka host:port override (optional)

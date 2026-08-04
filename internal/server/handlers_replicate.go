@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"strconv"
 	"time"
-
-	"github.com/maksim/camu/internal/log"
 )
+
+const maxReplicaFetchBytes = 1 << 20
 
 func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
@@ -34,7 +34,7 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ps := s.partitionManager.GetPartitionState(topic, pid)
-	if ps == nil || ps.replicaState == nil {
+	if ps == nil {
 		slog.Debug("replica_fetch: partition not found or not replicated",
 			"topic", topic, "pid", pid, "replica", replicaID)
 		writeError(w, http.StatusNotFound, "partition not found or not replicated")
@@ -44,9 +44,26 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	// Check epoch divergence and implicit ack under ps.mu.Lock
 	// because UpdateFollower mutates replica state.
 	ps.mu.Lock()
-	truncateTo, diverged := ps.replicaState.CheckDivergence(replicaEpoch, replicaOffset)
+	if !ps.isLeader || ps.replicaState == nil {
+		ps.mu.Unlock()
+		slog.Debug("replica_fetch: partition is no longer local leader",
+			"topic", topic, "pid", pid, "replica", replicaID)
+		writeError(w, http.StatusNotFound, "partition is no longer local leader")
+		return
+	}
+	replicaState := ps.replicaState
+	truncateTo, diverged := replicaState.CheckDivergence(replicaEpoch, replicaOffset)
 	if diverged {
 		epoch := ps.epoch
+		// A follower which is asked to truncate must continue at the epoch
+		// beginning at that offset. Returning the current partition epoch can
+		// leave it reporting an older epoch after it fetches the new tail,
+		// causing the same divergence check to repeat indefinitely.
+		if ps.epochHistory != nil {
+			if truncateEpoch, ok := ps.epochHistory.EpochAt(truncateTo); ok {
+				epoch = truncateEpoch
+			}
+		}
 		ps.mu.Unlock()
 		slog.Info("replica_fetch: epoch divergence, requesting truncation",
 			"topic", topic, "pid", pid, "replica", replicaID,
@@ -59,98 +76,86 @@ func (s *Server) handleReplicaFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Implicit ack
-	ps.replicaState.UpdateFollower(replicaID, replicaOffset)
+	replicaState.UpdateFollower(replicaID, replicaOffset)
 
+	activeBase := replicaActiveBase(ps)
+	dataAvailable := fromOffset >= activeBase && fromOffset < ps.nextOffset
+	behindSealedPrefix := fromOffset < activeBase
 	ps.mu.Unlock()
-	rawBytes, _, err := s.partitionManager.ReadReplicaRawBatches(r.Context(), topic, pid, int64(fromOffset), 1<<20)
-	if err != nil {
-		slog.Error("replica_fetch: ReadRawBatches failed",
-			"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
-		writeError(w, 500, "fetch failed")
-		return
+
+	// The replica protocol transports concatenated self-framing RecordBatches.
+	// Keep the bytes returned by the partition manager intact: reparsing them
+	// into BatchFrames only to write the same bytes again doubled allocation
+	// pressure for every follower fetch.
+	readBatches := func() ([]byte, error) {
+		bytes, _, err := s.partitionManager.ReadReplicaRawBatches(r.Context(), topic, pid, int64(fromOffset), maxReplicaFetchBytes)
+		return bytes, err
 	}
-	frames := make([]log.BatchFrame, 0)
-	if len(rawBytes) > 0 {
-		batches, bErr := log.ReadSegmentBatches(rawBytes, fromOffset, 0)
-		if bErr != nil {
-			slog.Error("replica_fetch: parse raw batches failed",
-				"topic", topic, "pid", pid, "from_offset", fromOffset, "error", bErr)
+	var rawBytes []byte
+	if dataAvailable {
+		rawBytes, err = readBatches()
+		if err != nil {
+			slog.Error("replica_fetch: ReadRawBatches failed",
+				"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
 			writeError(w, 500, "fetch failed")
 			return
 		}
-		frames = make([]log.BatchFrame, 0, len(batches))
-		for _, batch := range batches {
-			hdr, hErr := log.ReadRecordBatchHeader(batch)
-			if hErr != nil {
-				continue
-			}
-			frames = append(frames, log.BatchFrame{
-				Meta: log.BatchMeta{
-					FirstOffset: uint64(hdr.FirstOffset),
-					LastOffset:  uint64(hdr.LastOffset()),
-				},
-				Data: batch,
-			})
-		}
-		slog.Info("replica_fetch: served raw batches from segments",
-			"topic", topic, "pid", pid, "replica", replicaID,
-			"from_offset", fromOffset, "batch_count", len(frames))
 	}
 
 	// Long-poll if still no data (waiting for new writes)
 	// WaitForData uses its own internal signalling — don't hold ps.mu.
-	if len(frames) == 0 {
-		if ps.replicaState.WaitForData(500 * time.Millisecond) {
-			rawBytes, _, err = s.partitionManager.ReadReplicaRawBatches(r.Context(), topic, pid, int64(fromOffset), 1<<20)
+	if len(rawBytes) == 0 && !behindSealedPrefix {
+		if replicaState.WaitForData(500 * time.Millisecond) {
+			rawBytes, err = readBatches()
 			if err != nil {
 				slog.Error("replica_fetch: ReadRawBatches after wait failed",
 					"topic", topic, "pid", pid, "from_offset", fromOffset, "error", err)
-			} else if len(rawBytes) > 0 {
-				batches, bErr := log.ReadSegmentBatches(rawBytes, fromOffset, 0)
-				if bErr == nil {
-					frames = frames[:0]
-					for _, batch := range batches {
-						hdr, hErr := log.ReadRecordBatchHeader(batch)
-						if hErr != nil {
-							continue
-						}
-						frames = append(frames, log.BatchFrame{
-							Meta: log.BatchMeta{
-								FirstOffset: uint64(hdr.FirstOffset),
-								LastOffset:  uint64(hdr.LastOffset()),
-							},
-							Data: batch,
-						})
-					}
-				}
 			}
 		}
 	}
 
-	// Snapshot state under lock for response headers.
+	// Snapshot state under lock for response headers. A concurrent reassignment
+	// can demote this partition while the long-poll above is waiting. Do not
+	// serve data from the former leader, and never dereference replicaState
+	// after it has been cleared by that transition.
 	ps.mu.RLock()
-	respHW := ps.replicaState.HighWatermark()
+	if !ps.isLeader || ps.replicaState != replicaState {
+		ps.mu.RUnlock()
+		slog.Debug("replica_fetch: partition demoted during fetch",
+			"topic", topic, "pid", pid, "replica", replicaID)
+		writeError(w, http.StatusNotFound, "partition is no longer local leader")
+		return
+	}
+	respHW := replicaState.HighWatermark()
 	respEpoch := ps.epoch
 	respFlushed := ps.flushedOffset
+	respActiveBase := replicaActiveBase(ps)
 	ps.mu.RUnlock()
 
 	slog.Debug("replica_fetch: serving",
 		"topic", topic, "pid", pid, "replica", replicaID,
-		"from_offset", fromOffset, "batch_count", len(frames),
+		"from_offset", fromOffset, "bytes", len(rawBytes),
 		"hw", respHW, "epoch", respEpoch)
 
 	// Response headers
 	w.Header().Set("X-High-Watermark", strconv.FormatUint(respHW, 10))
 	w.Header().Set("X-Leader-Epoch", strconv.FormatUint(respEpoch, 10))
 	w.Header().Set("X-Flushed-Offset", strconv.FormatUint(respFlushed, 10))
+	w.Header().Set("X-Active-Base", strconv.FormatUint(respActiveBase, 10))
 
-	// Write binary frames
-	for _, frame := range frames {
-		if _, err := w.Write(frame.Data); err != nil {
-			slog.Error("replica_fetch: write raw batch frame failed",
-				"topic", topic, "pid", pid, "replica", replicaID,
-				"error", err)
-			return
+	if len(rawBytes) > 0 {
+		if _, err := w.Write(rawBytes); err != nil {
+			slog.Error("replica_fetch: write raw batches failed",
+				"topic", topic, "pid", pid, "replica", replicaID, "error", err)
 		}
 	}
+}
+
+// replicaActiveBase is the offset where the leader's local tail begins. The
+// preceding prefix is sealed and must be read by followers through S3.
+func replicaActiveBase(ps *partitionState) uint64 {
+	if ps.activeSegment != nil {
+		return uint64(ps.activeSegment.BaseOffset())
+	}
+	return ps.nextOffset
 }

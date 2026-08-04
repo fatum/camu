@@ -85,6 +85,52 @@ func TestAssignReplicated_PartialDeadReplicas(t *testing.T) {
 	}
 }
 
+func TestAssignReplicated_RebalancesLeadersAcrossFullyActiveReplicas(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {Replicas: []string{"n1", "n2", "n3", "n4", "n5"}, Leader: "n1", LeaderEpoch: 1},
+		1: {Replicas: []string{"n2", "n3", "n4", "n5", "n1"}, Leader: "n1", LeaderEpoch: 1},
+		2: {Replicas: []string{"n3", "n4", "n5", "n1", "n2"}, Leader: "n1", LeaderEpoch: 1},
+		3: {Replicas: []string{"n4", "n5", "n1", "n2", "n3"}, Leader: "n1", LeaderEpoch: 1},
+	}
+
+	got := AssignReplicated([]string{"n1", "n2", "n3", "n4", "n5"}, 4, 5, current)
+	for pid, wantLeader := range []string{"n1", "n2", "n3", "n4"} {
+		assignment := got[pid]
+		if assignment.Leader != wantLeader {
+			t.Fatalf("partition %d leader = %q, want %q", pid, assignment.Leader, wantLeader)
+		}
+		wantEpoch := uint64(1)
+		if pid > 0 {
+			wantEpoch++
+		}
+		if assignment.LeaderEpoch != wantEpoch {
+			t.Fatalf("partition %d epoch = %d, want %d", pid, assignment.LeaderEpoch, wantEpoch)
+		}
+	}
+
+	if again := AssignReplicated([]string{"n1", "n2", "n3", "n4", "n5"}, 4, 5, got); !sameAssignments(got, again) {
+		t.Fatalf("rebalanced assignments changed on the next cycle: %#v", again)
+	}
+}
+
+func sameAssignments(a, b map[int]PartitionAssignment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for pid, assignment := range a {
+		other, ok := b[pid]
+		if !ok || assignment.Leader != other.Leader || assignment.LeaderEpoch != other.LeaderEpoch || len(assignment.Replicas) != len(other.Replicas) {
+			return false
+		}
+		for i := range assignment.Replicas {
+			if assignment.Replicas[i] != other.Replicas[i] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func TestRebalancer_Deterministic(t *testing.T) {
 	a := AssignReplicated([]string{"n3", "n1", "n2"}, 4, 3, nil)
 	b := AssignReplicated([]string{"n2", "n3", "n1"}, 4, 3, nil)

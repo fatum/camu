@@ -151,6 +151,13 @@ func (ks *KafkaServer) StartListener(addr string) error {
 	if err != nil {
 		return err
 	}
+	return ks.serveListener(ln)
+}
+
+// serveListener serves an already-bound listener. Keeping listener creation
+// separate lets the owning server report Kafka readiness only after the port is
+// accepting connections.
+func (ks *KafkaServer) serveListener(ln net.Listener) error {
 	ks.listenerMu.Lock()
 	ks.listener = ln
 	ks.listenerMu.Unlock()

@@ -188,10 +188,13 @@
   ([node topic partition offset]
    (consume! node topic partition offset 1000))
   ([node topic partition offset limit]
+   (consume! node topic partition offset limit false))
+  ([node topic partition offset limit require-leader?]
    (let [resp (http/get (str (normalize-base-url node) "/v1/topics/" topic
                              "/partitions/" partition "/messages")
-                        {:query-params     {:offset offset
-                                            :limit  limit}
+                        {:query-params     (cond-> {:offset offset
+                                                     :limit  limit}
+                                             require-leader? (assoc :consistency "leader"))
                          :socket-timeout   http-timeout-ms
                          :connect-timeout  http-timeout-ms
                          :throw-exceptions false})]
@@ -786,7 +789,8 @@
                                              :partition partition
                                              :offset (or offset 0)})))
                           (let [result (try
-                                         (consume! (first nodes) topic partition (or offset 0))
+                                         (consume! (first nodes) topic partition (or offset 0) 1000
+                                                   (= :leader (read-mode test)))
                                          (catch ConnectException _ ::retry)
                                          (catch SocketTimeoutException _ ::retry)
                                          (catch clojure.lang.ExceptionInfo e

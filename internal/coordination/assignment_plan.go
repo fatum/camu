@@ -85,7 +85,52 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 			LeaderEpoch: leaderEpoch,
 		}
 	}
+	rebalanceLeaders(result, instances)
 	return result
+}
+
+// rebalanceLeaders spreads leadership across fully active replica sets. It is
+// deterministic, so once assignments are balanced, subsequent coordination
+// cycles leave their leaders unchanged. A partially available replica set is
+// left alone to avoid unnecessary leadership churn during recovery.
+func rebalanceLeaders(assignments map[int]PartitionAssignment, active []string) {
+	activeSet := make(map[string]struct{}, len(active))
+	for _, instance := range active {
+		activeSet[instance] = struct{}{}
+	}
+	leaders := make(map[string]int, len(active))
+	for _, instance := range active {
+		leaders[instance] = 0
+	}
+
+	for pid := 0; pid < len(assignments); pid++ {
+		assignment, ok := assignments[pid]
+		if !ok || !allReplicasActive(assignment.Replicas, activeSet) {
+			continue
+		}
+
+		leader := assignment.Replicas[0]
+		for _, replica := range assignment.Replicas[1:] {
+			if leaders[replica] < leaders[leader] {
+				leader = replica
+			}
+		}
+		if assignment.Leader != leader {
+			assignment.Leader = leader
+			assignment.LeaderEpoch++
+			assignments[pid] = assignment
+		}
+		leaders[leader]++
+	}
+}
+
+func allReplicasActive(replicas []string, active map[string]struct{}) bool {
+	for _, replica := range replicas {
+		if _, ok := active[replica]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func containsReplica(replicas []string, leader string) bool {

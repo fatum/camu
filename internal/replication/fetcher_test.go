@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,14 +22,12 @@ type mockPartitionManager struct {
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedRawBatches(_ context.Context, _ string, _ int, batches [][]byte) error {
+func (m *mockPartitionManager) AppendReplicatedRawBatch(_ context.Context, _ string, _ int, batch []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, batch := range batches {
-		cp := make([]byte, len(batch))
-		copy(cp, batch)
-		m.appendedRaw = append(m.appendedRaw, cp)
-	}
+	cp := make([]byte, len(batch))
+	copy(cp, batch)
+	m.appendedRaw = append(m.appendedRaw, cp)
 	return nil
 }
 
@@ -37,6 +36,10 @@ func (m *mockPartitionManager) TruncateLogFrom(_ string, _ int, offset uint64) e
 	defer m.mu.Unlock()
 	m.truncatedFrom = append(m.truncatedFrom, offset)
 	return nil
+}
+
+func (m *mockPartitionManager) SyncFollowerSealedPrefix(_ context.Context, _ string, _ int, _ uint64) uint64 {
+	return 0
 }
 
 func (m *mockPartitionManager) UpdateFollowerProgress(_ string, _ int, _ uint64, highWatermark, flushedOffset uint64) {
@@ -62,6 +65,47 @@ func (m *mockPartitionManager) progress() ([]uint64, []uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.highWatermarks, m.flushedOffsets
+}
+
+func TestReadReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
+	first := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("first")}})
+	second := log.EncodeRecordBatch(1, []log.Message{{Offset: 1, Value: []byte("second")}})
+
+	var got [][]byte
+	err := readReplicaBatches(bytes.NewReader(append(first, second...)), 0, func(batch []byte, header log.RecordBatchHeader) error {
+		if len(got) == 0 && header.FirstOffset != 0 {
+			t.Fatalf("first callback offset = %d, want 0", header.FirstOffset)
+		}
+		if len(got) == 1 && header.FirstOffset != 1 {
+			t.Fatalf("second callback offset = %d, want 1", header.FirstOffset)
+		}
+		got = append(got, append([]byte(nil), batch...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("readReplicaBatches() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("callback count = %d, want 2", len(got))
+	}
+	if !bytes.Equal(got[0], first) || !bytes.Equal(got[1], second) {
+		t.Fatal("streamed batches differ from the input")
+	}
+}
+
+func TestReadReplicaBatchesRejectsTruncatedBatch(t *testing.T) {
+	batch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("value")}})
+	called := false
+	err := readReplicaBatches(bytes.NewReader(batch[:len(batch)-1]), 0, func([]byte, log.RecordBatchHeader) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("readReplicaBatches() error = nil, want truncated-body error")
+	}
+	if called {
+		t.Fatal("callback was called for a truncated batch")
+	}
 }
 
 func TestFollowerFetcher_Basic(t *testing.T) {
@@ -138,6 +182,34 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 	}
 }
 
+func TestFollowerFetcher_CaughtUpDoesNotBusyLoop(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("X-High-Watermark", "0")
+		w.Header().Set("X-Leader-Epoch", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	pm := &mockPartitionManager{}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NewFollowerFetcher(&http.Client{Timeout: time.Second}, nil).Run(
+			ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm,
+		)
+	}()
+	<-done
+
+	if got := requests.Load(); got > 4 {
+		t.Fatalf("caught-up follower made %d fetches in 250ms; want bounded polling", got)
+	}
+}
+
 func TestFollowerFetcher_Truncation(t *testing.T) {
 	served := false
 	var servedMu sync.Mutex
@@ -195,7 +267,7 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	}
 }
 
-func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
+func TestFollowerFetcher_TruncationAdoptsEpochAtBoundary(t *testing.T) {
 	requestEpochs := make(chan string, 2)
 	requestOffsets := make(chan string, 2)
 	doneCh := make(chan struct{})
@@ -212,8 +284,8 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 		requestOffsets <- r.Header.Get("X-Replica-Offset")
 
 		if reqNum == 1 {
-			w.Header().Set("X-Truncate-To", "0")
-			w.Header().Set("X-High-Watermark", "0")
+			w.Header().Set("X-Truncate-To", "10")
+			w.Header().Set("X-High-Watermark", "10")
 			w.Header().Set("X-Leader-Epoch", "2")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -223,7 +295,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		w.Header().Set("X-High-Watermark", "0")
+		w.Header().Set("X-High-Watermark", "10")
 		w.Header().Set("X-Leader-Epoch", "2")
 		w.WriteHeader(http.StatusOK)
 		<-r.Context().Done()
@@ -236,7 +308,7 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 
 	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
 	go func() {
-		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 0, "test-node", pm)
+		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 20, 1, "test-node", pm)
 	}()
 
 	select {
@@ -247,19 +319,63 @@ func TestFollowerFetcher_TruncationToZeroAdvancesEpoch(t *testing.T) {
 	cancel()
 
 	truncated := pm.truncatedOffsets()
-	if len(truncated) == 0 || truncated[0] != 0 {
-		t.Fatalf("expected TruncateLogFrom(0), got %v", truncated)
+	if len(truncated) == 0 || truncated[0] != 10 {
+		t.Fatalf("expected TruncateLogFrom(10), got %v", truncated)
 	}
 
 	firstEpoch := <-requestEpochs
 	firstOffset := <-requestOffsets
 	secondEpoch := <-requestEpochs
 	secondOffset := <-requestOffsets
-	if firstEpoch != "0" || firstOffset != "0" {
-		t.Fatalf("first request headers = epoch %q offset %q, want 0/0", firstEpoch, firstOffset)
+	if firstEpoch != "1" || firstOffset != "20" {
+		t.Fatalf("first request headers = epoch %q offset %q, want 1/20", firstEpoch, firstOffset)
 	}
-	if secondEpoch != "2" || secondOffset != "0" {
-		t.Fatalf("second request headers = epoch %q offset %q, want 2/0", secondEpoch, secondOffset)
+	if secondEpoch != "2" || secondOffset != "10" {
+		t.Fatalf("second request headers = epoch %q offset %q, want 2/10", secondEpoch, secondOffset)
+	}
+}
+
+func TestFollowerFetcher_TruncationCanLowerEpoch(t *testing.T) {
+	requestEpochs := make(chan string, 2)
+	doneCh := make(chan struct{})
+	var requests int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		reqNum := requests
+		mu.Unlock()
+		requestEpochs <- r.Header.Get("X-Replica-Epoch")
+		if reqNum == 1 {
+			w.Header().Set("X-Truncate-To", "0")
+			w.Header().Set("X-Leader-Epoch", "2")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case doneCh <- struct{}{}:
+		default:
+		}
+		w.Header().Set("X-Leader-Epoch", "2")
+		w.WriteHeader(http.StatusOK)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	pm := &mockPartitionManager{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil).Run(ctx, "topic", 0, srv.Listener.Addr().String(), 4, 9, "node", pm)
+
+	select {
+	case <-doneCh:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for second fetch")
+	}
+	cancel()
+	if first, second := <-requestEpochs, <-requestEpochs; first != "9" || second != "2" {
+		t.Fatalf("request epochs = %q, %q, want 9, 2", first, second)
 	}
 }
 

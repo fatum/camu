@@ -33,6 +33,44 @@ func (eh *EpochHistory) Append(entry EpochEntry) {
 	eh.Entries = append(eh.Entries, entry)
 }
 
+// Ensure appends entry only when its epoch is not already recorded. Epoch
+// boundaries are immutable: callers receiving an authoritative history must
+// never create a second boundary for the same epoch.
+func (eh *EpochHistory) Ensure(entry EpochEntry) error {
+	for _, existing := range eh.Entries {
+		if existing.Epoch != entry.Epoch {
+			continue
+		}
+		if existing.StartOffset != entry.StartOffset {
+			return fmt.Errorf("epoch %d has conflicting boundaries %d and %d", entry.Epoch, existing.StartOffset, entry.StartOffset)
+		}
+		return nil
+	}
+	if n := len(eh.Entries); n > 0 {
+		previous := eh.Entries[n-1]
+		if entry.Epoch <= previous.Epoch || entry.StartOffset < previous.StartOffset {
+			return fmt.Errorf("epoch boundary %d@%d is not after %d@%d", entry.Epoch, entry.StartOffset, previous.Epoch, previous.StartOffset)
+		}
+	}
+	eh.Entries = append(eh.Entries, entry)
+	return nil
+}
+
+// EpochAt returns the leader epoch containing offset. An epoch begins at its
+// StartOffset and remains current until the next entry begins.
+func (eh *EpochHistory) EpochAt(offset uint64) (uint64, bool) {
+	var epoch uint64
+	found := false
+	for _, entry := range eh.Entries {
+		if entry.StartOffset > offset {
+			break
+		}
+		epoch = entry.Epoch
+		found = true
+	}
+	return epoch, found
+}
+
 // CheckDivergence determines whether a follower has divergent data relative to
 // this (leader) epoch history.
 //
@@ -61,12 +99,20 @@ func (eh *EpochHistory) CheckDivergence(followerEpoch uint64, followerOffset uin
 		if entry.Epoch != followerEpoch {
 			continue
 		}
-		// Found the matching epoch. Check whether there is a next entry.
-		if i+1 >= len(eh.Entries) {
+		// A previous version could persist a duplicate boundary for the same
+		// epoch during restart recovery. It is not a leadership transition and
+		// must not fence a follower: doing so tells the follower to truncate
+		// and then continue with the identical epoch forever.
+		nextIndex := i + 1
+		for nextIndex < len(eh.Entries) && eh.Entries[nextIndex].Epoch == followerEpoch {
+			nextIndex++
+		}
+		// Found the matching epoch. Check whether there is a next distinct epoch.
+		if nextIndex >= len(eh.Entries) {
 			// followerEpoch is the latest epoch — no divergence possible.
 			return 0, false
 		}
-		next := eh.Entries[i+1]
+		next := eh.Entries[nextIndex]
 		if followerOffset > next.StartOffset {
 			return next.StartOffset, true
 		}

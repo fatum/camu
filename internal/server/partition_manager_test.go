@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -648,6 +650,273 @@ func TestReadReplicaRawBatches_ReadsPastHighWatermark(t *testing.T) {
 	}
 }
 
+func TestReadReplicaRawBatchesDoesNotServeSealedPrefix(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 10)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	batch := log.EncodeRecordBatch(10, []log.Message{{Key: []byte("tail"), Value: []byte("v")}})
+	if err := as.Append(batch); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.nextOffset = 11
+	ps.mu.Unlock()
+
+	data, logEnd, err := pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadReplicaRawBatches() error = %v", err)
+	}
+	if logEnd != 11 {
+		t.Fatalf("log end = %d, want 11", logEnd)
+	}
+	if len(data) != 0 {
+		t.Fatalf("sealed-prefix read returned %d bytes, want none", len(data))
+	}
+
+	data, _, err = pm.ReadReplicaRawBatches(context.Background(), "topic", 0, 10, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadReplicaRawBatches(active tail) error = %v", err)
+	}
+	if !bytes.Equal(data, batch) {
+		t.Fatal("active tail bytes differ from appended batch")
+	}
+}
+
+func TestReadRawBatchesDoesNotJumpFromSealedPrefixToActiveTail(t *testing.T) {
+	ctx := context.Background()
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(ctx, newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatal(err)
+	}
+
+	sealed := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Key: []byte("sealed"), Value: []byte("zero")}})
+	ref := log.SegmentRef{BaseOffset: 0, EndOffset: 0, Key: "topic/0/0-0.segment"}
+	if err := pm.s3Client.Put(ctx, ref.Key, sealed, storage.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	var sidecar bytes.Buffer
+	if err := log.WriteSidecar(&sidecar, []log.IndexEntry{{BaseOffset: 0, LastOffset: 0, BatchSize: int32(len(sealed))}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := pm.s3Client.Put(ctx, ref.OffsetIndexObjectKey(), sidecar.Bytes(), storage.PutOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "active"), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	tail := log.EncodeRecordBatch(100, []log.Message{{Offset: 100, Key: []byte("tail"), Value: []byte("hundred")}})
+	if err := active.Append(tail); err != nil {
+		t.Fatal(err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	ps.mu.Lock()
+	ps.activeSegment = active
+	ps.nextOffset = 101
+	ps.index.Add(ref)
+	ps.index.SetHighWatermark(101)
+	ps.mu.Unlock()
+
+	raw, _, err := pm.ReadRawBatches(ctx, "topic", 0, 0, len(sealed)+len(tail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, sealed) {
+		t.Fatalf("read crossed offset gap: got %d bytes, want only sealed %d bytes", len(raw), len(sealed))
+	}
+}
+
+func TestSyncFollowerSealedPrefixAdvancesLocalOffsetFromIndex(t *testing.T) {
+	pm := newTestPartitionManager(t)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	ps.mu.Lock()
+	ps.index.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 9, Key: "topic/0/0-9.seg"})
+	ps.index.SetHighWatermark(10)
+	ps.nextOffset = 0
+	ps.mu.Unlock()
+
+	if got := pm.SyncFollowerSealedPrefix(context.Background(), "topic", 0, 10); got != 10 {
+		t.Fatalf("SyncFollowerSealedPrefix() = %d, want 10", got)
+	}
+}
+
+func TestInitPartitionPreservesRecoveredFollowerEpoch(t *testing.T) {
+	pm := newTestPartitionManager(t)
+	partitionDir := pm.localPartitionDir("topic", 0)
+	if err := os.MkdirAll(partitionDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(partitionDir, "epoch"), []byte("4"), 0o644); err != nil {
+		t.Fatalf("write epoch sidecar: %v", err)
+	}
+
+	ps, err := pm.initPartition(context.Background(), "topic", 0, 0)
+	if err != nil {
+		t.Fatalf("initPartition: %v", err)
+	}
+	if ps.epoch != 4 {
+		t.Fatalf("epoch = %d, want recovered follower epoch 4", ps.epoch)
+	}
+	epochData, err := os.ReadFile(filepath.Join(partitionDir, "epoch"))
+	if err != nil {
+		t.Fatalf("read epoch sidecar: %v", err)
+	}
+	if string(epochData) != "4" {
+		t.Fatalf("epoch sidecar = %q, want 4", epochData)
+	}
+}
+
+// A restarted follower can find an obsolete, previously flushed tail in S3.
+// When the current leader fences that tail at its active-segment boundary, the
+// follower must not use its local S3 index to advance back into the fenced
+// range. That would make it report the same divergent offset forever.
+func TestFollowerRestartDoesNotRestoreFencedS3Tail(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
+	cfg.Segments.MaxSize = 1 << 20
+	cfg.Segments.MaxAge = "1h"
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	if err != nil {
+		t.Fatalf("NewS3Client: %v", err)
+	}
+
+	const (
+		topic         = "bench2"
+		fenceOffset   = uint64(262144)
+		staleLogEnd   = uint64(263144)
+		followerEpoch = uint64(1)
+	)
+	// This is the shared state left by the old leader: a durable prefix plus an
+	// epoch-1 segment that the current leader has subsequently fenced.
+	for _, ref := range []log.SegmentRef{
+		{BaseOffset: 0, EndOffset: fenceOffset - 1, Epoch: 0, Key: log.FormatSegmentKey(topic, 0, 0, fenceOffset-1, 0)},
+		{BaseOffset: fenceOffset, EndOffset: staleLogEnd - 1, Epoch: followerEpoch, Key: log.FormatSegmentKey(topic, 0, fenceOffset, staleLogEnd-1, followerEpoch)},
+	} {
+		if err := s3Client.Put(ctx, ref.Key, []byte("stale segment"), storage.PutOpts{}); err != nil {
+			t.Fatalf("put %s: %v", ref.Key, err)
+		}
+	}
+	state, err := (&log.PartitionState{
+		HighWatermark: fenceOffset,
+		EpochHistory: []log.EpochEntry{
+			{Epoch: 0, StartOffset: 0},
+			{Epoch: followerEpoch, StartOffset: fenceOffset},
+		},
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := s3Client.Put(ctx, log.StateKey(topic, 0), state, storage.PutOpts{}); err != nil {
+		t.Fatalf("put state: %v", err)
+	}
+
+	// Persisted local state from the follower before its process restart.
+	localPartitionDir := filepath.Join(cfg.Cache.Directory, "local", topic, "0")
+	if err := os.MkdirAll(localPartitionDir, 0o755); err != nil {
+		t.Fatalf("mkdir local partition: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localPartitionDir, "epoch"), []byte("1"), 0o644); err != nil {
+		t.Fatalf("write epoch sidecar: %v", err)
+	}
+
+	pm, err := NewPartitionManager(cfg, s3Client)
+	if err != nil {
+		t.Fatalf("NewPartitionManager after restart: %v", err)
+	}
+	tc := meta.TopicConfig{Name: topic, Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 5, MinInsyncReplicas: 3}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic after restart: %v", err)
+	}
+	ps := pm.GetPartitionState(topic, 0)
+	ps.mu.RLock()
+	gotEpoch, gotNextOffset := ps.epoch, ps.nextOffset
+	ps.mu.RUnlock()
+	if gotEpoch != followerEpoch || gotNextOffset != staleLogEnd {
+		t.Fatalf("restarted follower = epoch %d offset %d, want epoch %d offset %d", gotEpoch, gotNextOffset, followerEpoch, staleLogEnd)
+	}
+
+	if err := pm.TruncateLogFrom(topic, 0, fenceOffset); err != nil {
+		t.Fatalf("TruncateLogFrom: %v", err)
+	}
+	if got := pm.SyncFollowerSealedPrefix(ctx, topic, 0, fenceOffset); got != fenceOffset {
+		t.Fatalf("SyncFollowerSealedPrefix() = %d, want fence boundary %d", got, fenceOffset)
+	}
+}
+
+// This is the exact partition-0 shape recovered from the live bench2 bucket:
+// a segment is present through 263643, but state.json commits only through
+// 263143. A follower may use the durable prefix but must not treat the 500
+// uncommitted records as replicated data after a restart.
+func TestFollowerRestartCapsS3PrefixAtPublishedHighWatermark(t *testing.T) {
+	ctx := context.Background()
+	cfg := &config.Config{}
+	cfg.Cache.Directory = filepath.Join(t.TempDir(), "cache")
+	cfg.Segments.MaxSize = 1 << 20
+	cfg.Segments.MaxAge = "1h"
+	s3Client, err := storage.NewS3Client(storage.S3Config{Bucket: "test", Endpoint: "memory://"})
+	if err != nil {
+		t.Fatalf("NewS3Client: %v", err)
+	}
+
+	const (
+		topic           = "bench2"
+		fenceOffset     = uint64(262144)
+		publishedHW     = uint64(263144)
+		publishedLogEnd = uint64(263644)
+		followerEpoch   = uint64(1)
+	)
+	ref := log.SegmentRef{BaseOffset: 0, EndOffset: publishedLogEnd - 1, Epoch: followerEpoch, Key: log.FormatSegmentKey(topic, 0, 0, publishedLogEnd-1, followerEpoch)}
+	if err := s3Client.Put(ctx, ref.Key, []byte("segment beyond high watermark"), storage.PutOpts{}); err != nil {
+		t.Fatalf("put segment: %v", err)
+	}
+	state, err := (&log.PartitionState{
+		HighWatermark: publishedHW,
+		EpochHistory: []log.EpochEntry{
+			{Epoch: 1, StartOffset: 0},
+			{Epoch: 1, StartOffset: fenceOffset},
+			{Epoch: 1, StartOffset: 262644},
+			{Epoch: 1, StartOffset: 262644},
+			{Epoch: 1, StartOffset: 262644},
+		},
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := s3Client.Put(ctx, log.StateKey(topic, 0), state, storage.PutOpts{}); err != nil {
+		t.Fatalf("put state: %v", err)
+	}
+
+	pm, err := NewPartitionManager(cfg, s3Client)
+	if err != nil {
+		t.Fatalf("NewPartitionManager: %v", err)
+	}
+	tc := meta.TopicConfig{Name: topic, Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 5, MinInsyncReplicas: 3}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+	if err := pm.TruncateLogFrom(topic, 0, fenceOffset); err != nil {
+		t.Fatalf("TruncateLogFrom: %v", err)
+	}
+	if got := pm.SyncFollowerSealedPrefix(ctx, topic, 0, publishedLogEnd); got != publishedHW {
+		t.Fatalf("SyncFollowerSealedPrefix() = %d, want published high watermark %d", got, publishedHW)
+	}
+}
+
 func TestReadRawBatches_UnknownTopicReturnsError(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 
@@ -825,5 +1094,81 @@ func TestUpdateFollowerProgressDoesNotAdvertiseUnreplicatedOffsets(t *testing.T)
 	defer ps.mu.RUnlock()
 	if ps.followerHW != 100 {
 		t.Fatalf("follower high watermark = %d, want local log end 100", ps.followerHW)
+	}
+}
+
+func TestUpdateFollowerProgressCompactsOnlyDurableFollowerPrefix(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatal(err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	seg, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "follower-active"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.activeSegment = seg
+	ps.mu.Unlock()
+	now := time.Now().UnixMilli()
+	first := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Timestamp: now, Value: []byte("zero")}, {Offset: 1, Timestamp: now, Value: []byte("one")}})
+	second := log.EncodeRecordBatch(2, []log.Message{{Offset: 2, Timestamp: now, Value: []byte("two")}})
+	if err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	ps.index.Add(log.SegmentRef{BaseOffset: 0, EndOffset: 1, Key: "topic/0/0-1.seg"})
+	ps.mu.Unlock()
+
+	pm.UpdateFollowerProgress("topic", 0, 1, 3, 1)
+	ps.mu.RLock()
+	compacted := ps.activeSegment
+	flushed := ps.flushedOffset
+	ps.mu.RUnlock()
+	if compacted == nil {
+		t.Fatal("follower active segment is nil after compaction")
+	}
+	if flushed != 1 || compacted.BaseOffset() != 2 || compacted.Size() != int64(len(second)) {
+		t.Fatalf("follower segment after compaction = flushed=%d base=%d size=%d", flushed, compacted.BaseOffset(), compacted.Size())
+	}
+}
+
+func TestUpdateFollowerProgressKeepsPrefixUntilIndexIsRefreshed(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+		t.Fatal(err)
+	}
+	ps := pm.GetPartitionState("topic", 0)
+	seg, err := log.OpenActiveSegment(filepath.Join(t.TempDir(), "follower-active"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps.mu.Lock()
+	ps.isLeader = false
+	ps.activeSegment = seg
+	ps.mu.Unlock()
+	batch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("zero")}, {Offset: 1, Value: []byte("one")}})
+	if err := pm.AppendReplicatedRawBatches(context.Background(), "topic", 0, [][]byte{batch}); err != nil {
+		t.Fatal(err)
+	}
+
+	pm.UpdateFollowerProgress("topic", 0, 1, 2, 1)
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if ps.activeSegment.BaseOffset() != 0 || ps.activeSegment.Size() == 0 {
+		t.Fatal("follower discarded a prefix before its sealed index was available")
+	}
+}
+
+func TestNewestActiveSegmentBaseOffsetPrefersCompactedTail(t *testing.T) {
+	dir := t.TempDir()
+	for _, offset := range []int64{0, 20} {
+		if err := os.WriteFile(filepath.Join(dir, log.SegmentFilename(offset)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := newestActiveSegmentBaseOffset(dir, 0); got != 20 {
+		t.Fatalf("active segment base = %d, want compacted tail 20", got)
 	}
 }

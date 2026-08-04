@@ -172,6 +172,46 @@ func (s *Server) sqlDBHandle() (*sql.DB, error) {
 	return db, nil
 }
 
+// cleanupSQLFilesystem removes files which can only be leftovers from an
+// interrupted query, export, or cache installation. Canonical parquet cache
+// files are deliberately retained: they are valid across restarts and are
+// reconciled by the cache LRU when next used.
+func cleanupSQLFilesystem(cacheDir, tempDir string) error {
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return fmt.Errorf("create sql cache directory: %w", err)
+	}
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return fmt.Errorf("create duckdb temp directory: %w", err)
+	}
+	if err := removeMatchingFiles(cacheDir, func(name string) bool {
+		return strings.HasPrefix(name, ".camu-cache-") && strings.HasSuffix(name, ".parquet.tmp")
+	}); err != nil {
+		return fmt.Errorf("clean sql cache leftovers: %w", err)
+	}
+	if err := removeMatchingFiles(tempDir, func(name string) bool {
+		return (strings.HasPrefix(name, "camu-query-") || strings.HasPrefix(name, "camu-parquet-")) && strings.HasSuffix(name, ".parquet")
+	}); err != nil {
+		return fmt.Errorf("clean sql temporary leftovers: %w", err)
+	}
+	return nil
+}
+
+func removeMatchingFiles(dir string, match func(string) bool) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !match(entry.Name()) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) prepareSQLConnection(ctx context.Context, conn *sql.Conn, scope sqlQueryScope) (func(), error) {
 	maxFiles := s.cfg.SQL.MaxScanFilesValue()
 	totalFiles := 0

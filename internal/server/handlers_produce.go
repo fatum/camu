@@ -251,14 +251,33 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For non-replicated topics, check ownership early to skip body parsing
-	// for non-owned partitions. Replicated topics defer the check to
-	// verifyProduceLeadership which checks both ownership and epoch in one
-	// lock acquisition.
+	// Check leadership before consuming the request body. A follower forwards
+	// the original request to the leader; parsing first would exhaust the body
+	// and make the leader receive an empty request.
 	if tc.ReplicationFactor <= 1 {
 		if !s.isOwnedPartition(topicName, partitionID) {
 			s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 			return
+		}
+	}
+
+	var ps *partitionState
+	if tc.StorageMode != "diskless" {
+		ps = s.partitionManager.GetPartitionState(topicName, partitionID)
+		if ps == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
+			return
+		}
+		if tc.ReplicationFactor > 1 {
+			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
+				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
+				return
+			}
+			if ps.replicaState == nil {
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusServiceUnavailable, "partition not ready for replicated writes")
+				return
+			}
 		}
 	}
 
@@ -313,30 +332,6 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 			Key:     key,
 			Value:   immutableStringBytes(m.Value),
 			Headers: m.Headers,
-		}
-	}
-
-	var ps *partitionState
-	if tc.StorageMode != "diskless" {
-		ps = s.partitionManager.GetPartitionState(topicName, partitionID)
-		if ps == nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("partition %d not initialized for topic %q", partitionID, topicName))
-			return
-		}
-
-		// For replicated topics, reject writes if replicaState not yet initialized.
-		// verifyProduceLeadership checks both ownership and epoch in a single
-		// assignmentsMu.RLock, avoiding a separate isOwnedPartition call.
-		if tc.ReplicationFactor > 1 {
-			if !s.verifyProduceLeadership(topicName, partitionID, ps.epoch) {
-				s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
-				return
-			}
-			if ps.replicaState == nil {
-				w.Header().Set("Retry-After", "1")
-				writeError(w, 503, "partition not ready for replicated writes")
-				return
-			}
 		}
 	}
 
