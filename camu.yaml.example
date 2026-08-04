@@ -40,6 +40,11 @@ coordination:
   maintenance_max_concurrency: 4
   isr_expansion_threshold: 1000
   replication_timeout: "30s"
+  # How long a follower waits for the leader to respond to a fetch before
+  # counting it toward leader-down detection. A healthy leader responds within
+  # its ~500ms long-poll window, so this can be far shorter than
+  # replication_timeout (which bounds produce purgatory waits).
+  replication_read_timeout: "10s"
   # How often rf=1 produce re-verifies partition ownership against the
   # assignment store before acknowledging. A shorter interval narrows the
   # window in which a fenced leader can ack writes it will later lose.

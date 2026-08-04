@@ -179,6 +179,7 @@ type CoordinationConfig struct {
 	InstanceTTL               string `yaml:"instance_ttl"`
 	ISRExpansionThreshold     int    `yaml:"isr_expansion_threshold"`
 	ReplicationTimeout        string `yaml:"replication_timeout"`
+	ReplicationReadTimeout    string `yaml:"replication_read_timeout"`
 	MaintenanceMaxConcurrency int    `yaml:"maintenance_max_concurrency"`
 	FenceInterval             string `yaml:"fence_interval"`
 }
@@ -189,6 +190,7 @@ const (
 	defaultRebalanceDelay            = 5 * time.Second
 	defaultISRExpansionThreshold     = 1000
 	defaultReplicationTimeout        = 30 * time.Second
+	defaultReplicationReadTimeout    = 10 * time.Second
 	defaultMaintenanceMaxConcurrency = 4
 	defaultFenceInterval             = 2 * time.Second
 )
@@ -232,6 +234,16 @@ func (c CoordinationConfig) ISRExpansionThresholdValue() int {
 
 func (c CoordinationConfig) ReplicationTimeoutDuration() (time.Duration, error) {
 	return parseDurationOrDefault(c.ReplicationTimeout, defaultReplicationTimeout)
+}
+
+// ReplicationReadTimeoutDuration returns how long a follower waits for the
+// leader to respond to a fetch before counting it as an error toward
+// leader-down detection. It is independent of the produce purgatory timeout:
+// a healthy leader responds within its ~500ms long-poll window, so this can be
+// far shorter than replication_timeout to detect a paused or unresponsive
+// leader faster.
+func (c CoordinationConfig) ReplicationReadTimeoutDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.ReplicationReadTimeout, defaultReplicationReadTimeout)
 }
 
 func (c CoordinationConfig) MaintenanceMaxConcurrencyValue() int {
@@ -350,6 +362,7 @@ func defaults() *Config {
 			RebalanceDelay:            defaultRebalanceDelay.String(),
 			MaintenanceMaxConcurrency: defaultMaintenanceMaxConcurrency,
 			FenceInterval:             defaultFenceInterval.String(),
+			ReplicationReadTimeout:    defaultReplicationReadTimeout.String(),
 		},
 	}
 }
