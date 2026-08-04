@@ -1225,8 +1225,10 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 	pm.mu.RUnlock()
 
 	ps.mu.Lock()
+	epochChanged := false
 	if leaderEpoch > ps.epoch {
 		ps.epoch = leaderEpoch
+		epochChanged = true
 	}
 	// A leader can advertise a high watermark beyond the batches carried by
 	// this fetch response. Never expose that remote position to local readers:
@@ -1257,6 +1259,11 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 		}
 	}
 	ps.mu.Unlock()
+
+	if epochChanged {
+		epochFile := filepath.Join(pm.localPartitionDir(topic, partitionID), "epoch")
+		_ = fsutil.AtomicWriteFile(epochFile, []byte(fmt.Sprintf("%d", leaderEpoch)), 0o644)
+	}
 }
 
 // TruncateLogFrom removes local active-segment data at and above the given
