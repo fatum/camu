@@ -26,11 +26,24 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
+// producerBatchMeta records the exact position of a producer's most recently
+// appended batch. A duplicate retry is confirmed only when it exactly matches
+// this batch, so it returns the retried batch's own base offset rather than
+// deriving one from the producer's latest offset (which would acknowledge an
+// earlier sequence range with the later batch's offsets).
+type producerBatchMeta struct {
+	FirstSequence uint64 `json:"first_sequence"`
+	NumRecords    int64  `json:"num_records"`
+	BaseOffset    int64  `json:"base_offset"`
+	LastOffset    uint64 `json:"last_offset"`
+}
+
 // producerPartitionState tracks idempotency sequence for one producer on this partition.
 type producerPartitionState struct {
-	NextSeq      uint64    `json:"next_seq"`
-	LastOffset   uint64    `json:"last_offset"`
-	LastActiveAt time.Time `json:"-"` // not persisted; set on each produce
+	NextSeq      uint64             `json:"next_seq"`
+	LastOffset   uint64             `json:"last_offset"`
+	LastActiveAt time.Time          `json:"-"` // not persisted; set on each produce
+	LastBatch    *producerBatchMeta `json:"-"` // most recent appended batch; rebuilt on load
 }
 
 func (pm *PartitionManager) ensureActiveSegment(topic string, partitionID int) error {
@@ -250,9 +263,19 @@ func (ps *partitionState) rollbackSeq(producerID, sequence uint64) {
 	}
 }
 
-func (ps *partitionState) recordLastOffset(producerID, offset uint64) {
-	if state, ok := ps.producerSeqs[producerID]; ok {
-		state.LastOffset = offset
+// recordAppendedBatch records the exact position of the most recently appended
+// batch for a producer. Callers must hold ps.mu.
+func (ps *partitionState) recordAppendedBatch(producerID, firstSeq uint64, numRecords int64, baseOffset int64, lastOffset uint64) {
+	state, ok := ps.producerSeqs[producerID]
+	if !ok {
+		return
+	}
+	state.LastOffset = lastOffset
+	state.LastBatch = &producerBatchMeta{
+		FirstSequence: firstSeq,
+		NumRecords:    numRecords,
+		BaseOffset:    baseOffset,
+		LastOffset:    lastOffset,
 	}
 }
 
@@ -293,6 +316,14 @@ func (ps *partitionState) rebuildProducerSeqsFromBatches(batches []log.BatchMeta
 		}
 		if b.LastOffset > state.LastOffset {
 			state.LastOffset = b.LastOffset
+			// Batches replay in offset order, so the highest LastOffset is the
+			// producer's most recent batch — the one a duplicate retry matches.
+			state.LastBatch = &producerBatchMeta{
+				FirstSequence: b.Sequence,
+				NumRecords:    int64(b.MessageCount),
+				BaseOffset:    int64(b.FirstOffset),
+				LastOffset:    b.LastOffset,
+			}
 		}
 		state.LastActiveAt = now
 	}
@@ -399,9 +430,6 @@ func NewPartitionManager(cfg *config.Config, s3Client *storage.S3Client) (*Parti
 	}
 
 	highWaterMark := maxSize64 * 8
-	if highWaterMark < 64*1024*1024 {
-		highWaterMark = 64 * 1024 * 1024
-	}
 	pm.batcher = producer.NewBatcher(producer.BatcherConfig{
 		MaxSize:       maxSize64,
 		MaxAge:        maxAge,
@@ -610,12 +638,12 @@ func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, parti
 	topicPartitions, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("topic %q not initialized", topic)
+		return nil, fmt.Errorf("%w: topic %q not initialized", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := topicPartitions[partitionID]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+		return nil, fmt.Errorf("%w: partition %d not found for topic %q", errKafkaUnknownTopicPartition, partitionID, topic)
 	}
 	pm.mu.RUnlock()
 
@@ -648,16 +676,26 @@ func (pm *PartitionManager) AppendBatchWithMeta(ctx context.Context, topic strin
 	topicPartitions, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("topic %q not initialized", topic)
+		return nil, fmt.Errorf("%w: topic %q not initialized", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := topicPartitions[partitionID]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+		return nil, fmt.Errorf("%w: partition %d not found for topic %q", errKafkaUnknownTopicPartition, partitionID, topic)
 	}
 	pm.mu.RUnlock()
 
-	return pm.appendBatchWithMetaToPS(ps, topic, partitionID, batch, idem)
+	offsets, err := pm.appendBatchWithMetaToPS(ps, topic, partitionID, batch, idem)
+	if errors.Is(err, idempotency.ErrDuplicateSequence) {
+		if prior, ok := pm.duplicateBaseOffset(ps, batch.ProducerID, batch.Sequence, int64(len(batch.Messages))); ok {
+			offsets = make([]uint64, len(batch.Messages))
+			for i := range offsets {
+				offsets[i] = uint64(prior) + uint64(i)
+			}
+			return offsets, nil
+		}
+	}
+	return offsets, err
 }
 
 // appendBatchWithMetaToPS is the inner implementation of AppendBatchWithMeta
@@ -695,6 +733,35 @@ func (pm *PartitionManager) appendNativeBatchToPS(ps *partitionState, topic stri
 	return offsets, nil
 }
 
+// duplicateBaseOffset returns the exact base offset of an already-appended
+// idempotent batch so that an exact retried duplicate can be confirmed with
+// success instead of an error, matching Kafka's idempotent produce semantics.
+// It only confirms when the retried batch exactly matches the producer's most
+// recently appended batch (same first sequence and record count). Anything else
+// is an overlapping or non-identical request for an earlier sequence range and
+// must not be acknowledged with a later batch's offsets.
+func (pm *PartitionManager) duplicateBaseOffset(ps *partitionState, producerID, firstSeq uint64, numRecords int64) (int64, bool) {
+	// Snapshot the batch metadata under the lock. A concurrent append can
+	// replace LastBatch between releasing the read lock and reading its fields;
+	// reading it without the lock is also a data race. EvictStaleProducerStates
+	// may delete the map entry concurrently, so check ok before dereferencing
+	// state to avoid a nil-pointer panic.
+	ps.mu.RLock()
+	state, ok := ps.producerSeqs[producerID]
+	var lastBatch *producerBatchMeta
+	if ok {
+		lastBatch = state.LastBatch
+	}
+	ps.mu.RUnlock()
+	if !ok || lastBatch == nil {
+		return 0, false
+	}
+	if lastBatch.FirstSequence != firstSeq || lastBatch.NumRecords != numRecords {
+		return 0, false
+	}
+	return lastBatch.BaseOffset, true
+}
+
 // AppendRawBatch writes a raw Kafka v2 RecordBatch to the active segment,
 // patching offsets and leader epoch in place. This is the zero-copy produce
 // path — no record-level decoding or re-serialization.
@@ -703,22 +770,31 @@ func (pm *PartitionManager) AppendRawBatch(ctx context.Context, topic string, pa
 	topicPartitions, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return 0, fmt.Errorf("topic %q not initialized", topic)
+		return 0, fmt.Errorf("%w: topic %q not initialized", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := topicPartitions[partitionID]
 	if !ok {
 		pm.mu.RUnlock()
-		return 0, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+		return 0, fmt.Errorf("%w: partition %d not found for topic %q", errKafkaUnknownTopicPartition, partitionID, topic)
 	}
 	pm.mu.RUnlock()
 
-	return pm.appendRawBatchToPS(ps, topic, partitionID, batch, nil, true)
+	baseOffset, err := pm.appendRawBatchToPS(ps, topic, partitionID, batch, nil, true)
+	if errors.Is(err, idempotency.ErrDuplicateSequence) {
+		if h, hErr := log.ReadRecordBatchHeader(batch); hErr == nil {
+			numRecords := int64(h.LastOffsetDelta) + 1
+			if prior, ok := pm.duplicateBaseOffset(ps, uint64(h.ProducerID), uint64(h.FirstSequence), numRecords); ok {
+				return prior, nil
+			}
+		}
+	}
+	return baseOffset, err
 }
 
 func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string, partitionID int, batch []byte, idem *IdempotencyOpts, enforceLeader bool) (int64, error) {
 	h, err := log.ReadRecordBatchHeader(batch)
 	if err != nil {
-		return 0, fmt.Errorf("read record batch header: %w", err)
+		return 0, fmt.Errorf("%w: %v", errKafkaInvalidRecordBatch, err)
 	}
 
 	numRecords := int64(h.LastOffsetDelta) + 1
@@ -732,7 +808,7 @@ func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string,
 
 	if ps.activeSegment == nil {
 		ps.mu.Unlock()
-		return 0, fmt.Errorf("active segment not initialized for %s/%d", topic, partitionID)
+		return 0, fmt.Errorf("%w: active segment not initialized for %s/%d", errKafkaSegmentNotReady, topic, partitionID)
 	}
 
 	// Idempotency check BEFORE append.
@@ -754,14 +830,14 @@ func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string,
 			ps.rollbackSeq(uint64(h.ProducerID), uint64(h.FirstSequence))
 		}
 		ps.mu.Unlock()
-		return 0, fmt.Errorf("patch first offset: %w", err)
+		return 0, fmt.Errorf("%w: %v", errKafkaInvalidRecordBatch, err)
 	}
 	if err := log.PatchRecordBatchLeaderEpoch(batch, int32(ps.epoch)); err != nil {
 		if h.ProducerID >= 0 {
 			ps.rollbackSeq(uint64(h.ProducerID), uint64(h.FirstSequence))
 		}
 		ps.mu.Unlock()
-		return 0, fmt.Errorf("patch leader epoch: %w", err)
+		return 0, fmt.Errorf("%w: %v", errKafkaInvalidRecordBatch, err)
 	}
 
 	// Write to active segment.
@@ -770,13 +846,19 @@ func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string,
 			ps.rollbackSeq(uint64(h.ProducerID), uint64(h.FirstSequence))
 		}
 		ps.mu.Unlock()
+		// A closed segment means the segment was retired (or a seal failed) —
+		// retryable, not a fatal unknown error. Other IO failures are returned
+		// as-is and mapped to UNKNOWN_SERVER_ERROR.
+		if errors.Is(err, os.ErrClosed) {
+			return 0, fmt.Errorf("%w: active segment append: %v", errKafkaSegmentNotReady, err)
+		}
 		return 0, fmt.Errorf("active segment append: %w", err)
 	}
 
 	// Update producer state AFTER successful append.
 	if h.ProducerID >= 0 {
 		lastOffset := uint64(baseOffset) + uint64(numRecords) - 1
-		ps.recordLastOffset(uint64(h.ProducerID), lastOffset)
+		ps.recordAppendedBatch(uint64(h.ProducerID), uint64(h.FirstSequence), numRecords, baseOffset, lastOffset)
 	}
 
 	ps.nextOffset += uint64(numRecords)
@@ -1801,13 +1883,34 @@ func (pm *PartitionManager) sealActiveSegmentLocked(ps *partitionState, topic st
 		return nil, nil
 	}
 
-	segmentPath, sidecarPath, err := oldSeg.Seal()
-	if err != nil {
-		return nil, fmt.Errorf("seal active segment: %w", err)
-	}
+	// Open the replacement segment before sealing the old one. If this fails
+	// the old segment is still open and writable, so concurrent produces are
+	// unaffected and the flush can be retried.
 	newSeg, err := log.OpenActiveSegment(oldSeg.Dir(), int64(ps.nextOffset))
 	if err != nil {
 		return nil, fmt.Errorf("open new active segment: %w", err)
+	}
+
+	segmentPath, sidecarPath, err := oldSeg.Seal()
+	if err != nil {
+		// The replacement was opened before the seal attempt; a failed seal
+		// must not leak its file descriptor or leave an empty orphan .log
+		// behind. Close and remove it so retried flushes don't accumulate
+		// descriptors and empty files at the next-offset path.
+		_ = newSeg.Close()
+		_ = os.Remove(newSeg.Path())
+		// Seal syncs and closes the segment file before writing the sidecar, so
+		// on a mid-seal failure the file may already be closed. Reopen the old
+		// segment from its log file so a concurrent produce never appends to a
+		// closed file and the next flush attempt can re-seal it.
+		if reopened, rerr := log.OpenActiveSegment(oldSeg.Dir(), oldSeg.BaseOffset()); rerr == nil {
+			if rerr := reopened.Recover(); rerr == nil {
+				ps.activeSegment = reopened
+			} else {
+				_ = reopened.Close()
+			}
+		}
+		return nil, fmt.Errorf("seal active segment: %w", err)
 	}
 	ps.activeSegment = newSeg
 

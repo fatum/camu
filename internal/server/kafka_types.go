@@ -22,10 +22,14 @@ var (
 	errKafkaNotLeader             = errors.New("kafka not leader")
 	errKafkaLeaderNotAvailable    = errors.New("kafka leader not available")
 	errKafkaInvalidRequest        = errors.New("kafka invalid request")
+	errKafkaInvalidRecordBatch    = errors.New("kafka invalid record batch")
+	errKafkaSegmentNotReady       = errors.New("kafka active segment not ready")
 )
 
 const (
-	kafkaErrorUnknownServer         int16 = 1
+	kafkaErrorUnknownServer         int16 = -1
+	kafkaErrorOffsetOutOfRange      int16 = 1
+	kafkaErrorCorruptMessage        int16 = 2
 	kafkaErrorUnknownTopicPartition int16 = 3
 	kafkaErrorLeaderNotAvailable    int16 = 5
 	kafkaErrorNotLeader             int16 = 6

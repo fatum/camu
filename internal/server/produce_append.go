@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
@@ -66,10 +65,7 @@ func isRawBatchUnavailable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errKafkaNotLeader) {
-		return true
-	}
-	return strings.Contains(err.Error(), "active segment not initialized")
+	return errors.Is(err, errKafkaNotLeader) || errors.Is(err, errKafkaSegmentNotReady)
 }
 
 // waitForReplicatedOffset blocks until the given offset has been replicated
