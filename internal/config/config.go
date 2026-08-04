@@ -92,6 +92,7 @@ func (d DisklessConfig) MaxBatchBytesValue() int64 {
 type ServerConfig struct {
 	Address               string `yaml:"address"`
 	InternalAddress       string `yaml:"internal_address"`
+	ReplicationAddress    string `yaml:"replication_address"`
 	InstanceID            string `yaml:"instance_id"`
 	AuthToken             string `yaml:"auth_token"`              // Public API bearer token (optional)
 	HeapProfileEnabled    bool   `yaml:"heap_profile_enabled"`    // Authenticated heap-profile endpoint (disabled by default)
@@ -311,9 +312,10 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Address:         ":8080",
-			InternalAddress: ":8081",
-			Mode:            ServerModeStream,
+			Address:            ":8080",
+			InternalAddress:    ":8081",
+			ReplicationAddress: ":8082",
+			Mode:               ServerModeStream,
 		},
 		Segments: SegmentsConfig{
 			MaxSize:               8388608,

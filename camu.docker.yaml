@@ -1,6 +1,7 @@
 server:
   address: ":8080"
   internal_address: ":8081"
+  replication_address: ":8082"
   kafka_port: 9092
   mode: stream
 

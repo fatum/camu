@@ -68,16 +68,16 @@ func buildTestRecordBatch(
 
 func TestReadRecordBatchHeader_HappyPath(t *testing.T) {
 	batch := buildTestRecordBatch(
-		42,    // firstOffset
-		7,     // partitionLeaderEpoch
-		0,     // attributes
-		5,     // lastOffsetDelta
-		1000,  // firstTimestamp
-		2000,  // maxTimestamp
-		99,    // producerID
-		3,     // producerEpoch
-		10,    // firstSequence
-		6,     // numRecords
+		42,   // firstOffset
+		7,    // partitionLeaderEpoch
+		0,    // attributes
+		5,    // lastOffsetDelta
+		1000, // firstTimestamp
+		2000, // maxTimestamp
+		99,   // producerID
+		3,    // producerEpoch
+		10,   // firstSequence
+		6,    // numRecords
 		[]byte("fake-records-payload"),
 	)
 

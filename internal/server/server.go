@@ -38,20 +38,22 @@ const headerForwardedBy = "X-Forwarded-By"
 
 // Server is the HTTP server for camu.
 type Server struct {
-	cfg              *config.Config
-	httpServer       *http.Server
-	internalServer   *http.Server
-	internalListener net.Listener
-	s3Client         *storage.S3Client
-	topicStore       *meta.TopicStore
-	partitionManager *PartitionManager
-	fetcher          *consumer.Fetcher
-	registry         *coordination.Registry
-	offsetStore      *storage.OffsetStore
-	aclStore         *storage.ACLStore
-	instanceID       string
-	metrics          *metrics.Registry
-	listener         net.Listener
+	cfg                 *config.Config
+	httpServer          *http.Server
+	internalServer      *http.Server
+	internalListener    net.Listener
+	replicationServer   *replication.ReplicationServer
+	replicationListener net.Listener
+	s3Client            *storage.S3Client
+	topicStore          *meta.TopicStore
+	partitionManager    *PartitionManager
+	fetcher             *consumer.Fetcher
+	registry            *coordination.Registry
+	offsetStore         *storage.OffsetStore
+	aclStore            *storage.ACLStore
+	instanceID          string
+	metrics             *metrics.Registry
+	listener            net.Listener
 
 	// Leader-based coordination.
 	leaderElection  *coordination.LeaderElection
@@ -261,7 +263,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	s.internalClient = replication.NewH2CClient(replicationTimeout)
 	s.assignmentPusher = NewAssignmentPusher(s.internalClient)
-	s.followerFetcher = replication.NewFollowerFetcher(s.internalClient, s.partitionFollower().handleLeaderDown)
+	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown, replicationTimeout)
 
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
@@ -328,6 +330,16 @@ func (s *Server) startWithListener(ln net.Listener) error {
 		return fmt.Errorf("listen internal on %s: %w", s.cfg.Server.InternalAddress, err)
 	}
 	s.internalListener = internalLn
+
+	replicationLn, err := net.Listen("tcp", s.cfg.Server.ReplicationAddress)
+	if err != nil {
+		return fmt.Errorf("listen replication on %s: %w", s.cfg.Server.ReplicationAddress, err)
+	}
+	s.replicationListener = replicationLn
+	s.replicationServer = replication.NewReplicationServer(s.handleReplicaFetchTCP, slog.Default())
+	go func() { _ = s.replicationServer.Serve(replicationLn) }()
+	slog.Info("replication_server_started", "address", replicationLn.Addr().String(), "protocol", "tcp")
+
 	instanceTTL, err := s.cfg.Coordination.InstanceTTLDuration()
 	if err != nil {
 		return fmt.Errorf("parsing coordination.instance_ttl: %w", err)
@@ -336,7 +348,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	if s.cfg.Server.KafkaPort > 0 {
 		kafkaAddr = kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort, s.cfg.Server.KafkaAdvertiseAddress)
 	}
-	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), s.InternalAddress(), kafkaAddr, instanceTTL)
+	s.registry = coordination.NewRegistry(s.s3Client, s.instanceID, s.Address(), s.InternalAddress(), s.ReplicationAddress(), kafkaAddr, instanceTTL)
 	if err := s.registry.Register(context.Background()); err != nil {
 		return fmt.Errorf("register registry: %w", err)
 	}
@@ -680,6 +692,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			httpErr = err
 		}
 	}
+	if s.replicationServer != nil {
+		if err := s.replicationServer.Close(); err != nil && httpErr == nil {
+			httpErr = err
+		}
+	}
 	if s.kafkaServer != nil {
 		if err := s.kafkaServer.Close(); err != nil && httpErr == nil {
 			httpErr = err
@@ -746,6 +763,13 @@ func (s *Server) InternalAddress() string {
 	return s.cfg.Server.InternalAddress
 }
 
+func (s *Server) ReplicationAddress() string {
+	if s.replicationListener != nil {
+		return s.replicationListener.Addr().String()
+	}
+	return s.cfg.Server.ReplicationAddress
+}
+
 func routableHTTPAddress(instanceID, rawAddr string) string {
 	host, port, err := net.SplitHostPort(rawAddr)
 	if err != nil {
@@ -789,10 +813,18 @@ func kafkaBrokerID(instanceID string) int32 {
 }
 
 func routablePeerAddress(instanceID, rawAddr string) string {
+	return routableAddress(instanceID, rawAddr, "8081")
+}
+
+func routableReplicationAddress(instanceID, rawAddr string) string {
+	return routableAddress(instanceID, rawAddr, "8082")
+}
+
+func routableAddress(instanceID, rawAddr, defaultPort string) string {
 	host, port, err := net.SplitHostPort(rawAddr)
 	if err != nil {
 		if rawAddr == "" {
-			return net.JoinHostPort(instanceID, "8081")
+			return net.JoinHostPort(instanceID, defaultPort)
 		}
 		return rawAddr
 	}
@@ -800,7 +832,7 @@ func routablePeerAddress(instanceID, rawAddr string) string {
 		host = instanceID
 	}
 	if port == "" {
-		port = "8081"
+		port = defaultPort
 	}
 	return net.JoinHostPort(host, port)
 }
@@ -1216,18 +1248,18 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
 
 	// Load epoch history from S3 (authoritative), fall back to local file,
-	// or use existing epochHistory if already set.
+	// or use existing epochHistory if S3 is unavailable.
+	ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
+	s3eh, _ := s.isrStore.ReadEpochHistory(ctx, topic, pid)
 	ps.mu.RLock()
 	eh := ps.epochHistory
 	ps.mu.RUnlock()
-	if eh == nil {
-		ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
-		eh, _ = s.isrStore.ReadEpochHistory(ctx, topic, pid)
-		if eh == nil || len(eh.Entries) == 0 {
-			eh, _ = replication.LoadEpochHistory(ehPath)
-			if eh == nil {
-				eh = &replication.EpochHistory{}
-			}
+	if s3eh != nil && len(s3eh.Entries) > 0 {
+		eh = s3eh
+	} else if eh == nil {
+		eh, _ = replication.LoadEpochHistory(ehPath)
+		if eh == nil {
+			eh = &replication.EpochHistory{}
 		}
 	}
 	hasCurrentEpoch := false
@@ -1237,6 +1269,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 			break
 		}
 	}
+	ehChanged := !hasCurrentEpoch
 	if !hasCurrentEpoch {
 		if err := eh.Ensure(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
 			slog.Error("initPartitionAsLeader: invalid epoch history", "topic", topic, "partition", pid, "error", err)
@@ -1257,7 +1290,7 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	ps.nextOffset = logEnd
 	ps.epochHistory = eh
 	ps.mu.Unlock()
-	if eh != prevEpochHistory {
+	if ehChanged || eh != prevEpochHistory {
 		if err := eh.SaveToFile(s.partitionManager.EpochHistoryPath(topic, pid)); err != nil {
 			slog.Warn("initPartitionAsLeader: save epoch history locally", "topic", topic, "partition", pid, "error", err)
 		}
@@ -1426,20 +1459,15 @@ func (s *Server) initPartitionAsFollower(ctx context.Context, topic string, pid 
 		"index_hw", indexHW,
 	)
 
-	// Resolve leader address. Use the internal address (h2c) for replication
-	// traffic. The registry stores the listener bind address (e.g. "[::]:8081")
-	// which is useless for inter-node comms — extract port and combine with
-	// the leader's instanceID (hostname).
+	// Resolve leader replication address. The registry stores the listener
+	// bind address (e.g. "[::]:8082") which is useless for inter-node comms —
+	// extract port and combine with the leader's instanceID (hostname).
 	leaderInfo, err := s.registry.GetInstanceInfo(ctx, pa.Leader)
 	if err != nil {
 		slog.Warn("initPartitionAsFollower: resolve leader", "leader", pa.Leader, "error", err)
 		return
 	}
-	addr := leaderInfo.InternalAddress
-	if addr == "" {
-		addr = leaderInfo.Address // fallback for rolling upgrades
-	}
-	leaderAddr := routablePeerAddress(pa.Leader, addr)
+	leaderAddr := routableReplicationAddress(pa.Leader, leaderInfo.ReplicationAddress)
 
 	// Cancel existing fetch loop and wait for it to finish.
 	if existingCancel != nil {

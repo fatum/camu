@@ -1,6 +1,7 @@
 server:
   address: ":8080"
   internal_address: ":8081"
+  replication_address: ":8082"
   instance_id: ""
   # "stream" is the default; use "query" with camu.query.yaml.example for
   # read-only SQL nodes. Query nodes do not need internal_address or kafka_port.

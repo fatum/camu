@@ -65,10 +65,21 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 		recoveredHW = indexNext
 	}
 
-	// 6. Build epoch history from the push.
+	// 6. Build epoch history. Load from S3 (authoritative) first, then merge
+	// the controller-provided history. The controller's PartitionMeta may be
+	// stale when rebalanceLeaders changed leaders without calling ElectLeader.
 	eh := &replication.EpochHistory{}
+	s3eh, err := s.isrStore.ReadEpochHistory(ctx, topic, pid)
+	if err != nil {
+		return fmt.Errorf("read epoch history from S3: %w", err)
+	}
+	if s3eh != nil {
+		for _, entry := range s3eh.Entries {
+			eh.Append(entry)
+		}
+	}
 	for _, entry := range req.EpochHistory {
-		eh.Append(replication.EpochEntry{Epoch: entry.Epoch, StartOffset: entry.StartOffset})
+		_ = eh.Ensure(replication.EpochEntry{Epoch: entry.Epoch, StartOffset: entry.StartOffset})
 	}
 	// Controller history usually already records this epoch. Do not create a
 	// duplicate boundary when it does.

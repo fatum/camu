@@ -3,8 +3,8 @@ package replication
 import (
 	"bytes"
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,12 +22,20 @@ type mockPartitionManager struct {
 	flushedOffsets []uint64
 }
 
-func (m *mockPartitionManager) AppendReplicatedRawBatch(_ context.Context, _ string, _ int, batch []byte) error {
+func (m *mockPartitionManager) AppendReplicatedBatchStream(_ string, _ int, hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := make([]byte, len(batch))
-	copy(cp, batch)
-	m.appendedRaw = append(m.appendedRaw, cp)
+	// Reconstruct the full batch for test verification.
+	batch := make([]byte, len(headerBytes), len(headerBytes)+int(bodySize))
+	copy(batch, headerBytes)
+	if bodySize > 0 {
+		rest := make([]byte, bodySize)
+		if _, err := io.ReadFull(body, rest); err != nil {
+			return err
+		}
+		batch = append(batch, rest...)
+	}
+	m.appendedRaw = append(m.appendedRaw, batch)
 	return nil
 }
 
@@ -67,23 +75,58 @@ func (m *mockPartitionManager) progress() ([]uint64, []uint64) {
 	return m.highWatermarks, m.flushedOffsets
 }
 
-func TestReadReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
+// startReplicationTestServer starts a TCP server that speaks the replication
+// wire protocol. The handler is called for each request; the response it
+// returns is written back to the follower. The server blocks on reading the
+// next request after each response, so tests can control the flow by choosing
+// when to respond.
+func startReplicationTestServer(t *testing.T, handler func(req *ReplicaFetchRequest) *ReplicaFetchResponse) (addr string, cleanup func()) {
+	t.Helper()
+	srv := NewReplicationServer(func(_ context.Context, req *ReplicaFetchRequest) (*ReplicaFetchResult, error) {
+		resp := handler(req)
+		result := &ReplicaFetchResult{Resp: resp}
+		if len(resp.BatchData) > 0 {
+			result.BatchReader = bytes.NewReader(resp.BatchData)
+			result.BatchLen = int32(len(resp.BatchData))
+			resp.BatchData = nil
+		}
+		return result, nil
+	}, nil)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go srv.Serve(ln)
+	return ln.Addr().String(), func() {
+		ln.Close()
+	}
+}
+
+func TestStreamReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
 	first := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("first")}})
 	second := log.EncodeRecordBatch(1, []log.Message{{Offset: 1, Value: []byte("second")}})
+	concatenated := append(first, second...)
 
 	var got [][]byte
-	err := readReplicaBatches(bytes.NewReader(append(first, second...)), 0, func(batch []byte, header log.RecordBatchHeader) error {
-		if len(got) == 0 && header.FirstOffset != 0 {
-			t.Fatalf("first callback offset = %d, want 0", header.FirstOffset)
+	err := streamReplicaBatches(bytes.NewReader(concatenated), int32(len(concatenated)), 0, func(hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
+		if len(got) == 0 && hdr.FirstOffset != 0 {
+			t.Fatalf("first callback offset = %d, want 0", hdr.FirstOffset)
 		}
-		if len(got) == 1 && header.FirstOffset != 1 {
-			t.Fatalf("second callback offset = %d, want 1", header.FirstOffset)
+		if len(got) == 1 && hdr.FirstOffset != 1 {
+			t.Fatalf("second callback offset = %d, want 1", hdr.FirstOffset)
 		}
-		got = append(got, append([]byte(nil), batch...))
+		batch := make([]byte, len(headerBytes), len(headerBytes)+int(bodySize))
+		copy(batch, headerBytes)
+		if bodySize > 0 {
+			rest := make([]byte, bodySize)
+			io.ReadFull(body, rest)
+			batch = append(batch, rest...)
+		}
+		got = append(got, batch)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("readReplicaBatches() error = %v", err)
+		t.Fatalf("streamReplicaBatches() error = %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("callback count = %d, want 2", len(got))
@@ -93,15 +136,16 @@ func TestReadReplicaBatchesStreamsOneBatchAtATime(t *testing.T) {
 	}
 }
 
-func TestReadReplicaBatchesRejectsTruncatedBatch(t *testing.T) {
+func TestStreamReplicaBatchesRejectsTruncatedBatch(t *testing.T) {
 	batch := log.EncodeRecordBatch(0, []log.Message{{Offset: 0, Value: []byte("value")}})
+	truncated := batch[:len(batch)-1]
 	called := false
-	err := readReplicaBatches(bytes.NewReader(batch[:len(batch)-1]), 0, func([]byte, log.RecordBatchHeader) error {
+	err := streamReplicaBatches(bytes.NewReader(truncated), int32(len(truncated)), 0, func(hdr log.RecordBatchHeader, headerBytes []byte, body io.Reader, bodySize int64) error {
 		called = true
 		return nil
 	})
 	if err == nil {
-		t.Fatal("readReplicaBatches() error = nil, want truncated-body error")
+		t.Fatal("streamReplicaBatches() error = nil, want truncated-body error")
 	}
 	if called {
 		t.Fatal("callback was called for a truncated batch")
@@ -114,47 +158,51 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 		{Offset: 1, Value: []byte("world")},
 	})
 
-	// served is used to ensure we only send messages once; subsequent requests
-	// block until the context is cancelled so the loop stays alive long enough
-	// for the test to observe the first batch.
 	served := false
 	var servedMu sync.Mutex
 	doneCh := make(chan struct{})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
 		servedMu.Lock()
 		first := !served
 		served = true
 		servedMu.Unlock()
 
 		if first {
-			w.Header().Set("X-High-Watermark", "2")
-			w.Header().Set("X-Leader-Epoch", "1")
-			w.Header().Set("X-Flushed-Offset", "0")
-			w.WriteHeader(http.StatusOK)
-			w.Write(body)
-			return
+			return &ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     ReplicaErrOK,
+				HighWatermark: 2,
+				LeaderEpoch:   1,
+				FlushedOffset: 0,
+				BatchData:     body,
+			}
 		}
-		// Subsequent calls: signal done and block until client disconnects.
 		select {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
+		// Block by sleeping; the test will cancel the context.
+		time.Sleep(10 * time.Second)
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrOK,
+			HighWatermark: 2,
+			LeaderEpoch:   1,
+		}
+	})
+	defer cleanup()
 
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 
 	go func() {
-		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm)
+		fetcher.Run(ctx, "test-topic", 0, addr, 0, 1, "test-node", pm)
 	}()
 
-	// Wait until the second request signals us (meaning the first was processed).
 	select {
 	case <-doneCh:
 	case <-ctx.Done():
@@ -184,13 +232,16 @@ func TestFollowerFetcher_Basic(t *testing.T) {
 
 func TestFollowerFetcher_CaughtUpDoesNotBusyLoop(t *testing.T) {
 	var requests atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
 		requests.Add(1)
-		w.Header().Set("X-High-Watermark", "0")
-		w.Header().Set("X-Leader-Epoch", "1")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrOK,
+			HighWatermark: 0,
+			LeaderEpoch:   1,
+		}
+	})
+	defer cleanup()
 
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -199,8 +250,8 @@ func TestFollowerFetcher_CaughtUpDoesNotBusyLoop(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		NewFollowerFetcher(&http.Client{Timeout: time.Second}, nil).Run(
-			ctx, "test-topic", 0, srv.Listener.Addr().String(), 0, 1, "test-node", pm,
+		NewFollowerFetcher(nil, 10*time.Second).Run(
+			ctx, "test-topic", 0, addr, 0, 1, "test-node", pm,
 		)
 	}()
 	<-done
@@ -215,36 +266,43 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 	var servedMu sync.Mutex
 	doneCh := make(chan struct{})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
 		servedMu.Lock()
 		first := !served
 		served = true
 		servedMu.Unlock()
 
 		if first {
-			// Signal divergence: ask follower to truncate to offset 5.
-			w.Header().Set("X-Truncate-To", "5")
-			w.Header().Set("X-High-Watermark", "10")
-			w.Header().Set("X-Leader-Epoch", "2")
-			w.WriteHeader(http.StatusOK)
-			return
+			return &ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     ReplicaErrTruncate,
+				TruncateTo:    5,
+				LeaderEpoch:   2,
+				HighWatermark: 10,
+			}
 		}
 		select {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
+		time.Sleep(10 * time.Second)
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrOK,
+			HighWatermark: 10,
+			LeaderEpoch:   2,
+		}
+	})
+	defer cleanup()
 
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 
 	go func() {
-		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 10, 1, "test-node", pm)
+		fetcher.Run(ctx, "test-topic", 0, addr, 10, 1, "test-node", pm)
 	}()
 
 	select {
@@ -268,47 +326,52 @@ func TestFollowerFetcher_Truncation(t *testing.T) {
 }
 
 func TestFollowerFetcher_TruncationAdoptsEpochAtBoundary(t *testing.T) {
-	requestEpochs := make(chan string, 2)
-	requestOffsets := make(chan string, 2)
+	requestEpochs := make(chan uint64, 2)
+	requestOffsets := make(chan uint64, 2)
 	doneCh := make(chan struct{})
 	var requests int
 	var mu sync.Mutex
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
 		mu.Lock()
 		requests++
 		reqNum := requests
 		mu.Unlock()
 
-		requestEpochs <- r.Header.Get("X-Replica-Epoch")
-		requestOffsets <- r.Header.Get("X-Replica-Offset")
+		requestEpochs <- req.ReplicaEpoch
+		requestOffsets <- req.ReplicaOffset
 
 		if reqNum == 1 {
-			w.Header().Set("X-Truncate-To", "10")
-			w.Header().Set("X-High-Watermark", "10")
-			w.Header().Set("X-Leader-Epoch", "2")
-			w.WriteHeader(http.StatusOK)
-			return
+			return &ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     ReplicaErrTruncate,
+				TruncateTo:    10,
+				LeaderEpoch:   2,
+				HighWatermark: 10,
+			}
 		}
 
 		select {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		w.Header().Set("X-High-Watermark", "10")
-		w.Header().Set("X-Leader-Epoch", "2")
-		w.WriteHeader(http.StatusOK)
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
+		time.Sleep(10 * time.Second)
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrOK,
+			HighWatermark: 10,
+			LeaderEpoch:   2,
+		}
+	})
+	defer cleanup()
 
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 	go func() {
-		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 20, 1, "test-node", pm)
+		fetcher.Run(ctx, "test-topic", 0, addr, 20, 1, "test-node", pm)
 	}()
 
 	select {
@@ -327,46 +390,51 @@ func TestFollowerFetcher_TruncationAdoptsEpochAtBoundary(t *testing.T) {
 	firstOffset := <-requestOffsets
 	secondEpoch := <-requestEpochs
 	secondOffset := <-requestOffsets
-	if firstEpoch != "1" || firstOffset != "20" {
-		t.Fatalf("first request headers = epoch %q offset %q, want 1/20", firstEpoch, firstOffset)
+	if firstEpoch != 1 || firstOffset != 20 {
+		t.Fatalf("first request = epoch %d offset %d, want 1/20", firstEpoch, firstOffset)
 	}
-	if secondEpoch != "2" || secondOffset != "10" {
-		t.Fatalf("second request headers = epoch %q offset %q, want 2/10", secondEpoch, secondOffset)
+	if secondEpoch != 2 || secondOffset != 10 {
+		t.Fatalf("second request = epoch %d offset %d, want 2/10", secondEpoch, secondOffset)
 	}
 }
 
 func TestFollowerFetcher_TruncationCanLowerEpoch(t *testing.T) {
-	requestEpochs := make(chan string, 2)
+	requestEpochs := make(chan uint64, 2)
 	doneCh := make(chan struct{})
 	var requests int
 	var mu sync.Mutex
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
 		mu.Lock()
 		requests++
 		reqNum := requests
 		mu.Unlock()
-		requestEpochs <- r.Header.Get("X-Replica-Epoch")
+		requestEpochs <- req.ReplicaEpoch
 		if reqNum == 1 {
-			w.Header().Set("X-Truncate-To", "0")
-			w.Header().Set("X-Leader-Epoch", "2")
-			w.WriteHeader(http.StatusOK)
-			return
+			return &ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     ReplicaErrTruncate,
+				TruncateTo:    0,
+				LeaderEpoch:   2,
+			}
 		}
 		select {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		w.Header().Set("X-Leader-Epoch", "2")
-		w.WriteHeader(http.StatusOK)
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
+		time.Sleep(10 * time.Second)
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrOK,
+			LeaderEpoch:   2,
+		}
+	})
+	defer cleanup()
 
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil).Run(ctx, "topic", 0, srv.Listener.Addr().String(), 4, 9, "node", pm)
+	go NewFollowerFetcher(nil, 10*time.Second).Run(ctx, "topic", 0, addr, 4, 9, "node", pm)
 
 	select {
 	case <-doneCh:
@@ -374,8 +442,8 @@ func TestFollowerFetcher_TruncationCanLowerEpoch(t *testing.T) {
 		t.Fatal("timed out waiting for second fetch")
 	}
 	cancel()
-	if first, second := <-requestEpochs, <-requestEpochs; first != "9" || second != "2" {
-		t.Fatalf("request epochs = %q, %q, want 9, 2", first, second)
+	if first, second := <-requestEpochs, <-requestEpochs; first != 9 || second != 2 {
+		t.Fatalf("request epochs = %d, %d, want 9, 2", first, second)
 	}
 }
 
@@ -389,35 +457,43 @@ func TestFollowerFetcher_AppliesRawRecordBatches(t *testing.T) {
 	var servedMu sync.Mutex
 	doneCh := make(chan struct{})
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
 		servedMu.Lock()
 		first := !served
 		served = true
 		servedMu.Unlock()
 
 		if first {
-			w.Header().Set("X-High-Watermark", "12")
-			w.Header().Set("X-Leader-Epoch", "1")
-			w.Header().Set("X-Flushed-Offset", "0")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(raw)
-			return
+			return &ReplicaFetchResponse{
+				CorrelationID: req.CorrelationID,
+				ErrorCode:     ReplicaErrOK,
+				HighWatermark: 12,
+				LeaderEpoch:   1,
+				FlushedOffset: 0,
+				BatchData:     raw,
+			}
 		}
 		select {
 		case doneCh <- struct{}{}:
 		default:
 		}
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
+		time.Sleep(10 * time.Second)
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrOK,
+			HighWatermark: 12,
+			LeaderEpoch:   1,
+		}
+	})
+	defer cleanup()
 
 	pm := &mockPartitionManager{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fetcher := NewFollowerFetcher(&http.Client{Timeout: 10 * time.Second}, nil)
+	fetcher := NewFollowerFetcher(nil, 10*time.Second)
 	go func() {
-		fetcher.Run(ctx, "test-topic", 0, srv.Listener.Addr().String(), 10, 1, "test-node", pm)
+		fetcher.Run(ctx, "test-topic", 0, addr, 10, 1, "test-node", pm)
 	}()
 
 	select {
@@ -433,5 +509,33 @@ func TestFollowerFetcher_AppliesRawRecordBatches(t *testing.T) {
 	}
 	if !bytes.Equal(appended[0], raw) {
 		t.Fatal("raw batch bytes changed during follower fetch/apply")
+	}
+}
+
+func TestFollowerFetcher_PartitionNotReadyRetries(t *testing.T) {
+	var requests atomic.Int64
+	addr, cleanup := startReplicationTestServer(t, func(req *ReplicaFetchRequest) *ReplicaFetchResponse {
+		requests.Add(1)
+		return &ReplicaFetchResponse{
+			CorrelationID: req.CorrelationID,
+			ErrorCode:     ReplicaErrNotFound,
+		}
+	})
+	defer cleanup()
+
+	pm := &mockPartitionManager{}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NewFollowerFetcher(nil, 10*time.Second).Run(ctx, "topic", 0, addr, 0, 1, "node", pm)
+	}()
+	<-done
+
+	// Should retry without declaring leader down.
+	if got := requests.Load(); got < 2 {
+		t.Fatalf("expected multiple retries on not-ready, got %d", got)
 	}
 }

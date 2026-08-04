@@ -67,19 +67,23 @@ func produceKafka(ctx context.Context, cfg config, count int64, expected []hashS
 				for first := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
 					records := make([]*kgo.Record, 0, cfg.BatchMessages)
 					for sequence := first; sequence < cfg.SequenceStart+count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
-						value := typedValue{ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
-						key := strconv.FormatInt(sequence, 10)
+						value := typedValue{RunID: cfg.RunID, ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
+						key := cfg.RunID + ":" + strconv.FormatInt(sequence, 10)
 						valueBytes := mustJSON(value)
 						records = append(records, &kgo.Record{Topic: cfg.Topic, Partition: int32(partition), Key: []byte(key), Value: valueBytes})
 						expected[partition].add(value)
 						atomic.AddInt64(&serialized, int64(len(key)+len(valueBytes)))
 					}
-					results := client.ProduceSync(ctx, records...)
-					for _, result := range results {
-						if result.Err != nil {
-							errs <- fmt.Errorf("produce partition %d: %w", partition, result.Err)
-							return
+					if err := retryProduce(ctx, fmt.Sprintf("produce Kafka partition %d sequence %d", partition, first), func() error {
+						for _, result := range client.ProduceSync(ctx, records...) {
+							if result.Err != nil {
+								return result.Err
+							}
 						}
+						return nil
+					}); err != nil {
+						errs <- err
+						return
 					}
 					atomic.AddInt64(&total, int64(len(records)))
 					progress(int64(len(records)))
@@ -126,6 +130,7 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 	var bytesRead int64
 	partitionRecords := make([]int64, cfg.Partitions)
 	partitionExpected := make([]int64, cfg.Partitions)
+	validators := make([]runSequenceValidator, cfg.Partitions)
 	for partition := range partitionExpected {
 		partitionExpected[partition] = expected[partition].recordsSnapshot()
 	}
@@ -151,11 +156,17 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 				return
 			}
 			if partitionRecords[partition] >= partitionExpected[partition] {
-				err = fmt.Errorf("consume Kafka: partition %d received record at offset %d after expected end offset %d", partition, record.Offset, partitionExpected[partition])
+				// The end offsets are snapshotted before consumption. A live topic
+				// may append more records while a fetch is in flight; those records
+				// are outside this verification run.
 				return
 			}
 			if validationErr := validateKafkaRecord(cfg, partition, partitionRecords[partition], record.Offset, value); validationErr != nil {
 				err = validationErr
+				return
+			}
+			if validationErr := validators[partition].validate(cfg, partition, value); validationErr != nil {
+				err = fmt.Errorf("consume Kafka: %w", validationErr)
 				return
 			}
 			actual[partition].add(value)
@@ -197,16 +208,12 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 	}, nil
 }
 
-// validateKafkaRecord verifies the benchmark's deterministic mapping before
-// hashing the record. The offset check catches duplicate or skipped Kafka
-// records; the sequence check catches a gap or reordering in the payload.
+// validateKafkaRecord verifies the persisted Kafka offset. Payload sequence
+// validation is performed separately per benchmark run so concurrent producer
+// runs may interleave in a partition.
 func validateKafkaRecord(cfg config, partition int, expectedOffset, offset int64, value typedValue) error {
 	if offset != expectedOffset {
 		return fmt.Errorf("consume Kafka: partition %d offset gap or reordering: got %d, want %d", partition, offset, expectedOffset)
-	}
-	expectedSequence := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions) + expectedOffset*int64(cfg.Partitions)
-	if value.Sequence != expectedSequence {
-		return fmt.Errorf("consume Kafka: partition %d sequence gap or reordering at offset %d: got %d, want %d", partition, offset, value.Sequence, expectedSequence)
 	}
 	return nil
 }

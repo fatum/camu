@@ -94,8 +94,9 @@ report to `/tmp/camu-digitalocean-benchmark.json` unless `OUTPUT` is set. A
 topic is retained by default; set `CLEANUP=1` only when the final operation may
 delete it. Each invocation without `TOPIC` creates a unique topic, which is
 appropriate for a standalone `produce` run but not a later consume or SQL run.
-Repeated `produce` runs with the same `TOPIC` append to that topic; the
-benchmark resumes sequence and key numbering from its committed offsets.
+Repeated `produce` runs with the same `TOPIC` append to that topic. Each run
+uses a unique run ID and validates its own per-partition sequence, so producers
+may run concurrently without sharing an offset-derived sequence range.
 `TARGET_BYTES`, `MESSAGE_BYTES`, and `PARTITIONS` can override the workload.
 The default is four partitions. Byte values accept a positive byte count or a
 binary unit such as `1GiB`, `512MiB`, or `64KiB`.

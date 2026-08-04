@@ -52,6 +52,7 @@ write_config() {
 server:
   address: "127.0.0.1:${CAMU_HTTP_PORT}"
   internal_address: "127.0.0.1:8081"
+  replication_address: "127.0.0.1:8082"
   instance_id: ""
   kafka_port: ${CAMU_KAFKA_PORT}
 storage:

@@ -28,7 +28,7 @@ func newTestServerForReportFailure(t *testing.T) (*Server, *storage.S3Client) {
 	s := &Server{
 		instanceID:     instanceID,
 		leaderElection: coordination.NewLeaderElection(s3Client, instanceID, 30*time.Second),
-		registry:       coordination.NewRegistry(s3Client, instanceID, "localhost:8080", "localhost:8081", "", 30*time.Second),
+		registry:       coordination.NewRegistry(s3Client, instanceID, "localhost:8080", "localhost:8081", "", "", 30*time.Second),
 		internalClient: &http.Client{Timeout: 5 * time.Second},
 		partitionManager: &PartitionManager{
 			partitions: make(map[string]map[int]*partitionState),
@@ -51,7 +51,7 @@ func acquireLeaseAs(t *testing.T, s3Client *storage.S3Client, leaderID string) {
 // internalAddress into the shared S3 store.
 func registerInstance(t *testing.T, s3Client *storage.S3Client, instanceID, internalAddr string) {
 	t.Helper()
-	reg := coordination.NewRegistry(s3Client, instanceID, "localhost:8080", internalAddr, "", 30*time.Second)
+	reg := coordination.NewRegistry(s3Client, instanceID, "localhost:8080", internalAddr, "", "", 30*time.Second)
 	if err := reg.Register(context.Background()); err != nil {
 		t.Fatalf("registerInstance %s: %v", instanceID, err)
 	}

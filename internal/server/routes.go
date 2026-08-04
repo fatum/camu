@@ -93,7 +93,6 @@ func (s *Server) internalRoutes() http.Handler {
 	if s.isQueryMode() {
 		return s.withMiddleware(mux)
 	}
-	mux.HandleFunc("GET /v1/internal/replicate/{topic}/{pid}", s.handleReplicaFetch)
 	// Produce endpoints are registered here so proxied requests from
 	// non-leader nodes can be handled by the leader's internal server.
 	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)

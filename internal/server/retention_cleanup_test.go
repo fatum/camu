@@ -26,7 +26,7 @@ func cloneTestServerForInstance(t *testing.T, src *Server, instanceID string) *S
 	if err != nil {
 		t.Fatalf("NewWithS3Client() error = %v", err)
 	}
-	s.registry = coordination.NewRegistry(src.s3Client, instanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", time.Minute)
+	s.registry = coordination.NewRegistry(src.s3Client, instanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", "", time.Minute)
 	return s
 }
 
