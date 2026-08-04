@@ -610,12 +610,12 @@ func (pm *PartitionManager) AppendBatch(ctx context.Context, topic string, parti
 	topicPartitions, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("topic %q not initialized", topic)
+		return nil, fmt.Errorf("%w: topic %q not initialized", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := topicPartitions[partitionID]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+		return nil, fmt.Errorf("%w: partition %d not found for topic %q", errKafkaUnknownTopicPartition, partitionID, topic)
 	}
 	pm.mu.RUnlock()
 
@@ -648,16 +648,26 @@ func (pm *PartitionManager) AppendBatchWithMeta(ctx context.Context, topic strin
 	topicPartitions, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("topic %q not initialized", topic)
+		return nil, fmt.Errorf("%w: topic %q not initialized", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := topicPartitions[partitionID]
 	if !ok {
 		pm.mu.RUnlock()
-		return nil, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+		return nil, fmt.Errorf("%w: partition %d not found for topic %q", errKafkaUnknownTopicPartition, partitionID, topic)
 	}
 	pm.mu.RUnlock()
 
-	return pm.appendBatchWithMetaToPS(ps, topic, partitionID, batch, idem)
+	offsets, err := pm.appendBatchWithMetaToPS(ps, topic, partitionID, batch, idem)
+	if errors.Is(err, idempotency.ErrDuplicateSequence) {
+		if prior, ok := pm.duplicateBaseOffset(ps, batch.ProducerID, int64(len(batch.Messages))); ok {
+			offsets = make([]uint64, len(batch.Messages))
+			for i := range offsets {
+				offsets[i] = uint64(prior) + uint64(i)
+			}
+			return offsets, nil
+		}
+	}
+	return offsets, err
 }
 
 // appendBatchWithMetaToPS is the inner implementation of AppendBatchWithMeta
@@ -695,6 +705,23 @@ func (pm *PartitionManager) appendNativeBatchToPS(ps *partitionState, topic stri
 	return offsets, nil
 }
 
+// duplicateBaseOffset returns the base offset of an already-appended idempotent
+// batch so that a retried duplicate can be confirmed with success instead of an
+// error, matching Kafka's idempotent produce semantics.
+func (pm *PartitionManager) duplicateBaseOffset(ps *partitionState, producerID uint64, numRecords int64) (int64, bool) {
+	ps.mu.RLock()
+	last, ok := ps.getLastOffset(producerID)
+	ps.mu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	prior := int64(last) - numRecords + 1
+	if prior < 0 {
+		return 0, false
+	}
+	return prior, true
+}
+
 // AppendRawBatch writes a raw Kafka v2 RecordBatch to the active segment,
 // patching offsets and leader epoch in place. This is the zero-copy produce
 // path — no record-level decoding or re-serialization.
@@ -703,22 +730,31 @@ func (pm *PartitionManager) AppendRawBatch(ctx context.Context, topic string, pa
 	topicPartitions, ok := pm.partitions[topic]
 	if !ok {
 		pm.mu.RUnlock()
-		return 0, fmt.Errorf("topic %q not initialized", topic)
+		return 0, fmt.Errorf("%w: topic %q not initialized", errKafkaUnknownTopicPartition, topic)
 	}
 	ps, ok := topicPartitions[partitionID]
 	if !ok {
 		pm.mu.RUnlock()
-		return 0, fmt.Errorf("partition %d not found for topic %q", partitionID, topic)
+		return 0, fmt.Errorf("%w: partition %d not found for topic %q", errKafkaUnknownTopicPartition, partitionID, topic)
 	}
 	pm.mu.RUnlock()
 
-	return pm.appendRawBatchToPS(ps, topic, partitionID, batch, nil, true)
+	baseOffset, err := pm.appendRawBatchToPS(ps, topic, partitionID, batch, nil, true)
+	if errors.Is(err, idempotency.ErrDuplicateSequence) {
+		if h, hErr := log.ReadRecordBatchHeader(batch); hErr == nil {
+			numRecords := int64(h.LastOffsetDelta) + 1
+			if prior, ok := pm.duplicateBaseOffset(ps, uint64(h.ProducerID), numRecords); ok {
+				return prior, nil
+			}
+		}
+	}
+	return baseOffset, err
 }
 
 func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string, partitionID int, batch []byte, idem *IdempotencyOpts, enforceLeader bool) (int64, error) {
 	h, err := log.ReadRecordBatchHeader(batch)
 	if err != nil {
-		return 0, fmt.Errorf("read record batch header: %w", err)
+		return 0, fmt.Errorf("%w: %v", errKafkaInvalidRecordBatch, err)
 	}
 
 	numRecords := int64(h.LastOffsetDelta) + 1
@@ -732,7 +768,7 @@ func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string,
 
 	if ps.activeSegment == nil {
 		ps.mu.Unlock()
-		return 0, fmt.Errorf("active segment not initialized for %s/%d", topic, partitionID)
+		return 0, fmt.Errorf("%w: active segment not initialized for %s/%d", errKafkaSegmentNotReady, topic, partitionID)
 	}
 
 	// Idempotency check BEFORE append.
@@ -754,14 +790,14 @@ func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string,
 			ps.rollbackSeq(uint64(h.ProducerID), uint64(h.FirstSequence))
 		}
 		ps.mu.Unlock()
-		return 0, fmt.Errorf("patch first offset: %w", err)
+		return 0, fmt.Errorf("%w: %v", errKafkaInvalidRecordBatch, err)
 	}
 	if err := log.PatchRecordBatchLeaderEpoch(batch, int32(ps.epoch)); err != nil {
 		if h.ProducerID >= 0 {
 			ps.rollbackSeq(uint64(h.ProducerID), uint64(h.FirstSequence))
 		}
 		ps.mu.Unlock()
-		return 0, fmt.Errorf("patch leader epoch: %w", err)
+		return 0, fmt.Errorf("%w: %v", errKafkaInvalidRecordBatch, err)
 	}
 
 	// Write to active segment.

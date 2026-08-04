@@ -478,6 +478,70 @@ func TestAppendRawBatch_NilActiveSegmentReturnsError(t *testing.T) {
 	}
 }
 
+func TestAppendRawBatch_DuplicateSequenceReturnsPriorOffset(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	msgs := []log.Message{
+		{Key: []byte("k1"), Value: []byte("v1"), Timestamp: now},
+		{Key: []byte("k2"), Value: []byte("v2"), Timestamp: now + 1},
+	}
+	// Idempotent batch: producer 42, sequence 0.
+	rawBatch := log.EncodeRecordBatchWithMeta(0, log.Batch{
+		ProducerID: 42,
+		Sequence:   0,
+		Messages:   msgs,
+	})
+
+	baseOffset, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch)
+	if err != nil {
+		t.Fatalf("AppendRawBatch() first error = %v", err)
+	}
+	if baseOffset != 0 {
+		t.Fatalf("first baseOffset = %d, want 0", baseOffset)
+	}
+
+	// Retry the identical batch with the same producer/sequence.
+	baseOffset2, err := pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch)
+	if err != nil {
+		t.Fatalf("AppendRawBatch() duplicate error = %v, want success with prior offset", err)
+	}
+	if baseOffset2 != 0 {
+		t.Fatalf("duplicate baseOffset = %d, want prior offset 0", baseOffset2)
+	}
+
+	// The duplicate must not have advanced the log.
+	ps.mu.RLock()
+	nextOff := ps.nextOffset
+	ps.mu.RUnlock()
+	if nextOff != 2 {
+		t.Fatalf("nextOffset after duplicate = %d, want 2", nextOff)
+	}
+}
+
 func TestReadRawBatches_ActiveSegment(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
 

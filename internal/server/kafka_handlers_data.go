@@ -42,7 +42,7 @@ func (ks *KafkaServer) handleProduce(req *kmsg.ProduceRequest) (kmsg.Response, e
 							partResp.BaseOffset = firstOffset
 						}
 					} else if err != nil {
-						errorCode = kafkaErrorUnknownServer
+						errorCode = kafkaErrorCorruptMessage
 					}
 				} else if ks.cfg.AppendBatchFunc != nil {
 					batches, err := decodeKafkaProduceBatches(partition.Records)

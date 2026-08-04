@@ -8,6 +8,7 @@ import (
 
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/producer"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -76,10 +77,16 @@ func mapKafkaError(err error) int16 {
 		return kafkaErrorNotLeader
 	case errors.Is(err, errKafkaInvalidRequest):
 		return kafkaErrorInvalidRequest
-	case errors.Is(err, idempotency.ErrSequenceGap):
-		return kafkaErrorOutOfOrderSequence
+	case errors.Is(err, errKafkaSegmentNotReady):
+		return kafkaErrorLeaderNotAvailable
+	case errors.Is(err, errKafkaInvalidRecordBatch):
+		return kafkaErrorCorruptMessage
+	case errors.Is(err, producer.ErrBackpressure):
+		return kafkaErrorLeaderNotAvailable
 	case errors.Is(err, idempotency.ErrUnknownProducer):
 		return kafkaErrorUnknownProducerID
+	case errors.Is(err, idempotency.ErrSequenceGap):
+		return kafkaErrorOutOfOrderSequence
 	default:
 		return kafkaErrorUnknownServer
 	}
