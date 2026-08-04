@@ -1226,7 +1226,7 @@ func (pm *PartitionManager) UpdateFollowerProgress(topic string, partitionID int
 
 	ps.mu.Lock()
 	epochChanged := false
-	if leaderEpoch > ps.epoch {
+	if leaderEpoch != ps.epoch {
 		ps.epoch = leaderEpoch
 		epochChanged = true
 	}

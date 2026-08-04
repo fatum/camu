@@ -69,7 +69,10 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	// the controller-provided history. The controller's PartitionMeta may be
 	// stale when rebalanceLeaders changed leaders without calling ElectLeader.
 	eh := &replication.EpochHistory{}
-	s3eh, _ := s.isrStore.ReadEpochHistory(ctx, topic, pid)
+	s3eh, err := s.isrStore.ReadEpochHistory(ctx, topic, pid)
+	if err != nil {
+		return fmt.Errorf("read epoch history from S3: %w", err)
+	}
 	if s3eh != nil {
 		for _, entry := range s3eh.Entries {
 			eh.Append(entry)
