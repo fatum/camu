@@ -232,6 +232,13 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parsing coordination.replication_timeout: %w", err)
 	}
+	replicationReadTimeout, err := cfg.Coordination.ReplicationReadTimeoutDuration()
+	if err != nil {
+		return nil, fmt.Errorf("parsing coordination.replication_read_timeout: %w", err)
+	}
+	if replicationReadTimeout <= 0 {
+		return nil, fmt.Errorf("coordination.replication_read_timeout must be > 0")
+	}
 	fenceInterval, err := cfg.Coordination.FenceIntervalDuration()
 	if err != nil {
 		return nil, fmt.Errorf("parsing coordination.fence_interval: %w", err)
@@ -281,7 +288,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 
 	s.internalClient = replication.NewH2CClient(replicationTimeout)
 	s.assignmentPusher = NewAssignmentPusher(s.internalClient)
-	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown, replicationTimeout)
+	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown, replicationReadTimeout)
 
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
