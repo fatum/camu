@@ -11,7 +11,6 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"golang.org/x/sync/errgroup"
 )
 
 // DynamoMetaStoreConfig configures a DynamoDB-backed MetaStore.
@@ -63,50 +62,72 @@ func NewDynamoMetaStore(ctx context.Context, cfg DynamoMetaStoreConfig) (*Dynamo
 // pre-increment value (base offset) is returned atomically. Concurrent calls
 // from different nodes are safe — DynamoDB ADD is commutative and UPDATED_OLD
 // returns the value before this specific increment.
+//
+// Allocations are performed sequentially with a bounded per-entry retry so a
+// transient DynamoDB failure on one partition does not fail the whole batch
+// and strand the offsets already advanced for the other partitions.
 func (d *DynamoMetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error) {
 	if len(allocs) == 0 {
 		return nil, nil
 	}
 
 	results := make([]OffsetResult, len(allocs))
-	g, gctx := errgroup.WithContext(ctx)
-
 	for i, alloc := range allocs {
-		g.Go(func() error {
-			pk := partitionKey(alloc.Topic, alloc.Partition)
-			out, err := d.client.UpdateItem(gctx, &dynamodb.UpdateItemInput{
-				TableName: &d.offsetsTable,
-				Key: map[string]ddbtypes.AttributeValue{
-					"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
-				},
-				UpdateExpression: aws.String("ADD next_offset :count"),
-				ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-					":count": &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(alloc.Count)},
-				},
-				ReturnValues: ddbtypes.ReturnValueUpdatedOld,
-			})
-			if err != nil {
-				return fmt.Errorf("update offsets for %s: %w", pk, err)
-			}
+		base, err := d.allocateOne(ctx, alloc)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = OffsetResult{BaseOffset: base}
+	}
+	return results, nil
+}
 
-			var base int64
+// maxAllocateAttempts bounds retries of a single partition offset allocation.
+const maxAllocateAttempts = 3
+
+func (d *DynamoMetaStore) allocateOne(ctx context.Context, alloc OffsetAllocation) (int64, error) {
+	var base int64
+	pk := partitionKey(alloc.Topic, alloc.Partition)
+	var lastErr error
+	for attempt := 0; attempt < maxAllocateAttempts; attempt++ {
+		out, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: &d.offsetsTable,
+			Key: map[string]ddbtypes.AttributeValue{
+				"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
+			},
+			UpdateExpression: aws.String("ADD next_offset :count"),
+			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+				":count": &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(alloc.Count)},
+			},
+			ReturnValues: ddbtypes.ReturnValueUpdatedOld,
+		})
+		if err == nil {
 			if v, ok := out.Attributes["next_offset"]; ok {
 				if nv, ok := v.(*ddbtypes.AttributeValueMemberN); ok {
 					base, err = strconv.ParseInt(nv.Value, 10, 64)
 					if err != nil {
-						return fmt.Errorf("parse next_offset for %s: %w", pk, err)
+						return 0, fmt.Errorf("parse next_offset for %s: %w", pk, err)
 					}
 				}
 			}
-			results[i] = OffsetResult{BaseOffset: base}
-			return nil
-		})
+			return base, nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("allocate offsets for %s: %w", pk, ctx.Err())
+		case <-time.After(allocateRetryBackoff(attempt)):
+		}
 	}
+	return 0, fmt.Errorf("allocate offsets for %s after %d attempts: %w", pk, maxAllocateAttempts, lastErr)
+}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+func allocateRetryBackoff(attempt int) time.Duration {
+	backoff := time.Duration(50*(1<<uint(attempt))) * time.Millisecond
+	if backoff > time.Second {
+		return time.Second
 	}
-	return results, nil
+	return backoff
 }
 
 // RegisterSegment writes segment batch references using BatchWriteItem.

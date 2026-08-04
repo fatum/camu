@@ -417,6 +417,11 @@ Important behavior:
 - a sealed segment remains available to follower replication while it is pending publication
 - `rf=1` does not survive permanent loss of its only owner before object-store persistence
 - reads are capped by readable high watermark for replicated topics
+- for `diskless` topics, offsets are allocated before the object-store write (the
+  RecordBatch base offset is patched before persistence); a transient PUT or
+  segment-registration failure is retried idempotently so it does not strand
+  allocated offsets as a permanent gap. Only a persistent failure that outlives
+  the flush retry window surfaces an error to the producer
 
 ## Where To Check Exact Support
 

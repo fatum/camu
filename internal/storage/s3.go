@@ -85,6 +85,31 @@ type S3Client struct {
 	// can be re-pointed at a new server's registry while the previous server's
 	// goroutines are still draining.
 	metrics atomic.Pointer[metrics.Registry]
+	// fault is an optional test-only injector called before every operation.
+	fault atomic.Pointer[faultInjector]
+}
+
+type faultInjector func(op string) error
+
+// SetFaultInjector installs a test-only fault injector invoked before every
+// operation. op is the operation name ("put", "get", "get_range",
+// "get_etag", "delete", "list", "conditional_put"). Returning a non-nil error
+// fails the operation. Passing nil removes the injector. It is safe for
+// concurrent use and has no effect on production paths when unset.
+func (c *S3Client) SetFaultInjector(fn func(op string) error) {
+	if fn == nil {
+		c.fault.Store(nil)
+		return
+	}
+	f := faultInjector(fn)
+	c.fault.Store(&f)
+}
+
+func (c *S3Client) checkFault(op string) error {
+	if p := c.fault.Load(); p != nil {
+		return (*p)(op)
+	}
+	return nil
 }
 
 func (c *S3Client) SetMetrics(registry *metrics.Registry) { c.metrics.Store(registry) }
@@ -129,6 +154,9 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 
 // Put stores data at key.
 func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpts) error {
+	if err := c.checkFault("put"); err != nil {
+		return err
+	}
 	started := time.Now()
 	err := c.backend.put(ctx, key, data, opts)
 	c.observe("put", started, int64(len(data)), err)
@@ -137,6 +165,9 @@ func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpt
 
 // Get retrieves data at key. Returns ErrNotFound if missing.
 func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := c.checkFault("get"); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	data, err := c.backend.get(ctx, key)
 	c.observe("get", started, int64(len(data)), err)
@@ -145,6 +176,9 @@ func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetRange retrieves a byte range from key. Returns ErrNotFound if missing.
 func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	if err := c.checkFault("get_range"); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	data, err := c.backend.getRange(ctx, key, offset, length)
 	c.observe("get_range", started, int64(len(data)), err)
@@ -153,6 +187,9 @@ func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int6
 
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
 func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	if err := c.checkFault("get_etag"); err != nil {
+		return nil, "", err
+	}
 	started := time.Now()
 	data, etag, err := c.backend.getWithETag(ctx, key)
 	c.observe("get_etag", started, int64(len(data)), err)
@@ -161,6 +198,9 @@ func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string,
 
 // Delete removes key. Does not error if key does not exist.
 func (c *S3Client) Delete(ctx context.Context, key string) error {
+	if err := c.checkFault("delete"); err != nil {
+		return err
+	}
 	started := time.Now()
 	err := c.backend.delete(ctx, key)
 	c.observe("delete", started, 0, err)
@@ -169,6 +209,9 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 
 // List returns keys with the given prefix.
 func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := c.checkFault("list"); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	keys, err := c.backend.list(ctx, prefix)
 	c.observe("list", started, 0, err)
@@ -179,6 +222,9 @@ func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
 // An empty etag means "write unconditionally on first creation".
 // Returns the new ETag on success, or ErrConflict on mismatch.
 func (c *S3Client) ConditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error) {
+	if err := c.checkFault("conditional_put"); err != nil {
+		return "", err
+	}
 	started := time.Now()
 	newETag, err := c.backend.conditionalPut(ctx, key, data, etag)
 	c.observe("conditional_put", started, int64(len(data)), err)
@@ -190,6 +236,9 @@ func (c *S3Client) ConditionalPut(ctx context.Context, key string, data []byte, 
 // file after writing it. Unlike ConditionalPut, this path never needs to make
 // a complete in-memory copy of the upload.
 func (c *S3Client) ConditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error) {
+	if err := c.checkFault("conditional_put"); err != nil {
+		return "", err
+	}
 	if size < 0 {
 		return "", fmt.Errorf("conditional put file %q: negative size", key)
 	}
@@ -206,6 +255,9 @@ func (c *S3Client) ConditionalPutFile(ctx context.Context, key string, file io.R
 // It is used to make immutable create retries idempotent after a conditional
 // create reports a conflict.
 func (c *S3Client) ObjectEqualsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error) {
+	if err := c.checkFault("get"); err != nil {
+		return false, err
+	}
 	if size < 0 {
 		return false, fmt.Errorf("compare object %q: negative size", key)
 	}
