@@ -399,9 +399,6 @@ func NewPartitionManager(cfg *config.Config, s3Client *storage.S3Client) (*Parti
 	}
 
 	highWaterMark := maxSize64 * 8
-	if highWaterMark < 64*1024*1024 {
-		highWaterMark = 64 * 1024 * 1024
-	}
 	pm.batcher = producer.NewBatcher(producer.BatcherConfig{
 		MaxSize:       maxSize64,
 		MaxAge:        maxAge,
@@ -806,6 +803,12 @@ func (pm *PartitionManager) appendRawBatchToPS(ps *partitionState, topic string,
 			ps.rollbackSeq(uint64(h.ProducerID), uint64(h.FirstSequence))
 		}
 		ps.mu.Unlock()
+		// A closed segment means the segment was retired (or a seal failed) —
+		// retryable, not a fatal unknown error. Other IO failures are returned
+		// as-is and mapped to UNKNOWN_SERVER_ERROR.
+		if errors.Is(err, os.ErrClosed) {
+			return 0, fmt.Errorf("%w: active segment append: %v", errKafkaSegmentNotReady, err)
+		}
 		return 0, fmt.Errorf("active segment append: %w", err)
 	}
 
@@ -1837,13 +1840,28 @@ func (pm *PartitionManager) sealActiveSegmentLocked(ps *partitionState, topic st
 		return nil, nil
 	}
 
-	segmentPath, sidecarPath, err := oldSeg.Seal()
-	if err != nil {
-		return nil, fmt.Errorf("seal active segment: %w", err)
-	}
+	// Open the replacement segment before sealing the old one. If this fails
+	// the old segment is still open and writable, so concurrent produces are
+	// unaffected and the flush can be retried.
 	newSeg, err := log.OpenActiveSegment(oldSeg.Dir(), int64(ps.nextOffset))
 	if err != nil {
 		return nil, fmt.Errorf("open new active segment: %w", err)
+	}
+
+	segmentPath, sidecarPath, err := oldSeg.Seal()
+	if err != nil {
+		// Seal syncs and closes the segment file before writing the sidecar, so
+		// on a mid-seal failure the file may already be closed. Reopen the old
+		// segment from its log file so a concurrent produce never appends to a
+		// closed file and the next flush attempt can re-seal it.
+		if reopened, rerr := log.OpenActiveSegment(oldSeg.Dir(), oldSeg.BaseOffset()); rerr == nil {
+			if rerr := reopened.Recover(); rerr == nil {
+				ps.activeSegment = reopened
+			} else {
+				_ = reopened.Close()
+			}
+		}
+		return nil, fmt.Errorf("seal active segment: %w", err)
 	}
 	ps.activeSegment = newSeg
 

@@ -16,7 +16,7 @@ type BatcherConfig struct {
 	MaxSize       int64
 	MaxAge        time.Duration
 	OnFlush       func(partitionID int) error
-	HighWaterMark int64 // 0 means disabled
+	HighWaterMark int64 // per-partition allowance in bytes; 0 means disabled
 }
 
 // partitionBuffer holds size metadata for a single partition — no messages.
@@ -49,6 +49,14 @@ func NewBatcher(cfg BatcherConfig) *Batcher {
 	}
 }
 
+// activePartitions returns the number of partitions that currently have a
+// buffer in the batcher.
+func (b *Batcher) activePartitions() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.buffers)
+}
+
 // getOrCreate returns the partitionBuffer for the given partition, creating it
 // if it does not already exist. Caller must NOT hold b.mu.
 func (b *Batcher) getOrCreate(partitionID int) *partitionBuffer {
@@ -63,18 +71,24 @@ func (b *Batcher) getOrCreate(partitionID int) *partitionBuffer {
 }
 
 // Append records that msgSize bytes were added to partitionID. If the total
-// buffered size across all partitions exceeds HighWaterMark (when non-zero),
-// ErrBackpressure is returned. If the partition buffer exceeds MaxSize after the
-// append, a background flush is scheduled. Otherwise the age timer is
-// (re)started so the buffer is flushed after MaxAge even without further writes.
+// buffered size across all partitions exceeds HighWaterMark * activePartitions
+// (when HighWaterMark is non-zero), ErrBackpressure is returned. If the
+// partition buffer exceeds MaxSize after the append, a background flush is
+// scheduled. Otherwise the age timer is (re)started so the buffer is flushed
+// after MaxAge even without further writes.
 // OnFlush is never invoked on the caller's goroutine.
 func (b *Batcher) Append(partitionID int, msgSize int64) error {
 	if b.stopped.Load() {
 		return ErrBackpressure
 	}
-	// Check backpressure before buffering.
-	if b.cfg.HighWaterMark > 0 && b.totalSize.Load()+msgSize > b.cfg.HighWaterMark {
-		return ErrBackpressure
+	// Check backpressure before buffering. The allowance scales with the
+	// number of active partitions so that high-partition topics are not
+	// spuriously rejected when each partition holds up to MaxSize buffered.
+	if b.cfg.HighWaterMark > 0 {
+		hwm := b.cfg.HighWaterMark * int64(b.activePartitions())
+		if hwm > 0 && b.totalSize.Load()+msgSize > hwm {
+			return ErrBackpressure
+		}
 	}
 
 	buf := b.getOrCreate(partitionID)

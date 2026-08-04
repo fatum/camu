@@ -182,3 +182,31 @@ func TestBatcher_StopFlushesDataAppendedDuringInflightFlush(t *testing.T) {
 		t.Fatalf("flushes = %d, want 2", got)
 	}
 }
+
+func TestBatcher_BackpressureScalesWithActivePartitions(t *testing.T) {
+	b := NewBatcher(BatcherConfig{
+		MaxSize:       1 << 30,
+		MaxAge:        time.Hour,
+		HighWaterMark: 100,
+	})
+	defer b.Stop()
+
+	// One active partition: allowance is 100.
+	if err := b.Append(0, 50); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+	if err := b.Append(0, 60); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("Append() error = %v, want ErrBackpressure (50+60 > 100)", err)
+	}
+
+	// A second active partition doubles the allowance to 200.
+	if err := b.Append(1, 50); err != nil {
+		t.Fatalf("Append() second partition error = %v", err)
+	}
+	if err := b.Append(0, 60); err != nil {
+		t.Fatalf("Append() error = %v, want success with 2 partitions", err)
+	}
+	if err := b.Append(0, 50); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("Append() error = %v, want ErrBackpressure (160+50 > 200)", err)
+	}
+}

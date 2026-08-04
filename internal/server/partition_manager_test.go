@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -539,6 +541,106 @@ func TestAppendRawBatch_DuplicateSequenceReturnsPriorOffset(t *testing.T) {
 	ps.mu.RUnlock()
 	if nextOff != 2 {
 		t.Fatalf("nextOffset after duplicate = %d, want 2", nextOff)
+	}
+}
+
+func TestOnFlushActiveSegment_OpenReplacementFailureKeepsOldSegmentUsable(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	if err := as.Append(log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.nextOffset = 1
+	ps.mu.Unlock()
+
+	// Block opening the replacement segment by putting a directory at its path.
+	replacementPath := filepath.Join(segDir, log.SegmentFilename(1))
+	if err := os.Mkdir(replacementPath, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+
+	err = pm.onFlushActiveSegment("topic", 0)
+	if err == nil {
+		t.Fatal("expected open new active segment error")
+	}
+	if !strings.Contains(err.Error(), "open new active segment") {
+		t.Fatalf("err = %v, want open-new-segment error", err)
+	}
+
+	// The old segment must still be the active one and still writable.
+	ps.mu.RLock()
+	got := ps.activeSegment
+	ps.mu.RUnlock()
+	if got != as {
+		t.Fatal("ps.activeSegment changed after failed flush; want the old segment")
+	}
+	if err := as.Append(log.EncodeRecordBatch(1, []log.Message{{Key: []byte("k2"), Value: []byte("v2"), Timestamp: 2}})); err != nil {
+		t.Fatalf("old segment no longer writable after failed flush: %v", err)
+	}
+}
+
+func TestAppendRawBatch_ClosedActiveSegmentReturnsSegmentNotReady(t *testing.T) {
+	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
+
+	tc := meta.TopicConfig{
+		Name:              "topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := pm.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := pm.GetPartitionState("topic", 0)
+	segDir := filepath.Join(t.TempDir(), "seg")
+	as, err := log.OpenActiveSegment(segDir, 0)
+	if err != nil {
+		t.Fatalf("OpenActiveSegment() error = %v", err)
+	}
+	if err := as.Append(log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k"), Value: []byte("v"), Timestamp: 1}})); err != nil {
+		t.Fatalf("activeSegment.Append() error = %v", err)
+	}
+	// Seal closes the file, simulating a retired-but-still-active segment.
+	if _, _, err := as.Seal(); err != nil {
+		t.Fatalf("Seal() error = %v", err)
+	}
+	ps.mu.Lock()
+	ps.activeSegment = as
+	ps.isLeader = true
+	ps.nextOffset = 1
+	ps.mu.Unlock()
+
+	rawBatch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k2"), Value: []byte("v2"), Timestamp: 2}})
+	_, err = pm.AppendRawBatch(context.Background(), "topic", 0, rawBatch)
+	if err == nil {
+		t.Fatal("expected error for closed active segment")
+	}
+	if !errors.Is(err, errKafkaSegmentNotReady) {
+		t.Fatalf("AppendRawBatch() error = %v, want errKafkaSegmentNotReady", err)
 	}
 }
 
