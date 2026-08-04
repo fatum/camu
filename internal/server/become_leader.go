@@ -108,6 +108,12 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	}
 	ps.mu.Unlock()
 
+	// Persist the leader epoch locally so a later state reload (on demotion or
+	// restart) reports the correct epoch of this node's active tail instead of a
+	// stale follower epoch. This is a failover-time promotion, not the startup
+	// path.
+	s.partitionManager.PersistLocalEpoch(topic, pid, req.Epoch)
+
 	// Persist epoch history locally and to S3.
 	ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
 	if err := eh.SaveToFile(ehPath); err != nil {

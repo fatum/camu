@@ -41,8 +41,8 @@ func (s *Server) handleKafkaMetadata(ctx context.Context, req *kmsg.MetadataRequ
 	// Use the cached leader lease if available (leader node always has it).
 	// Non-leader nodes fall back to an S3 lookup so the AdminClient can
 	// route controller-bound requests (CreateTopics, etc.) correctly.
-	if s.leaderLease.InstanceID != "" {
-		resp.ControllerID = kafkaBrokerID(s.leaderLease.InstanceID)
+	if lease := s.leaderLease.Load(); lease != nil && lease.InstanceID != "" {
+		resp.ControllerID = kafkaBrokerID(lease.InstanceID)
 	} else if lease, err := s.leaderElection.GetLeader(ctx); err == nil && lease.InstanceID != "" {
 		resp.ControllerID = kafkaBrokerID(lease.InstanceID)
 	} else {

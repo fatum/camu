@@ -104,24 +104,17 @@ HTTP matrix above is HTTP-API only.
 - `leader-pause-then-ack` (Kafka, `rf=3`, `minISR=2`): **Pass** — 390 acked, 0
   lost. This verifies the Kafka produce path waits for the ISR quorum: a stale
   leader resumed after lease expiry does not acknowledge uncommitted writes.
-- `leader-kill` (Kafka, `rf=3`, `minISR=2`): **Known failure (pre-existing)** —
-  committed-durability loses the leader's unflushed tail (35 of 254 acked
-  records in the latest run). The same fault passes on the HTTP API. The base
-  branch (before the coordination-hardening work) loses 81 records under the
-  identical run, so this is a failover/recovery bug that predates the Kafka
-  ack fix; the stricter ack path reduces but does not eliminate it.
-  **Root cause (investigated):** a demoted leader's local epoch sidecar lags its
-  actual leader epoch (promotions never persisted it, only follower observations
-  did), so a later state reload reports a stale epoch and the new leader's
-  divergence check fences the demoted leader's committed tail (`truncate_to`
-  cuts acked records). The harness node logs show exactly this:
-  `replica=n1 replica_epoch=2 replica_offset=66 truncate_to=25` with 66
-  committed. A fix that persisted the leader epoch on promotion was rejected
-  because it deterministically regressed `TestKafkaClientRecoversAcrossLeaderFailover`
-  (a timing-sensitive rf=2/minISR=1 test). Follow-up options: retry the epoch
-  persistence on the non-startup promotion paths, cap divergence `truncate_to`
-  at the leader's committed high watermark, or make the affected integration
-  test timing-robust. See `store/camu-kafka/` for the failing runs.
+- `leader-kill` (Kafka, `rf=3`, `minISR=2`): **Pass** — 337 acked, 0 lost, 0
+  missing. Previously this failed (35 lost): a demoted leader's local epoch
+  sidecar lagged its actual leader epoch (promotions never persisted it), so a
+  later state reload reported a stale epoch and the new leader's divergence
+  check fenced the demoted leader's committed tail. The fix persists the leader
+  epoch to the sidecar on the failover-time promotion paths
+  (`become_leader`, `attemptPartitionLeadership`); the startup
+  `initPartitionAsLeader` path is deliberately excluded because a synchronous
+  write there perturbed a timing-sensitive rf=2/minISR=1 integration test. The
+  base branch loses 81 records under the identical run. See
+  `store/camu-kafka/20260804T190713.515Z` for the passing run.
 
 ## Checkers
 
