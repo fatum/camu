@@ -27,6 +27,7 @@ type S3MetaStore struct {
 const (
 	s3MetaPrefix       = "_diskless_meta/"
 	s3HeadPrefix       = s3MetaPrefix + "head/"
+	s3CommittedPrefix  = s3MetaPrefix + "committed/"
 	s3SegmentPrefix    = s3MetaPrefix + "seg/"
 	s3HeadFile         = ".json"
 	s3SegmentFile      = ".json"
@@ -34,8 +35,13 @@ const (
 )
 
 type s3HeadState struct {
-	Version   int   `json:"version"`
+	Version    int   `json:"version"`
 	NextOffset int64 `json:"next_offset"`
+}
+
+type s3CommittedState struct {
+	Version         int   `json:"version"`
+	CommittedOffset int64 `json:"committed_offset"`
 }
 
 type s3SegmentRef struct {
@@ -54,6 +60,10 @@ func NewS3MetaStore(s3 *storage.S3Client) *S3MetaStore {
 
 func s3HeadKey(topic string, partition int) string {
 	return fmt.Sprintf("%s%s/%d%s", s3HeadPrefix, topic, partition, s3HeadFile)
+}
+
+func s3CommittedKey(topic string, partition int) string {
+	return fmt.Sprintf("%s%s/%d%s", s3CommittedPrefix, topic, partition, s3HeadFile)
 }
 
 func s3SegPrefix(topic string, partition int) string {
@@ -132,7 +142,50 @@ func (m *S3MetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) er
 			return fmt.Errorf("register segment ref %s: %w", key, err)
 		}
 	}
+	// Advance the partition's committed heads so reads never report
+	// allocated-but-unpersisted offsets as committed.
+	for _, b := range seg.Batches {
+		if err := m.advanceCommitted(ctx, b.Topic, b.Partition, b.EndOffset); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// advanceCommitted raises a partition's committed offset to at least end via a
+// read-CAS loop. It only ever advances, so a concurrent lower update is a no-op.
+func (m *S3MetaStore) advanceCommitted(ctx context.Context, topic string, partition int, end int64) error {
+	key := s3CommittedKey(topic, partition)
+	for {
+		data, etag, err := m.s3.GetWithETag(ctx, key)
+		var committed int64
+		switch {
+		case err == nil:
+			var st s3CommittedState
+			if err := json.Unmarshal(data, &st); err != nil {
+				return fmt.Errorf("parse committed %s: %w", key, err)
+			}
+			committed = st.CommittedOffset
+		case errors.Is(err, storage.ErrNotFound):
+			committed = 0
+		default:
+			return fmt.Errorf("read committed %s: %w", key, err)
+		}
+		if committed >= end {
+			return nil
+		}
+		next, err := json.Marshal(s3CommittedState{Version: s3HeadStateVersion, CommittedOffset: end})
+		if err != nil {
+			return err
+		}
+		if _, err := m.s3.ConditionalPut(ctx, key, next, etag); err != nil {
+			if errors.Is(err, storage.ErrConflict) {
+				continue // another writer advanced; retry with a fresh read.
+			}
+			return fmt.Errorf("update committed %s: %w", key, err)
+		}
+		return nil
+	}
 }
 
 // QuerySegments returns segment references covering [fromOffset, ...) for a
@@ -189,6 +242,23 @@ func (m *S3MetaStore) GetPartitionHead(ctx context.Context, topic string, partit
 	return head.NextOffset, nil
 }
 
+// GetCommittedHead returns the highest offset durably materialized for a
+// partition, or 0 if nothing has been registered yet.
+func (m *S3MetaStore) GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error) {
+	data, err := m.s3.Get(ctx, s3CommittedKey(topic, partition))
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get committed %s/%d: %w", topic, partition, err)
+	}
+	var st s3CommittedState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return 0, fmt.Errorf("parse committed %s/%d: %w", topic, partition, err)
+	}
+	return st.CommittedOffset, nil
+}
+
 // GetPartitionStart returns the first readable offset for a partition, or the
 // current head if all prior segments have been expired.
 func (m *S3MetaStore) GetPartitionStart(ctx context.Context, topic string, partition int) (int64, error) {
@@ -197,7 +267,7 @@ func (m *S3MetaStore) GetPartitionStart(ctx context.Context, topic string, parti
 		return 0, fmt.Errorf("list segment refs %s/%d: %w", topic, partition, err)
 	}
 	if len(keys) == 0 {
-		return m.GetPartitionHead(ctx, topic, partition)
+		return m.GetCommittedHead(ctx, topic, partition)
 	}
 	base, err := s3SegBaseOffset(keys[0])
 	if err != nil {
@@ -288,6 +358,16 @@ func (m *S3MetaStore) DeleteTopic(ctx context.Context, topic string) error {
 	for _, key := range keys {
 		if err := m.s3.Delete(ctx, key); err != nil {
 			return fmt.Errorf("delete head %s: %w", key, err)
+		}
+	}
+	committedPrefix := s3CommittedPrefix + topic + "/"
+	keys, err = m.s3.List(ctx, committedPrefix)
+	if err != nil {
+		return fmt.Errorf("list committed heads for %s: %w", topic, err)
+	}
+	for _, key := range keys {
+		if err := m.s3.Delete(ctx, key); err != nil {
+			return fmt.Errorf("delete committed %s: %w", key, err)
 		}
 	}
 	return nil

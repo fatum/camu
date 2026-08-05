@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -349,6 +350,9 @@ func (m *memBackend) list(_ context.Context, prefix string) ([]string, error) {
 			keys = append(keys, k)
 		}
 	}
+	// Real S3 ListObjectsV2 returns keys in UTF-8 binary order; callers (e.g.
+	// the diskless segment catalog) depend on that ordering.
+	sort.Strings(keys)
 	return keys, nil
 }
 

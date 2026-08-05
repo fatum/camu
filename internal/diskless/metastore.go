@@ -21,6 +21,13 @@ type MetaStore interface {
 	// GetPartitionHead returns the next offset that will be allocated for a partition.
 	GetPartitionHead(ctx context.Context, topic string, partition int) (int64, error)
 
+	// GetCommittedHead returns the highest offset durably materialized for a
+	// partition — the readable high watermark. It advances only when a flushed
+	// segment is registered, so it never includes offsets that were allocated
+	// but not yet persisted (in-flight flushes) or abandoned (gap after a hard
+	// failure).
+	GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error)
+
 	// GetPartitionStart returns the earliest readable offset for a partition
 	// after retention cleanup has removed old segment references.
 	GetPartitionStart(ctx context.Context, topic string, partition int) (int64, error)

@@ -176,6 +176,39 @@ func (d *DynamoMetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord
 			}
 		}
 	}
+
+	// Advance the per-partition committed heads to the highest materialized end
+	// so reads never report allocated-but-unpersisted offsets as committed.
+	for _, b := range seg.Batches {
+		if err := d.advanceCommitted(ctx, b.Topic, b.Partition, b.EndOffset); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// advanceCommitted raises a partition's committed offset to at least end. The
+// update is conditional so a lower value never regresses a concurrent advance.
+func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, partition int, end int64) error {
+	pk := partitionKey(topic, partition)
+	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &d.offsetsTable,
+		Key: map[string]ddbtypes.AttributeValue{
+			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
+		},
+		UpdateExpression:          aws.String("SET committed_offset = :end"),
+		ConditionExpression:       aws.String("attribute_not_exists(committed_offset) OR committed_offset < :end"),
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":end": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(end, 10)},
+		},
+	})
+	if err != nil {
+		var cond *ddbtypes.ConditionalCheckFailedException
+		if errors.As(err, &cond) {
+			return nil // already advanced at least as far
+		}
+		return fmt.Errorf("advance committed for %s: %w", pk, err)
+	}
 	return nil
 }
 
@@ -260,6 +293,29 @@ func (d *DynamoMetaStore) GetPartitionHead(ctx context.Context, topic string, pa
 	return 0, nil
 }
 
+// GetCommittedHead returns the highest offset durably materialized for a
+// partition, or 0 if nothing has been registered yet.
+func (d *DynamoMetaStore) GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error) {
+	pk := partitionKey(topic, partition)
+	out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &d.offsetsTable,
+		Key: map[string]ddbtypes.AttributeValue{
+			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
+		},
+		ProjectionExpression: aws.String("committed_offset"),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("get committed head for %s: %w", pk, err)
+	}
+	if out.Item == nil {
+		return 0, nil
+	}
+	if v, ok := out.Item["committed_offset"].(*ddbtypes.AttributeValueMemberN); ok {
+		return strconv.ParseInt(v.Value, 10, 64)
+	}
+	return 0, nil
+}
+
 // GetPartitionStart returns the first readable offset for a partition, or the
 // current head if all prior segments have been expired.
 func (d *DynamoMetaStore) GetPartitionStart(ctx context.Context, topic string, partition int) (int64, error) {
@@ -279,7 +335,7 @@ func (d *DynamoMetaStore) GetPartitionStart(ctx context.Context, topic string, p
 		return 0, fmt.Errorf("get partition start for %s: %w", pk, err)
 	}
 	if len(out.Items) == 0 {
-		return d.GetPartitionHead(ctx, topic, partition)
+		return d.GetCommittedHead(ctx, topic, partition)
 	}
 	if v, ok := out.Items[0]["sk"].(*ddbtypes.AttributeValueMemberN); ok {
 		return strconv.ParseInt(v.Value, 10, 64)

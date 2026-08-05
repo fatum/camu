@@ -19,16 +19,18 @@ type segmentEntry struct {
 
 // MemoryMetaStore is an in-memory implementation of MetaStore for testing and development.
 type MemoryMetaStore struct {
-	mu       sync.Mutex
-	offsets  map[string]int64
-	segments map[string][]segmentEntry
+	mu        sync.Mutex
+	offsets   map[string]int64
+	committed map[string]int64
+	segments  map[string][]segmentEntry
 }
 
 // NewMemoryMetaStore creates a new in-memory MetaStore.
 func NewMemoryMetaStore() *MemoryMetaStore {
 	return &MemoryMetaStore{
-		offsets:  make(map[string]int64),
-		segments: make(map[string][]segmentEntry),
+		offsets:   make(map[string]int64),
+		committed: make(map[string]int64),
+		segments:  make(map[string][]segmentEntry),
 	}
 }
 
@@ -51,7 +53,8 @@ func (m *MemoryMetaStore) AllocateOffsets(_ context.Context, allocs []OffsetAllo
 	return results, nil
 }
 
-// RegisterSegment records a flushed data file in the segment catalog.
+// RegisterSegment records a flushed data file in the segment catalog and
+// advances the partition's committed head to the highest materialized end.
 func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -66,6 +69,9 @@ func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) 
 			byteLength: b.ByteLength,
 			createdAt:  seg.CreatedAt,
 		})
+		if b.EndOffset > m.committed[key] {
+			m.committed[key] = b.EndOffset
+		}
 	}
 	return nil
 }
@@ -109,6 +115,14 @@ func (m *MemoryMetaStore) GetPartitionHead(_ context.Context, topic string, part
 	return m.offsets[partitionKey(topic, partition)], nil
 }
 
+// GetCommittedHead returns the highest offset durably materialized for a partition.
+func (m *MemoryMetaStore) GetCommittedHead(_ context.Context, topic string, partition int) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.committed[partitionKey(topic, partition)], nil
+}
+
 // GetPartitionStart returns the first readable offset for a partition, or the
 // current head if all prior segments have been expired.
 func (m *MemoryMetaStore) GetPartitionStart(_ context.Context, topic string, partition int) (int64, error) {
@@ -118,7 +132,7 @@ func (m *MemoryMetaStore) GetPartitionStart(_ context.Context, topic string, par
 	key := partitionKey(topic, partition)
 	entries := m.segments[key]
 	if len(entries) == 0 {
-		return m.offsets[key], nil
+		return m.committed[key], nil
 	}
 	return entries[0].baseOffset, nil
 }
@@ -182,6 +196,11 @@ func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	for k := range m.offsets {
 		if strings.HasPrefix(k, prefix) {
 			delete(m.offsets, k)
+		}
+	}
+	for k := range m.committed {
+		if strings.HasPrefix(k, prefix) {
+			delete(m.committed, k)
 		}
 	}
 	for k := range m.segments {

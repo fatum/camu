@@ -132,14 +132,33 @@ func TestMemoryMetaStore_DeleteTopic(t *testing.T) {
 	assert.Empty(t, refs)
 }
 
-func TestMemoryMetaStore_GetPartitionStartUsesHeadWhenNoSegmentsRemain(t *testing.T) {
+func TestMemoryMetaStore_GetPartitionStartUsesCommittedWhenNoSegmentsRemain(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
 
+	// Allocated but never materialized offsets must not be reported as the
+	// readable start: nothing is committed, so the start is 0.
 	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 5}})
 	require.NoError(t, err)
 
 	start, err := ms.GetPartitionStart(ctx, "events", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), start)
+
+	// Once a segment is registered, the committed head becomes the start when
+	// nothing else remains.
+	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
+		FileKey: "seg-001.dat",
+		Batches: []BatchRef{{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteLength: 500}},
+	}))
+	start, err = ms.GetPartitionStart(ctx, "events", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), start)
+
+	// After the registered segment is expired, the start advances to the
+	// committed head (which stays at 5; it never regresses).
+	require.NoError(t, ms.DeleteFileRefs(ctx, "seg-001.dat"))
+	start, err = ms.GetPartitionStart(ctx, "events", 0)
 	require.NoError(t, err)
 	assert.Equal(t, int64(5), start)
 }

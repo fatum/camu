@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/storage"
@@ -100,5 +101,73 @@ func TestReader_FetchPastEnd(t *testing.T) {
 	}
 	if hw != 3 {
 		t.Fatalf("expected hw=3, got %d", hw)
+	}
+}
+
+// TestReader_HighWatermarkIsCommittedNotAllocated verifies that the readable
+// high watermark reflects only durably materialized segments, never offsets
+// that were allocated but not yet registered (in-flight flushes or gaps).
+func TestReader_HighWatermarkIsCommittedNotAllocated(t *testing.T) {
+	ctx := context.Background()
+
+	for name, meta := range map[string]MetaStore{
+		"memory": NewMemoryMetaStore(),
+		"s3":     NewS3MetaStore(testS3Client(t)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := NewReader(testS3Client(t), meta)
+
+			// Allocate 5 offsets without materializing them.
+			if _, err := meta.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 5}}); err != nil {
+				t.Fatalf("allocate: %v", err)
+			}
+			allocHead, err := meta.GetPartitionHead(ctx, "t", 0)
+			if err != nil {
+				t.Fatalf("get partition head: %v", err)
+			}
+			if allocHead != 5 {
+				t.Fatalf("allocation head = %d, want 5", allocHead)
+			}
+
+			// Nothing committed yet: the readable HW must be 0, not the
+			// allocated 5.
+			data, hw, err := r.Fetch(ctx, "t", 0, 0, 1<<20)
+			if err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			if hw != 0 {
+				t.Fatalf("hw = %d, want 0 before registration", hw)
+			}
+			if data != nil {
+				t.Fatalf("expected nil data, got %d bytes", len(data))
+			}
+
+			// After registration the HW reflects the materialized end. Fetch at
+			// the committed head so no backing data file is required.
+			if err := meta.RegisterSegment(ctx, SegmentRecord{
+				FileKey:   "f.data",
+				Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteLength: 10}},
+				CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			committed, err := meta.GetCommittedHead(ctx, "t", 0)
+			if err != nil {
+				t.Fatalf("get committed head: %v", err)
+			}
+			if committed != 5 {
+				t.Fatalf("committed head = %d, want 5", committed)
+			}
+			data, hw, err = r.Fetch(ctx, "t", 0, 5, 1<<20)
+			if err != nil {
+				t.Fatalf("fetch: %v", err)
+			}
+			if hw != 5 {
+				t.Fatalf("hw = %d, want 5 after registration", hw)
+			}
+			if data != nil {
+				t.Fatalf("expected nil data at committed head, got %d bytes", len(data))
+			}
+		})
 	}
 }
