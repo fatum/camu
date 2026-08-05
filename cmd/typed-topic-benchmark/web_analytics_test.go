@@ -12,8 +12,8 @@ import (
 
 func TestWebAnalyticsSchemaFields(t *testing.T) {
 	fields := webAnalyticsSchemaFields()
-	if len(fields) != 15 {
-		t.Fatalf("web analytics schema has %d fields, want 15", len(fields))
+	if len(fields) != 17 {
+		t.Fatalf("web analytics schema has %d fields, want 17 (15 web-analytics + sequence + payload_bytes)", len(fields))
 	}
 	seen := map[string]bool{}
 	fixed := map[string]bool{"record_offset": true, "record_timestamp": true, "key": true, "value": true, "headers": true}
@@ -71,6 +71,19 @@ func TestWebAnalyticsEventRoundTripsThroughTypedValue(t *testing.T) {
 	}
 }
 
+func TestWebAnalyticsSchemaIncludesBenchmarkIntegrityColumns(t *testing.T) {
+	fields := map[string]string{}
+	for _, f := range webAnalyticsSchemaFields() {
+		fields[f["name"].(string)] = f["type"].(string)
+	}
+	for name, want := range map[string]string{"sequence": "int64", "payload_bytes": "int64"} {
+		got, ok := fields[name]
+		if !ok || got != want {
+			t.Fatalf("schema column %q = %q (present=%t), want %q — benchmark SQL queries min/max(sequence) and sum(payload_bytes)", name, got, ok, want)
+		}
+	}
+}
+
 func TestWebAnalyticsPurchaseCount(t *testing.T) {
 	for count, want := range map[int64]int64{0: 0, 1: 0, 4: 1, 5: 1, 8: 2, 1000: 250} {
 		if got := webAnalyticsPurchaseCount(count); got != want {
@@ -116,8 +129,8 @@ func TestBenchmarkEventDefaultsToTypedValue(t *testing.T) {
 
 func TestBenchmarkSchemaFieldsByExport(t *testing.T) {
 	exported := benchmarkSchemaFields(config{ExportEnabled: true})
-	if len(exported) != 15 {
-		t.Fatalf("exported topic schema has %d fields, want 15", len(exported))
+	if len(exported) != 17 {
+		t.Fatalf("exported topic schema has %d fields, want 17 (15 web-analytics + sequence + payload_bytes)", len(exported))
 	}
 	plain := benchmarkSchemaFields(config{ExportEnabled: false})
 	if len(plain) != 4 {

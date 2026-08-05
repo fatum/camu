@@ -94,6 +94,8 @@ func webAnalyticsSchemaFields() []map[string]any {
 		{"name": "event_time", "type": "timestamp", "path": "$.event_time"},
 		{"name": "duration_ms", "type": "int64", "path": "$.duration_ms"},
 		{"name": "revenue", "type": "float64", "path": "$.revenue"},
+		{"name": "sequence", "type": "int64", "path": "$.sequence"},
+		{"name": "payload_bytes", "type": "int64", "path": "$.payload_bytes"},
 	}
 }
 
