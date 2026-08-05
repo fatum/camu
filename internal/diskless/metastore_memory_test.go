@@ -2,6 +2,7 @@ package diskless
 
 import (
 	"context"
+	"fmt"
 	"github.com/stretchr/testify/require"
 	"testing"
 )
@@ -54,6 +55,31 @@ func TestMemoryMetaStore_CommitIdempotentRetryDeduplicatesAcrossBatches(t *testi
 	head, err := ms.GetCommittedHead(ctx, "t", 0)
 	require.NoError(t, err)
 	require.Equal(t, int64(3), head)
+}
+
+func TestMemoryMetaStore_CommitDeduplicatesInWindowOldReplayAndRejectsRotatedOut(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemoryMetaStore()
+	// Producer 7 commits sequences 0..5 (count 1 each). History is capped to the
+	// last `uploadedProducerHistory` batches, so sequence 0 rotates out.
+	for seq := int64(0); seq <= 5; seq++ {
+		_, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: fmt.Sprintf("obj%d:0:1", seq), FileKey: fmt.Sprintf("obj%d", seq), Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: seq}})
+		require.NoError(t, err)
+	}
+	// An exact replay of a non-latest but still-recorded sequence (3) is
+	// deduplicated: original base, no new ref.
+	old, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "replay3:0:1", FileKey: "replay3", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 3}})
+	require.NoError(t, err)
+	require.True(t, old[0].Duplicate)
+	require.Equal(t, int64(3), old[0].BaseOffset)
+	// An exact replay that has rotated out of the window is rejected as
+	// out-of-order, never silently re-allocated at a fresh offset.
+	_, err = ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "replay0:0:1", FileKey: "replay0", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 0}})
+	require.ErrorIs(t, err, ErrOutOfOrderSequence)
+	// Neither retry advanced the committed head.
+	head, err := ms.GetCommittedHead(ctx, "t", 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(6), head)
 }
 
 func TestMemoryMetaStore_CommitRequiresInitialProducerSequenceZero(t *testing.T) {

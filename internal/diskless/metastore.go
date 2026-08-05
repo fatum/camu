@@ -14,8 +14,14 @@ type MetaStore interface {
 	// sequences, assigns offsets, publishes uploaded refs, and advances the
 	// readable head. Idempotency follows the Kafka contract: an exact retry of
 	// an idempotent batch (same producer, first sequence, count) is deduplicated
-	// against the producer's recent commit history and returns its original
-	// offset without another ref. Non-idempotent batches are not deduplicated.
+	// against the producer's commit history and returns its original offset
+	// without another ref. Dedup matches any recorded sequence within the
+	// bounded history (the last `uploadedProducerHistory` batches per producer),
+	// so a retry of a non-latest but still-recorded batch is also deduplicated.
+	// An exact replay that has rotated out of that window is rejected as
+	// out-of-order rather than re-allocated, so a stale retry can never
+	// silently duplicate records at a fresh offset. Non-idempotent batches are
+	// not deduplicated.
 	CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error)
 	// QuerySegments returns segment references covering [fromOffset, ...) for a
 	// given topic-partition, up to maxBytes of data.
