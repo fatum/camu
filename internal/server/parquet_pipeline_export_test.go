@@ -11,12 +11,122 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/parquet"
 	"github.com/maksim/camu/internal/pipeline"
 	"github.com/maksim/camu/internal/storage"
 )
+
+// TestReadDisklessCommittedBatchBoundedToCapturedWatermark verifies that a
+// concurrent commit between the caller's GetCommittedHead and the engine's
+// Fetch never exports offsets at or above the captured watermark, which would
+// duplicate records on the next pass.
+func TestReadDisklessCommittedBatchBoundedToCapturedWatermark(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}
+	raw := log.EncodeRecordBatch(0, []log.Message{
+		{Value: []byte(`{"id":0}`)},
+		{Value: []byte(`{"id":1}`)},
+		{Value: []byte(`{"id":2}`)},
+	})
+	if _, err := s.disklessEngine.Produce(ctx, tc.Name, 0, raw); err != nil {
+		t.Fatalf("diskless produce: %v", err)
+	}
+	committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("committed head: %v", err)
+	}
+	if committed != 3 {
+		t.Fatalf("committed head = %d, want 3", committed)
+	}
+
+	// Call with a captured watermark of 2, simulating a record that committed
+	// after the exporter captured its watermark.
+	msgs, next, err := s.readDisklessCommittedBatch(ctx, tc, 0, 0, 2, 100)
+	if err != nil {
+		t.Fatalf("readDisklessCommittedBatch: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2 (offset 2 must be deferred to the next pass)", len(msgs))
+	}
+	if msgs[0].Offset != 0 || msgs[1].Offset != 1 {
+		t.Fatalf("message offsets = [%d %d], want [0 1]", msgs[0].Offset, msgs[1].Offset)
+	}
+	if next != 2 {
+		t.Fatalf("next = %d, want 2 (bounded to the captured watermark)", next)
+	}
+}
+
+func TestDisklessExportPass(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
+	defer s.disklessEngine.Close()
+
+	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
+	tc := meta.TopicConfig{Name: "disk-orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true, Schema: schema}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	// Produce two committed records through the diskless engine.
+	raw := log.EncodeRecordBatch(0, []log.Message{
+		{Key: []byte("k1"), Value: []byte(`{"id":7}`)},
+		{Key: []byte("k2"), Value: []byte(`{"id":8}`)},
+	})
+	if _, err := s.disklessEngine.Produce(ctx, tc.Name, 0, raw); err != nil {
+		t.Fatalf("diskless produce: %v", err)
+	}
+	committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("committed head: %v", err)
+	}
+	if committed != 2 {
+		t.Fatalf("committed head = %d, want 2", committed)
+	}
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	cp := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion}
+	s.runParquetExportPass(ctx, tc, identity, &cp)
+	if cp.NextOffset != 2 {
+		t.Fatalf("checkpoint next offset = %d, want 2", cp.NextOffset)
+	}
+
+	// The checkpoint must be durable and the exported object must exist.
+	store := pipeline.NewCheckpointStore(s.s3Client, serverPipelineFence{server: s})
+	durable, err := store.Load(ctx, parquetPipelineName, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if durable.NextOffset != 2 {
+		t.Fatalf("durable checkpoint next offset = %d, want 2", durable.NextOffset)
+	}
+	ingestTime := time.Unix(0, 0).UTC() // diskless records carry no ingest segment; fallback epoch
+	objectKey := parquet.ExportObjectKey(tc.Name, 0, ingestTime, 0, 1, 1, "pipeline")
+	if _, err := s.s3Client.Get(ctx, objectKey); err != nil {
+		t.Fatalf("expected exported parquet object %s: %v", objectKey, err)
+	}
+}
 
 func TestWriteParquetChunkIsReadableByDuckDB(t *testing.T) {
 	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{

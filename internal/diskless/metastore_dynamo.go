@@ -456,9 +456,68 @@ func (d *DynamoMetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord
 	return nil
 }
 
-// advanceCommitted raises a partition's committed offset to the end of the
-// longest run of segment refs contiguous with the current head. The update is
-// conditional so a lower value never regresses a concurrent advance.
+// ReplaceSegmentRefs atomically removes the refs identified by remove and
+// inserts add into the segment table using a single DynamoDB transaction, so
+// readers never observe a gap or duplicate for the covered range. The committed
+// watermark is not modified. A transaction is limited to 100 operations, so a
+// merge run must stay within that bound.
+func (d *DynamoMetaStore) ReplaceSegmentRefs(ctx context.Context, topic string, partition int, remove []RefKey, add []SegmentRef) error {
+	if len(remove)+len(add) > 100 {
+		return fmt.Errorf("replace segment refs: %d operations exceed the 100-item transaction limit", len(remove)+len(add))
+	}
+	pk := partitionKey(topic, partition)
+	now := time.Now()
+
+	// DynamoDB forbids two operations on the same item in one transaction. A
+	// merged ref often starts at the same base offset as the first ref it
+	// replaces, so a remove and an add can collide on sk. When that happens the
+	// Put alone is sufficient (it overwrites the removed ref); emit only one
+	// operation per sk.
+	addedByBase := make(map[int64]bool, len(add))
+	for _, ref := range add {
+		addedByBase[ref.BaseOffset] = true
+	}
+	writes := make([]ddbtypes.TransactWriteItem, 0, len(remove)+len(add))
+	for _, rk := range remove {
+		if addedByBase[rk.BaseOffset] {
+			continue // replaced by the Put below
+		}
+		writes = append(writes, ddbtypes.TransactWriteItem{
+			Delete: &ddbtypes.Delete{
+				TableName: &d.segmentsTable,
+				Key: map[string]ddbtypes.AttributeValue{
+					"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
+					"sk": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(rk.BaseOffset, 10)},
+				},
+			},
+		})
+	}
+	for _, ref := range add {
+		writes = append(writes, ddbtypes.TransactWriteItem{
+			Put: &ddbtypes.Put{
+				TableName: &d.segmentsTable,
+				Item: map[string]ddbtypes.AttributeValue{
+					"pk":          &ddbtypes.AttributeValueMemberS{Value: pk},
+					"sk":          &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(ref.BaseOffset, 10)},
+					"file_key":    &ddbtypes.AttributeValueMemberS{Value: ref.FileKey},
+					"byte_offset": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(ref.ByteOffset, 10)},
+					"byte_length": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(ref.ByteLength, 10)},
+					"end_offset":  &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(ref.EndOffset, 10)},
+					"created_at":  &ddbtypes.AttributeValueMemberS{Value: now.Format(time.RFC3339)},
+				},
+			},
+		})
+	}
+	if len(writes) == 0 {
+		return nil
+	}
+	if _, err := d.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: writes,
+	}); err != nil {
+		return fmt.Errorf("replace segment refs %s: %w", pk, err)
+	}
+	return nil
+}
 func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, partition int) error {
 	pk := partitionKey(topic, partition)
 	committed, err := d.readCommittedOffset(ctx, pk)
@@ -627,6 +686,11 @@ func itemToSegmentRef(item map[string]ddbtypes.AttributeValue) (SegmentRef, erro
 	}
 	if v, ok := item["byte_length"].(*ddbtypes.AttributeValueMemberN); ok {
 		ref.ByteLength, _ = strconv.ParseInt(v.Value, 10, 64)
+	}
+	if v, ok := item["created_at"].(*ddbtypes.AttributeValueMemberS); ok {
+		if t, err := time.Parse(time.RFC3339, v.Value); err == nil {
+			ref.CreatedAt = t
+		}
 	}
 	return ref, nil
 }
@@ -823,6 +887,58 @@ func (d *DynamoMetaStore) hasFileReference(ctx context.Context, fileKey string) 
 		}
 	}
 	return false, nil
+}
+
+// PlanUnreferencedFileDeletes returns the subset of fileKeys with no segment
+// refs anywhere, so their data objects can be deleted after compaction.
+func (d *DynamoMetaStore) PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error) {
+	var deletable []string
+	for _, fileKey := range fileKeys {
+		referenced, err := d.hasFileReference(ctx, fileKey)
+		if err != nil {
+			return nil, err
+		}
+		if !referenced {
+			deletable = append(deletable, fileKey)
+		}
+	}
+	return deletable, nil
+}
+
+// ListFileRefs returns every segment reference across all partitions that
+// points at fileKey.
+func (d *DynamoMetaStore) ListFileRefs(ctx context.Context, fileKey string) ([]FileRef, error) {
+	input := &dynamodb.ScanInput{
+		TableName:        &d.segmentsTable,
+		FilterExpression: aws.String("file_key = :file_key"),
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":file_key": &ddbtypes.AttributeValueMemberS{Value: fileKey},
+		},
+	}
+	var refs []FileRef
+	paginator := dynamodb.NewScanPaginator(d.client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list file refs for %s: %w", fileKey, err)
+		}
+		for _, item := range page.Items {
+			ref, err := itemToSegmentRef(item)
+			if err != nil {
+				return nil, err
+			}
+			pk, ok := item["pk"].(*ddbtypes.AttributeValueMemberS)
+			if !ok {
+				continue
+			}
+			topic, partition, err := parsePartitionKey(pk.Value)
+			if err != nil {
+				continue
+			}
+			refs = append(refs, FileRef{Topic: topic, Partition: partition, Ref: ref})
+		}
+	}
+	return refs, nil
 }
 
 func (d *DynamoMetaStore) hasFileFreshReference(ctx context.Context, fileKey string, cutoff time.Time) (bool, error) {

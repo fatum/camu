@@ -2,6 +2,9 @@ package diskless
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +20,13 @@ type MetaStore interface {
 	// given topic-partition, up to maxBytes of data.
 	QuerySegments(ctx context.Context, topic string, partition int,
 		fromOffset int64, maxBytes int) ([]SegmentRef, error)
+
+	// ReplaceSegmentRefs atomically removes the references identified by remove
+	// and inserts add into the partition's segment catalog. Readers must never
+	// observe a gap or a duplicate for the affected range: add must exactly
+	// cover the union of the removed ranges (compaction of a contiguous run).
+	// The committed watermark is never modified by this call.
+	ReplaceSegmentRefs(ctx context.Context, topic string, partition int, remove []RefKey, add []SegmentRef) error
 
 	// GetPartitionHead returns the next offset that will be allocated for a partition.
 	GetPartitionHead(ctx context.Context, topic string, partition int) (int64, error)
@@ -42,6 +52,16 @@ type MetaStore interface {
 	// DeleteFileRefs removes all segment references pointing at fileKey.
 	DeleteFileRefs(ctx context.Context, fileKey string) error
 
+	// ListFileRefs returns every segment reference across all partitions that
+	// points at fileKey. A flush can pack batches for multiple partitions into
+	// one data file, so retention must account for every reference before
+	// deleting the object.
+	ListFileRefs(ctx context.Context, fileKey string) ([]FileRef, error)
+
+	// PlanUnreferencedFileDeletes returns the subset of fileKeys that are no
+	// longer referenced by any partition, so their data objects can be deleted.
+	PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error)
+
 	// DeleteTopic removes all MetaStore state for a topic.
 	DeleteTopic(ctx context.Context, topic string) error
 
@@ -65,4 +85,19 @@ func contiguousCommittedEnd(committed int64, refs []SegmentRef) int64 {
 		}
 	}
 	return committed
+}
+
+// parsePartitionKey splits a partition key of the form "topic#partition". The
+// partition is the segment after the last "#", so topic names containing "#"
+// are preserved.
+func parsePartitionKey(key string) (string, int, error) {
+	idx := strings.LastIndex(key, "#")
+	if idx < 0 {
+		return "", 0, fmt.Errorf("malformed partition key %q", key)
+	}
+	partition, err := strconv.Atoi(key[idx+1:])
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed partition key %q: %w", key, err)
+	}
+	return key[:idx], partition, nil
 }

@@ -4,6 +4,7 @@ package diskless
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -170,6 +171,82 @@ func TestDynamoMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix(t *testing.T
 	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}})
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), next[0].BaseOffset, "subsequent valid write continues contiguously")
+}
+
+// TestDynamoMetaStore_ReplaceSegmentRefs_AtomicallyMergesRun verifies that
+// replacing a contiguous committed run with a single merged ref never exposes a
+// gap or duplicate and never moves the committed watermark.
+func TestDynamoMetaStore_ReplaceSegmentRefs_AtomicallyMergesRun(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	now := time.Now()
+	for i := int64(0); i < 3; i++ {
+		require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
+			FileKey:   fmt.Sprintf("f%d.data", i),
+			Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: i, EndOffset: i + 1, ByteLength: 10}},
+			CreatedAt: now,
+		}))
+	}
+	committed, err := ms.GetCommittedHead(ctx, "t", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), committed)
+
+	merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 30, BaseOffset: 0, EndOffset: 3}
+	remove := []RefKey{{BaseOffset: 0, EndOffset: 1}, {BaseOffset: 1, EndOffset: 2}, {BaseOffset: 2, EndOffset: 3}}
+	require.NoError(t, ms.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}))
+
+	refs, err := ms.QuerySegments(ctx, "t", 0, 0, 10000)
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	assert.Equal(t, "merged.data", refs[0].FileKey)
+	assert.Equal(t, int64(0), refs[0].BaseOffset)
+	assert.Equal(t, int64(3), refs[0].EndOffset)
+
+	committed, err = ms.GetCommittedHead(ctx, "t", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), committed, "compaction must not move the committed watermark")
+
+	require.NoError(t, ms.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}))
+	refs, err = ms.QuerySegments(ctx, "t", 0, 0, 10000)
+	require.NoError(t, err)
+	assert.Len(t, refs, 1, "idempotent retry must not duplicate refs")
+}
+
+// TestDynamoMetaStore_ReplaceSegmentRefs_WithinTransactionLimit verifies that a
+// 99-source merge (99 deletes + 1 put after collapsing the shared base) fits
+// within DynamoDB's 100-operation transaction limit.
+func TestDynamoMetaStore_ReplaceSegmentRefs_WithinTransactionLimit(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	var remove []RefKey
+	for i := 0; i < 99; i++ {
+		remove = append(remove, RefKey{BaseOffset: int64(i), EndOffset: int64(i) + 1})
+	}
+	merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 990, BaseOffset: 0, EndOffset: 99}
+	require.NoError(t, ms.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}))
+
+	refs, err := ms.QuerySegments(ctx, "t", 0, 0, 10000)
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	assert.Equal(t, int64(99), refs[0].EndOffset)
+}
+
+// TestDynamoMetaStore_ReplaceSegmentRefs_ExceedsTransactionLimit verifies the
+// guard that bounds a single transaction to 100 operations.
+func TestDynamoMetaStore_ReplaceSegmentRefs_ExceedsTransactionLimit(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	var remove []RefKey
+	for i := 0; i < 100; i++ {
+		remove = append(remove, RefKey{BaseOffset: int64(i), EndOffset: int64(i) + 1})
+	}
+	merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 1000, BaseOffset: 0, EndOffset: 100}
+	err := ms.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged})
+	require.Error(t, err, "100-source merge must exceed the 100-operation transaction limit")
+	assert.Contains(t, err.Error(), "transaction limit")
 }
 
 func TestDynamoMetaStore_GetPartitionHead(t *testing.T) {	ctx := context.Background()

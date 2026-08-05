@@ -70,6 +70,7 @@ type s3Backend interface {
 	put(ctx context.Context, key string, data []byte, opts PutOpts) error
 	get(ctx context.Context, key string) ([]byte, error)
 	getRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+	getRangeInto(ctx context.Context, key string, offset, length int64, dst []byte) error
 	getWithETag(ctx context.Context, key string) ([]byte, string, error)
 	delete(ctx context.Context, key string) error
 	list(ctx context.Context, prefix string) ([]string, error)
@@ -184,6 +185,19 @@ func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int6
 	data, err := c.backend.getRange(ctx, key, offset, length)
 	c.observe("get_range", started, int64(len(data)), err)
 	return data, err
+}
+
+// GetRangeInto retrieves a byte range from key directly into dst[:length],
+// avoiding the intermediate allocation and copy of GetRange. dst must hold at
+// least length bytes. Returns ErrNotFound if the key is missing.
+func (c *S3Client) GetRangeInto(ctx context.Context, key string, offset, length int64, dst []byte) error {
+	if err := c.checkFault("get_range"); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := c.backend.getRangeInto(ctx, key, offset, length, dst)
+	c.observe("get_range", started, length, err)
+	return err
 }
 
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
@@ -303,23 +317,36 @@ func (m *memBackend) get(_ context.Context, key string) ([]byte, error) {
 	return cp, nil
 }
 
-func (m *memBackend) getRange(_ context.Context, key string, offset, length int64) ([]byte, error) {
+func (m *memBackend) getRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	data := make([]byte, length)
+	if err := m.getRangeInto(ctx, key, offset, length, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (m *memBackend) getRangeInto(_ context.Context, key string, offset, length int64, dst []byte) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	obj, ok := m.objects[key]
 	if !ok {
-		return nil, ErrNotFound
+		return ErrNotFound
 	}
 	end := offset + length
 	if end > int64(len(obj.data)) {
 		end = int64(len(obj.data))
 	}
 	if offset >= int64(len(obj.data)) {
-		return nil, nil
+		return nil
 	}
-	cp := make([]byte, end-offset)
-	copy(cp, obj.data[offset:end])
-	return cp, nil
+	if int64(len(dst)) < end-offset {
+		return fmt.Errorf("s3 GetRangeInto %q: destination buffer too small", key)
+	}
+	n := copy(dst[:length], obj.data[offset:end])
+	if int64(n) != length {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }
 
 func (m *memBackend) getWithETag(_ context.Context, key string) ([]byte, string, error) {
@@ -494,6 +521,20 @@ func (b *awsS3Backend) get(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (b *awsS3Backend) getRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	data := make([]byte, length)
+	if err := b.getRangeInto(ctx, key, offset, length, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (b *awsS3Backend) getRangeInto(ctx context.Context, key string, offset, length int64, dst []byte) error {
+	if int64(len(dst)) < length {
+		return fmt.Errorf("s3 GetRangeInto %q: destination buffer too small (%d < %d)", key, len(dst), length)
+	}
+	if length <= 0 {
+		return nil
+	}
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	out, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
@@ -502,16 +543,15 @@ func (b *awsS3Backend) getRange(ctx context.Context, key string, offset, length 
 	})
 	if err != nil {
 		if isS3NotFound(err) {
-			return nil, ErrNotFound
+			return ErrNotFound
 		}
-		return nil, fmt.Errorf("s3 GetRange %q: %w", key, err)
+		return fmt.Errorf("s3 GetRange %q: %w", key, err)
 	}
 	defer out.Body.Close()
-	data, err := io.ReadAll(out.Body)
-	if err != nil {
-		return nil, fmt.Errorf("s3 GetRange %q read body: %w", key, err)
+	if _, err := io.ReadFull(out.Body, dst[:length]); err != nil {
+		return fmt.Errorf("s3 GetRangeInto %q read: %w", key, err)
 	}
-	return data, nil
+	return nil
 }
 
 func (b *awsS3Backend) getWithETag(ctx context.Context, key string) ([]byte, string, error) {

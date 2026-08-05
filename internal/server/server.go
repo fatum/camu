@@ -1060,6 +1060,9 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 		}
 
 		newPartitions := coordination.AssignReplicated(active, tc.Partitions, tc.ReplicationFactor, currentPartitions)
+		if tc.StorageMode == meta.StorageModeDiskless {
+			newPartitions = coordination.AssignDiskless(active, tc.Partitions, currentPartitions)
+		}
 
 		if err == nil {
 			// Ignore version and leader epoch churn, but persist any leader or replica-set change.
@@ -1080,6 +1083,9 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 			if readErr == nil {
 				ta.Version = existing2.Version + 1
 				ta.Partitions = coordination.AssignReplicated(active, tc.Partitions, tc.ReplicationFactor, existing2.Partitions)
+				if tc.StorageMode == meta.StorageModeDiskless {
+					ta.Partitions = coordination.AssignDiskless(active, tc.Partitions, existing2.Partitions)
+				}
 				if retryErr := s.assignmentStore.Write(ctx, tc.Name, ta, existing2.ETag); retryErr != nil {
 					slog.Warn("publishAssignments: retry failed", "topic", tc.Name, "error", retryErr)
 				}

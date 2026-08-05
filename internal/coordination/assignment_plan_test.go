@@ -149,3 +149,68 @@ func TestRebalancer_Deterministic(t *testing.T) {
 		}
 	}
 }
+
+func TestAssignDiskless_SpreadsLeaders(t *testing.T) {
+	instances := []string{"n1", "n2", "n3", "n4", "n5"}
+	got := AssignDiskless(instances, 4, nil)
+
+	leaders := make(map[string]bool)
+	for pid, pa := range got {
+		if len(pa.Replicas) != 1 {
+			t.Fatalf("partition %d: replicas = %v, want single leader", pid, pa.Replicas)
+		}
+		if pa.Replicas[0] != pa.Leader {
+			t.Fatalf("partition %d: replicas[0] = %q, leader = %q", pid, pa.Replicas[0], pa.Leader)
+		}
+		leaders[pa.Leader] = true
+		if pa.LeaderEpoch != 1 {
+			t.Fatalf("partition %d: epoch = %d, want 1", pid, pa.LeaderEpoch)
+		}
+	}
+	if len(leaders) != 4 {
+		t.Fatalf("leaders = %v, want 4 distinct nodes", leaders)
+	}
+}
+
+func TestAssignDiskless_SelfHealsPinnedAssignment(t *testing.T) {
+	// A topic created while only one node was active is pinned to it; once the
+	// full cluster is active, diskless assignments must re-spread.
+	current := map[int]PartitionAssignment{
+		0: {Replicas: []string{"n1"}, Leader: "n1", LeaderEpoch: 1},
+		1: {Replicas: []string{"n1"}, Leader: "n1", LeaderEpoch: 1},
+		2: {Replicas: []string{"n1"}, Leader: "n1", LeaderEpoch: 1},
+		3: {Replicas: []string{"n1"}, Leader: "n1", LeaderEpoch: 1},
+	}
+	instances := []string{"n1", "n2", "n3", "n4", "n5"}
+	got := AssignDiskless(instances, 4, current)
+
+	leaders := make(map[string]bool)
+	for pid, pa := range got {
+		leaders[pa.Leader] = true
+		if pa.Leader == "n1" && pa.LeaderEpoch != 1 {
+			t.Fatalf("partition %d: epoch = %d, want 1 (leader unchanged)", pid, pa.LeaderEpoch)
+		}
+		if pa.Leader != "n1" && pa.LeaderEpoch != 2 {
+			t.Fatalf("partition %d: epoch = %d, want 2 (leader changed)", pid, pa.LeaderEpoch)
+		}
+	}
+	if len(leaders) != 4 {
+		t.Fatalf("leaders = %v, want 4 distinct nodes after self-heal", leaders)
+	}
+}
+
+func TestAssignDiskless_PreservesEpochOnStableLeader(t *testing.T) {
+	instances := []string{"n1", "n2", "n3", "n4", "n5"}
+	current := AssignDiskless(instances, 4, nil)
+	again := AssignDiskless(instances, 4, current)
+
+	if !sameAssignments(current, again) {
+		t.Fatalf("stable diskless assignments churned: %#v vs %#v", current, again)
+	}
+}
+
+func TestAssignDiskless_EmptyInstances(t *testing.T) {
+	if got := AssignDiskless(nil, 4, nil); len(got) != 0 {
+		t.Fatalf("got %#v, want empty", got)
+	}
+}

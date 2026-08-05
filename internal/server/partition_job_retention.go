@@ -112,7 +112,21 @@ func (s *Server) discoverDisklessRetentionJobs(ctx context.Context, tc meta.Topi
 		slog.Warn("diskless_retention_plan_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
 		return
 	}
+
+	// A flush can pack batches for several partitions into one data file, so a
+	// file may be shared across partitions. Retention must not delete a file
+	// until every partition referencing it has exported its refs: an exporting
+	// partition behind its Parquet checkpoint would otherwise permanently lose
+	// committed records. Mirror the classic checkpoint gate per partition.
 	for _, fileKey := range fileKeys {
+		safe, err := s.disklessFileExported(ctx, fileKey)
+		if err != nil {
+			slog.Warn("diskless_retention_export_gate_failed", "topic", tc.Name, "partition", identity.Partition, "file", fileKey, "error", err)
+			return
+		}
+		if !safe {
+			continue // keep the data until every referencing exporter catches up
+		}
 		payload, err := json.Marshal(ClassicRetentionPayload{
 			StorageMode: tc.StorageMode,
 			FileKey:     fileKey,
@@ -136,6 +150,55 @@ func (s *Server) discoverDisklessRetentionJobs(ctx context.Context, tc meta.Topi
 			slog.Warn("diskless_retention_enqueue_failed", "topic", tc.Name, "partition", identity.Partition, "file_key", fileKey, "error", err)
 		}
 	}
+}
+
+// disklessFileExported reports whether every ref into fileKey is covered by the
+// Parquet checkpoint of its owning partition. A data file can be shared across
+// partitions (one flush packs several partitions into a single object), so all
+// of them must be exported before retention may delete it. Non-exporting
+// partitions have no dependent pipeline and are not gated. A missing checkpoint
+// (boundary 0, nothing exported) blocks deletion.
+func (s *Server) disklessFileExported(ctx context.Context, fileKey string) (bool, error) {
+	refs, err := s.disklessMeta.ListFileRefs(ctx, fileKey)
+	if err != nil {
+		return false, err
+	}
+	boundaries := make(map[string]int64)
+	for _, fr := range refs {
+		tc, err := s.topicStore.Get(ctx, fr.Topic)
+		if err != nil {
+			return false, err
+		}
+		if !tc.ExportEnabled {
+			continue
+		}
+		key := partitionKey(fr.Topic, fr.Partition)
+		boundary, ok := boundaries[key]
+		if !ok {
+			boundary, err = s.disklessExportBoundary(ctx, fr.Topic, fr.Partition)
+			if err != nil {
+				return false, err
+			}
+			boundaries[key] = boundary
+		}
+		if fr.Ref.EndOffset > boundary {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// disklessExportBoundary returns the Parquet checkpoint's exclusive next-export
+// offset for a partition, or 0 when nothing has been exported.
+func (s *Server) disklessExportBoundary(ctx context.Context, topic string, partition int) (int64, error) {
+	checkpoint, err := s.getParquetPipelineCheckpoint(ctx, topic, partition)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return int64(checkpoint.NextOffset), nil
 }
 
 func (s *Server) runRetentionJob(ctx context.Context, job PartitionJob) error {
@@ -264,6 +327,14 @@ func (s *Server) classicRetentionEndOffset(ctx context.Context, payload ClassicR
 func (s *Server) runDisklessRetentionJob(ctx context.Context, job PartitionJob, payload ClassicRetentionPayload) error {
 	if job.Phase == PartitionJobPhaseDeleteData {
 		if payload.FileKey != "" {
+			// Re-check export coverage at run time: a job enqueued before the
+			// checkpoint gate, or one that raced the exporter, must not delete a
+			// shared file while any partition's refs into it are unexported.
+			if ok, err := s.disklessFileExported(ctx, payload.FileKey); err != nil {
+				return err
+			} else if !ok {
+				return nil // retry on a later maintenance tick
+			}
 			if err := s.s3Client.Delete(ctx, payload.FileKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
 				return err
 			}

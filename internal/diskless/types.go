@@ -42,4 +42,22 @@ type SegmentRef struct {
 	ByteLength int64
 	BaseOffset int64
 	EndOffset  int64
+	// CreatedAt is when the ref was materialized; used by compaction and
+	// retention to decide eligibility. Ignored by the read path.
+	CreatedAt time.Time
+}
+
+// RefKey identifies a segment reference by its offset range within a partition.
+type RefKey struct {
+	BaseOffset int64
+	EndOffset  int64
+}
+
+// FileRef identifies one segment reference pointing at a shared data file. A
+// single flush can pack batches for several partitions into one file, so a file
+// may be referenced by multiple (topic, partition) pairs.
+type FileRef struct {
+	Topic     string
+	Partition int
+	Ref       SegmentRef
 }

@@ -58,10 +58,11 @@ type SQLConfig struct {
 
 // DisklessConfig holds settings for diskless topic mode.
 type DisklessConfig struct {
-	LingerMs      int            `yaml:"linger_ms"`       // Max buffer time before flush (default 250)
-	MaxBatchBytes int64          `yaml:"max_batch_bytes"` // Max buffer size before flush (default 8MiB)
-	MetaStore     string         `yaml:"metastore"`       // "memory" (default), "s3", or "dynamodb"
-	DynamoDB      DynamoDBConfig `yaml:"dynamodb"`
+	LingerMs      int              `yaml:"linger_ms"`       // Max buffer time before flush (default 250)
+	MaxBatchBytes int64            `yaml:"max_batch_bytes"` // Max buffer size before flush (default 8MiB)
+	MetaStore     string           `yaml:"metastore"`       // "memory" (default), "s3", or "dynamodb"
+	DynamoDB      DynamoDBConfig   `yaml:"dynamodb"`
+	Compaction    CompactionConfig `yaml:"compaction"`
 }
 
 // DynamoDBConfig holds DynamoDB settings for the diskless MetaStore.
@@ -69,6 +70,80 @@ type DynamoDBConfig struct {
 	TablePrefix string `yaml:"table_prefix"` // default "camu"
 	Region      string `yaml:"region"`
 	Endpoint    string `yaml:"endpoint"` // for local DynamoDB
+}
+
+// CompactionConfig holds settings for diskless small-segment compaction.
+type CompactionConfig struct {
+	Enabled             bool   `yaml:"enabled"`
+	MinSegments         int    `yaml:"min_segments"`           // merge only when at least this many eligible refs
+	TargetBytes         int64  `yaml:"target_bytes"`           // merge refs until approximately this total size
+	MaxSegmentsPerMerge int    `yaml:"max_segments_per_merge"` // cap a single merge (DynamoDB transactions allow at most 100)
+	Grace               string `yaml:"grace"`                  // minimum age of a ref before it is eligible
+	DeleteGrace         string `yaml:"delete_grace"`           // delay before deleting compacted source data
+}
+
+const (
+	defaultCompactionMinSegments         = 4
+	defaultCompactionTargetBytes         = 64 << 20
+	defaultCompactionMaxSegmentsPerMerge = 90
+	defaultCompactionGrace               = 60 * time.Second
+	defaultCompactionDeleteGrace         = 5 * time.Minute
+
+	// minCompactionSegments is the lower bound for a merge run. A single source
+	// cannot be merged (there is nothing to combine) and would be rejected by
+	// the merge executor, so min_segments is clamped to at least 2.
+	minCompactionSegments = 2
+	// maxCompactionSegmentsPerMerge is the upper bound for a merge run. The
+	// DynamoDB metastore replaces refs in one transaction of at most 100
+	// operations (one delete per removed ref plus one put for the merged ref),
+	// so a run is clamped to 99 sources to guarantee the transaction fits.
+	maxCompactionSegmentsPerMerge = 99
+)
+
+func (c CompactionConfig) MinSegmentsValue() int {
+	min := defaultCompactionMinSegments
+	if c.MinSegments > 0 {
+		min = c.MinSegments
+	}
+	if min < minCompactionSegments {
+		min = minCompactionSegments
+	}
+	// Clamp the minimum to the effective maximum so the two bounds never become
+	// unreachable (a run is capped at the maximum, so it must be able to reach
+	// the minimum).
+	if max := c.MaxSegmentsPerMergeValue(); min > max {
+		min = max
+	}
+	return min
+}
+
+func (c CompactionConfig) TargetBytesValue() int64 {
+	if c.TargetBytes <= 0 {
+		return defaultCompactionTargetBytes
+	}
+	return c.TargetBytes
+}
+
+func (c CompactionConfig) MaxSegmentsPerMergeValue() int {
+	max := defaultCompactionMaxSegmentsPerMerge
+	if c.MaxSegmentsPerMerge > 0 {
+		max = c.MaxSegmentsPerMerge
+	}
+	if max < minCompactionSegments {
+		return minCompactionSegments
+	}
+	if max > maxCompactionSegmentsPerMerge {
+		return maxCompactionSegmentsPerMerge
+	}
+	return max
+}
+
+func (c CompactionConfig) GraceDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.Grace, defaultCompactionGrace)
+}
+
+func (c CompactionConfig) DeleteGraceDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.DeleteGrace, defaultCompactionDeleteGrace)
 }
 
 // LingerDuration returns the linger duration, defaulting to 250ms.

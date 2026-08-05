@@ -112,12 +112,27 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 		}
 	}
 
+	storageMode := req.StorageMode
+	if storageMode == "" {
+		storageMode = meta.StorageModeClassic
+	}
+	if storageMode != meta.StorageModeClassic && storageMode != meta.StorageModeDiskless {
+		return meta.TopicConfig{}, fmt.Errorf("invalid storage_mode, must be classic or diskless")
+	}
+
 	rf := req.ReplicationFactor
 	if rf == 0 {
 		rf = 1
 	}
 	minISR := req.MinInsyncReplicas
 	if minISR == 0 {
+		minISR = 1
+	}
+
+	// Diskless topics store data in the shared object store and do not
+	// replicate; ISR and replication factor settings are ignored.
+	if storageMode == meta.StorageModeDiskless {
+		rf = 1
 		minISR = 1
 	}
 
@@ -130,20 +145,6 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	}
 	if minISR > rf {
 		return meta.TopicConfig{}, fmt.Errorf("min_insync_replicas cannot exceed replication_factor")
-	}
-
-	storageMode := req.StorageMode
-	if storageMode == "" {
-		storageMode = meta.StorageModeClassic
-	}
-	if storageMode != meta.StorageModeClassic && storageMode != meta.StorageModeDiskless {
-		return meta.TopicConfig{}, fmt.Errorf("invalid storage_mode, must be classic or diskless")
-	}
-	if storageMode == meta.StorageModeDiskless && req.Schema != nil {
-		return meta.TopicConfig{}, fmt.Errorf("typed schemas are unsupported for diskless topics")
-	}
-	if storageMode == meta.StorageModeDiskless && req.ExportEnabled {
-		return meta.TopicConfig{}, fmt.Errorf("export_enabled is unsupported for diskless topics")
 	}
 
 	tc := meta.TopicConfig{

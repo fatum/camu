@@ -532,9 +532,6 @@ func applyKafkaTopicConfigs(tc meta.TopicConfig, values map[string]*string, rese
 			if err != nil {
 				return tc, fmt.Errorf("invalid camu.export.enabled")
 			}
-			if v && next.StorageMode == meta.StorageModeDiskless {
-				return tc, fmt.Errorf("export_enabled is unsupported for diskless topics")
-			}
 			next.ExportEnabled = v
 		case "cleanup.policy":
 			if value == nil {

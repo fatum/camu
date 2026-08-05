@@ -215,6 +215,172 @@ func TestClassicRetentionOwnerJobResumesAfterSegmentDataDeleted(t *testing.T) {
 	}
 }
 
+// TestDisklessRetentionExportCheckpointGate verifies that diskless retention
+// for an exporting topic never deletes refs the Parquet pipeline has not
+// exported yet, and proceeds once the checkpoint covers them.
+func TestDisklessRetentionExportCheckpointGate(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	ctx := context.Background()
+
+	tc := meta.TopicConfig{Name: "diskless-export", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	// Four expired refs [0,1),[1,2),[2,3),[3,4), each in its own data file.
+	for i := int64(0); i < 4; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
+		if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
+			FileKey:   fileKey,
+			CreatedAt: time.Now().Add(-2 * time.Hour),
+			Batches: []diskless.BatchRef{{
+				Topic:      tc.Name,
+				Partition:  0,
+				BaseOffset: i,
+				EndOffset:  i + 1,
+				ByteOffset: 0,
+				ByteLength: 10,
+			}},
+		}); err != nil {
+			t.Fatalf("RegisterSegment([%d,%d)) error = %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	generation := uint64(0)
+	publishCheckpoint := func(nextOffset uint64) {
+		t.Helper()
+		generation++
+		store := pipeline.NewCheckpointStore(s.s3Client, pipeline.NoFence{})
+		if err := store.Publish(ctx, parquetPipelineName, pipeline.Checkpoint{
+			SourceTopic: tc.Name, Partition: 0, NextOffset: nextOffset, SourceEpoch: 1,
+			Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, Generation: generation,
+		}); err != nil {
+			t.Fatalf("publish checkpoint %d: %v", nextOffset, err)
+		}
+	}
+
+	// No checkpoint yet: nothing is safe to retain.
+	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("no checkpoint: retention enqueued %d jobs, want 0", len(jobs))
+	}
+
+	// Checkpoint covers [0,2): only f0 and f1 are eligible.
+	publishCheckpoint(2)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("checkpoint 2: retention enqueued %d jobs, want 2", len(jobs))
+	}
+
+	// Checkpoint covers the whole log: all four files are eligible.
+	publishCheckpoint(4)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("checkpoint 4: retention enqueued %d jobs, want 4", len(jobs))
+	}
+}
+
+// TestDisklessRetentionSharedFileWaitsForEveryPartition verifies that a shared
+// backing object referenced by several partitions is not deleted until every
+// exporting partition has exported its refs.
+func TestDisklessRetentionSharedFileWaitsForEveryPartition(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	ctx := context.Background()
+
+	tc := meta.TopicConfig{Name: "diskless-shared", Partitions: 2, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+			1: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{
+		0: {Owned: true, LeaderEpoch: 1},
+		1: {Owned: true, LeaderEpoch: 1},
+	}
+	s.assignmentsMu.Unlock()
+
+	// One shared file holds refs for both partitions [0,2), both old enough to
+	// be retained.
+	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
+		FileKey:   "_diskless/test-node/shared.data",
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+		Batches: []diskless.BatchRef{
+			{Topic: tc.Name, Partition: 0, BaseOffset: 0, EndOffset: 2, ByteOffset: 0, ByteLength: 10},
+			{Topic: tc.Name, Partition: 1, BaseOffset: 0, EndOffset: 2, ByteOffset: 10, ByteLength: 10},
+		},
+	}); err != nil {
+		t.Fatalf("RegisterSegment() error = %v", err)
+	}
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	publishCheckpoint := func(partition int) {
+		t.Helper()
+		store := pipeline.NewCheckpointStore(s.s3Client, pipeline.NoFence{})
+		if err := store.Publish(ctx, parquetPipelineName, pipeline.Checkpoint{
+			SourceTopic: tc.Name, Partition: partition, NextOffset: 2, SourceEpoch: 1,
+			Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, Generation: 1,
+		}); err != nil {
+			t.Fatalf("publish checkpoint for partition %d: %v", partition, err)
+		}
+	}
+
+	// Partition 0 exported, partition 1 not: the shared file must be kept.
+	publishCheckpoint(0)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("partition 1 unexported: retention enqueued %d jobs, want 0", len(jobs))
+	}
+
+	// Both partitions exported: the shared file may be retained.
+	publishCheckpoint(1)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("all partitions exported: retention enqueued %d jobs, want 1", len(jobs))
+	}
+}
+
 func TestDisklessRetentionOwnerJobResumesAfterS3Delete(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()

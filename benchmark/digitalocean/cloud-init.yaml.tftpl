@@ -36,6 +36,9 @@ runcmd:
         secret_key: "${spaces_secret_key}"
     diskless:
       metastore: s3
+      compaction:
+        enabled: true
+        target_bytes: 67108864
     segments:
       max_size: 67108864
       max_age: 1m

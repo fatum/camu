@@ -2,7 +2,6 @@ package diskless
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -211,17 +210,19 @@ func TestReader_HidesPartiallyRegisteredRefs(t *testing.T) {
 		t.Fatalf("register A: %v", err)
 	}
 
-	// Simulate a partial register: B's ref object exists but the committed head
-	// has not advanced past it yet.
-	refB, err := json.Marshal(s3SegmentRef{
+	// Simulate a partial register: B's ref is present in the catalog but the
+	// committed head has not advanced past it yet.
+	cat, etag, err := meta.readCatalog(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("read catalog: %v", err)
+	}
+	cat.Refs = append(cat.Refs, s3CatalogRef{
 		FileKey: "dataB", ByteOffset: 0, ByteLength: int64(len(batchB)),
 		BaseOffset: 1, EndOffset: 3, CreatedAt: time.Now(),
 	})
-	if err != nil {
-		t.Fatalf("marshal ref B: %v", err)
-	}
-	if _, err := s3.ConditionalPut(ctx, s3SegKey("t", 0, 1, 3), refB, ""); err != nil {
-		t.Fatalf("create partial ref B: %v", err)
+	cat.sortRefs()
+	if err := meta.writeCatalog(ctx, "t", 0, cat, etag); err != nil {
+		t.Fatalf("write partial catalog B: %v", err)
 	}
 
 	r := NewReader(s3, meta)

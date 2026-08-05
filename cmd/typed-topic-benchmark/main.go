@@ -288,9 +288,6 @@ func loadConfig() (config, error) {
 	if storageMode != "" && storageMode != "classic" && storageMode != "diskless" {
 		return config{}, fmt.Errorf("STORAGE_MODE must be classic or diskless")
 	}
-	if storageMode == "diskless" && exportEnabled {
-		return config{}, fmt.Errorf("STORAGE_MODE=diskless requires EXPORT_ENABLED=false")
-	}
 	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID, StorageMode: storageMode}, nil
 }
 
@@ -411,11 +408,14 @@ func (c client) create(ctx context.Context, cfg config) error {
 	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled}
 	if cfg.StorageMode != "" {
 		body["storage_mode"] = cfg.StorageMode
+		if cfg.StorageMode == "diskless" {
+			// Diskless topics do not replicate; the server ignores these, so
+			// request the single-leader default explicitly.
+			body["replication_factor"] = 1
+			body["min_insync_replicas"] = 1
+		}
 	}
-	if cfg.StorageMode != "diskless" {
-		// Diskless topics reject schemas and cannot export.
-		body["schema"] = map[string]any{"encoding": "json", "fields": benchmarkSchemaFields(cfg)}
-	}
+	body["schema"] = map[string]any{"encoding": "json", "fields": benchmarkSchemaFields(cfg)}
 	if err := c.request(ctx, http.MethodPost, "/v1/topics", body, nil); err != nil {
 		return err
 	}
