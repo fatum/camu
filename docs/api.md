@@ -432,6 +432,10 @@ Important behavior:
   segment-registration failure is retried idempotently so it does not strand
   allocated offsets as a permanent gap. Only a persistent failure that outlives
   the flush retry window surfaces an error to the producer
+- the diskless readable high watermark is the committed point (segments that
+  have been durably registered), not the allocation counter: a consumer never
+  sees offsets that were allocated but not yet persisted, and never observes a
+  partially-registered flush
 
 ## Where To Check Exact Support
 
