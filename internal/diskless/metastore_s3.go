@@ -188,19 +188,28 @@ func (m *S3MetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) er
 			return fmt.Errorf("register segment ref %s: %w", key, err)
 		}
 	}
-	// Advance the partition's committed heads so reads never report
-	// allocated-but-unpersisted offsets as committed.
+	// Advance each partition's committed head so reads never report
+	// allocated-but-unpersisted offsets as committed. The head only moves
+	// through contiguous materialized ranges, so out-of-order registrations
+	// from concurrent writers never expose a gap.
+	seen := make(map[string]struct{})
 	for _, b := range seg.Batches {
-		if err := m.advanceCommitted(ctx, b.Topic, b.Partition, b.EndOffset); err != nil {
+		key := partitionKey(b.Topic, b.Partition)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if err := m.advanceCommitted(ctx, b.Topic, b.Partition); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// advanceCommitted raises a partition's committed offset to at least end via a
-// read-CAS loop. It only ever advances, so a concurrent lower update is a no-op.
-func (m *S3MetaStore) advanceCommitted(ctx context.Context, topic string, partition int, end int64) error {
+// advanceCommitted raises a partition's committed offset to the end of the
+// longest run of refs contiguous with the current head via a read-CAS loop.
+// It only ever advances, so a concurrent lower update is a no-op.
+func (m *S3MetaStore) advanceCommitted(ctx context.Context, topic string, partition int) error {
 	key := s3CommittedKey(topic, partition)
 	for {
 		data, etag, err := m.s3.GetWithETag(ctx, key)
@@ -217,21 +226,65 @@ func (m *S3MetaStore) advanceCommitted(ctx context.Context, topic string, partit
 		default:
 			return fmt.Errorf("read committed %s: %w", key, err)
 		}
-		if committed >= end {
-			return nil
-		}
-		next, err := json.Marshal(s3CommittedState{Version: s3HeadStateVersion, CommittedOffset: end})
+
+		next, err := m.contiguousCommitted(ctx, topic, partition, committed)
 		if err != nil {
 			return err
 		}
-		if _, err := m.s3.ConditionalPut(ctx, key, next, etag); err != nil {
+		if next <= committed {
+			return nil
+		}
+		payload, err := json.Marshal(s3CommittedState{Version: s3HeadStateVersion, CommittedOffset: next})
+		if err != nil {
+			return err
+		}
+		if _, err := m.s3.ConditionalPut(ctx, key, payload, etag); err != nil {
 			if errors.Is(err, storage.ErrConflict) {
-				continue // another writer advanced; retry with a fresh read.
+				continue // another writer advanced; re-read and re-walk.
 			}
 			return fmt.Errorf("update committed %s: %w", key, err)
 		}
 		return nil
 	}
+}
+
+// contiguousCommitted returns the end of the longest run of segment refs for
+// the partition that is contiguous with the current committed head.
+func (m *S3MetaStore) contiguousCommitted(ctx context.Context, topic string, partition int, committed int64) (int64, error) {
+	refs, err := m.partitionSegmentRefs(ctx, topic, partition)
+	if err != nil {
+		return 0, err
+	}
+	return contiguousCommittedEnd(committed, refs), nil
+}
+
+// partitionSegmentRefs lists a partition's segment refs in offset order. Refs
+// are keyed by zero-padded base offset, so lexical listing order equals
+// numeric order.
+func (m *S3MetaStore) partitionSegmentRefs(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
+	keys, err := m.s3.List(ctx, s3SegPrefix(topic, partition))
+	if err != nil {
+		return nil, fmt.Errorf("list segment refs %s/%d: %w", topic, partition, err)
+	}
+	refs := make([]SegmentRef, 0, len(keys))
+	for _, key := range keys {
+		data, err := m.s3.Get(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("get segment ref %s: %w", key, err)
+		}
+		var r s3SegmentRef
+		if err := json.Unmarshal(data, &r); err != nil {
+			return nil, fmt.Errorf("parse segment ref %s: %w", key, err)
+		}
+		refs = append(refs, SegmentRef{
+			FileKey:    r.FileKey,
+			ByteOffset: r.ByteOffset,
+			ByteLength: r.ByteLength,
+			BaseOffset: r.BaseOffset,
+			EndOffset:  r.EndOffset,
+		})
+	}
+	return refs, nil
 }
 
 // QuerySegments returns segment references covering [fromOffset, ...) for a

@@ -111,6 +111,41 @@ func TestDynamoMetaStore_RegisterAndQuery(t *testing.T) {
 	assert.Equal(t, int64(600), refs[0].ByteOffset)
 }
 
+// TestDynamoMetaStore_CommittedHeadOnlyAdvancesContiguously verifies that the
+// committed high watermark never advances past an unmaterialized range, even
+// when concurrent writers register adjacent ranges out of order.
+func TestDynamoMetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	committed := func() int64 {
+		t.Helper()
+		h, err := ms.GetCommittedHead(ctx, "t", 0)
+		require.NoError(t, err)
+		return h
+	}
+	register := func(base, end int64) {
+		t.Helper()
+		require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
+			FileKey:   "f.data",
+			Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: end, ByteLength: end - base}},
+			CreatedAt: time.Now(),
+		}))
+	}
+
+	register(10, 20)
+	assert.Equal(t, int64(0), committed(), "later range alone must not advance past missing prefix")
+
+	register(0, 10)
+	assert.Equal(t, int64(20), committed(), "filled prefix must expose the whole chain")
+
+	register(30, 40)
+	assert.Equal(t, int64(20), committed(), "abandoned range must not advance past gap")
+
+	register(20, 30)
+	assert.Equal(t, int64(40), committed(), "closing the gap advances through the full chain")
+}
+
 func TestDynamoMetaStore_GetPartitionHead(t *testing.T) {	ctx := context.Background()
 	ms := dynamoTestStore(t)
 

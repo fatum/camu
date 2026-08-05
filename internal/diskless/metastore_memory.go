@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -92,13 +93,15 @@ func (m *MemoryMetaStore) AllocateOffsets(_ context.Context, allocs []OffsetAllo
 }
 
 // RegisterSegment records a flushed data file in the segment catalog and
-// advances the partition's committed head to the highest materialized end.
-// Registering an already-registered offset range is a no-op so an idempotent
-// produce retry that re-materializes a batch does not create duplicate refs.
+// advances the partition's committed head through the longest run of contiguous
+// materialized ranges. Registering an already-registered offset range is a
+// no-op so an idempotent produce retry that re-materializes a batch does not
+// create duplicate refs.
 func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	affected := make(map[string]bool)
 	for _, b := range seg.Batches {
 		key := partitionKey(b.Topic, b.Partition)
 		if m.rangeRegistered(key, b.BaseOffset, b.EndOffset) {
@@ -112,11 +115,27 @@ func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) 
 			byteLength: b.ByteLength,
 			createdAt:  seg.CreatedAt,
 		})
-		if b.EndOffset > m.committed[key] {
-			m.committed[key] = b.EndOffset
-		}
+		affected[key] = true
+	}
+
+	// Advance committed heads only through contiguous materialized ranges so an
+	// out-of-order registration never exposes a gap to readers.
+	for key := range affected {
+		m.committed[key] = m.contiguousCommittedLocked(key)
 	}
 	return nil
+}
+
+// contiguousCommittedLocked returns the end of the longest run of segment refs
+// for a partition that is contiguous with its current committed head.
+func (m *MemoryMetaStore) contiguousCommittedLocked(key string) int64 {
+	entries := m.segments[key]
+	refs := make([]SegmentRef, 0, len(entries))
+	for _, e := range entries {
+		refs = append(refs, SegmentRef{BaseOffset: e.baseOffset, EndOffset: e.endOffset})
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].BaseOffset < refs[j].BaseOffset })
+	return contiguousCommittedEnd(m.committed[key], refs)
 }
 
 // rangeRegistered reports whether a batch for the same offset range is already

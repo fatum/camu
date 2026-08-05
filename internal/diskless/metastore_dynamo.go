@@ -345,20 +345,42 @@ func (d *DynamoMetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord
 	}
 
 	// Advance the per-partition committed heads to the highest materialized end
-	// so reads never report allocated-but-unpersisted offsets as committed.
+	// so reads never report allocated-but-unpersisted offsets as committed. The
+	// head only moves through contiguous materialized ranges, so out-of-order
+	// registrations from concurrent writers never expose a gap.
+	seen := make(map[string]struct{})
 	for _, b := range seg.Batches {
-		if err := d.advanceCommitted(ctx, b.Topic, b.Partition, b.EndOffset); err != nil {
+		key := partitionKey(b.Topic, b.Partition)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if err := d.advanceCommitted(ctx, b.Topic, b.Partition); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// advanceCommitted raises a partition's committed offset to at least end. The
-// update is conditional so a lower value never regresses a concurrent advance.
-func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, partition int, end int64) error {
+// advanceCommitted raises a partition's committed offset to the end of the
+// longest run of segment refs contiguous with the current head. The update is
+// conditional so a lower value never regresses a concurrent advance.
+func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, partition int) error {
 	pk := partitionKey(topic, partition)
-	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+	committed, err := d.readCommittedOffset(ctx, pk)
+	if err != nil {
+		return err
+	}
+
+	next, err := d.contiguousCommitted(ctx, pk, committed)
+	if err != nil {
+		return err
+	}
+	if next <= committed {
+		return nil
+	}
+
+	_, err = d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: &d.offsetsTable,
 		Key: map[string]ddbtypes.AttributeValue{
 			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
@@ -366,7 +388,7 @@ func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, pa
 		UpdateExpression:          aws.String("SET committed_offset = :end"),
 		ConditionExpression:       aws.String("attribute_not_exists(committed_offset) OR committed_offset < :end"),
 		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-			":end": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(end, 10)},
+			":end": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(next, 10)},
 		},
 	})
 	if err != nil {
@@ -377,6 +399,83 @@ func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, pa
 		return fmt.Errorf("advance committed for %s: %w", pk, err)
 	}
 	return nil
+}
+
+// contiguousCommitted returns the end of the longest run of segment refs for
+// the partition that is contiguous with the current committed head, by walking
+// the refs in ascending offset order.
+func (d *DynamoMetaStore) contiguousCommitted(ctx context.Context, pk string, committed int64) (int64, error) {
+	forward := true
+	input := &dynamodb.QueryInput{
+		TableName:              &d.segmentsTable,
+		KeyConditionExpression: aws.String("pk = :pk AND sk >= :from"),
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":pk":   &ddbtypes.AttributeValueMemberS{Value: pk},
+			":from": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(committed, 10)},
+		},
+		ProjectionExpression: aws.String("sk, end_offset"),
+		ScanIndexForward:     &forward,
+	}
+
+	pos := committed
+	paginator := dynamodb.NewQueryPaginator(d.client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("query contiguous refs for %s: %w", pk, err)
+		}
+		for _, item := range page.Items {
+			base, ok := offsetFromItem(item, "sk")
+			if !ok {
+				continue
+			}
+			end, ok := offsetFromItem(item, "end_offset")
+			if !ok {
+				continue
+			}
+			if base > pos {
+				return pos, nil
+			}
+			if base == pos {
+				pos = end
+			}
+		}
+	}
+	return pos, nil
+}
+
+// readCommittedOffset returns the partition's committed offset, or 0 if none.
+func (d *DynamoMetaStore) readCommittedOffset(ctx context.Context, pk string) (int64, error) {
+	out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: &d.offsetsTable,
+		Key: map[string]ddbtypes.AttributeValue{
+			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
+		},
+		ProjectionExpression: aws.String("committed_offset"),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("get committed offset for %s: %w", pk, err)
+	}
+	if out.Item == nil {
+		return 0, nil
+	}
+	if v, ok := offsetFromItem(out.Item, "committed_offset"); ok {
+		return v, nil
+	}
+	return 0, nil
+}
+
+// offsetFromItem extracts an integer attribute value from a DynamoDB item.
+func offsetFromItem(item map[string]ddbtypes.AttributeValue, name string) (int64, bool) {
+	v, ok := item[name].(*ddbtypes.AttributeValueMemberN)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v.Value, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // QuerySegments returns segment references covering [fromOffset, ...) up to maxBytes.
@@ -463,24 +562,7 @@ func (d *DynamoMetaStore) GetPartitionHead(ctx context.Context, topic string, pa
 // GetCommittedHead returns the highest offset durably materialized for a
 // partition, or 0 if nothing has been registered yet.
 func (d *DynamoMetaStore) GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error) {
-	pk := partitionKey(topic, partition)
-	out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: &d.offsetsTable,
-		Key: map[string]ddbtypes.AttributeValue{
-			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
-		},
-		ProjectionExpression: aws.String("committed_offset"),
-	})
-	if err != nil {
-		return 0, fmt.Errorf("get committed head for %s: %w", pk, err)
-	}
-	if out.Item == nil {
-		return 0, nil
-	}
-	if v, ok := out.Item["committed_offset"].(*ddbtypes.AttributeValueMemberN); ok {
-		return strconv.ParseInt(v.Value, 10, 64)
-	}
-	return 0, nil
+	return d.readCommittedOffset(ctx, partitionKey(topic, partition))
 }
 
 // GetPartitionStart returns the first readable offset for a partition, or the

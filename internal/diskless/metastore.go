@@ -22,10 +22,11 @@ type MetaStore interface {
 	GetPartitionHead(ctx context.Context, topic string, partition int) (int64, error)
 
 	// GetCommittedHead returns the highest offset durably materialized for a
-	// partition — the readable high watermark. It advances only when a flushed
-	// segment is registered, so it never includes offsets that were allocated
-	// but not yet persisted (in-flight flushes) or abandoned (gap after a hard
-	// failure).
+	// partition — the readable high watermark. It advances only through the
+	// longest run of contiguous registered segments, so it never includes
+	// offsets that were allocated but not yet persisted (in-flight flushes),
+	// abandoned (gap after a hard failure), or registered out of order (a later
+	// range materialized before an earlier one).
 	GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error)
 
 	// GetPartitionStart returns the earliest readable offset for a partition
@@ -46,4 +47,22 @@ type MetaStore interface {
 
 	// Close releases any resources held by the MetaStore.
 	Close() error
+}
+
+// contiguousCommittedEnd walks refs (sorted ascending by BaseOffset and
+// non-overlapping within a partition) starting at the current committed head,
+// returning the end of the longest run of refs that are contiguous with it. A
+// ref advances the watermark only when its base equals the current position, so
+// a registration that arrives before an earlier range (an in-flight or
+// abandoned prefix) never exposes a gap to readers.
+func contiguousCommittedEnd(committed int64, refs []SegmentRef) int64 {
+	for _, r := range refs {
+		if r.BaseOffset > committed {
+			break
+		}
+		if r.BaseOffset == committed {
+			committed = r.EndOffset
+		}
+	}
+	return committed
 }

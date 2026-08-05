@@ -2,6 +2,7 @@ package diskless
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -134,6 +135,83 @@ func TestS3MetaStore_ConcurrentAllocation(t *testing.T) {
 	}
 }
 
+// TestS3MetaStore_CommittedHeadConcurrentRegistration verifies the P1 scenario:
+// concurrent writers flushing adjacent allocations in any order never expose a
+// gap to readers. After every registration the committed head is checked: every
+// offset below it must be covered by a registered ref.
+func TestS3MetaStore_CommittedHeadConcurrentRegistration(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+
+	const (
+		count     = 3
+		perWorker = 20
+		workers   = 4
+	)
+	total := workers * perWorker * count
+
+	// Pre-allocate disjoint adjacent ranges: writer w registers bases
+	// w*perWorker*count, then +total, +2*total, ... so ranges from different
+	// writers are adjacent and interleave.
+	allBases := make([]int64, 0, workers*perWorker)
+	for i := 0; i < perWorker; i++ {
+		for w := 0; w < workers; w++ {
+			allBases = append(allBases, int64(i*count+ w*perWorker*count))
+		}
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				base := allBases[i*workers+worker]
+				seg := SegmentRecord{
+					FileKey:   fmt.Sprintf("f-%d.data", base),
+					Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: base + count, ByteLength: count}},
+					CreatedAt: time.Now(),
+				}
+				if err := m.RegisterSegment(ctx, seg); err != nil {
+					t.Errorf("register [%d,%d): %v", base, base+count, err)
+					return
+				}
+				committed, err := m.GetCommittedHead(ctx, "t", 0)
+				if err != nil {
+					t.Errorf("committed head: %v", err)
+					return
+				}
+				refs, err := m.partitionSegmentRefs(ctx, "t", 0)
+				if err != nil {
+					t.Errorf("list refs: %v", err)
+					return
+				}
+				covered := make([]bool, committed)
+				for _, r := range refs {
+					for o := r.BaseOffset; o < r.EndOffset && o < committed; o++ {
+						covered[o] = true
+					}
+				}
+				for o := int64(0); o < committed; o++ {
+					if !covered[o] {
+						t.Errorf("committed head %d exposes uncovered offset %d (gap)", committed, o)
+						return
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	committed, err := m.GetCommittedHead(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("final committed head: %v", err)
+	}
+	if committed != int64(total) {
+		t.Fatalf("final committed = %d, want %d", committed, total)
+	}
+}
+
 func TestS3MetaStore_IdempotentAllocation(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()
@@ -185,6 +263,59 @@ func TestS3MetaStore_IdempotentAllocation(t *testing.T) {
 	}
 	if head != 10 {
 		t.Fatalf("head = %d, want 10 (4+4+2, retry not counted)", head)
+	}
+}
+
+// TestS3MetaStore_CommittedHeadOnlyAdvancesContiguously verifies that the
+// committed high watermark never advances past an unmaterialized range, even
+// when concurrent writers register adjacent ranges out of order.
+func TestS3MetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+
+	committed := func() int64 {
+		t.Helper()
+		h, err := m.GetCommittedHead(ctx, "t", 0)
+		if err != nil {
+			t.Fatalf("committed head: %v", err)
+		}
+		return h
+	}
+	register := func(base, end int64) {
+		t.Helper()
+		if err := m.RegisterSegment(ctx, SegmentRecord{
+			FileKey:   fmt.Sprintf("f-%d-%d.data", base, end),
+			Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: end, ByteLength: end - base}},
+			CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("register [%d,%d): %v", base, end, err)
+		}
+	}
+
+	// A later range registering first must not advertise past the missing
+	// prefix: the consumer would otherwise skip the not-yet-materialized
+	// [0,10).
+	register(10, 20)
+	if got := committed(); got != 0 {
+		t.Fatalf("committed after [10,20) = %d, want 0 (gap at [0,10))", got)
+	}
+
+	// Filling the prefix makes the whole chain readable.
+	register(0, 10)
+	if got := committed(); got != 20 {
+		t.Fatalf("committed after [0,10)+[10,20) = %d, want 20", got)
+	}
+
+	// An abandoned range never advances the head past the gap.
+	register(30, 40)
+	if got := committed(); got != 20 {
+		t.Fatalf("committed after [30,40) = %d, want 20 (gap at [20,30))", got)
+	}
+
+	// Closing the gap advances through the full contiguous chain.
+	register(20, 30)
+	if got := committed(); got != 40 {
+		t.Fatalf("committed after gap filled = %d, want 40", got)
 	}
 }
 
