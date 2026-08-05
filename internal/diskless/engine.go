@@ -25,6 +25,11 @@ type Engine struct {
 	lingerRst chan struct{} // signals linger timer to start
 	stop      chan struct{}
 	wg        sync.WaitGroup
+	// produceMu serializes Produce against Close. triggerFlush calls wg.Add
+	// from Produce, which must never race Close's wg.Wait: Close takes the
+	// write lock so no Produce (and therefore no wg.Add) can be in flight when
+	// it waits.
+	produceMu sync.RWMutex
 }
 
 // NewEngine creates an Engine that flushes to s3 via meta, identified by nodeID.
@@ -46,6 +51,9 @@ func NewEngine(s3 *storage.S3Client, meta MetaStore, nodeID string, cfg EngineCo
 // Produce appends a batch to the buffer and blocks until flush completes.
 // Callee takes ownership of batch — caller must not mutate it after this call.
 func (e *Engine) Produce(ctx context.Context, topic string, partition int, batch []byte) (FlushResult, error) {
+	e.produceMu.RLock()
+	defer e.produceMu.RUnlock()
+
 	done := make(chan FlushResult, 1)
 	e.buf.Append(BufferEntry{
 		Topic:     topic,
@@ -81,6 +89,8 @@ func (e *Engine) Fetch(ctx context.Context, topic string, partition int, fromOff
 
 // Close stops the linger loop and performs a final flush.
 func (e *Engine) Close() {
+	e.produceMu.Lock()
+	defer e.produceMu.Unlock()
 	close(e.stop)
 	e.wg.Wait()
 }

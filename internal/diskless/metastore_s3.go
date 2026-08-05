@@ -27,16 +27,13 @@ type S3MetaStore struct {
 }
 
 const (
-	s3MetaPrefix      = "_diskless_meta/"
-	s3HeadPrefix      = s3MetaPrefix + "head/"
-	s3CommittedPrefix = s3MetaPrefix + "committed/"
-	s3ManifestPrefix  = s3MetaPrefix + "manifest/"
+	s3MetaPrefix     = "_diskless_meta/"
+	s3ManifestPrefix = s3MetaPrefix + "manifest/"
 	// Catalog operations (compaction and retention) operate on the same
 	// authoritative manifest as commits; there is no second ref format.
-	s3CatalogPrefix    = s3ManifestPrefix
-	s3SegmentPrefix    = s3MetaPrefix + "seg/"
-	s3HeadFile         = ".json"
-	s3HeadStateVersion = 1
+	s3CatalogPrefix = s3ManifestPrefix
+	s3SegmentPrefix = s3MetaPrefix + "seg/"
+	s3HeadFile      = ".json"
 )
 
 // s3UploadManifest is the clean-cut upload-first state. Unlike the transitional
@@ -48,13 +45,7 @@ type s3UploadManifest struct {
 	CommittedOffset int64                        `json:"committed_offset"`
 	Refs            []s3CatalogRef               `json:"refs"`
 	Producers       map[string][]s3ProducerBatch `json:"producers,omitempty"`
-	BatchCommits    map[string]OffsetResult      `json:"batch_commits,omitempty"`
-}
-
-type s3HeadState struct {
-	Version    int                        `json:"version"`
-	NextOffset int64                      `json:"next_offset"`
-	Producers  map[string]s3ProducerBatch `json:"producers,omitempty"`
+	BatchCommits    map[string]committedBatch    `json:"batch_commits,omitempty"`
 }
 
 // s3ProducerBatch records the most recent idempotent allocation for a producer
@@ -64,11 +55,6 @@ type s3ProducerBatch struct {
 	FirstSequence int64 `json:"first_sequence"`
 	BaseOffset    int64 `json:"base_offset"`
 	Count         int   `json:"count"`
-}
-
-type s3CommittedState struct {
-	Version         int   `json:"version"`
-	CommittedOffset int64 `json:"committed_offset"`
 }
 
 // s3CatalogRef is one materialized segment reference within a partition catalog.
@@ -94,18 +80,6 @@ func NewS3MetaStore(s3 *storage.S3Client) *S3MetaStore {
 	return &S3MetaStore{s3: s3}
 }
 
-func s3HeadKey(topic string, partition int) string {
-	return fmt.Sprintf("%s%s/%d%s", s3HeadPrefix, topic, partition, s3HeadFile)
-}
-
-func s3CommittedKey(topic string, partition int) string {
-	return fmt.Sprintf("%s%s/%d%s", s3CommittedPrefix, topic, partition, s3HeadFile)
-}
-
-func s3CatalogKey(topic string, partition int) string {
-	return s3ManifestKey(topic, partition)
-}
-
 func s3ManifestKey(topic string, partition int) string {
 	return fmt.Sprintf("%s%s/%d.json", s3ManifestPrefix, topic, partition)
 }
@@ -125,7 +99,7 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 		for {
 			key := s3ManifestKey(batch.Topic, batch.Partition)
 			data, etag, err := m.s3.GetWithETag(ctx, key)
-			manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}, BatchCommits: map[string]OffsetResult{}}
+			manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}, BatchCommits: map[string]committedBatch{}}
 			if err == nil {
 				if err := json.Unmarshal(data, &manifest); err != nil {
 					return nil, fmt.Errorf("parse upload manifest %s/%d: %w", batch.Topic, batch.Partition, err)
@@ -134,8 +108,8 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 				return nil, err
 			}
 			if old, ok := manifest.BatchCommits[batch.BatchID]; ok {
-				old.Duplicate = true
-				results[i] = old
+				old.Result.Duplicate = true
+				results[i] = old.Result
 				break
 			}
 			pid := strconv.FormatInt(batch.ProducerID, 10)
@@ -169,9 +143,11 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 			end := base + int64(batch.Count)
 			manifest.NextOffset, manifest.CommittedOffset = end, end
 			manifest.Refs = append(manifest.Refs, s3CatalogRef{FileKey: batch.FileKey, ByteOffset: batch.ByteOffset, ByteLength: batch.ByteLength, BaseOffset: base, EndOffset: end, CreatedAt: batch.CreatedAt})
-			manifest.BatchCommits[batch.BatchID] = OffsetResult{BaseOffset: base}
+			manifest.BatchCommits[batch.BatchID] = committedBatch{Result: OffsetResult{BaseOffset: base}, CommittedAt: time.Now()}
+			pruneBatchCommits(manifest.BatchCommits, time.Now())
 			if batch.ProducerID != 0 {
-				h := append(manifest.Producers[pid], s3ProducerBatch{FirstSequence: batch.Sequence, BaseOffset: base, Count: batch.Count})
+				h := manifest.Producers[pid]
+				h = append(h, s3ProducerBatch{FirstSequence: batch.Sequence, BaseOffset: base, Count: batch.Count})
 				if len(h) > uploadedProducerHistory {
 					h = h[len(h)-uploadedProducerHistory:]
 				}
@@ -201,10 +177,6 @@ func s3CatalogPrefixForTopic(topic string) string {
 
 func s3SegPrefixForTopic(topic string) string {
 	return s3SegmentPrefix + topic + "/"
-}
-
-func s3HeadPrefixForTopic(topic string) string {
-	return s3HeadPrefix + topic + "/"
 }
 
 // hasRef reports whether the catalog already holds a ref with the given range.
@@ -487,9 +459,9 @@ func (m *S3MetaStore) DeleteTopic(ctx context.Context, topic string) error {
 	for _, prefix := range []string{
 		s3CatalogPrefixForTopic(topic),
 		s3ManifestPrefix + topic + "/",
-		s3HeadPrefixForTopic(topic),
-		s3CommittedPrefix + topic + "/",
-		s3SegPrefixForTopic(topic), // legacy per-batch refs, if any remain
+		"_diskless_meta/head/" + topic + "/",      // legacy, if any remain
+		"_diskless_meta/committed/" + topic + "/", // legacy, if any remain
+		s3SegPrefixForTopic(topic),                // legacy per-batch refs, if any remain
 	} {
 		keys, err := m.s3.List(ctx, prefix)
 		if err != nil {

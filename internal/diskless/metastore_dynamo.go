@@ -17,7 +17,7 @@ import (
 type dynamoUploadState struct {
 	NextOffset   int64                            `json:"next_offset"`
 	Producers    map[string][]dynamoProducerBatch `json:"producers,omitempty"`
-	BatchCommits map[string]OffsetResult          `json:"batch_commits,omitempty"`
+	BatchCommits map[string]committedBatch        `json:"batch_commits,omitempty"`
 }
 
 type dynamoProducerBatch struct {
@@ -96,7 +96,7 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 			if err != nil {
 				return nil, fmt.Errorf("read upload state %s: %w", pk, err)
 			}
-			state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}, BatchCommits: map[string]OffsetResult{}}
+			state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}, BatchCommits: map[string]committedBatch{}}
 			var old string
 			if out.Item != nil {
 				if a, ok := out.Item["upload_state"].(*ddbtypes.AttributeValueMemberS); ok {
@@ -107,8 +107,8 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 				}
 			}
 			if old, ok := state.BatchCommits[b.BatchID]; ok {
-				old.Duplicate = true
-				results[i] = old
+				old.Result.Duplicate = true
+				results[i] = old.Result
 				break
 			}
 			pid := strconv.FormatInt(b.ProducerID, 10)
@@ -140,9 +140,11 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 			base := state.NextOffset
 			end := base + int64(b.Count)
 			state.NextOffset = end
-			state.BatchCommits[b.BatchID] = OffsetResult{BaseOffset: base}
+			state.BatchCommits[b.BatchID] = committedBatch{Result: OffsetResult{BaseOffset: base}, CommittedAt: time.Now()}
+			pruneBatchCommits(state.BatchCommits, time.Now())
 			if b.ProducerID != 0 {
-				h := append(state.Producers[pid], dynamoProducerBatch{FirstSequence: b.Sequence, BaseOffset: base, Count: b.Count})
+				h := state.Producers[pid]
+				h = append(h, dynamoProducerBatch{FirstSequence: b.Sequence, BaseOffset: base, Count: b.Count})
 				if len(h) > uploadedProducerHistory {
 					h = h[len(h)-uploadedProducerHistory:]
 				}
@@ -241,84 +243,6 @@ func (d *DynamoMetaStore) ReplaceSegmentRefs(ctx context.Context, topic string, 
 		return fmt.Errorf("replace segment refs %s: %w", pk, err)
 	}
 	return nil
-}
-func (d *DynamoMetaStore) advanceCommitted(ctx context.Context, topic string, partition int) error {
-	pk := partitionKey(topic, partition)
-	committed, err := d.readCommittedOffset(ctx, pk)
-	if err != nil {
-		return err
-	}
-
-	next, err := d.contiguousCommitted(ctx, pk, committed)
-	if err != nil {
-		return err
-	}
-	if next <= committed {
-		return nil
-	}
-
-	_, err = d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: &d.offsetsTable,
-		Key: map[string]ddbtypes.AttributeValue{
-			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
-		},
-		UpdateExpression:    aws.String("SET committed_offset = :end"),
-		ConditionExpression: aws.String("attribute_not_exists(committed_offset) OR committed_offset < :end"),
-		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-			":end": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(next, 10)},
-		},
-	})
-	if err != nil {
-		var cond *ddbtypes.ConditionalCheckFailedException
-		if errors.As(err, &cond) {
-			return nil // already advanced at least as far
-		}
-		return fmt.Errorf("advance committed for %s: %w", pk, err)
-	}
-	return nil
-}
-
-// contiguousCommitted returns the end of the longest run of segment refs for
-// the partition that is contiguous with the current committed head, by walking
-// the refs in ascending offset order.
-func (d *DynamoMetaStore) contiguousCommitted(ctx context.Context, pk string, committed int64) (int64, error) {
-	forward := true
-	input := &dynamodb.QueryInput{
-		TableName:              &d.segmentsTable,
-		KeyConditionExpression: aws.String("pk = :pk AND sk >= :from"),
-		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-			":pk":   &ddbtypes.AttributeValueMemberS{Value: pk},
-			":from": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(committed, 10)},
-		},
-		ProjectionExpression: aws.String("sk, end_offset"),
-		ScanIndexForward:     &forward,
-	}
-
-	pos := committed
-	paginator := dynamodb.NewQueryPaginator(d.client, input)
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return 0, fmt.Errorf("query contiguous refs for %s: %w", pk, err)
-		}
-		for _, item := range page.Items {
-			base, ok := offsetFromItem(item, "sk")
-			if !ok {
-				continue
-			}
-			end, ok := offsetFromItem(item, "end_offset")
-			if !ok {
-				continue
-			}
-			if base > pos {
-				return pos, nil
-			}
-			if base == pos {
-				pos = end
-			}
-		}
-	}
-	return pos, nil
 }
 
 // readCommittedOffset returns the partition's committed offset, or 0 if none.

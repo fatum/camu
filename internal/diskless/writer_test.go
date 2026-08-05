@@ -194,20 +194,6 @@ func TestWriter_FlushOrdersIdempotentCommitsWhenEarlierUploadIsDelayed(t *testin
 	}
 }
 
-// flakyMetaStore wraps a MetaStore and fails a configurable number of metadata
-// commits, modeling a transient commit failure after upload.
-type flakyMetaStore struct {
-	MetaStore
-	commitFails atomic.Int32
-}
-
-func (m *flakyMetaStore) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
-	if m.commitFails.Add(1) == 1 {
-		return nil, errors.New("transient commit error")
-	}
-	return m.MetaStore.CommitUploadedBatches(ctx, batches)
-}
-
 // TestWriter_Flush_RetriesTransientPutFailure verifies that a transient S3 PUT
 // failure does not strand the allocated offsets as a gap: the flush retries
 // idempotently with the same file key and succeeds.
