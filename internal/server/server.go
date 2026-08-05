@@ -1140,6 +1140,8 @@ func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.To
 // applyDisklessAssignments reads assignments for a diskless topic and updates
 // the local ownership cache without initializing partition managers.
 func (s *Server) applyDisklessAssignments(ctx context.Context, tc meta.TopicConfig) {
+	s.markTopicDiskless(tc.Name)
+
 	assigned, err := s.readAssignments(ctx, tc.Name)
 	if err != nil {
 		// Fallback: assume we own all partitions (single-node case).
