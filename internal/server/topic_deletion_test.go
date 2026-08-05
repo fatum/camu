@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -240,6 +241,79 @@ func TestTopicDeletionGCRemovesRegistryEntryAfterCrashWindow(t *testing.T) {
 	}
 	if _, err := s.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected deletion marker to be cleared, got %v", err)
+	}
+}
+
+// TestTopicDeletionAsyncWorkersProcessPendingMarkers verifies the leader's
+// async enqueue hands markers to the worker pool, which completes the cleanup
+// (data, registry, marker) off the GC tick.
+func TestTopicDeletionAsyncWorkersProcessPendingMarkers(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.startTopicDeletionWorkers()
+	defer s.stopTopicDeletionWorkers()
+	ctx := context.Background()
+
+	tc := meta.TopicConfig{
+		Name:              "async-del",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "classic",
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.s3Client.Put(ctx, tc.Name+"/0/segment.data", []byte("x"), storage.PutOpts{}); err != nil {
+		t.Fatalf("s3Client.Put() error = %v", err)
+	}
+	if err := s.putTopicDeletion(ctx, topicDeletionRecord{Topic: tc, StartedAt: time.Now()}); err != nil {
+		t.Fatalf("putTopicDeletion() error = %v", err)
+	}
+
+	s.enqueueTopicDeletions(ctx)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := s.getTopicDeletion(ctx, tc.Name); errors.Is(err, storage.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("worker did not complete deletion in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := s.s3Client.Get(ctx, tc.Name+"/0/segment.data"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("topic data not deleted, got %v", err)
+	}
+	if _, err := s.topicStore.Get(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("registry entry not deleted, got %v", err)
+	}
+}
+
+// TestDeleteTopicS3DataStreamsLargeTopics verifies a topic with more objects
+// than one delete batch is fully removed (the streaming list + batched delete
+// path).
+func TestDeleteTopicS3DataStreamsLargeTopics(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 1100; i++ {
+		key := fmt.Sprintf("big/0/%05d.segment", i)
+		if err := s.s3Client.Put(ctx, key, []byte("x"), storage.PutOpts{}); err != nil {
+			t.Fatalf("s3Client.Put(%s) error = %v", key, err)
+		}
+	}
+	if err := s.deleteTopicS3Data(ctx, "big"); err != nil {
+		t.Fatalf("deleteTopicS3Data() error = %v", err)
+	}
+	keys, err := s.s3Client.List(ctx, "big/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("remaining keys after delete = %d, want 0", len(keys))
 	}
 }
 

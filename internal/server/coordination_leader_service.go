@@ -17,5 +17,7 @@ func (s *Server) coordinationLeader() coordinationLeaderService {
 func (c coordinationLeaderService) runGC(ctx context.Context, topics []meta.TopicConfig) {
 	c.server.gcStaleInstances(ctx)
 	c.server.gcStaleISR(ctx, topics)
-	c.server.gcPendingTopicDeletions(ctx)
+	// Enqueue pending topic cleanups to the async workers; the GC tick must
+	// never block on a long deletion.
+	c.server.enqueueTopicDeletions(ctx)
 }

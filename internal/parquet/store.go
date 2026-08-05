@@ -24,6 +24,11 @@ type ObjectStore interface {
 	ConditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error)
 	Delete(ctx context.Context, key string) error
 	List(ctx context.Context, prefix string) ([]string, error)
+	// ListEach streams keys with the given prefix to fn one page at a time so a
+	// cleanup never holds the full key set in memory. Stops at fn's first error.
+	ListEach(ctx context.Context, prefix string, fn func(key string) error) error
+	// DeleteMany deletes the given keys in batches (idempotent).
+	DeleteMany(ctx context.Context, keys []string) error
 }
 
 // Fencer reports whether Parquet writes for a topic must be refused
@@ -491,37 +496,63 @@ func (s *Store) ListTopicManifests(ctx context.Context, topic string, from, to t
 // Fencer BEFORE invoking this — the fence blocks in-flight export jobs
 // from republishing state that this routine is about to erase.
 func (s *Store) DeleteTopicMetadata(ctx context.Context, topic string) error {
+	const deleteBatchSize = 1000
 	for _, prefix := range []string{
 		ManifestPrefix + topic + "/",
 		BucketIndexPrefix + topic + "/",
 	} {
-		keys, err := s.objects.List(ctx, prefix)
-		if err != nil {
+		if err := s.deletePrefix(ctx, prefix, deleteBatchSize); err != nil {
 			return err
 		}
-		for _, key := range keys {
-			if err := s.objects.Delete(ctx, key); err != nil && !errors.Is(err, ErrNotFound) {
-				return err
-			}
-		}
 	}
-	dataKeys, err := s.objects.List(ctx, DataPrefix)
-	if err != nil {
-		return err
-	}
+	// Data is Hive-partitioned (shared DataPrefix across topics), so stream the
+	// prefix and delete only the objects carrying this topic's partition marker.
 	topicMarker := "/topic=" + topic + "/"
-	for _, key := range dataKeys {
-		if !strings.Contains(key, topicMarker) {
-			continue
-		}
-		if err := s.objects.Delete(ctx, key); err != nil && !errors.Is(err, ErrNotFound) {
-			return err
-		}
+	if err := s.deletePrefixWhere(ctx, DataPrefix, deleteBatchSize, func(key string) bool {
+		return strings.Contains(key, topicMarker)
+	}); err != nil {
+		return err
 	}
 	if err := s.objects.Delete(ctx, QueryCatalogTopicKey(topic)); err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
 	return nil
+}
+
+// deletePrefix streams every key under prefix and deletes it in batches, never
+// materializing the full key list.
+func (s *Store) deletePrefix(ctx context.Context, prefix string, batchSize int) error {
+	return s.deletePrefixWhere(ctx, prefix, batchSize, func(string) bool { return true })
+}
+
+// deletePrefixWhere streams keys under prefix and deletes, in batches, those
+// for which keep is true.
+func (s *Store) deletePrefixWhere(ctx context.Context, prefix string, batchSize int, keep func(string) bool) error {
+	var batch []string
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := s.objects.DeleteMany(ctx, batch); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
+	err := s.objects.ListEach(ctx, prefix, func(key string) error {
+		if !keep(key) {
+			return nil
+		}
+		batch = append(batch, key)
+		if len(batch) >= batchSize {
+			return flush()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
 }
 
 // ReconcileBucket removes Parquet data objects in a (topic, date, hour)
