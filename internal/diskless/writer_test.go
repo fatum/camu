@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -137,18 +138,74 @@ func TestWriter_FlushMultiPartition(t *testing.T) {
 	}
 }
 
-// flakyMetaStore wraps a MetaStore and fails a configurable number of
-// RegisterSegment calls, modeling a transient segment-catalog write failure.
-type flakyMetaStore struct {
-	MetaStore
-	registerFails atomic.Int32
+func TestWriter_FlushOrdersIdempotentCommitsWhenEarlierUploadIsDelayed(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := NewMemoryMetaStore()
+	w := NewWriter(s3, meta, "node1")
+	firstPutStarted := make(chan struct{})
+	secondPutFinished := make(chan struct{})
+	releaseFirstPut := make(chan struct{})
+	var once sync.Once
+	var puts atomic.Int32
+	s3.SetFaultInjector(func(op string) error {
+		if op != "put" {
+			return nil
+		}
+		switch puts.Add(1) {
+		case 1:
+			once.Do(func() { close(firstPutStarted) })
+			<-releaseFirstPut
+		case 2:
+			close(secondPutFinished)
+		}
+		return nil
+	})
+	defer s3.SetFaultInjector(nil)
+
+	batch := func(sequence uint64) []byte {
+		return log.EncodeRecordBatchWithMeta(0, log.Batch{ProducerID: 7, Sequence: sequence, Messages: []log.Message{{Key: []byte("k"), Value: []byte("v")}}})
+	}
+	done0, done1 := make(chan FlushResult, 1), make(chan FlushResult, 1)
+	err0 := make(chan error, 1)
+	go func() {
+		err0 <- w.Flush(context.Background(), []BufferEntry{{Topic: "t", Partition: 0, Batch: batch(0), Done: done0}})
+	}()
+	<-firstPutStarted
+	err1 := make(chan error, 1)
+	go func() {
+		err1 <- w.Flush(context.Background(), []BufferEntry{{Topic: "t", Partition: 0, Batch: batch(1), Done: done1}})
+	}()
+	<-secondPutFinished
+	close(releaseFirstPut)
+	if err := <-err0; err != nil {
+		t.Fatalf("sequence 0 flush: %v", err)
+	}
+	if err := <-err1; err != nil {
+		t.Fatalf("sequence 1 flush: %v", err)
+	}
+	if got := (<-done0).BaseOffset; got != 0 {
+		t.Fatalf("sequence 0 offset = %d, want 0", got)
+	}
+	if got := (<-done1).BaseOffset; got != 1 {
+		t.Fatalf("sequence 1 offset = %d, want 1", got)
+	}
+	if head, _ := meta.GetCommittedHead(context.Background(), "t", 0); head != 2 {
+		t.Fatalf("head = %d, want 2", head)
+	}
 }
 
-func (m *flakyMetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) error {
-	if m.registerFails.Add(1) == 1 {
-		return errors.New("transient register error")
+// flakyMetaStore wraps a MetaStore and fails a configurable number of metadata
+// commits, modeling a transient commit failure after upload.
+type flakyMetaStore struct {
+	MetaStore
+	commitFails atomic.Int32
+}
+
+func (m *flakyMetaStore) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
+	if m.commitFails.Add(1) == 1 {
+		return nil, errors.New("transient commit error")
 	}
-	return m.MetaStore.RegisterSegment(ctx, seg)
+	return m.MetaStore.CommitUploadedBatches(ctx, batches)
 }
 
 // TestWriter_Flush_RetriesTransientPutFailure verifies that a transient S3 PUT
@@ -197,40 +254,8 @@ func TestWriter_Flush_RetriesTransientPutFailure(t *testing.T) {
 	}
 }
 
-// TestWriter_Flush_RetriesTransientRegisterFailure verifies that a transient
 // segment-registration failure after a successful PUT is retried rather than
 // orphaning the materialized offsets.
-func TestWriter_Flush_RetriesTransientRegisterFailure(t *testing.T) {
-	s3 := testS3Client(t)
-	meta := &flakyMetaStore{MetaStore: NewMemoryMetaStore()}
-	w := NewWriter(s3, meta, "node1")
-	ctx := context.Background()
-
-	batch := makeTestBatch(t, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
-	done := make(chan FlushResult, 1)
-	entries := []BufferEntry{{Topic: "t1", Partition: 0, Batch: batch, Done: done}}
-
-	if err := w.Flush(ctx, entries); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-
-	head, err := meta.GetPartitionHead(ctx, "t1", 0)
-	if err != nil {
-		t.Fatalf("get head: %v", err)
-	}
-	if head != 1 {
-		t.Fatalf("head = %d, want 1", head)
-	}
-	refs, err := meta.QuerySegments(ctx, "t1", 0, 0, 1<<20)
-	if err != nil {
-		t.Fatalf("query segments: %v", err)
-	}
-	if len(refs) != 1 {
-		t.Fatalf("refs = %d, want 1 (register retried)", len(refs))
-	}
-}
-
-// TestWriter_Flush_FailsAfterPersistentPutError verifies that a persistent
 // object-store failure surfaces to the caller once the retry budget (the
 // context) is exhausted, instead of blocking forever.
 func TestWriter_Flush_FailsAfterPersistentPutError(t *testing.T) {

@@ -307,7 +307,7 @@ func TestHandleProduceLowLevel_DisklessIdempotentRetryReturnsSameOffsets(t *test
 	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
 	s.assignmentsMu.Unlock()
 
-	body := `{"producer_id":7,"sequence":100,"messages":[{"key":"k1","value":"v1"},{"key":"k2","value":"v2"}]}`
+	body := `{"producer_id":7,"sequence":0,"messages":[{"key":"k1","value":"v1"},{"key":"k2","value":"v2"}]}`
 	produce := func() *produceResponse {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/v1/topics/diskless-topic/partitions/0/messages", strings.NewReader(body))
@@ -1884,26 +1884,11 @@ func TestHandleKafkaDeleteTopicsEnqueuesDisklessCleanup(t *testing.T) {
 		t.Fatalf("topicStore.Create() error = %v", err)
 	}
 
-	_, err := s.disklessMeta.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
-		Topic:     "diskless-topic",
-		Partition: 0,
-		Count:     5,
-	}})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey: "seg-001.dat",
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  5,
-			ByteOffset: 0,
-			ByteLength: 500,
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "seg-001", FileKey: "seg-001.dat", Topic: "diskless-topic", Partition: 0,
+		Count: 5, ByteLength: 500,
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
 
 	head, err := s.disklessMeta.GetPartitionHead(ctx, "diskless-topic", 0)
@@ -2145,40 +2130,13 @@ func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *
 		t.Fatalf("s3Client.Put fresh batch error = %v", err)
 	}
 
-	_, err := s.disklessMeta.AllocateOffsets(context.Background(), []diskless.OffsetAllocation{
-		{Topic: "diskless-topic", Partition: 0, Count: 2},
-	})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-
-	if err := s.disklessMeta.RegisterSegment(context.Background(), diskless.SegmentRecord{
-		FileKey:   oldFileKey,
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  1,
-			ByteOffset: 0,
-			ByteLength: int64(len(oldBatch)),
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment(old) error = %v", err)
-	}
-	if err := s.disklessMeta.RegisterSegment(context.Background(), diskless.SegmentRecord{
-		FileKey:   freshFileKey,
-		CreatedAt: time.Now(),
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 1,
-			EndOffset:  2,
-			ByteOffset: 0,
-			ByteLength: int64(len(freshBatch)),
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment(fresh) error = %v", err)
+	for _, batch := range []diskless.UploadedBatch{
+		{BatchID: "old", FileKey: oldFileKey, Topic: "diskless-topic", Partition: 0, Count: 1, ByteLength: int64(len(oldBatch)), CreatedAt: time.Now().Add(-2 * time.Hour)},
+		{BatchID: "fresh", FileKey: freshFileKey, Topic: "diskless-topic", Partition: 0, Count: 1, ByteLength: int64(len(freshBatch)), CreatedAt: time.Now()},
+	} {
+		if _, err := s.disklessMeta.CommitUploadedBatches(context.Background(), []diskless.UploadedBatch{batch}); err != nil {
+			t.Fatalf("CommitUploadedBatches() error = %v", err)
+		}
 	}
 
 	topics, err := s.topicStore.List(context.Background())

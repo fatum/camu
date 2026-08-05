@@ -27,18 +27,33 @@ type S3MetaStore struct {
 }
 
 const (
-	s3MetaPrefix       = "_diskless_meta/"
-	s3HeadPrefix       = s3MetaPrefix + "head/"
-	s3CommittedPrefix  = s3MetaPrefix + "committed/"
-	s3CatalogPrefix    = s3MetaPrefix + "catalog/"
+	s3MetaPrefix      = "_diskless_meta/"
+	s3HeadPrefix      = s3MetaPrefix + "head/"
+	s3CommittedPrefix = s3MetaPrefix + "committed/"
+	s3ManifestPrefix  = s3MetaPrefix + "manifest/"
+	// Catalog operations (compaction and retention) operate on the same
+	// authoritative manifest as commits; there is no second ref format.
+	s3CatalogPrefix    = s3ManifestPrefix
 	s3SegmentPrefix    = s3MetaPrefix + "seg/"
 	s3HeadFile         = ".json"
 	s3HeadStateVersion = 1
 )
 
+// s3UploadManifest is the clean-cut upload-first state. Unlike the transitional
+// head/catalog objects, this one object is the complete ordering authority for
+// a partition.
+type s3UploadManifest struct {
+	Version         int64                        `json:"version"`
+	NextOffset      int64                        `json:"next_offset"`
+	CommittedOffset int64                        `json:"committed_offset"`
+	Refs            []s3CatalogRef               `json:"refs"`
+	Producers       map[string][]s3ProducerBatch `json:"producers,omitempty"`
+	BatchCommits    map[string]OffsetResult      `json:"batch_commits,omitempty"`
+}
+
 type s3HeadState struct {
-	Version    int                       `json:"version"`
-	NextOffset int64                     `json:"next_offset"`
+	Version    int                        `json:"version"`
+	NextOffset int64                      `json:"next_offset"`
 	Producers  map[string]s3ProducerBatch `json:"producers,omitempty"`
 }
 
@@ -88,7 +103,96 @@ func s3CommittedKey(topic string, partition int) string {
 }
 
 func s3CatalogKey(topic string, partition int) string {
-	return fmt.Sprintf("%s%s/%d%s", s3CatalogPrefix, topic, partition, s3HeadFile)
+	return s3ManifestKey(topic, partition)
+}
+
+func s3ManifestKey(topic string, partition int) string {
+	return fmt.Sprintf("%s%s/%d.json", s3ManifestPrefix, topic, partition)
+}
+
+// CommitUploadedBatches publishes already-uploaded batches through a single
+// CAS-protected partition manifest. An upload which never reaches this method
+// cannot consume an offset or affect the readable head.
+func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
+	if len(batches) > 1 {
+		return nil, fmt.Errorf("commit uploaded batches accepts one batch per invocation")
+	}
+	results := make([]OffsetResult, len(batches))
+	for i, batch := range batches {
+		if batch.BatchID == "" || batch.Count <= 0 {
+			return nil, fmt.Errorf("uploaded batch %s has invalid count %d", batch.FileKey, batch.Count)
+		}
+		for {
+			key := s3ManifestKey(batch.Topic, batch.Partition)
+			data, etag, err := m.s3.GetWithETag(ctx, key)
+			manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}, BatchCommits: map[string]OffsetResult{}}
+			if err == nil {
+				if err := json.Unmarshal(data, &manifest); err != nil {
+					return nil, fmt.Errorf("parse upload manifest %s/%d: %w", batch.Topic, batch.Partition, err)
+				}
+			} else if !errors.Is(err, storage.ErrNotFound) {
+				return nil, err
+			}
+			if old, ok := manifest.BatchCommits[batch.BatchID]; ok {
+				old.Duplicate = true
+				results[i] = old
+				break
+			}
+			pid := strconv.FormatInt(batch.ProducerID, 10)
+			duplicate := false
+			if batch.ProducerID != 0 {
+				h := manifest.Producers[pid]
+				for _, old := range h {
+					if old.FirstSequence != batch.Sequence {
+						continue
+					}
+					if old.Count != batch.Count {
+						return nil, fmt.Errorf("producer %d retried sequence %d with different count", batch.ProducerID, batch.Sequence)
+					}
+					results[i] = OffsetResult{BaseOffset: old.BaseOffset, Duplicate: true}
+					duplicate = true
+					break
+				}
+				if len(h) > 0 {
+					last := h[len(h)-1]
+					if _, err := checkProducerSequence(batch.ProducerID, batch.Sequence, batch.Count, last.FirstSequence, last.Count); err != nil {
+						return nil, err
+					}
+				} else if err := checkInitialProducerSequence(batch.ProducerID, batch.Sequence); err != nil {
+					return nil, err
+				}
+			}
+			if duplicate {
+				break
+			}
+			base := manifest.NextOffset
+			end := base + int64(batch.Count)
+			manifest.NextOffset, manifest.CommittedOffset = end, end
+			manifest.Refs = append(manifest.Refs, s3CatalogRef{FileKey: batch.FileKey, ByteOffset: batch.ByteOffset, ByteLength: batch.ByteLength, BaseOffset: base, EndOffset: end, CreatedAt: batch.CreatedAt})
+			manifest.BatchCommits[batch.BatchID] = OffsetResult{BaseOffset: base}
+			if batch.ProducerID != 0 {
+				h := append(manifest.Producers[pid], s3ProducerBatch{FirstSequence: batch.Sequence, BaseOffset: base, Count: batch.Count})
+				if len(h) > uploadedProducerHistory {
+					h = h[len(h)-uploadedProducerHistory:]
+				}
+				manifest.Producers[pid] = h
+			}
+			manifest.Version++
+			encoded, err := json.Marshal(manifest)
+			if err != nil {
+				return nil, err
+			}
+			if _, err = m.s3.ConditionalPut(ctx, key, encoded, etag); err != nil {
+				if errors.Is(err, storage.ErrConflict) {
+					continue
+				}
+				return nil, fmt.Errorf("commit uploaded batch %s: %w", batch.FileKey, err)
+			}
+			results[i] = OffsetResult{BaseOffset: base}
+			break
+		}
+	}
+	return results, nil
 }
 
 func s3CatalogPrefixForTopic(topic string) string {
@@ -120,14 +224,14 @@ func (c *s3Catalog) sortRefs() {
 
 // readCatalog returns the partition catalog and its current etag.
 func (m *S3MetaStore) readCatalog(ctx context.Context, topic string, partition int) (*s3Catalog, string, error) {
-	data, etag, err := m.s3.GetWithETag(ctx, s3CatalogKey(topic, partition))
+	data, etag, err := m.s3.GetWithETag(ctx, s3ManifestKey(topic, partition))
 	switch {
 	case err == nil:
-		var c s3Catalog
-		if err := json.Unmarshal(data, &c); err != nil {
+		var manifest s3UploadManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
 			return nil, "", fmt.Errorf("parse catalog %s/%d: %w", topic, partition, err)
 		}
-		return &c, etag, nil
+		return &s3Catalog{Version: manifest.Version, Refs: manifest.Refs}, etag, nil
 	case errors.Is(err, storage.ErrNotFound):
 		return &s3Catalog{}, "", nil
 	default:
@@ -138,336 +242,41 @@ func (m *S3MetaStore) readCatalog(ctx context.Context, topic string, partition i
 // writeCatalog CAS-writes the catalog, returning storage.ErrConflict when a
 // concurrent writer changed it first.
 func (m *S3MetaStore) writeCatalog(ctx context.Context, topic string, partition int, cat *s3Catalog, etag string) error {
-	cat.Version++
-	data, err := json.Marshal(cat)
+	// The ETag passed by readCatalog is for the manifest. Re-read is avoided so
+	// the CAS detects a concurrent append, preserving producer/batch history.
+	data, currentETag, err := m.s3.GetWithETag(ctx, s3ManifestKey(topic, partition))
+	if err != nil {
+		return fmt.Errorf("read manifest for catalog update %s/%d: %w", topic, partition, err)
+	}
+	if currentETag != etag {
+		return storage.ErrConflict
+	}
+	var manifest s3UploadManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return fmt.Errorf("parse manifest for catalog update %s/%d: %w", topic, partition, err)
+	}
+	manifest.Version++
+	manifest.Refs = cat.Refs
+	data, err = json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
-	if _, err := m.s3.ConditionalPut(ctx, s3CatalogKey(topic, partition), data, etag); err != nil {
+	if _, err := m.s3.ConditionalPut(ctx, s3ManifestKey(topic, partition), data, etag); err != nil {
 		return fmt.Errorf("update catalog %s/%d: %w", topic, partition, err)
 	}
 	return nil
 }
 
-// AllocateOffsets atomically assigns offset ranges for one or more partition
-// batches via per-partition CAS on the head object. The whole batch is
-// validated before any offset state is mutated, so an invalid later allocation
-// can never strand a valid prefix as a permanent gap in the log.
-func (m *S3MetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error) {
-	if len(allocs) == 0 {
-		return nil, nil
-	}
-	// A single allocation cannot strand a prefix (there is none), so skip the
-	// extra validation read on the common produce path.
-	if len(allocs) > 1 {
-		if err := m.validateBatch(ctx, allocs); err != nil {
-			return nil, err
-		}
-	}
-	results := make([]OffsetResult, len(allocs))
-	for i, alloc := range allocs {
-		result, err := m.allocateOne(ctx, alloc)
-		if err != nil {
-			return nil, err
-		}
-		results[i] = result
-	}
-	return results, nil
-}
-
-// validateBatch verifies that every allocation in a batch can be applied before
-// any offset state is mutated. It simulates the sequential application —
-// including producer-record updates made by earlier entries in the batch — so a
-// mixed valid/invalid flush is rejected up front and a valid prefix is never
-// abandoned. It performs reads only.
-func (m *S3MetaStore) validateBatch(ctx context.Context, allocs []OffsetAllocation) error {
-	heads := make(map[string]*s3HeadState)
-	for _, alloc := range allocs {
-		key := s3HeadKey(alloc.Topic, alloc.Partition)
-		head := heads[key]
-		if head == nil {
-			head = &s3HeadState{}
-			data, _, err := m.s3.GetWithETag(ctx, key)
-			switch {
-			case err == nil:
-				if err := json.Unmarshal(data, head); err != nil {
-					return fmt.Errorf("parse head %s: %w", key, err)
-				}
-			case errors.Is(err, storage.ErrNotFound):
-				// fresh partition: start from an empty head.
-			default:
-				return fmt.Errorf("read head %s: %w", key, err)
-			}
-			heads[key] = head
-		}
-		if err := simulateS3Alloc(key, head, alloc); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// simulateS3Alloc applies a single allocation to the in-memory head state for
-// validation purposes, returning an error if the allocation is invalid. An
-// exact retry does not advance the head, mirroring allocateOne.
-func simulateS3Alloc(key string, head *s3HeadState, alloc OffsetAllocation) error {
-	if alloc.ProducerID != 0 {
-		pidKey := strconv.FormatInt(alloc.ProducerID, 10)
-		if prev, ok := head.Producers[pidKey]; ok {
-			exact, err := checkProducerSequence(alloc.ProducerID, alloc.Sequence, alloc.Count, prev.FirstSequence, prev.Count)
-			if err != nil {
-				return err
-			}
-			if exact {
-				if prev.Count != alloc.Count {
-					return fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", alloc.ProducerID, key, alloc.Sequence, alloc.Count, prev.Count)
-				}
-				return nil // exact retry: offsets already assigned
-			}
-		}
-	}
-	if head.Producers == nil {
-		head.Producers = make(map[string]s3ProducerBatch)
-	}
-	head.NextOffset += int64(alloc.Count)
-	if alloc.ProducerID != 0 {
-		pidKey := strconv.FormatInt(alloc.ProducerID, 10)
-		head.Producers[pidKey] = s3ProducerBatch{
-			FirstSequence: alloc.Sequence,
-			BaseOffset:    head.NextOffset - int64(alloc.Count),
-			Count:         alloc.Count,
-		}
-	}
-	return nil
-}
-
-// allocateOne allocates a range for a single batch. For idempotent batches the
-// head records the producer's latest allocation; an exact retry (same first
-// sequence and record count) returns the prior base offset without advancing
-// the counter.
-func (m *S3MetaStore) allocateOne(ctx context.Context, alloc OffsetAllocation) (OffsetResult, error) {
-	key := s3HeadKey(alloc.Topic, alloc.Partition)
-	var pidKey string
-	if alloc.ProducerID != 0 {
-		pidKey = strconv.FormatInt(alloc.ProducerID, 10)
-	}
-	for {
-		data, etag, err := m.s3.GetWithETag(ctx, key)
-		var head s3HeadState
-		var next int64
-		switch {
-		case err == nil:
-			if err := json.Unmarshal(data, &head); err != nil {
-				return OffsetResult{}, fmt.Errorf("parse head %s: %w", key, err)
-			}
-			next = head.NextOffset
-		case errors.Is(err, storage.ErrNotFound):
-			next = 0
-		default:
-			return OffsetResult{}, fmt.Errorf("read head %s: %w", key, err)
-		}
-
-		if pidKey != "" {
-			if prev, ok := head.Producers[pidKey]; ok {
-				exact, err := checkProducerSequence(alloc.ProducerID, alloc.Sequence, alloc.Count, prev.FirstSequence, prev.Count)
-				if err != nil {
-					return OffsetResult{}, err
-				}
-				if exact {
-					if prev.Count == alloc.Count {
-						return OffsetResult{BaseOffset: prev.BaseOffset, Duplicate: true}, nil
-					}
-					return OffsetResult{}, fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", alloc.ProducerID, key, alloc.Sequence, alloc.Count, prev.Count)
-				}
-			}
-		}
-
-		base := next
-		if head.Producers == nil {
-			head.Producers = make(map[string]s3ProducerBatch)
-		}
-		head.NextOffset = next + int64(alloc.Count)
-		if pidKey != "" {
-			head.Producers[pidKey] = s3ProducerBatch{
-				FirstSequence: alloc.Sequence,
-				BaseOffset:    base,
-				Count:         alloc.Count,
-			}
-		}
-
-		newHead, err := json.Marshal(head)
-		if err != nil {
-			return OffsetResult{}, err
-		}
-		if _, err := m.s3.ConditionalPut(ctx, key, newHead, etag); err != nil {
-			if errors.Is(err, storage.ErrConflict) {
-				continue // another writer advanced the head; retry with a fresh read.
-			}
-			return OffsetResult{}, fmt.Errorf("update head %s: %w", key, err)
-		}
-		return OffsetResult{BaseOffset: base}, nil
-	}
-}
-
-// RegisterSegment records a flushed data file in the partition catalog as
-// immutable per-batch references, advancing each partition's committed head.
-func (m *S3MetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) error {
-	// Group batch refs by partition so each catalog is updated once.
-	type catalogBatch struct {
-		topic     string
-		partition int
-		refs      []s3CatalogRef
-	}
-	groups := make(map[string]*catalogBatch)
-	for _, b := range seg.Batches {
-		key := partitionKey(b.Topic, b.Partition)
-		g := groups[key]
-		if g == nil {
-			g = &catalogBatch{topic: b.Topic, partition: b.Partition}
-			groups[key] = g
-		}
-		g.refs = append(g.refs, s3CatalogRef{
-			FileKey:    seg.FileKey,
-			ByteOffset: b.ByteOffset,
-			ByteLength: b.ByteLength,
-			BaseOffset: b.BaseOffset,
-			EndOffset:  b.EndOffset,
-			CreatedAt:  seg.CreatedAt,
-		})
-	}
-	for _, g := range groups {
-		if err := m.appendCatalogRefs(ctx, g.topic, g.partition, g.refs); err != nil {
-			return err
-		}
-	}
-
-	// Advance each partition's committed head so reads never report
-	// allocated-but-unpersisted offsets as committed. The head only moves
-	// through contiguous materialized ranges, so out-of-order registrations
-	// from concurrent writers never expose a gap.
-	seen := make(map[string]struct{})
-	for _, b := range seg.Batches {
-		key := partitionKey(b.Topic, b.Partition)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		if err := m.advanceCommitted(ctx, b.Topic, b.Partition); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// appendCatalogRefs idempotently appends refs to a partition catalog via a
-// read-modify-write CAS. Refs already present (by offset range) are skipped so
-// a retried registration never creates duplicates.
-func (m *S3MetaStore) appendCatalogRefs(ctx context.Context, topic string, partition int, refs []s3CatalogRef) error {
-	for {
-		cat, etag, err := m.readCatalog(ctx, topic, partition)
-		if err != nil {
-			return err
-		}
-		changed := false
-		for _, ref := range refs {
-			if cat.hasRef(ref.BaseOffset, ref.EndOffset) {
-				continue
-			}
-			cat.Refs = append(cat.Refs, ref)
-			changed = true
-		}
-		if !changed {
-			return nil
-		}
-		cat.sortRefs()
-		if err := m.writeCatalog(ctx, topic, partition, cat, etag); err != nil {
-			if errors.Is(err, storage.ErrConflict) {
-				continue
-			}
-			return fmt.Errorf("append catalog refs %s/%d: %w", topic, partition, err)
-		}
-		return nil
-	}
-}
-
-// advanceCommitted raises a partition's committed offset to the end of the
-// longest run of refs contiguous with the current head via a read-CAS loop.
-// It only ever advances, so a concurrent lower update is a no-op.
-func (m *S3MetaStore) advanceCommitted(ctx context.Context, topic string, partition int) error {
-	key := s3CommittedKey(topic, partition)
-	for {
-		data, etag, err := m.s3.GetWithETag(ctx, key)
-		var committed int64
-		switch {
-		case err == nil:
-			var st s3CommittedState
-			if err := json.Unmarshal(data, &st); err != nil {
-				return fmt.Errorf("parse committed %s: %w", key, err)
-			}
-			committed = st.CommittedOffset
-		case errors.Is(err, storage.ErrNotFound):
-			committed = 0
-		default:
-			return fmt.Errorf("read committed %s: %w", key, err)
-		}
-
-		next, err := m.contiguousCommitted(ctx, topic, partition, committed)
-		if err != nil {
-			return err
-		}
-		if next <= committed {
-			return nil
-		}
-		payload, err := json.Marshal(s3CommittedState{Version: s3HeadStateVersion, CommittedOffset: next})
-		if err != nil {
-			return err
-		}
-		if _, err := m.s3.ConditionalPut(ctx, key, payload, etag); err != nil {
-			if errors.Is(err, storage.ErrConflict) {
-				continue // another writer advanced; re-read and re-walk.
-			}
-			return fmt.Errorf("update committed %s: %w", key, err)
-		}
-		return nil
-	}
-}
-
-// contiguousCommitted returns the end of the longest run of segment refs for
-// the partition that is contiguous with the current committed head.
-func (m *S3MetaStore) contiguousCommitted(ctx context.Context, topic string, partition int, committed int64) (int64, error) {
-	refs, err := m.partitionSegmentRefs(ctx, topic, partition)
-	if err != nil {
-		return 0, err
-	}
-	return contiguousCommittedEnd(committed, refs), nil
-}
-
-// partitionSegmentRefs returns a partition's segment refs in offset order from
-// its catalog.
-func (m *S3MetaStore) partitionSegmentRefs(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
-	cat, _, err := m.readCatalog(ctx, topic, partition)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]SegmentRef, 0, len(cat.Refs))
-	for _, r := range cat.Refs {
-		refs = append(refs, SegmentRef(r))
-	}
-	return refs, nil
-}
-
-// QuerySegments returns segment references covering [fromOffset, ...) for a
-// given topic-partition, up to maxBytes of data.
 func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition int,
 	fromOffset int64, maxBytes int) ([]SegmentRef, error) {
-	cat, _, err := m.readCatalog(ctx, topic, partition)
+	manifest, err := m.readUploadManifest(ctx, topic, partition)
 	if err != nil {
 		return nil, err
 	}
 
 	var refs []SegmentRef
 	var totalBytes int64
-	for _, r := range cat.Refs {
+	for _, r := range manifest.Refs {
 		if r.EndOffset <= fromOffset {
 			continue
 		}
@@ -482,48 +291,43 @@ func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition
 
 // GetPartitionHead returns the next offset that will be allocated for a partition.
 func (m *S3MetaStore) GetPartitionHead(ctx context.Context, topic string, partition int) (int64, error) {
-	data, err := m.s3.Get(ctx, s3HeadKey(topic, partition))
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("get head %s/%d: %w", topic, partition, err)
-	}
-	var head s3HeadState
-	if err := json.Unmarshal(data, &head); err != nil {
-		return 0, fmt.Errorf("parse head %s/%d: %w", topic, partition, err)
-	}
-	return head.NextOffset, nil
+	manifest, err := m.readUploadManifest(ctx, topic, partition)
+	return manifest.NextOffset, err
 }
 
 // GetCommittedHead returns the highest offset durably materialized for a
 // partition, or 0 if nothing has been registered yet.
 func (m *S3MetaStore) GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error) {
-	data, err := m.s3.Get(ctx, s3CommittedKey(topic, partition))
+	manifest, err := m.readUploadManifest(ctx, topic, partition)
+	return manifest.CommittedOffset, err
+}
+
+func (m *S3MetaStore) readUploadManifest(ctx context.Context, topic string, partition int) (*s3UploadManifest, error) {
+	data, err := m.s3.Get(ctx, s3ManifestKey(topic, partition))
+	if errors.Is(err, storage.ErrNotFound) {
+		return &s3UploadManifest{}, nil
+	}
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("get committed %s/%d: %w", topic, partition, err)
+		return nil, fmt.Errorf("get upload manifest %s/%d: %w", topic, partition, err)
 	}
-	var st s3CommittedState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return 0, fmt.Errorf("parse committed %s/%d: %w", topic, partition, err)
+	var manifest s3UploadManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("parse upload manifest %s/%d: %w", topic, partition, err)
 	}
-	return st.CommittedOffset, nil
+	return &manifest, nil
 }
 
 // GetPartitionStart returns the first readable offset for a partition, or the
 // current head if all prior segments have been expired.
 func (m *S3MetaStore) GetPartitionStart(ctx context.Context, topic string, partition int) (int64, error) {
-	cat, _, err := m.readCatalog(ctx, topic, partition)
+	manifest, err := m.readUploadManifest(ctx, topic, partition)
 	if err != nil {
 		return 0, err
 	}
-	if len(cat.Refs) == 0 {
+	if len(manifest.Refs) == 0 {
 		return m.GetCommittedHead(ctx, topic, partition)
 	}
-	return cat.Refs[0].BaseOffset, nil
+	return manifest.Refs[0].BaseOffset, nil
 }
 
 // PlanExpiredFileDeletes returns file keys whose refs for the given
@@ -682,6 +486,7 @@ func (m *S3MetaStore) ListFileRefs(ctx context.Context, fileKey string) ([]FileR
 func (m *S3MetaStore) DeleteTopic(ctx context.Context, topic string) error {
 	for _, prefix := range []string{
 		s3CatalogPrefixForTopic(topic),
+		s3ManifestPrefix + topic + "/",
 		s3HeadPrefixForTopic(topic),
 		s3CommittedPrefix + topic + "/",
 		s3SegPrefixForTopic(topic), // legacy per-batch refs, if any remain

@@ -53,12 +53,8 @@ func TestDisklessSegmentMerge(t *testing.T) {
 		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
 			t.Fatalf("put source %s: %v", fileKey, err)
 		}
-		if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-			FileKey:   fileKey,
-			Batches:   []diskless.BatchRef{{Topic: "t", Partition: 0, BaseOffset: int64(i), EndOffset: int64(i) + 1, ByteOffset: 0, ByteLength: int64(len(data))}},
-			CreatedAt: now,
-		}); err != nil {
-			t.Fatalf("register [%d,%d): %v", i, i+1, err)
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
 		}
 	}
 	committed, err := s.disklessMeta.GetCommittedHead(ctx, "t", 0)
@@ -147,12 +143,8 @@ func TestDisklessSegmentMergeSkipsRetentionPendingRefs(t *testing.T) {
 		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
 			t.Fatalf("put source %s: %v", fileKey, err)
 		}
-		if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-			FileKey:   fileKey,
-			Batches:   []diskless.BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: base + 1, ByteOffset: 0, ByteLength: int64(len(data))}},
-			CreatedAt: createdAt,
-		}); err != nil {
-			t.Fatalf("register [%d,%d): %v", base, base+1, err)
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: createdAt}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", base, base+1, err)
 		}
 	}
 
@@ -220,12 +212,8 @@ func TestDisklessSegmentMergeDropsJobWhenSourcesRetained(t *testing.T) {
 		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
 			t.Fatalf("put source %s: %v", fileKey, err)
 		}
-		if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-			FileKey:   fileKey,
-			Batches:   []diskless.BatchRef{{Topic: "t", Partition: 0, BaseOffset: int64(i), EndOffset: int64(i) + 1, ByteOffset: 0, ByteLength: int64(len(data))}},
-			CreatedAt: now,
-		}); err != nil {
-			t.Fatalf("register [%d,%d): %v", i, i+1, err)
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
 		}
 		sources = append(sources, diskless.SegmentRef{FileKey: fileKey, ByteOffset: 0, ByteLength: int64(len(data)), BaseOffset: int64(i), EndOffset: int64(i) + 1})
 	}

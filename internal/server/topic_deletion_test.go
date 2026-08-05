@@ -32,27 +32,11 @@ func TestDeleteTopicEnqueuesAsyncDisklessCleanupAndPreservesMetaUntilS3Deleted(t
 		t.Fatalf("topicStore.Create() error = %v", err)
 	}
 
-	_, err := s.disklessMeta.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
-		Topic:     tc.Name,
-		Partition: 0,
-		Count:     5,
-	}})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey:   tc.Name + "/0/segment.data",
-		CreatedAt: time.Now(),
-		Batches: []diskless.BatchRef{{
-			Topic:      tc.Name,
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  5,
-			ByteOffset: 0,
-			ByteLength: 100,
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "delete-segment", FileKey: tc.Name + "/0/segment.data", Topic: tc.Name, Partition: 0,
+		Count: 5, ByteLength: 100, CreatedAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
 	for _, key := range []string{
 		tc.Name + "/0/segment.data",
@@ -144,27 +128,11 @@ func TestTopicDeletionGCResumesFromMarkerAfterRestart(t *testing.T) {
 	if err := s1.topicStore.Create(ctx, tc); err != nil {
 		t.Fatalf("topicStore.Create() error = %v", err)
 	}
-	_, err := ms.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
-		Topic:     tc.Name,
-		Partition: 0,
-		Count:     1,
-	}})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-	if err := ms.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey:   tc.Name + "/0/segment.data",
-		CreatedAt: time.Now(),
-		Batches: []diskless.BatchRef{{
-			Topic:      tc.Name,
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  1,
-			ByteOffset: 0,
-			ByteLength: 10,
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	if _, err := ms.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "restart-segment", FileKey: tc.Name + "/0/segment.data", Topic: tc.Name, Partition: 0,
+		Count: 1, ByteLength: 10, CreatedAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
 	if err := s1.s3Client.Put(ctx, tc.Name+"/0/segment.data", []byte("x"), storage.PutOpts{}); err != nil {
 		t.Fatalf("s3Client.Put() error = %v", err)

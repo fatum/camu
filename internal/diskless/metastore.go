@@ -10,12 +10,11 @@ import (
 
 // MetaStore coordinates offset allocation and segment discovery for diskless topics.
 type MetaStore interface {
-	// AllocateOffsets atomically assigns offset ranges for one or more partition batches.
-	AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error)
-
-	// RegisterSegment records a flushed data file in the segment catalog.
-	RegisterSegment(ctx context.Context, seg SegmentRecord) error
-
+	// CommitUploadedBatches atomically, per partition, validates producer
+	// sequences, assigns offsets, publishes uploaded refs, and advances the
+	// readable head. Callers may retry the same uploaded batch; an exact
+	// idempotent retry returns its original offset without another ref.
+	CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error)
 	// QuerySegments returns segment references covering [fromOffset, ...) for a
 	// given topic-partition, up to maxBytes of data.
 	QuerySegments(ctx context.Context, topic string, partition int,

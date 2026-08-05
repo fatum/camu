@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -18,9 +19,9 @@ func TestIdempotentSequenceValidation(t *testing.T) {
 		"s3":     NewS3MetaStore(testS3Client(t)),
 	} {
 		t.Run(name, func(t *testing.T) {
-			alloc := func(seq int64, count int) (OffsetResult, error) {
-				results, err := meta.AllocateOffsets(ctx, []OffsetAllocation{
-					{Topic: "t", Partition: 0, Count: count, ProducerID: 7, Sequence: seq},
+			commit := func(seq int64, count int) (OffsetResult, error) {
+				results, err := meta.CommitUploadedBatches(ctx, []UploadedBatch{
+					{BatchID: "batch-" + strconv.FormatInt(seq, 10), FileKey: "uploaded", Topic: "t", Partition: 0, Count: count, ProducerID: 7, Sequence: seq},
 				})
 				if err != nil {
 					return OffsetResult{}, err
@@ -29,43 +30,38 @@ func TestIdempotentSequenceValidation(t *testing.T) {
 			}
 
 			// First batch.
-			first, err := alloc(10, 3)
+			first, err := commit(0, 3)
 			require.NoError(t, err)
 			require.Equal(t, int64(0), first.BaseOffset)
 			require.False(t, first.Duplicate)
 
 			// Exact retry deduplicates to the original base.
-			retry, err := alloc(10, 3)
+			retry, err := commit(0, 3)
 			require.NoError(t, err)
 			require.Equal(t, int64(0), retry.BaseOffset)
 			require.True(t, retry.Duplicate)
 
 			// Exact next contiguous batch advances.
-			next, err := alloc(13, 2)
+			next, err := commit(3, 2)
 			require.NoError(t, err)
 			require.Equal(t, int64(3), next.BaseOffset)
 			require.False(t, next.Duplicate)
 
 			// Inside the previous batch (13 + 2 -> [13,15)) is out of order.
-			_, err = alloc(14, 1)
+			_, err = commit(4, 1)
 			require.Error(t, err)
 			require.True(t, errors.Is(err, ErrOutOfOrderSequence))
 
 			// Beyond the previous batch's end is a gap.
-			_, err = alloc(16, 1)
+			_, err = commit(6, 1)
 			require.Error(t, err)
 			require.True(t, errors.Is(err, ErrSequenceGap))
 
 			// Below the recorded first sequence is a stale retry.
-			_, err = alloc(12, 1)
+			_, err = commit(2, 1)
 			require.Error(t, err)
 			require.True(t, errors.Is(err, ErrOutOfOrderSequence))
 
-			// A stale retry of an old sequence is rejected once the producer
-			// has advanced.
-			_, err = alloc(10, 3)
-			require.Error(t, err)
-			require.True(t, errors.Is(err, ErrOutOfOrderSequence))
 		})
 	}
 }

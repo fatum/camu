@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -66,6 +67,12 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOff
 		if err := r.s3.GetRangeInto(ctx, ref.FileKey, ref.ByteOffset, ref.ByteLength, result[pos:pos+ref.ByteLength]); err != nil {
 			return nil, 0, fmt.Errorf("s3 get range %s [%d:%d]: %w",
 				ref.FileKey, ref.ByteOffset, ref.ByteOffset+ref.ByteLength, err)
+		}
+		// Uploaded diskless objects deliberately contain raw RecordBatch bytes;
+		// logical offsets are assigned by the metastore commit. Patch only the
+		// returned copy, leaving immutable S3 data safe for retries/compaction.
+		if err := log.PatchRecordBatchFirstOffset(result[pos:pos+ref.ByteLength], ref.BaseOffset); err != nil {
+			return nil, 0, fmt.Errorf("patch fetched batch at offset %d: %w", ref.BaseOffset, err)
 		}
 		pos += ref.ByteLength
 	}

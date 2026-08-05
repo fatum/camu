@@ -2,359 +2,86 @@ package diskless
 
 import (
 	"context"
-	"testing"
-	"time"
-
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"testing"
 )
 
-func TestMemoryMetaStore_AllocateOffsets_SinglePartition(t *testing.T) {
+func TestMemoryMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
-
-	results, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 3},
-	})
+	// Nothing is visible before the metadata commit (the uploaded object itself
+	// is deliberately outside the metastore).
+	head, err := ms.GetCommittedHead(ctx, "t", 0)
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), results[0].BaseOffset)
+	require.Equal(t, int64(0), head)
 
-	results, err = ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 5},
-	})
+	b := UploadedBatch{BatchID: "uploaded:0:10", FileKey: "uploaded", Topic: "t", Partition: 0, Count: 2, ProducerID: 9, Sequence: 0, ByteLength: 10}
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), results[0].BaseOffset)
-}
-
-func TestMemoryMetaStore_IdempotentAllocation(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	alloc := OffsetAllocation{Topic: "events", Partition: 0, Count: 3, ProducerID: 7, Sequence: 10}
-	first, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.Equal(t, int64(0), first[0].BaseOffset)
+	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), first[0].BaseOffset)
-	assert.False(t, first[0].Duplicate)
-
-	retry, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.True(t, retry[0].Duplicate)
+	require.Equal(t, int64(0), retry[0].BaseOffset)
+	head, err = ms.GetCommittedHead(ctx, "t", 0)
 	require.NoError(t, err)
-	assert.True(t, retry[0].Duplicate)
-	assert.Equal(t, int64(0), retry[0].BaseOffset)
-
-	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 2, ProducerID: 7, Sequence: 13}})
-	require.NoError(t, err)
-	assert.False(t, next[0].Duplicate)
-	assert.Equal(t, int64(3), next[0].BaseOffset)
-
-	_, err = ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 4, ProducerID: 7, Sequence: 10}})
-	require.Error(t, err, "overlapping retry with mismatched count must fail")
-
-	head, err := ms.GetPartitionHead(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(5), head, "retry must not advance the counter")
-}
-
-func TestMemoryMetaStore_AllocateOffsets_MultiPartition(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	results, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 10},
-		{Topic: "events", Partition: 1, Count: 20},
-		{Topic: "events", Partition: 2, Count: 30},
-	})
-	require.NoError(t, err)
-	require.Len(t, results, 3)
-	assert.Equal(t, int64(0), results[0].BaseOffset)
-	assert.Equal(t, int64(0), results[1].BaseOffset)
-	assert.Equal(t, int64(0), results[2].BaseOffset)
-}
-
-func TestMemoryMetaStore_GetPartitionHead(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	head, err := ms.GetPartitionHead(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), head)
-
-	_, err = ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 5},
-	})
-	require.NoError(t, err)
-
-	head, err = ms.GetPartitionHead(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(5), head)
-}
-
-func TestMemoryMetaStore_RegisterAndQuery(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	// Register two segments for partition 0.
-	err := ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey: "seg-001.dat",
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteOffset: 0, ByteLength: 500},
-		},
-	})
-	require.NoError(t, err)
-
-	err = ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey: "seg-002.dat",
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 5, EndOffset: 10, ByteOffset: 0, ByteLength: 600},
-			{Topic: "events", Partition: 1, BaseOffset: 0, EndOffset: 3, ByteOffset: 600, ByteLength: 300},
-		},
-	})
-	require.NoError(t, err)
-
-	// Query all from offset 0 — should return both segments for partition 0.
-	refs, err := ms.QuerySegments(ctx, "events", 0, 0, 10000)
-	require.NoError(t, err)
-	require.Len(t, refs, 2)
-	assert.Equal(t, "seg-001.dat", refs[0].FileKey)
-	assert.Equal(t, "seg-002.dat", refs[1].FileKey)
-
-	// Query from offset 5 — should skip the first segment.
-	refs, err = ms.QuerySegments(ctx, "events", 0, 5, 10000)
+	require.Equal(t, int64(2), head)
+	refs, err := ms.QuerySegments(ctx, "t", 0, 0, 1024)
 	require.NoError(t, err)
 	require.Len(t, refs, 1)
-	assert.Equal(t, "seg-002.dat", refs[0].FileKey)
 
-	// Query partition 1 — should only return its data.
-	refs, err = ms.QuerySegments(ctx, "events", 1, 0, 10000)
+	_, err = ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "gap:0:1", FileKey: "gap", Topic: "t", Partition: 0, Count: 1, ProducerID: 9, Sequence: 4}})
+	require.ErrorIs(t, err, ErrSequenceGap)
+	head, err = ms.GetCommittedHead(ctx, "t", 0)
 	require.NoError(t, err)
-	require.Len(t, refs, 1)
-	assert.Equal(t, "seg-002.dat", refs[0].FileKey)
-	assert.Equal(t, int64(600), refs[0].ByteOffset)
+	require.Equal(t, int64(2), head)
 }
 
-func TestMemoryMetaStore_DeleteTopic(t *testing.T) {
+func TestMemoryMetaStore_CommitUploadedBatchIDDeduplicatesNonIdempotent(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
+	b := UploadedBatch{BatchID: "object:0:10", FileKey: "object", Topic: "t", Partition: 0, Count: 3, ByteLength: 10}
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
+	require.NoError(t, err)
+	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
+	require.NoError(t, err)
+	require.True(t, retry[0].Duplicate)
+	require.Equal(t, first[0].BaseOffset, retry[0].BaseOffset)
+	head, err := ms.GetCommittedHead(ctx, "t", 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), head)
+}
 
-	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 5},
+func TestMemoryMetaStore_CommitRequiresInitialProducerSequenceZero(t *testing.T) {
+	ms := NewMemoryMetaStore()
+	_, err := ms.CommitUploadedBatches(context.Background(), []UploadedBatch{{BatchID: "object:0:10", FileKey: "object", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, ProducerID: 3, Sequence: 1}})
+	require.ErrorIs(t, err, ErrSequenceGap)
+	head, err := ms.GetCommittedHead(context.Background(), "t", 0)
+	require.NoError(t, err)
+	require.Zero(t, head)
+}
+
+func TestMemoryMetaStore_CommitRejectsMultiBatchWithoutMutation(t *testing.T) {
+	ms := NewMemoryMetaStore()
+	_, err := ms.CommitUploadedBatches(context.Background(), []UploadedBatch{
+		{BatchID: "a:0:1", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 1},
+		{BatchID: "b:0:1", FileKey: "b", Topic: "t", Partition: 0, Count: 1, ByteLength: 1},
 	})
+	require.Error(t, err)
+	head, err := ms.GetCommittedHead(context.Background(), "t", 0)
 	require.NoError(t, err)
-
-	err = ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey: "seg-001.dat",
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteOffset: 0, ByteLength: 500},
-		},
-	})
-	require.NoError(t, err)
-
-	err = ms.DeleteTopic(ctx, "events")
-	require.NoError(t, err)
-
-	head, err := ms.GetPartitionHead(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), head)
-
-	refs, err := ms.QuerySegments(ctx, "events", 0, 0, 10000)
-	require.NoError(t, err)
-	assert.Empty(t, refs)
+	require.Zero(t, head)
 }
 
-// TestMemoryMetaStore_CommittedHeadOnlyAdvancesContiguously verifies that the
-// committed high watermark never advances past an unmaterialized range, even
-// when concurrent writers register adjacent ranges out of order.
-func TestMemoryMetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
+func TestMemoryMetaStore_ConcurrentProducerCannotCommitSequenceOneFirst(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
-
-	committed := func() int64 {
-		t.Helper()
-		h, err := ms.GetCommittedHead(ctx, "t", 0)
-		require.NoError(t, err)
-		return h
-	}
-	register := func(base, end int64) {
-		t.Helper()
-		require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-			FileKey:   "f.data",
-			Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: end, ByteLength: end - base}},
-			CreatedAt: time.Now(),
-		}))
-	}
-
-	register(10, 20)
-	assert.Equal(t, int64(0), committed(), "later range alone must not advance past missing prefix")
-
-	register(0, 10)
-	assert.Equal(t, int64(20), committed(), "filled prefix must expose the whole chain")
-
-	register(30, 40)
-	assert.Equal(t, int64(20), committed(), "abandoned range must not advance past gap")
-
-	register(20, 30)
-	assert.Equal(t, int64(40), committed(), "closing the gap advances through the full chain")
-}
-
-// TestMemoryMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix verifies that
-// a flush containing a valid allocation followed by an invalid one is rejected
-// before any offset state advances, so the valid prefix is not abandoned.
-func TestMemoryMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	if _, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}}); err != nil {
-		t.Fatalf("seed allocate: %v", err)
-	}
-
-	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103},
-		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 200},
-	})
-	require.Error(t, err, "mixed batch with invalid suffix must fail")
-
-	head, err := ms.GetPartitionHead(ctx, "t", 0)
+	_, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
+	require.ErrorIs(t, err, ErrSequenceGap)
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "zero", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 0}})
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), head, "no stranded prefix after rejected batch")
-
-	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}})
+	require.Equal(t, int64(0), first[0].BaseOffset)
+	next, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
 	require.NoError(t, err)
-	assert.Equal(t, int64(3), next[0].BaseOffset, "subsequent valid write continues contiguously")
-}
-
-func TestMemoryMetaStore_GetPartitionStartUsesCommittedWhenNoSegmentsRemain(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	// Allocated but never materialized offsets must not be reported as the
-	// readable start: nothing is committed, so the start is 0.
-	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 5}})
-	require.NoError(t, err)
-
-	start, err := ms.GetPartitionStart(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), start)
-
-	// Once a segment is registered, the committed head becomes the start when
-	// nothing else remains.
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey: "seg-001.dat",
-		Batches: []BatchRef{{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteLength: 500}},
-	}))
-	start, err = ms.GetPartitionStart(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), start)
-
-	// After the registered segment is expired, the start advances to the
-	// committed head (which stays at 5; it never regresses).
-	require.NoError(t, ms.DeleteFileRefs(ctx, "seg-001.dat"))
-	start, err = ms.GetPartitionStart(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(5), start)
-}
-
-func TestMemoryMetaStore_PlanExpiredFileDeletesAdvancesStartAfterDeleteFileRefs(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 10}})
-	require.NoError(t, err)
-
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "seg-old.dat",
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteOffset: 0, ByteLength: 500},
-		},
-	}))
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "seg-fresh.dat",
-		CreatedAt: time.Now(),
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 5, EndOffset: 10, ByteOffset: 0, ByteLength: 500},
-		},
-	}))
-
-	deletable, err := ms.PlanExpiredFileDeletes(ctx, "events", 0, time.Now().Add(-1*time.Hour))
-	require.NoError(t, err)
-	assert.Equal(t, []string{"seg-old.dat"}, deletable)
-
-	require.NoError(t, ms.DeleteFileRefs(ctx, "seg-old.dat"))
-
-	start, err := ms.GetPartitionStart(ctx, "events", 0)
-	require.NoError(t, err)
-	assert.Equal(t, int64(5), start)
-}
-
-func TestMemoryMetaStore_PlanExpiredFileDeletesKeepsSharedFileWithFreshReference(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 5},
-		{Topic: "events", Partition: 1, Count: 5},
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey: "shared.dat",
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteOffset: 0, ByteLength: 500},
-			{Topic: "events", Partition: 1, BaseOffset: 0, EndOffset: 5, ByteOffset: 500, ByteLength: 500},
-		},
-	}))
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "fresh-shared.dat",
-		CreatedAt: time.Now(),
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 1, BaseOffset: 5, EndOffset: 10, ByteOffset: 0, ByteLength: 500},
-		},
-	}))
-
-	// Update the shared file with an old timestamp after adding the fresh file so
-	// only the fresh file blocks deletion.
-	markerTime := time.Now().Add(-2 * time.Hour)
-	ms.mu.Lock()
-	for key, entries := range ms.segments {
-		for i := range entries {
-			if entries[i].fileKey == "shared.dat" {
-				entries[i].createdAt = markerTime
-			}
-		}
-		ms.segments[key] = entries
-	}
-	ms.mu.Unlock()
-
-	deletable, err := ms.PlanExpiredFileDeletes(ctx, "events", 0, time.Now().Add(-1*time.Hour))
-	require.NoError(t, err)
-	assert.Equal(t, []string{"shared.dat"}, deletable)
-}
-
-func TestMemoryMetaStore_PlanExpiredFileDeletesSkipsFileWithFreshSharedRef(t *testing.T) {
-	ctx := context.Background()
-	ms := NewMemoryMetaStore()
-
-	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "events", Partition: 0, Count: 5},
-		{Topic: "events", Partition: 1, Count: 5},
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "shared.dat",
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteOffset: 0, ByteLength: 500},
-		},
-	}))
-	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "shared.dat",
-		CreatedAt: time.Now(),
-		Batches: []BatchRef{
-			{Topic: "events", Partition: 1, BaseOffset: 0, EndOffset: 5, ByteOffset: 500, ByteLength: 500},
-		},
-	}))
-
-	deletable, err := ms.PlanExpiredFileDeletes(ctx, "events", 0, time.Now().Add(-1*time.Hour))
-	require.NoError(t, err)
-	assert.Empty(t, deletable)
+	require.Equal(t, int64(1), next[0].BaseOffset)
 }

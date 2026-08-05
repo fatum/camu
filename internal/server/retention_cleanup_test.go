@@ -242,19 +242,11 @@ func TestDisklessRetentionExportCheckpointGate(t *testing.T) {
 	// Four expired refs [0,1),[1,2),[2,3),[3,4), each in its own data file.
 	for i := int64(0); i < 4; i++ {
 		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
-		if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-			FileKey:   fileKey,
-			CreatedAt: time.Now().Add(-2 * time.Hour),
-			Batches: []diskless.BatchRef{{
-				Topic:      tc.Name,
-				Partition:  0,
-				BaseOffset: i,
-				EndOffset:  i + 1,
-				ByteOffset: 0,
-				ByteLength: 10,
-			}},
-		}); err != nil {
-			t.Fatalf("RegisterSegment([%d,%d)) error = %v", i, i+1, err)
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+			BatchID: fmt.Sprintf("batch-%d", i), FileKey: fileKey, Topic: tc.Name, Partition: 0,
+			Count: 1, ByteLength: 10, CreatedAt: time.Now().Add(-2 * time.Hour),
+		}}); err != nil {
+			t.Fatalf("CommitUploadedBatches([%d,%d)) error = %v", i, i+1, err)
 		}
 	}
 
@@ -335,15 +327,13 @@ func TestDisklessRetentionSharedFileWaitsForEveryPartition(t *testing.T) {
 
 	// One shared file holds refs for both partitions [0,2), both old enough to
 	// be retained.
-	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey:   "_diskless/test-node/shared.data",
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []diskless.BatchRef{
-			{Topic: tc.Name, Partition: 0, BaseOffset: 0, EndOffset: 2, ByteOffset: 0, ByteLength: 10},
-			{Topic: tc.Name, Partition: 1, BaseOffset: 0, EndOffset: 2, ByteOffset: 10, ByteLength: 10},
-		},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	for _, batch := range []diskless.UploadedBatch{
+		{BatchID: "shared-0", FileKey: "_diskless/test-node/shared.data", Topic: tc.Name, Partition: 0, Count: 2, ByteLength: 10, CreatedAt: time.Now().Add(-2 * time.Hour)},
+		{BatchID: "shared-1", FileKey: "_diskless/test-node/shared.data", Topic: tc.Name, Partition: 1, Count: 2, ByteOffset: 10, ByteLength: 10, CreatedAt: time.Now().Add(-2 * time.Hour)},
+	} {
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{batch}); err != nil {
+			t.Fatalf("CommitUploadedBatches() error = %v", err)
+		}
 	}
 
 	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
@@ -386,27 +376,11 @@ func TestDisklessRetentionOwnerJobResumesAfterS3Delete(t *testing.T) {
 	s.disklessMeta = diskless.NewMemoryMetaStore()
 	ctx := context.Background()
 
-	_, err := s.disklessMeta.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
-		Topic:     "diskless-topic",
-		Partition: 0,
-		Count:     5,
-	}})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey:   "_diskless/test-node/expired.data",
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  5,
-			ByteOffset: 0,
-			ByteLength: 64,
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "expired", FileKey: "_diskless/test-node/expired.data", Topic: "diskless-topic", Partition: 0,
+		Count: 5, ByteLength: 64, CreatedAt: time.Now().Add(-2 * time.Hour),
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
 	job := PartitionJob{
 		ID:            partitionJobID(PartitionJobTypeRetention, "_diskless/test-node/expired.data"),
@@ -585,27 +559,11 @@ func TestDisklessRetentionOwnerJobResumesAfterReassignment(t *testing.T) {
 	if err := s1.topicStore.Create(ctx, tc); err != nil {
 		t.Fatalf("topicStore.Create() error = %v", err)
 	}
-	_, err := s1.disklessMeta.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
-		Topic:     tc.Name,
-		Partition: 0,
-		Count:     3,
-	}})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-	if err := s1.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey:   "_diskless/test-node/reassign.data",
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []diskless.BatchRef{{
-			Topic:      tc.Name,
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  3,
-			ByteOffset: 0,
-			ByteLength: 32,
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	if _, err := s1.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "reassign", FileKey: "_diskless/test-node/reassign.data", Topic: tc.Name, Partition: 0,
+		Count: 3, ByteLength: 32, CreatedAt: time.Now().Add(-2 * time.Hour),
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
 
 	job := PartitionJob{
