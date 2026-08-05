@@ -123,8 +123,9 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 
 	// For non-replicated topics, check ownership early to avoid unnecessary work.
 	// Replicated topics defer the check to verifyProduceLeadership which checks
-	// both ownership and epoch in a single assignmentsMu.RLock.
-	if topicCfg.ReplicationFactor <= 1 {
+	// both ownership and epoch in a single assignmentsMu.RLock. Diskless topics
+	// are stateless and accept produce on any node, so they skip ownership.
+	if topicCfg.ReplicationFactor <= 1 && topicCfg.StorageMode != "diskless" {
 		for partitionID := range byPartition {
 			if !s.isOwnedPartition(topicName, partitionID) {
 				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -264,8 +265,9 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	// Check leadership before consuming the request body. A follower forwards
 	// the original request to the leader; parsing first would exhaust the body
-	// and make the leader receive an empty request.
-	if tc.ReplicationFactor <= 1 {
+	// and make the leader receive an empty request. Diskless topics are
+	// stateless and accept produce on any node, so they skip ownership.
+	if tc.ReplicationFactor <= 1 && tc.StorageMode != "diskless" {
 		if !s.isOwnedPartition(topicName, partitionID) {
 			s.proxyOrRejectNotLeader(w, r, topicName, partitionID)
 			return

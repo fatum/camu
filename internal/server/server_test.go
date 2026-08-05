@@ -1982,6 +1982,137 @@ func TestHandleKafkaListOffsets_DisklessTimestampLookupReturnsInvalidRequest(t *
 	}
 }
 
+func TestCreateTopicDisklessForcesReplicationFactorOne(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.registry.Register(ctx); err != nil {
+		t.Fatalf("registry.Register() error = %v", err)
+	}
+
+	tc, err := s.createTopic(ctx, createTopicRequest{
+		Name:              "diskless-topic",
+		Partitions:        4,
+		ReplicationFactor: 5,
+		MinInsyncReplicas: 3,
+		Retention:         "24h",
+		StorageMode:       "diskless",
+	})
+	if err != nil {
+		t.Fatalf("createTopic() error = %v", err)
+	}
+	if tc.ReplicationFactor != 1 || tc.MinInsyncReplicas != 1 {
+		t.Fatalf("diskless topic rf=%d minISR=%d, want rf=1 minISR=1", tc.ReplicationFactor, tc.MinInsyncReplicas)
+	}
+
+	stored, err := s.topicStore.Get(ctx, "diskless-topic")
+	if err != nil {
+		t.Fatalf("topicStore.Get() error = %v", err)
+	}
+	if stored.ReplicationFactor != 1 || stored.MinInsyncReplicas != 1 {
+		t.Fatalf("stored diskless topic rf=%d minISR=%d, want rf=1 minISR=1", stored.ReplicationFactor, stored.MinInsyncReplicas)
+	}
+
+	assigned, err := s.assignmentStore.Read(ctx, "diskless-topic")
+	if err != nil {
+		t.Fatalf("assignmentStore.Read() error = %v", err)
+	}
+	if len(assigned.Partitions) != 4 {
+		t.Fatalf("assigned partitions = %d, want 4", len(assigned.Partitions))
+	}
+	for pid, pa := range assigned.Partitions {
+		if len(pa.Replicas) != 1 {
+			t.Fatalf("partition %d: replicas = %v, want single leader", pid, pa.Replicas)
+		}
+		if pa.Leader == "" {
+			t.Fatalf("partition %d: no leader", pid)
+		}
+	}
+}
+
+func TestCreateTopicClassicHonorsReplicationFactor(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.registry.Register(ctx); err != nil {
+		t.Fatalf("registry.Register() error = %v", err)
+	}
+
+	tc, err := s.createTopic(ctx, createTopicRequest{
+		Name:              "classic-topic",
+		Partitions:        2,
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		Retention:         "24h",
+	})
+	if err != nil {
+		t.Fatalf("createTopic() error = %v", err)
+	}
+	if tc.ReplicationFactor != 1 || tc.MinInsyncReplicas != 1 {
+		t.Fatalf("classic topic rf=%d minISR=%d, want rf=1 minISR=1", tc.ReplicationFactor, tc.MinInsyncReplicas)
+	}
+}
+
+func TestKafkaPartitionErrorDisklessIgnoredOnAnyNode(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        2,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	// The assignment pins the leader to another node; diskless produce/fetch
+	// must not be rejected with NOT_LEADER here.
+	if err := s.assignmentStore.Write(ctx, "diskless-topic", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: "other-node", Replicas: []string{"other-node"}, LeaderEpoch: 1},
+			1: {Leader: "other-node", Replicas: []string{"other-node"}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+
+	for partition := 0; partition < 2; partition++ {
+		if code := s.kafkaPartitionError(ctx, "diskless-topic", partition); code != 0 {
+			t.Fatalf("kafkaPartitionError() partition %d = %d, want 0", partition, code)
+		}
+	}
+}
+
+func TestKafkaPartitionErrorClassicRejectsNonLeader(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{
+		Name:              "classic-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "classic-topic", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: "other-node", Replicas: []string{"other-node"}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+
+	if code := s.kafkaPartitionError(ctx, "classic-topic", 0); code != kafkaErrorNotLeader {
+		t.Fatalf("kafkaPartitionError() = %d, want %d", code, kafkaErrorNotLeader)
+	}
+}
+
 func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()

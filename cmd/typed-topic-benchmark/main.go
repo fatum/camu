@@ -408,6 +408,12 @@ func (c client) create(ctx context.Context, cfg config) error {
 	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled}
 	if cfg.StorageMode != "" {
 		body["storage_mode"] = cfg.StorageMode
+		if cfg.StorageMode == "diskless" {
+			// Diskless topics do not replicate; the server ignores these, so
+			// request the single-leader default explicitly.
+			body["replication_factor"] = 1
+			body["min_insync_replicas"] = 1
+		}
 	}
 	body["schema"] = map[string]any{"encoding": "json", "fields": benchmarkSchemaFields(cfg)}
 	if err := c.request(ctx, http.MethodPost, "/v1/topics", body, nil); err != nil {

@@ -89,6 +89,40 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 	return result
 }
 
+// AssignDiskless computes single-replica assignments for a diskless topic,
+// spreading the leader of every partition across the active instances. Diskless
+// topics are stateless (data lives in the shared object store), so there is no
+// replica set to preserve: leaders are always recomputed from the current active
+// set so a topic created while the cluster was partially up self-heals to a
+// spread once the full cluster is active. The leader epoch is preserved when the
+// leader is unchanged and bumped otherwise, so maintenance jobs that gate on
+// (leader, epoch) are fenced correctly.
+func AssignDiskless(instances []string, numPartitions int, current map[int]PartitionAssignment) map[int]PartitionAssignment {
+	sort.Strings(instances)
+	n := len(instances)
+	result := make(map[int]PartitionAssignment, numPartitions)
+	if n == 0 {
+		return result
+	}
+	for pid := range numPartitions {
+		leader := instances[pid%n]
+		epoch := uint64(1)
+		if cur, ok := current[pid]; ok {
+			if cur.Leader == leader {
+				epoch = cur.LeaderEpoch
+			} else {
+				epoch = cur.LeaderEpoch + 1
+			}
+		}
+		result[pid] = PartitionAssignment{
+			Replicas:    []string{leader},
+			Leader:      leader,
+			LeaderEpoch: epoch,
+		}
+	}
+	return result
+}
+
 // rebalanceLeaders spreads leadership across fully active replica sets. It is
 // deterministic, so once assignments are balanced, subsequent coordination
 // cycles leave their leaders unchanged. A partially available replica set is

@@ -6,6 +6,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kmsg"
 
+	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -206,6 +207,13 @@ func (s *Server) kafkaPartitionError(ctx context.Context, topic string, partitio
 	}
 	if partition < 0 || partition >= topicCfg.Partitions {
 		return kafkaErrorUnknownTopicPartition
+	}
+
+	// Diskless topics are stateless: any node can serve produce, fetch, and
+	// offset lookups for every partition, so leadership does not gate the
+	// request. The partition leader only runs maintenance jobs.
+	if topicCfg.StorageMode == meta.StorageModeDiskless {
+		return 0
 	}
 
 	assignments, err := s.assignmentStore.Read(ctx, topic)
