@@ -116,7 +116,8 @@ Leader failover works through:
 2. **Reassignment**: The controller publishes a new assignment with a higher epoch (or a follower self-promotes with a CAS bump).
 3. **Index refresh**: The promoted leader refreshes its segment index from object storage and continues at `max(local log end, index next offset)`, so an empty local tail still serves committed S3 records.
 4. **Local recovery**: The promoted leader recovers its active segment, truncating any divergent tail using epoch history. Promotions persist the new leader epoch to the local `epoch` sidecar, so a later demotion reports the correct epoch of the active tail.
-5. **Resume**: Replication and reads resume under the new leader. The high watermark advances once the ISR re-forms.
+5. **ISR claim**: The promoted leader writes `ISR = [self]` with an epoch-guarded conditional update. If a newer leader epoch already owns the partition (`ErrISRStaleEpoch`), the promotion **aborts entirely**: the local leader state and ownership are rolled back, so the stale node cannot acknowledge writes even if it briefly held the assignment.
+6. **Resume**: Replication and reads resume under the new leader. The high watermark advances once the ISR re-forms.
 
 Epoch history is used to fence stale leaders and to instruct followers to truncate divergent tails when required. The local `epoch` sidecar keeps the follower's reported epoch accurate across demotions; without it a stale epoch made the divergence check fence a demoted leader that actually held committed tail data.
 

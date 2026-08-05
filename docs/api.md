@@ -47,6 +47,12 @@ Diskless coordination:
 - With `s3`, offset allocation uses a per-partition head object and
   conditional-write CAS, and the segment catalog is immutable per-batch-ref
   objects; both work against any S3-compatible store.
+- With `dynamodb`, idempotent offset allocation is atomic: the producer's last
+  batch and the real base offset are stored in the same conditional write that
+  advances the counter, pinned to the previously read state, so concurrent
+  same-producer requests cannot bypass sequence validation or duplicate
+  offsets. The DynamoDB metastore is exercised against a real DynamoDB in CI
+  (`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` set).
 
 ## Query Mode
 
@@ -330,10 +336,20 @@ curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
 
 Current behavior:
 
-- duplicate sequence: accepted as duplicate, not appended again
-- sequence gap: rejected
+- duplicate sequence: accepted as duplicate, not appended again; the response
+  returns the original offsets, and for `diskless` topics carries
+  `"duplicate": true`
+- sequence gap (a skipped sequence number): rejected with 422
+- out-of-order or stale sequence (lower than, or overlapping, the last batch):
+  rejected with 422
 - unknown producer with non-zero sequence: rejected
 - high-level routed produce does not accept idempotent batch bodies
+
+Sequence validation applies to both `classic` and `diskless` topics. For
+`diskless`, the decision is made atomically in the metastore at offset
+allocation (per-producer last batch + the real base offset are stored in the
+same conditional write that advances the counter), so a concurrent stale
+retry is rejected rather than allocating new offsets.
 
 Operational rules:
 

@@ -177,6 +177,10 @@ wire-protocol API, including leader-kill, leader-pause-then-ack, partition,
 pause, clock-skew, and object-store isolation faults; its exact scope and latest
 reproducible runs are in [docs/reliability.md](docs/reliability.md).
 
+The `dynamodb` diskless metastore is exercised against a real DynamoDB in CI
+(`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT`
+pointing at DynamoDB Local).
+
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE).
