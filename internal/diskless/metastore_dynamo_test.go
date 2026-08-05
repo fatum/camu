@@ -33,13 +33,14 @@ func dynamoTestStore(t *testing.T) *DynamoMetaStore {
 }
 
 // TestDynamoMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent verifies a
-// committed batch is assigned a contiguous offset, an exact BatchID retry is
-// deduplicated, and the readable head reflects only committed batches.
+// committed batch is assigned a contiguous offset, an exact idempotent retry is
+// deduplicated by the producer-sequence history, and the readable head reflects
+// only committed batches.
 func TestDynamoMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	ms := dynamoTestStore(t)
 
-	b := UploadedBatch{BatchID: "f:0:10", FileKey: "f.data", Topic: "t", Partition: 0, Count: 3, ByteOffset: 0, ByteLength: 10, CreatedAt: time.Now()}
+	b := UploadedBatch{BatchID: "f:0:10", FileKey: "f.data", Topic: "t", Partition: 0, Count: 3, ByteOffset: 0, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()}
 
 	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
 	require.NoError(t, err)
@@ -55,7 +56,7 @@ func TestDynamoMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent(t *testing.
 	assert.True(t, retry[0].Duplicate)
 
 	// A distinct batch continues contiguously.
-	second, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "f:10:10", FileKey: "f.data", Topic: "t", Partition: 0, Count: 2, ByteOffset: 10, ByteLength: 10, CreatedAt: time.Now()}})
+	second, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "f:10:10", FileKey: "f.data", Topic: "t", Partition: 0, Count: 2, ByteOffset: 10, ByteLength: 10, ProducerID: 7, Sequence: 3, CreatedAt: time.Now()}})
 	require.NoError(t, err)
 	require.Len(t, second, 1)
 	assert.Equal(t, int64(3), second[0].BaseOffset)
@@ -72,20 +73,20 @@ func TestDynamoMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent(t *testing.
 	assert.Equal(t, int64(3), refs[1].BaseOffset)
 }
 
-// TestDynamoMetaStore_CommitUploadedBatchIDDeduplicatesNonIdempotent verifies
-// that non-idempotent batches are protected by the BatchID dedup: a retry of an
-// uncertain commit never appends the same uploaded bytes twice.
-func TestDynamoMetaStore_CommitUploadedBatchIDDeduplicatesNonIdempotent(t *testing.T) {
+// TestDynamoMetaStore_CommitIdempotentRetryDeduplicatesAcrossBatches verifies
+// that an idempotent retry (same producer and sequence) is deduplicated by the
+// producer-sequence history even when the retry is a new physical upload, and
+// that the committed head does not advance.
+func TestDynamoMetaStore_CommitIdempotentRetryDeduplicatesAcrossBatches(t *testing.T) {
 	ctx := context.Background()
 	ms := dynamoTestStore(t)
 
-	b := UploadedBatch{BatchID: "f:0:10", FileKey: "f.data", Topic: "t", Partition: 0, Count: 2, ByteOffset: 0, ByteLength: 10, CreatedAt: time.Now()}
-	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "obj1:0:10", FileKey: "obj1", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()}})
 	require.NoError(t, err)
 	require.Len(t, first, 1)
 	assert.Equal(t, int64(0), first[0].BaseOffset)
 
-	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
+	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "obj2:0:10", FileKey: "obj2", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()}})
 	require.NoError(t, err)
 	require.Len(t, retry, 1)
 	assert.Equal(t, int64(0), retry[0].BaseOffset)

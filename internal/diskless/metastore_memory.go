@@ -33,7 +33,6 @@ type MemoryMetaStore struct {
 	committed       map[string]int64
 	segments        map[string][]segmentEntry
 	producerCommits map[string]map[int64][]producerCommit
-	batchCommits    map[string]committedBatch // batch id -> durable outcome
 }
 
 // NewMemoryMetaStore creates a new in-memory MetaStore.
@@ -43,7 +42,6 @@ func NewMemoryMetaStore() *MemoryMetaStore {
 		committed:       make(map[string]int64),
 		segments:        make(map[string][]segmentEntry),
 		producerCommits: make(map[string]map[int64][]producerCommit),
-		batchCommits:    make(map[string]committedBatch),
 	}
 }
 
@@ -63,11 +61,6 @@ func (m *MemoryMetaStore) CommitUploadedBatches(_ context.Context, batches []Upl
 	for i, b := range batches {
 		if b.BatchID == "" || b.Count <= 0 {
 			return nil, fmt.Errorf("uploaded batch %s has invalid count %d", b.FileKey, b.Count)
-		}
-		if old, ok := m.batchCommits[b.BatchID]; ok {
-			old.Result.Duplicate = true
-			results[i] = old.Result
-			continue
 		}
 		key := partitionKey(b.Topic, b.Partition)
 		var duplicate *producerCommit
@@ -111,8 +104,6 @@ func (m *MemoryMetaStore) CommitUploadedBatches(_ context.Context, batches []Upl
 			m.producerCommits[key][b.ProducerID] = h
 		}
 		results[i] = OffsetResult{BaseOffset: base}
-		m.batchCommits[b.BatchID] = committedBatch{Result: results[i], CommittedAt: time.Now()}
-		pruneBatchCommits(m.batchCommits, time.Now())
 	}
 	return results, nil
 }

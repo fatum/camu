@@ -37,13 +37,17 @@ func TestMemoryMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent(t *testing.
 	require.Equal(t, int64(2), head)
 }
 
-func TestMemoryMetaStore_CommitUploadedBatchIDDeduplicatesNonIdempotent(t *testing.T) {
+func TestMemoryMetaStore_CommitIdempotentRetryDeduplicatesAcrossBatches(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
-	b := UploadedBatch{BatchID: "object:0:10", FileKey: "object", Topic: "t", Partition: 0, Count: 3, ByteLength: 10}
-	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
+	// Producer 7 commits sequence 0 from a first physical upload.
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "obj1:0:10", FileKey: "obj1", Topic: "t", Partition: 0, Count: 3, ByteLength: 10, ProducerID: 7, Sequence: 0}})
 	require.NoError(t, err)
-	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{b})
+	require.Equal(t, int64(0), first[0].BaseOffset)
+	// A client retry re-uploads the same logical batch (new BatchID/file). The
+	// producer-sequence history deduplicates it (retroactive tombstone): same
+	// base, no new ref, head unchanged.
+	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "obj2:0:10", FileKey: "obj2", Topic: "t", Partition: 0, Count: 3, ByteLength: 10, ProducerID: 7, Sequence: 0}})
 	require.NoError(t, err)
 	require.True(t, retry[0].Duplicate)
 	require.Equal(t, first[0].BaseOffset, retry[0].BaseOffset)

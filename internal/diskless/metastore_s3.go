@@ -45,7 +45,6 @@ type s3UploadManifest struct {
 	CommittedOffset int64                        `json:"committed_offset"`
 	Refs            []s3CatalogRef               `json:"refs"`
 	Producers       map[string][]s3ProducerBatch `json:"producers,omitempty"`
-	BatchCommits    map[string]committedBatch    `json:"batch_commits,omitempty"`
 }
 
 // s3ProducerBatch records the most recent idempotent allocation for a producer
@@ -99,18 +98,13 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 		for {
 			key := s3ManifestKey(batch.Topic, batch.Partition)
 			data, etag, err := m.s3.GetWithETag(ctx, key)
-			manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}, BatchCommits: map[string]committedBatch{}}
+			manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}}
 			if err == nil {
 				if err := json.Unmarshal(data, &manifest); err != nil {
 					return nil, fmt.Errorf("parse upload manifest %s/%d: %w", batch.Topic, batch.Partition, err)
 				}
 			} else if !errors.Is(err, storage.ErrNotFound) {
 				return nil, err
-			}
-			if old, ok := manifest.BatchCommits[batch.BatchID]; ok {
-				old.Result.Duplicate = true
-				results[i] = old.Result
-				break
 			}
 			pid := strconv.FormatInt(batch.ProducerID, 10)
 			duplicate := false
@@ -143,8 +137,6 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 			end := base + int64(batch.Count)
 			manifest.NextOffset, manifest.CommittedOffset = end, end
 			manifest.Refs = append(manifest.Refs, s3CatalogRef{FileKey: batch.FileKey, ByteOffset: batch.ByteOffset, ByteLength: batch.ByteLength, BaseOffset: base, EndOffset: end, CreatedAt: batch.CreatedAt})
-			manifest.BatchCommits[batch.BatchID] = committedBatch{Result: OffsetResult{BaseOffset: base}, CommittedAt: time.Now()}
-			pruneBatchCommits(manifest.BatchCommits, time.Now())
 			if batch.ProducerID != 0 {
 				h := manifest.Producers[pid]
 				h = append(h, s3ProducerBatch{FirstSequence: batch.Sequence, BaseOffset: base, Count: batch.Count})

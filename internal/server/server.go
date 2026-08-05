@@ -1674,6 +1674,7 @@ func (s *Server) renewLeases() {
 	s.coordinationGCTick++
 	if s.amLeader() && s.coordinationGCTick%10 == 0 {
 		s.coordinationGC(ctx, topics)
+		s.sweepDisklessOrphans(ctx)
 	}
 
 	// Evict stale idempotent producers every 10th tick.

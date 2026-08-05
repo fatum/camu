@@ -12,8 +12,10 @@ import (
 type MetaStore interface {
 	// CommitUploadedBatches atomically, per partition, validates producer
 	// sequences, assigns offsets, publishes uploaded refs, and advances the
-	// readable head. Callers may retry the same uploaded batch; an exact
-	// idempotent retry returns its original offset without another ref.
+	// readable head. Idempotency follows the Kafka contract: an exact retry of
+	// an idempotent batch (same producer, first sequence, count) is deduplicated
+	// against the producer's recent commit history and returns its original
+	// offset without another ref. Non-idempotent batches are not deduplicated.
 	CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error)
 	// QuerySegments returns segment references covering [fromOffset, ...) for a
 	// given topic-partition, up to maxBytes of data.
@@ -66,49 +68,6 @@ type MetaStore interface {
 
 	// Close releases any resources held by the MetaStore.
 	Close() error
-}
-
-// committedBatch records the durable outcome of an uploaded batch, keyed by
-// BatchID, so an exact retry of the same physical batch never appends the same
-// bytes twice. Entries are pruned so the per-partition manifest stays bounded
-// (an unbounded map would make every commit rewrite a growing object and, for
-// the DynamoDB backend, eventually exceed the 400 KB item limit).
-type committedBatch struct {
-	Result      OffsetResult `json:"result"`
-	CommittedAt time.Time    `json:"committed_at"`
-}
-
-const (
-	// uploadedBatchCommitRetention is how long a batch-commit record is kept to
-	// cover retries of an uncertain commit; well beyond any produce retry
-	// horizon.
-	uploadedBatchCommitRetention = 24 * time.Hour
-	// uploadedBatchCommitMax caps the retained batch-commit records per
-	// partition so the manifest has a hard size bound regardless of throughput.
-	uploadedBatchCommitMax = 8192
-)
-
-// pruneBatchCommits drops batch-commit records older than the retention window
-// and, if still over the entry cap, evicts the oldest so the per-partition
-// manifest never grows without bound.
-func pruneBatchCommits(commits map[string]committedBatch, now time.Time) {
-	for id, c := range commits {
-		if now.Sub(c.CommittedAt) > uploadedBatchCommitRetention {
-			delete(commits, id)
-		}
-	}
-	for len(commits) > uploadedBatchCommitMax {
-		oldest, oldestID := now, ""
-		for id, c := range commits {
-			if c.CommittedAt.Before(oldest) {
-				oldest, oldestID = c.CommittedAt, id
-			}
-		}
-		if oldestID == "" {
-			break
-		}
-		delete(commits, oldestID)
-	}
 }
 
 // parsePartitionKey splits a partition key of the form "topic#partition". The

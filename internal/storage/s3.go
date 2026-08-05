@@ -61,8 +61,9 @@ type PutOpts struct {
 
 // memObject is a stored object in the in-memory backend.
 type memObject struct {
-	data []byte
-	etag string
+	data      []byte
+	etag      string
+	createdAt time.Time
 }
 
 // s3Backend is the interface for storage backends.
@@ -71,6 +72,7 @@ type s3Backend interface {
 	get(ctx context.Context, key string) ([]byte, error)
 	getRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	getRangeInto(ctx context.Context, key string, offset, length int64, dst []byte) error
+	stat(ctx context.Context, key string) (time.Time, error)
 	getWithETag(ctx context.Context, key string) ([]byte, string, error)
 	delete(ctx context.Context, key string) error
 	list(ctx context.Context, prefix string) ([]string, error)
@@ -200,6 +202,18 @@ func (c *S3Client) GetRangeInto(ctx context.Context, key string, offset, length 
 	return err
 }
 
+// Stat returns the object's last modification time. Returns ErrNotFound if the
+// key is missing.
+func (c *S3Client) Stat(ctx context.Context, key string) (time.Time, error) {
+	if err := c.checkFault("get"); err != nil {
+		return time.Time{}, err
+	}
+	started := time.Now()
+	t, err := c.backend.stat(ctx, key)
+	c.observe("get", started, 0, err)
+	return t, err
+}
+
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
 func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	if err := c.checkFault("get_etag"); err != nil {
@@ -301,8 +315,18 @@ func (m *memBackend) put(_ context.Context, key string, data []byte, _ PutOpts) 
 	copy(cp, data)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.objects[key] = memObject{data: cp, etag: uuid.NewString()}
+	m.objects[key] = memObject{data: cp, etag: uuid.NewString(), createdAt: time.Now()}
 	return nil
+}
+
+func (m *memBackend) stat(_ context.Context, key string) (time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	obj, ok := m.objects[key]
+	if !ok {
+		return time.Time{}, ErrNotFound
+	}
+	return obj.createdAt, nil
 }
 
 func (m *memBackend) get(_ context.Context, key string) ([]byte, error) {
@@ -406,7 +430,7 @@ func (m *memBackend) conditionalPut(_ context.Context, key string, data []byte, 
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	newEtag := uuid.NewString()
-	m.objects[key] = memObject{data: cp, etag: newEtag}
+	m.objects[key] = memObject{data: cp, etag: newEtag, createdAt: time.Now()}
 	return newEtag, nil
 }
 
@@ -552,6 +576,23 @@ func (b *awsS3Backend) getRangeInto(ctx context.Context, key string, offset, len
 		return fmt.Errorf("s3 GetRangeInto %q read: %w", key, err)
 	}
 	return nil
+}
+
+func (b *awsS3Backend) stat(ctx context.Context, key string) (time.Time, error) {
+	out, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return time.Time{}, ErrNotFound
+		}
+		return time.Time{}, fmt.Errorf("s3 Stat %q: %w", key, err)
+	}
+	if out.LastModified != nil {
+		return *out.LastModified, nil
+	}
+	return time.Now(), nil
 }
 
 func (b *awsS3Backend) getWithETag(ctx context.Context, key string) ([]byte, string, error) {

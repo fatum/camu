@@ -15,9 +15,8 @@ import (
 )
 
 type dynamoUploadState struct {
-	NextOffset   int64                            `json:"next_offset"`
-	Producers    map[string][]dynamoProducerBatch `json:"producers,omitempty"`
-	BatchCommits map[string]committedBatch        `json:"batch_commits,omitempty"`
+	NextOffset int64                            `json:"next_offset"`
+	Producers  map[string][]dynamoProducerBatch `json:"producers,omitempty"`
 }
 
 type dynamoProducerBatch struct {
@@ -96,7 +95,7 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 			if err != nil {
 				return nil, fmt.Errorf("read upload state %s: %w", pk, err)
 			}
-			state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}, BatchCommits: map[string]committedBatch{}}
+			state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}}
 			var old string
 			if out.Item != nil {
 				if a, ok := out.Item["upload_state"].(*ddbtypes.AttributeValueMemberS); ok {
@@ -105,11 +104,6 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 						return nil, fmt.Errorf("parse upload state %s: %w", pk, err)
 					}
 				}
-			}
-			if old, ok := state.BatchCommits[b.BatchID]; ok {
-				old.Result.Duplicate = true
-				results[i] = old.Result
-				break
 			}
 			pid := strconv.FormatInt(b.ProducerID, 10)
 			duplicate := false
@@ -140,8 +134,6 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 			base := state.NextOffset
 			end := base + int64(b.Count)
 			state.NextOffset = end
-			state.BatchCommits[b.BatchID] = committedBatch{Result: OffsetResult{BaseOffset: base}, CommittedAt: time.Now()}
-			pruneBatchCommits(state.BatchCommits, time.Now())
 			if b.ProducerID != 0 {
 				h := state.Producers[pid]
 				h = append(h, dynamoProducerBatch{FirstSequence: b.Sequence, BaseOffset: base, Count: b.Count})
