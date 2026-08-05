@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )
 
@@ -213,6 +214,12 @@ func (s *Server) clusterStatus(parent context.Context) clusterStatusResponse {
 		return resp
 	}
 	for _, tc := range topics {
+		if tc.StorageMode == meta.StorageModeDiskless {
+			// Diskless topics are served by any node's engine plus the shared
+			// metastore; they have no replica assignments to initialize, so they
+			// neither contribute to nor block classic cluster readiness.
+			continue
+		}
 		resp.ExpectedPartitions += tc.Partitions
 		assignments, readErr := s.assignmentStore.Read(ctx, tc.Name)
 		if readErr != nil {
