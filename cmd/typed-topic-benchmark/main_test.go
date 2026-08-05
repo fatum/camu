@@ -122,6 +122,35 @@ func TestParseByteSizeRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestDisklessSkipsClusterReadinessAndReplicationWait(t *testing.T) {
+	// An unreachable base proves no network request is made for diskless topics.
+	cfg := config{StorageMode: "diskless"}
+	c := client{base: "http://127.0.0.1:1", http: &http.Client{}, requestTimeout: time.Second}
+	if err := c.waitClusterReady(context.Background(), cfg); err != nil {
+		t.Fatalf("waitClusterReady() error = %v, want nil for diskless", err)
+	}
+	if err := c.waitForReplication(context.Background(), cfg); err != nil {
+		t.Fatalf("waitForReplication() error = %v, want nil for diskless", err)
+	}
+}
+
+func TestNodeClientRoundRobin(t *testing.T) {
+	cfg := config{NodeURLs: []string{"http://n0:8080", "http://n1:8080", "http://n2:8080"}}
+	c := client{base: "http://default:8080"}
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		seen[c.nodeClient(cfg).base] = true
+	}
+	for _, url := range cfg.NodeURLs {
+		if !seen[url] {
+			t.Fatalf("node %s never selected in round-robin", url)
+		}
+	}
+	if c.base != "http://default:8080" {
+		t.Fatal("nodeClient must not mutate the receiver")
+	}
+}
+
 func TestLoadConfigExportEnabled(t *testing.T) {
 	t.Setenv("EXPORT_ENABLED", "false")
 	cfg, err := loadConfig()

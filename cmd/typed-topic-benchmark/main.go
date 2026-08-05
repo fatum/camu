@@ -301,6 +301,20 @@ type client struct {
 	requestTimeout time.Duration
 }
 
+// nodeRoundRobin rotates which node each benchmark request targets so produce
+// and topic-setup traffic is spread round-robin across every node instead of
+// pinning a partition to one node or depending on a single CAMU_URL endpoint.
+var nodeRoundRobin atomic.Uint64
+
+// nodeClient returns a copy of c pointed at the next node from cfg.NodeURLs.
+func (c client) nodeClient(cfg config) client {
+	if len(cfg.NodeURLs) == 0 {
+		return c
+	}
+	c.base = cfg.NodeURLs[int(nodeRoundRobin.Add(1)-1)%len(cfg.NodeURLs)]
+	return c
+}
+
 func (c client) request(ctx context.Context, method, path string, body any, out any) error {
 	_, err := c.requestHeaders(ctx, method, path, body, out)
 	return err
@@ -352,7 +366,13 @@ func (c client) clusterStatus(ctx context.Context) (clusterStatus, error) {
 	return status, err
 }
 
-func (c client) waitClusterReady(ctx context.Context) error {
+// waitClusterReady blocks until the full cluster reports ready. Diskless topics
+// are served by any node's engine plus the shared metastore, so they skip the
+// cluster-wide wait and can produce/consume as soon as a node is up.
+func (c client) waitClusterReady(ctx context.Context, cfg config) error {
+	if cfg.StorageMode == "diskless" {
+		return nil
+	}
 	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		var status clusterStatus
@@ -402,18 +422,31 @@ func (c client) create(ctx context.Context, cfg config) error {
 	return c.waitForReplication(ctx, cfg)
 }
 
-func (c client) initBenchmarkProducer(ctx context.Context) (uint64, error) {
-	var response initBenchmarkProducerResponse
-	if err := retryProduce(ctx, "initialize HTTP producer", func() error {
-		response = initBenchmarkProducerResponse{}
-		return c.request(ctx, http.MethodPost, "/v1/producers/init", nil, &response)
-	}); err != nil {
-		return 0, err
+func (c client) initBenchmarkProducer(ctx context.Context, cfg config) (uint64, error) {
+	nodes := cfg.NodeURLs
+	if len(nodes) == 0 {
+		nodes = []string{c.base}
 	}
-	if response.ProducerID == 0 {
-		return 0, errors.New("initialize HTTP producer: server returned producer_id 0")
+	start := int(nodeRoundRobin.Add(1)-1) % len(nodes)
+	var lastErr error
+	for i := 0; i < len(nodes); i++ {
+		nodeClient := c
+		nodeClient.base = nodes[(start+i)%len(nodes)]
+		var response initBenchmarkProducerResponse
+		if err := retryProduce(ctx, "initialize HTTP producer", func() error {
+			response = initBenchmarkProducerResponse{}
+			return nodeClient.request(ctx, http.MethodPost, "/v1/producers/init", nil, &response)
+		}); err != nil {
+			lastErr = err
+			continue
+		}
+		if response.ProducerID == 0 {
+			lastErr = errors.New("initialize HTTP producer: server returned producer_id 0")
+			continue
+		}
+		return response.ProducerID, nil
 	}
-	return response.ProducerID, nil
+	return 0, fmt.Errorf("initialize HTTP producer on all %d nodes: %w", len(nodes), lastErr)
 }
 
 type benchmarkTopic struct {
@@ -422,7 +455,29 @@ type benchmarkTopic struct {
 	StorageMode   string `json:"storage_mode,omitempty"`
 }
 
+// ensureTopic checks whether the topic exists (creating it if absent) by trying
+// each node in round-robin order so setup does not depend on a single endpoint.
 func (c client) ensureTopic(ctx context.Context, cfg config) (bool, error) {
+	nodes := cfg.NodeURLs
+	if len(nodes) == 0 {
+		nodes = []string{c.base}
+	}
+	start := int(nodeRoundRobin.Add(1)-1) % len(nodes)
+	var lastErr error
+	for i := 0; i < len(nodes); i++ {
+		nodeClient := c
+		nodeClient.base = nodes[(start+i)%len(nodes)]
+		existing, err := nodeClient.ensureTopicOnNode(ctx, cfg)
+		if err == nil {
+			return existing, nil
+		}
+		benchmarkLog("topic setup via %s failed: %v", nodeClient.base, err)
+		lastErr = err
+	}
+	return false, fmt.Errorf("topic setup failed on all %d nodes: %w", len(nodes), lastErr)
+}
+
+func (c client) ensureTopicOnNode(ctx context.Context, cfg config) (bool, error) {
 	var topic benchmarkTopic
 	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
 	if err != nil {
@@ -492,6 +547,11 @@ func (c client) committedPartitionOffsets(ctx context.Context, cfg config) ([]in
 }
 
 func (c client) waitForReplication(ctx context.Context, cfg config) error {
+	if cfg.StorageMode == "diskless" {
+		// Diskless topics do not replicate; there are no replica assignments to
+		// wait for.
+		return nil
+	}
 	type routingPartition struct {
 		Replicas []any `json:"replicas"`
 	}
@@ -580,7 +640,7 @@ func expectedStatesForPartitionOffsets(cfg config, endOffsets []int64) ([]hashSt
 
 func (c client) produce(ctx context.Context, cfg config, count int64, expected []hashState, progress func(int64)) (phaseResult, error) {
 	start := time.Now()
-	producerID, err := c.initBenchmarkProducer(ctx)
+	producerID, err := c.initBenchmarkProducer(ctx, cfg)
 	if err != nil {
 		return phaseResult{}, err
 	}
@@ -609,10 +669,7 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 					}
 					atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
 					path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(cfg.Topic), p)
-					partitionClient := c
-					if len(cfg.NodeURLs) > 0 {
-						partitionClient.base = cfg.NodeURLs[p%len(cfg.NodeURLs)]
-					}
+					partitionClient := c.nodeClient(cfg)
 					request := idempotentProduceRequest{ProducerID: producerID, Sequence: sequence, Messages: batch}
 					if err := retryProduce(ctx, fmt.Sprintf("produce HTTP partition %d sequence %d", p, sequence), func() error {
 						return partitionClient.request(ctx, http.MethodPost, path, request, nil)
@@ -950,7 +1007,7 @@ func (c client) waitForSQL(ctx context.Context, cfg config, res *result, count i
 }
 
 func runSingleOperation(ctx context.Context, c client, cfg config, res *result) {
-	if err := c.waitClusterReady(ctx); err != nil {
+	if err := c.waitClusterReady(ctx, cfg); err != nil {
 		res.Integrity.Error = "cluster readiness: " + err.Error()
 		benchmarkLog("cluster readiness failed: %v", err)
 		return
@@ -1138,7 +1195,7 @@ func main() {
 		return
 	}
 	benchmarkLog("topic %q created and partition assignments are ready", cfg.Topic)
-	if err := c.waitClusterReady(ctx); err != nil {
+	if err := c.waitClusterReady(ctx, cfg); err != nil {
 		res.Integrity.Error = "cluster readiness: " + err.Error()
 		benchmarkLog("cluster readiness failed: %v", err)
 		return
@@ -1146,38 +1203,42 @@ func main() {
 	benchmarkLog("cluster is ready; starting producer and SQL visibility sampling")
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
-	readinessDone = make(chan struct{})
-	go func() {
-		defer close(readinessDone)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		poll := func() {
-			status, err := c.clusterStatus(runCtx)
-			sample := clusterStatusSample{At: time.Now(), Status: status}
-			if err != nil {
-				sample.Error = err.Error()
-				readinessLost.Store(true)
-			} else if !status.Ready {
-				readinessLost.Store(true)
+	if cfg.StorageMode != "diskless" {
+		// Diskless runs do not depend on cluster-wide readiness, so the run is
+		// not canceled when the aggregate cluster status reports not ready.
+		readinessDone = make(chan struct{})
+		go func() {
+			defer close(readinessDone)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			poll := func() {
+				status, err := c.clusterStatus(runCtx)
+				sample := clusterStatusSample{At: time.Now(), Status: status}
+				if err != nil {
+					sample.Error = err.Error()
+					readinessLost.Store(true)
+				} else if !status.Ready {
+					readinessLost.Store(true)
+				}
+				if readinessLost.Load() {
+					runCancel()
+				}
+				readinessMu.Lock()
+				res.Cluster.Samples = append(res.Cluster.Samples, sample)
+				res.Cluster.Final = status
+				readinessMu.Unlock()
 			}
-			if readinessLost.Load() {
-				runCancel()
+			poll()
+			for {
+				select {
+				case <-ticker.C:
+					poll()
+				case <-runCtx.Done():
+					return
+				}
 			}
-			readinessMu.Lock()
-			res.Cluster.Samples = append(res.Cluster.Samples, sample)
-			res.Cluster.Final = status
-			readinessMu.Unlock()
-		}
-		poll()
-		for {
-			select {
-			case <-ticker.C:
-				poll()
-			case <-runCtx.Done():
-				return
-			}
-		}
-	}()
+		}()
+	}
 	count, countErr := targetCount(cfg.TargetBytes, cfg.MessageBytes)
 	if countErr != nil {
 		panic(countErr)
