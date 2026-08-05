@@ -1635,7 +1635,8 @@ func TestParquetExportGuardsKafkaUncleanElectionMutation(t *testing.T) {
 		for _, enabled := range []bool{true, false} {
 			t.Run(test.name+"/export_"+strconv.FormatBool(enabled), func(t *testing.T) {
 				s := newTestServer(t)
-				s.leaderLease = coordination.LeaderLease{InstanceID: s.instanceID, ExpiresAt: time.Now().Add(time.Minute)}
+				lease := coordination.LeaderLease{InstanceID: s.instanceID, ExpiresAt: time.Now().Add(time.Minute)}
+				s.leaderLease.Store(&lease)
 				ctx := context.Background()
 				if err := s.topicStore.Create(ctx, meta.TopicConfig{Name: "events", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeClassic, ExportEnabled: enabled}); err != nil {
 					t.Fatalf("seed topic: %v", err)
@@ -1676,7 +1677,8 @@ func TestParquetExportRejectsUncleanLeaderElectionOnKafkaTopicCreate(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
-			s.leaderLease = coordination.LeaderLease{InstanceID: s.instanceID, ExpiresAt: time.Now().Add(time.Minute)}
+			lease := coordination.LeaderLease{InstanceID: s.instanceID, ExpiresAt: time.Now().Add(time.Minute)}
+			s.leaderLease.Store(&lease)
 			unclean := "true"
 			exportEnabled := strconv.FormatBool(tc.enabled)
 			req := kmsg.NewPtrCreateTopicsRequest()
@@ -1787,10 +1789,11 @@ func TestHandleKafkaDeleteTopicsRequiresController(t *testing.T) {
 func TestHandleKafkaDeleteTopicsEnqueuesDisklessCleanup(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()
-	s.leaderLease = coordination.LeaderLease{
+	lease := coordination.LeaderLease{
 		InstanceID: s.instanceID,
 		ExpiresAt:  time.Now().Add(time.Minute),
 	}
+	s.leaderLease.Store(&lease)
 
 	ctx := context.Background()
 	tc := meta.TopicConfig{
@@ -2037,7 +2040,7 @@ func TestKafkaControllerBrokerUsesLeaderLease(t *testing.T) {
 	if !acquired {
 		t.Fatal("expected n1 to acquire controller lease")
 	}
-	s.leaderLease = lease
+	s.leaderLease.Store(&lease)
 
 	brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
 	if err != nil {
@@ -2101,7 +2104,7 @@ func TestIsLocalKafkaCoordinatorFollowsControllerLease(t *testing.T) {
 	if !acquired {
 		t.Fatal("expected n1 to acquire controller lease")
 	}
-	s.leaderLease = lease
+	s.leaderLease.Store(&lease)
 	if got := s.isLocalKafkaCoordinator(context.Background(), "any-group"); !got {
 		t.Fatalf("isLocalKafkaCoordinator() = %v, want true", got)
 	}

@@ -70,8 +70,8 @@ func (s *Server) isLocalKafkaCoordinator(ctx context.Context, groupKey string) b
 }
 
 func (s *Server) currentControllerEpoch() string {
-	if s.leaderLease.ETag != "" {
-		return s.leaderLease.ETag
+	if lease := s.leaderLease.Load(); lease != nil && lease.ETag != "" {
+		return lease.ETag
 	}
 	lease, err := s.leaderElection.GetLeader(context.Background())
 	if err != nil {

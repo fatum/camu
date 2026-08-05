@@ -10,6 +10,15 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
+// maxISRUpdateAttempts bounds the read-modify-write retries in Update before
+// giving up on a persistently contended ISR object.
+const maxISRUpdateAttempts = 8
+
+// ErrISRStaleEpoch is returned by Update when a caller attempts to write ISR
+// state with a leader epoch below the currently persisted epoch. The caller is
+// a stale leader and must stop acting as the partition leader.
+var ErrISRStaleEpoch = errors.New("isr: stale leader epoch")
+
 // ISRState holds the in-sync replica state for a single partition.
 type ISRState struct {
 	Partition     int       `json:"partition"`
@@ -36,25 +45,58 @@ func isrKey(topic string, pid int) string {
 }
 
 // Write writes ISR state for a topic partition.
-// Pass etag="" for initial creation (unconditional write), or the ETag from a
-// previous Read to guard against concurrent overwrites (CAS write).
+// Pass etag="" for create-if-absent (the object must not exist yet), or the
+// ETag from a previous Read for a guarded CAS update. An unconditional
+// last-writer-wins overwrite is intentionally not supported: a stale leader
+// must never clobber a newer leader's ISR state.
 func (s *ISRStore) Write(ctx context.Context, topic string, state ISRState, etag string) error {
 	state.UpdatedAt = time.Now()
 	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("isr: marshal: %w", err)
 	}
-	if etag == "" {
-		if err := s.s3Client.Put(ctx, isrKey(topic, state.Partition), data, storage.PutOpts{}); err != nil {
-			return fmt.Errorf("isr: put: %w", err)
+	if _, err := s.s3Client.ConditionalPut(ctx, isrKey(topic, state.Partition), data, etag); err != nil {
+		if errors.Is(err, storage.ErrConflict) {
+			return fmt.Errorf("isr: conditional put %s/%d: %w", topic, state.Partition, err)
 		}
-		return nil
-	}
-	_, err = s.s3Client.ConditionalPut(ctx, isrKey(topic, state.Partition), data, etag)
-	if err != nil {
 		return fmt.Errorf("isr: conditional put: %w", err)
 	}
 	return nil
+}
+
+// Update performs a read-modify-write of the ISR state for a partition. The
+// mutator receives the current persisted state (empty on first creation) and
+// returns the state to persist. The write is guarded by a conditional PUT on
+// the read ETag and retried on conflict. A caller whose wantEpoch is lower than
+// the persisted epoch is rejected: it is a stale writer and must not clobber a
+// newer leader's state.
+func (s *ISRStore) Update(ctx context.Context, topic string, pid int, wantEpoch uint64, mut func(cur ISRState) (ISRState, error)) error {
+	for attempt := 0; attempt < maxISRUpdateAttempts; attempt++ {
+		cur, err := s.Read(ctx, topic, pid)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) {
+				return err
+			}
+			cur = ISRState{Partition: pid}
+		}
+		if cur.LeaderEpoch > wantEpoch {
+			return fmt.Errorf("%w: %s/%d has epoch %d", ErrISRStaleEpoch, topic, pid, cur.LeaderEpoch)
+		}
+		next, err := mut(cur)
+		if err != nil {
+			return err
+		}
+		next.Partition = pid
+		next.LeaderEpoch = wantEpoch
+		if err := s.Write(ctx, topic, next, cur.ETag); err != nil {
+			if errors.Is(err, storage.ErrConflict) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("isr: update %s/%d after %d attempts: %w", topic, pid, maxISRUpdateAttempts, storage.ErrConflict)
 }
 
 func epochHistoryKey(topic string, pid int) string {

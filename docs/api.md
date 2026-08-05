@@ -38,6 +38,16 @@ Create mode over Kafka:
 
 - `camu.storage.mode=diskless`
 
+Diskless coordination:
+
+- `diskless.metastore` selects the offset/segment-catalog backend:
+  `memory` (default, single-node dev), `s3` (backed by the same object store,
+  so diskless topics run on any S3-compatible service without DynamoDB), or
+  `dynamodb`.
+- With `s3`, offset allocation uses a per-partition head object and
+  conditional-write CAS, and the segment catalog is immutable per-batch-ref
+  objects; both work against any S3-compatible store.
+
 ## Query Mode
 
 Camu also supports a separate runtime role:
@@ -403,8 +413,13 @@ Kafka admin notes:
 
 Ack semantics:
 
-- `rf=1`, `minISR=1`: durable in the local active segment on the owner
+- `rf=1`, `minISR=1`: durable in the local active segment on the owner, and the
+  ack re-verifies ownership against the assignment store on an amortized
+  `coordination.fence_interval` cadence (default `2s`)
 - `rf>1`: durable on the leader and acknowledged only after ISR quorum confirms
+  (HTTP and Kafka alike)
+- Kafka `acks=0` requests are fire-and-forget and return without waiting for a
+  quorum
 
 Important behavior:
 
@@ -412,6 +427,11 @@ Important behavior:
 - a sealed segment remains available to follower replication while it is pending publication
 - `rf=1` does not survive permanent loss of its only owner before object-store persistence
 - reads are capped by readable high watermark for replicated topics
+- for `diskless` topics, offsets are allocated before the object-store write (the
+  RecordBatch base offset is patched before persistence); a transient PUT or
+  segment-registration failure is retried idempotently so it does not strand
+  allocated offsets as a permanent gap. Only a persistent failure that outlives
+  the flush retry window surfaces an error to the producer
 
 ## Where To Check Exact Support
 

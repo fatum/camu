@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 	"github.com/maksim/camu/internal/metrics"
 )
@@ -23,6 +25,24 @@ var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("conflict: etag mismatch")
 )
+
+// ConflictError is returned when an S3 conditional write fails its
+// precondition. It wraps ErrConflict so errors.Is(err, ErrConflict) remains
+// true, and preserves the underlying cause for typed detection across
+// providers.
+type ConflictError struct {
+	Key   string
+	Cause error
+}
+
+func (e *ConflictError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("conflict on %q: %v", e.Key, e.Cause)
+	}
+	return fmt.Sprintf("conflict on %q", e.Key)
+}
+
+func (e *ConflictError) Unwrap() error { return ErrConflict }
 
 // S3Config holds configuration for the S3 client.
 type S3Config struct {
@@ -61,24 +81,53 @@ type s3Backend interface {
 type S3Client struct {
 	cfg     S3Config
 	backend s3Backend
-	metrics *metrics.Registry
+	// metrics is atomic because a shared client (e.g. the camutest harness)
+	// can be re-pointed at a new server's registry while the previous server's
+	// goroutines are still draining.
+	metrics atomic.Pointer[metrics.Registry]
+	// fault is an optional test-only injector called before every operation.
+	fault atomic.Pointer[faultInjector]
 }
 
-func (c *S3Client) SetMetrics(registry *metrics.Registry) { c.metrics = registry }
+type faultInjector func(op string) error
+
+// SetFaultInjector installs a test-only fault injector invoked before every
+// operation. op is the operation name ("put", "get", "get_range",
+// "get_etag", "delete", "list", "conditional_put"). Returning a non-nil error
+// fails the operation. Passing nil removes the injector. It is safe for
+// concurrent use and has no effect on production paths when unset.
+func (c *S3Client) SetFaultInjector(fn func(op string) error) {
+	if fn == nil {
+		c.fault.Store(nil)
+		return
+	}
+	f := faultInjector(fn)
+	c.fault.Store(&f)
+}
+
+func (c *S3Client) checkFault(op string) error {
+	if p := c.fault.Load(); p != nil {
+		return (*p)(op)
+	}
+	return nil
+}
+
+func (c *S3Client) SetMetrics(registry *metrics.Registry) { c.metrics.Store(registry) }
 
 func (c *S3Client) observe(op string, started time.Time, bytes int64, err error) {
-	if c.metrics == nil {
+	m := c.metrics.Load()
+	if m == nil {
 		return
 	}
 	labels := map[string]string{"operation": op, "result": "ok"}
 	if err != nil {
 		labels["result"] = "error"
 	}
-	c.metrics.Inc("camu_s3_operations_total", "S3 operations", labels)
+	m.Inc("camu_s3_operations_total", "S3 operations", labels)
 	if bytes > 0 {
-		c.metrics.Add("camu_s3_bytes_total", "S3 payload bytes", map[string]string{"operation": op, "direction": direction(op)}, float64(bytes))
+		m.Add("camu_s3_bytes_total", "S3 payload bytes", map[string]string{"operation": op, "direction": direction(op)}, float64(bytes))
 	}
-	c.metrics.Observe("camu_s3_operation_duration", "S3 operation duration", map[string]string{"operation": op}, time.Since(started))
+	m.Observe("camu_s3_operation_duration", "S3 operation duration", map[string]string{"operation": op}, time.Since(started))
 }
 
 func direction(op string) string {
@@ -105,6 +154,9 @@ func NewS3Client(cfg S3Config) (*S3Client, error) {
 
 // Put stores data at key.
 func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpts) error {
+	if err := c.checkFault("put"); err != nil {
+		return err
+	}
 	started := time.Now()
 	err := c.backend.put(ctx, key, data, opts)
 	c.observe("put", started, int64(len(data)), err)
@@ -113,6 +165,9 @@ func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpt
 
 // Get retrieves data at key. Returns ErrNotFound if missing.
 func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := c.checkFault("get"); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	data, err := c.backend.get(ctx, key)
 	c.observe("get", started, int64(len(data)), err)
@@ -121,6 +176,9 @@ func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetRange retrieves a byte range from key. Returns ErrNotFound if missing.
 func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	if err := c.checkFault("get_range"); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	data, err := c.backend.getRange(ctx, key, offset, length)
 	c.observe("get_range", started, int64(len(data)), err)
@@ -129,6 +187,9 @@ func (c *S3Client) GetRange(ctx context.Context, key string, offset, length int6
 
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
 func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
+	if err := c.checkFault("get_etag"); err != nil {
+		return nil, "", err
+	}
 	started := time.Now()
 	data, etag, err := c.backend.getWithETag(ctx, key)
 	c.observe("get_etag", started, int64(len(data)), err)
@@ -137,6 +198,9 @@ func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string,
 
 // Delete removes key. Does not error if key does not exist.
 func (c *S3Client) Delete(ctx context.Context, key string) error {
+	if err := c.checkFault("delete"); err != nil {
+		return err
+	}
 	started := time.Now()
 	err := c.backend.delete(ctx, key)
 	c.observe("delete", started, 0, err)
@@ -145,6 +209,9 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 
 // List returns keys with the given prefix.
 func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := c.checkFault("list"); err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	keys, err := c.backend.list(ctx, prefix)
 	c.observe("list", started, 0, err)
@@ -155,6 +222,9 @@ func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
 // An empty etag means "write unconditionally on first creation".
 // Returns the new ETag on success, or ErrConflict on mismatch.
 func (c *S3Client) ConditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error) {
+	if err := c.checkFault("conditional_put"); err != nil {
+		return "", err
+	}
 	started := time.Now()
 	newETag, err := c.backend.conditionalPut(ctx, key, data, etag)
 	c.observe("conditional_put", started, int64(len(data)), err)
@@ -166,6 +236,9 @@ func (c *S3Client) ConditionalPut(ctx context.Context, key string, data []byte, 
 // file after writing it. Unlike ConditionalPut, this path never needs to make
 // a complete in-memory copy of the upload.
 func (c *S3Client) ConditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error) {
+	if err := c.checkFault("conditional_put"); err != nil {
+		return "", err
+	}
 	if size < 0 {
 		return "", fmt.Errorf("conditional put file %q: negative size", key)
 	}
@@ -182,6 +255,9 @@ func (c *S3Client) ConditionalPutFile(ctx context.Context, key string, file io.R
 // It is used to make immutable create retries idempotent after a conditional
 // create reports a conflict.
 func (c *S3Client) ObjectEqualsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error) {
+	if err := c.checkFault("get"); err != nil {
+		return false, err
+	}
 	if size < 0 {
 		return false, fmt.Errorf("compare object %q: negative size", key)
 	}
@@ -503,8 +579,8 @@ func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []by
 	}
 	out, err := b.client.PutObject(ctx, input)
 	if err != nil {
-		if isS3Conflict(err) {
-			return "", ErrConflict
+		if cause := conflictCause(err); cause != nil {
+			return "", &ConflictError{Key: key, Cause: cause}
 		}
 		return "", fmt.Errorf("s3 ConditionalPut %q: %w", key, err)
 	}
@@ -527,8 +603,8 @@ func (b *awsS3Backend) conditionalPutFile(ctx context.Context, key string, file 
 	}
 	out, err := b.client.PutObject(ctx, input)
 	if err != nil {
-		if isS3Conflict(err) {
-			return "", ErrConflict
+		if cause := conflictCause(err); cause != nil {
+			return "", &ConflictError{Key: key, Cause: cause}
 		}
 		return "", fmt.Errorf("s3 ConditionalPutFile %q: %w", key, err)
 	}
@@ -593,8 +669,21 @@ func isS3NotFound(err error) bool {
 	return strings.Contains(msg, "NoSuchKey") || strings.Contains(msg, "StatusCode: 404")
 }
 
-// isS3Conflict checks if an AWS error is a 412 Precondition Failed.
-func isS3Conflict(err error) bool {
+// conflictCause reports whether err is a conditional-write precondition failure
+// (HTTP 412) and returns a non-nil cause when it is. AWS SDK v2 surfaces these
+// as typed API errors; MinIO and other S3-compatible stores may only provide a
+// status line.
+func conflictCause(err error) error {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "PreconditionFailed", "IfMatchFailed", "IfNoneMatchFailed":
+			return err
+		}
+	}
 	msg := err.Error()
-	return strings.Contains(msg, "PreconditionFailed") || strings.Contains(msg, "StatusCode: 412")
+	if strings.Contains(msg, "PreconditionFailed") || strings.Contains(msg, "StatusCode: 412") {
+		return err
+	}
+	return nil
 }

@@ -73,7 +73,7 @@ func TestControllerLifecycle_LeaseAcquire(t *testing.T) {
 	}
 
 	// Simulate lease loss by zeroing the lease and stopping the controller.
-	s.leaderLease = coordination.LeaderLease{}
+	s.leaderLease.Store(&coordination.LeaderLease{})
 	s.stopController()
 
 	if s.controllerState.Load() != nil {

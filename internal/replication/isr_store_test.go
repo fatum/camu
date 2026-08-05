@@ -133,3 +133,111 @@ func TestISRStore_CAS(t *testing.T) {
 		t.Errorf("final ISR: expected 2 members, got %v", final.ISR)
 	}
 }
+
+func TestISRStore_CreateIfAbsentNoClobber(t *testing.T) {
+	s3 := newTestS3Client(t)
+	store := NewISRStore(s3)
+	ctx := context.Background()
+
+	first := ISRState{
+		Partition:     0,
+		ISR:           []string{"leader-a"},
+		Leader:        "leader-a",
+		LeaderEpoch:   1,
+		HighWatermark: 5,
+	}
+	if err := store.Write(ctx, "no-clobber", first, ""); err != nil {
+		t.Fatalf("initial Write: %v", err)
+	}
+
+	// A second unconditional "create" must fail: no last-writer-wins overwrite.
+	stale := ISRState{
+		Partition:     0,
+		ISR:           []string{"stale-leader"},
+		Leader:        "stale-leader",
+		LeaderEpoch:   1,
+		HighWatermark: 5,
+	}
+	if err := store.Write(ctx, "no-clobber", stale, ""); err == nil || !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("second create-if-absent Write: err = %v, want ErrConflict", err)
+	}
+
+	got, err := store.Read(ctx, "no-clobber", 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.Leader != "leader-a" {
+		t.Errorf("Leader: expected leader-a preserved, got %q", got.Leader)
+	}
+}
+
+func TestISRStore_UpdateCreatesAndMutates(t *testing.T) {
+	s3 := newTestS3Client(t)
+	store := NewISRStore(s3)
+	ctx := context.Background()
+
+	// Update on a nonexistent partition creates the ISR state.
+	if err := store.Update(ctx, "upd-topic", 0, 2, func(_ ISRState) (ISRState, error) {
+		return ISRState{
+			ISR:           []string{"leader-b"},
+			Leader:        "leader-b",
+			HighWatermark: 7,
+		}, nil
+	}); err != nil {
+		t.Fatalf("Update create: %v", err)
+	}
+
+	got, err := store.Read(ctx, "upd-topic", 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.Leader != "leader-b" || got.LeaderEpoch != 2 || got.HighWatermark != 7 {
+		t.Fatalf("unexpected created state: %+v", got)
+	}
+
+	// A higher-epoch update overwrites.
+	if err := store.Update(ctx, "upd-topic", 0, 3, func(_ ISRState) (ISRState, error) {
+		return ISRState{
+			ISR:           []string{"leader-c"},
+			Leader:        "leader-c",
+			HighWatermark: 9,
+		}, nil
+	}); err != nil {
+		t.Fatalf("Update higher epoch: %v", err)
+	}
+	got, err = store.Read(ctx, "upd-topic", 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.Leader != "leader-c" || got.LeaderEpoch != 3 || got.HighWatermark != 9 {
+		t.Fatalf("unexpected mutated state: %+v", got)
+	}
+}
+
+func TestISRStore_UpdateRejectsStaleEpoch(t *testing.T) {
+	s3 := newTestS3Client(t)
+	store := NewISRStore(s3)
+	ctx := context.Background()
+
+	if err := store.Update(ctx, "stale-topic", 0, 4, func(_ ISRState) (ISRState, error) {
+		return ISRState{ISR: []string{"leader-d"}, Leader: "leader-d"}, nil
+	}); err != nil {
+		t.Fatalf("initial Update: %v", err)
+	}
+
+	// A stale writer with a lower epoch must be rejected.
+	err := store.Update(ctx, "stale-topic", 0, 3, func(_ ISRState) (ISRState, error) {
+		return ISRState{ISR: []string{"stale-leader"}, Leader: "stale-leader"}, nil
+	})
+	if err == nil {
+		t.Fatal("Update with lower epoch should be rejected")
+	}
+
+	got, err := store.Read(ctx, "stale-topic", 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.Leader != "leader-d" {
+		t.Errorf("Leader: expected leader-d preserved, got %q", got.Leader)
+	}
+}

@@ -2,6 +2,8 @@ package coordination
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -127,5 +129,90 @@ func TestLeaderElection_GetLeader(t *testing.T) {
 	}
 	if got.InstanceID != "instance-1" {
 		t.Errorf("expected instance-1, got %q", got.InstanceID)
+	}
+}
+
+func TestLeaderElection_LeaseEpochMonotonic(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le1 := NewLeaderElection(s3, "instance-1", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le1.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire: acquired=%v err=%v", acquired, err)
+	}
+	if lease.LeaseEpoch != 0 {
+		t.Fatalf("first acquire LeaseEpoch = %d, want 0", lease.LeaseEpoch)
+	}
+
+	// Renew bumps the epoch monotonically.
+	for want := uint64(1); want <= 3; want++ {
+		lease, err = le1.Renew(ctx, lease)
+		if err != nil {
+			t.Fatalf("Renew: %v", err)
+		}
+		if lease.LeaseEpoch != want {
+			t.Fatalf("renew %d: LeaseEpoch = %d, want %d", want, lease.LeaseEpoch, want)
+		}
+	}
+}
+
+func TestLeaderElection_TakeoverBumpsPastPriorEpoch(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le1 := NewLeaderElection(s3, "instance-1", 1*time.Millisecond)
+	le2 := NewLeaderElection(s3, "instance-2", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le1.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire instance-1: acquired=%v err=%v", acquired, err)
+	}
+	lease, err = le1.Renew(ctx, lease)
+	if err != nil {
+		t.Fatalf("Renew instance-1: %v", err)
+	}
+	if lease.LeaseEpoch != 1 {
+		t.Fatalf("LeaseEpoch after one renew = %d, want 1", lease.LeaseEpoch)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	lease2, acquired, err := le2.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire instance-2 after expiry: acquired=%v err=%v", acquired, err)
+	}
+	if lease2.LeaseEpoch <= lease.LeaseEpoch {
+		t.Fatalf("takeover LeaseEpoch = %d, want > %d", lease2.LeaseEpoch, lease.LeaseEpoch)
+	}
+}
+
+func TestLeaderElection_RenewFencedByHigherEpoch(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le := NewLeaderElection(s3, "instance-1", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire: acquired=%v err=%v", acquired, err)
+	}
+
+	// Simulate a takeover that advanced the lease while this instance was
+	// partitioned from the store: a higher-epoch lease is written directly.
+	staleFence := LeaderLease{
+		InstanceID: "instance-2",
+		ExpiresAt:  time.Now().Add(time.Minute),
+		LeaseEpoch: lease.LeaseEpoch + 10,
+	}
+	data, err := json.Marshal(staleFence)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s3.Put(ctx, leaderKey, data, storage.PutOpts{}); err != nil {
+		t.Fatalf("put fenced lease: %v", err)
+	}
+
+	_, err = le.Renew(ctx, lease)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("Renew err = %v, want ErrLeaseFenced", err)
 	}
 }

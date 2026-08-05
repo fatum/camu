@@ -65,7 +65,7 @@ Evidence references below point to the main current proof points:
 
 | API | Classic | Diskless | Status | Main Evidence | Current Gaps / Notes |
 |---|---|---|---|---|---|
-| `Produce` | Supported | Supported | `Partial` | `test/integration/kafka_basic_test.go`, `test/integration/diskless_kafka_test.go`, `internal/server/kafka_transport_test.go` | Diskless compressed produce is now directly covered; remaining gap is broader diskless idempotent semantics. |
+| `Produce` | Supported | Supported | `Partial` | `test/integration/kafka_basic_test.go`, `test/integration/diskless_kafka_test.go`, `internal/server/kafka_transport_test.go` | `acks=0` is fire-and-forget; `acks=1`/`all` wait for the ISR quorum before acknowledging, matching the HTTP path. Diskless compressed produce is covered; remaining gap is broader diskless idempotent semantics. |
 | `Fetch` | Supported | Supported | `Verified` | `test/integration/kafka_basic_test.go`, `test/integration/diskless_kafka_test.go`, `internal/server/kafka_roundtrip_test.go`, transport tests | Empty fetch watermark behavior is covered in both paths. |
 | `InitProducerID` | Supported | Supported API surface | `Partial` | `internal/server/kafka_api_test.go`, `test/integration/kafka_basic_test.go` | Direct integration now covers non-transactional allocation and transactional rejection; remaining gap is broader diskless/idempotent end-to-end semantics. |
 
