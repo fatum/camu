@@ -95,6 +95,10 @@ func TestVerifyWebAnalyticsSQL(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
+		if strings.Contains(req.SQL, "distinct event_id") {
+			_, _ = w.Write([]byte(`{"rows":[[1000,1000]]}`))
+			return
+		}
 		_, _ = w.Write([]byte(webAnalyticsGroupByRows(t, req.SQL, 1000)))
 	}))
 	defer server.Close()
@@ -105,17 +109,45 @@ func TestVerifyWebAnalyticsSQL(t *testing.T) {
 	}
 }
 
-func TestVerifyWebAnalyticsSQLMismatch(t *testing.T) {
+func TestVerifyWebAnalyticsSQLRejectsDuplicates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rows":[]}`))
+		_, _ = w.Write([]byte(`{"rows":[[1000,999]]}`))
 	}))
 	defer server.Close()
 	cfg := config{ExportEnabled: true, Topic: "events"}
 	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
 	err := verifyWebAnalyticsSQL(context.Background(), c, cfg, 1000)
-	if err == nil || !strings.Contains(err.Error(), "want 250") {
-		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want count mismatch", err)
+	if err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want duplicate detection", err)
+	}
+}
+
+func TestVerifyWebAnalyticsSQLRejectsUnexpectedDimensionValue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var req struct {
+			SQL string `json:"sql"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if strings.Contains(req.SQL, "distinct event_id") {
+			_, _ = w.Write([]byte(`{"rows":[[1000,1000]]}`))
+			return
+		}
+		if strings.Contains(req.SQL, "event_type") {
+			_, _ = w.Write([]byte(`{"rows":[["bogus",1000]]}`))
+			return
+		}
+		_, _ = w.Write([]byte(webAnalyticsGroupByRows(t, req.SQL, 1000)))
+	}))
+	defer server.Close()
+	cfg := config{ExportEnabled: true, Topic: "events"}
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	err := verifyWebAnalyticsSQL(context.Background(), c, cfg, 1000)
+	if err == nil || !strings.Contains(err.Error(), "unexpected value") {
+		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want unexpected-value rejection", err)
 	}
 }
 

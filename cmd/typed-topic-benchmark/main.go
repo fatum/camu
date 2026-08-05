@@ -1032,6 +1032,16 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			res.Integrity.Error = "sql operation requires EXPORT_ENABLED=true"
 			return
 		}
+		// The topic may already hold records from prior runs, so SQL visibility
+		// is verified against the committed record count, not the run target.
+		committed, err := c.committedRecordCount(ctx, cfg)
+		if err != nil {
+			res.Integrity.Error = "committed record count: " + err.Error()
+			benchmarkLog("committed record count failed: %v", err)
+			return
+		}
+		count = committed
+		res.Expected, res.ExpectedBytes = count, count*cfg.MessageBytes
 		benchmarkLog("waiting for SQL visibility of %d records", count)
 		metrics, err := c.waitForSQL(ctx, cfg, res, count)
 		if err != nil {
@@ -1039,11 +1049,11 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			benchmarkLog("SQL visibility failed: %v", err)
 			return
 		}
-		res.Integrity.OK = metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1
+		res.Integrity.OK = metrics.Count == count
 		if !res.Integrity.OK {
-			res.Integrity.Error = "SQL integrity mismatch"
+			res.Integrity.Error = "SQL integrity mismatch: visible records do not match committed count"
 		}
-		if res.Integrity.OK && cfg.ExportEnabled {
+		if res.Integrity.OK {
 			if err := verifyWebAnalyticsSQL(ctx, c, cfg, count); err != nil {
 				res.Integrity.OK = false
 				res.Integrity.Error = "SQL typed column mismatch: " + err.Error()
