@@ -227,7 +227,7 @@ func (s *Server) runSegmentMergeJob(ctx context.Context, job PartitionJob) error
 		return fmt.Errorf("decode segment merge payload: %w", err)
 	}
 	if payload.StorageMode == meta.StorageModeDiskless {
-		return fmt.Errorf("segment merge is unsupported for diskless topics")
+		return s.runDisklessSegmentMergeJob(ctx, job)
 	}
 
 	job.State = PartitionJobStateRunning

@@ -74,6 +74,13 @@ func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc
 			slog.Warn("partition_maintenance_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
 			return
 		}
+	} else {
+		p.server.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
+		jobs, err = p.server.listPartitionJobs(ctx, tc.Name, partition)
+		if err != nil {
+			slog.Warn("partition_maintenance_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
+			return
+		}
 	}
 	for _, job := range jobs {
 		if err := p.runJob(ctx, job); err != nil {
