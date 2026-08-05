@@ -1024,7 +1024,7 @@ func (s *Server) initialCoordination() {
 
 	// All instances apply assignments (acquire leases for assigned partitions).
 	s.applyAssignmentsForTopics(ctx, topics)
-	s.runPartitionMaintenance(ctx, topics)
+	s.runPartitionMaintenance(ctx, topics, nil)
 }
 
 // AcquireLeasesForTopic is called from handleCreateTopic when a new topic is
@@ -1682,15 +1682,16 @@ func (s *Server) renewLeases() {
 
 	// Partition leaders run partition-scoped maintenance on a slow cadence.
 	if s.coordinationGCTick%10 == 0 {
-		s.runPartitionMaintenance(ctx, topics)
+		s.runPartitionMaintenance(ctx, topics, s.buildDisklessFileIndex(ctx))
 	}
 
 	// Leader: periodically GC stale coordination files in S3.
 	s.coordinationGCTick++
 	if s.amLeader() && s.coordinationGCTick%10 == 0 {
+		fileIdx := s.buildDisklessFileIndex(ctx)
 		s.coordinationGC(ctx, topics)
-		s.sweepDisklessOrphans(ctx)
-		s.sweepDisklessArchiveOrphans(ctx)
+		s.sweepDisklessOrphans(ctx, fileIdx)
+		s.sweepDisklessArchiveOrphans(ctx, fileIdx)
 	}
 
 	// Evict stale idempotent producers every 10th tick.

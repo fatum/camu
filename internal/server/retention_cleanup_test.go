@@ -113,7 +113,7 @@ func TestClassicRetentionOwnerJobDeletesMetadataLastAndInvalidatesLocalState(t *
 		t.Fatalf("diskCache.Put(meta) error = %v", err)
 	}
 
-	s.runPartitionMaintenance(ctx, []meta.TopicConfig{tc})
+	s.runPartitionMaintenance(ctx, []meta.TopicConfig{tc}, nil)
 
 	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
 	if err != nil {
@@ -265,7 +265,7 @@ func TestDisklessRetentionExportCheckpointGate(t *testing.T) {
 	}
 
 	// No checkpoint yet: nothing is safe to retain.
-	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity, nil)
 	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
@@ -276,7 +276,7 @@ func TestDisklessRetentionExportCheckpointGate(t *testing.T) {
 
 	// Checkpoint covers [0,2): only f0 and f1 are eligible.
 	publishCheckpoint(2)
-	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity, nil)
 	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
@@ -287,7 +287,7 @@ func TestDisklessRetentionExportCheckpointGate(t *testing.T) {
 
 	// Checkpoint covers the whole log: all four files are eligible.
 	publishCheckpoint(4)
-	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity, nil)
 	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
@@ -350,7 +350,7 @@ func TestDisklessRetentionSharedFileWaitsForEveryPartition(t *testing.T) {
 
 	// Partition 0 exported, partition 1 not: the shared file must be kept.
 	publishCheckpoint(0)
-	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity, nil)
 	jobs, err := s.listPartitionJobs(ctx, tc.Name, 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
@@ -361,7 +361,7 @@ func TestDisklessRetentionSharedFileWaitsForEveryPartition(t *testing.T) {
 
 	// Both partitions exported: the shared file may be retained.
 	publishCheckpoint(1)
-	s.discoverDisklessRetentionJobs(ctx, tc, identity)
+	s.discoverDisklessRetentionJobs(ctx, tc, identity, nil)
 	jobs, err = s.listPartitionJobs(ctx, tc.Name, 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
@@ -528,7 +528,7 @@ func TestClassicRetentionOwnerJobResumesAfterReassignment(t *testing.T) {
 	}
 
 	s2 := cloneTestServerForInstance(t, s1, "n2")
-	s2.runPartitionMaintenance(ctx, []meta.TopicConfig{tc})
+	s2.runPartitionMaintenance(ctx, []meta.TopicConfig{tc}, nil)
 
 	if _, err := s2.s3Client.Get(ctx, metaKey); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected metadata to be deleted by new owner, got %v", err)
@@ -619,7 +619,7 @@ func TestDisklessRetentionOwnerJobResumesAfterReassignment(t *testing.T) {
 
 	s2 := cloneTestServerForInstance(t, s1, "n2")
 	s2.disklessMeta = s1.disklessMeta
-	s2.runPartitionMaintenance(ctx, []meta.TopicConfig{tc})
+	s2.runPartitionMaintenance(ctx, []meta.TopicConfig{tc}, nil)
 
 	refs, err = s2.disklessMeta.QuerySegments(ctx, tc.Name, 0, 0, 100)
 	if err != nil {

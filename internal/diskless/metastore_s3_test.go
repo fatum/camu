@@ -156,6 +156,123 @@ func TestS3MetaStore_DeleteFileRefsAcrossCheckpoints(t *testing.T) {
 	}
 }
 
+// TestS3MetaStore_ListOrphanedCheckpoints verifies the reaper lists archive
+// checkpoints no head chain references, while leaving linked ones alone.
+func TestS3MetaStore_ListOrphanedCheckpoints(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	if _, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	// A stray checkpoint from a run whose head CAS lost.
+	strayKey := s3ArchiveKey("t", 0, 99)
+	if err := m.s3.Put(ctx, strayKey, []byte(`{"version":1,"end":99,"refs":[]}`), storage.PutOpts{}); err != nil {
+		t.Fatalf("put stray checkpoint: %v", err)
+	}
+	orphans, err := m.ListOrphanedCheckpoints(ctx)
+	if err != nil {
+		t.Fatalf("list orphans: %v", err)
+	}
+	if len(orphans) != 1 || orphans[0] != strayKey {
+		t.Fatalf("orphans = %v, want [%s]", orphans, strayKey)
+	}
+	// Deleting the stray leaves nothing orphaned; the linked checkpoint stays.
+	if err := m.s3.Delete(ctx, strayKey); err != nil {
+		t.Fatalf("delete stray: %v", err)
+	}
+	orphans, err = m.ListOrphanedCheckpoints(ctx)
+	if err != nil {
+		t.Fatalf("list orphans: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("orphans after cleanup = %v, want none", orphans)
+	}
+	head := readS3Head(t, m)
+	if head.Archive == nil {
+		t.Fatal("linked checkpoint must survive the orphan listing")
+	}
+}
+
+// TestS3MetaStore_ArchiveCommittedAdoptsExistingCheckpoint verifies that when a
+// racing run already published the same checkpoint range (create-if-not-exists
+// conflict) but its head CAS lost, the next run adopts the existing immutable
+// checkpoint instead of failing or livelocking.
+func TestS3MetaStore_ArchiveCommittedAdoptsExistingCheckpoint(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 1
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	// Simulate the concurrent run: the same checkpoint range already exists.
+	head := readS3Head(t, m)
+	chk := s3Checkpoint{Version: 1, End: 3, Refs: head.Refs}
+	chkData, err := json.Marshal(chk)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	chkKey := s3ArchiveKey("t", 0, 3)
+	if err := m.s3.Put(ctx, chkKey, chkData, storage.PutOpts{}); err != nil {
+		t.Fatalf("put existing checkpoint: %v", err)
+	}
+	n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour))
+	if err != nil || n != 3 {
+		t.Fatalf("archive = %d, %v; want 3, nil", n, err)
+	}
+	h := readS3Head(t, m)
+	if h.Archive == nil || h.Archive.Key != chkKey || h.Archive.End != 3 || len(h.Refs) != 0 {
+		t.Fatalf("head after adopt = %+v, want archive=%s end=3 empty window", h, chkKey)
+	}
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
+	if err != nil || len(refs) != 3 {
+		t.Fatalf("refs after adopt = %+v, %v; want 3", refs, err)
+	}
+}
+
+// TestS3MetaStore_BuildFileIndex verifies the single-pass index captures every
+// referenced file (archived + head window) and every live checkpoint key.
+func TestS3MetaStore_BuildFileIndex(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	if n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil || n != 3 {
+		t.Fatalf("archive = %d, %v; want 3", n, err)
+	}
+	commitS3Batch(t, m, "obj3", 1, 100, now) // head window
+
+	idx, err := m.BuildFileIndex(ctx)
+	if err != nil {
+		t.Fatalf("build index: %v", err)
+	}
+	for _, key := range []string{"obj0", "obj1", "obj2", "obj3"} {
+		if len(idx.ByFile[key]) != 1 {
+			t.Fatalf("ByFile[%s] = %d refs, want 1", key, len(idx.ByFile[key]))
+		}
+	}
+	if len(idx.LiveCheckpoints) != 1 {
+		t.Fatalf("LiveCheckpoints = %d, want 1 (the archived checkpoint)", len(idx.LiveCheckpoints))
+	}
+	pl := idx.PartitionFileLatest("t", 0)
+	if len(pl) != 4 {
+		t.Fatalf("PartitionFileLatest = %d files, want 4", len(pl))
+	}
+	for _, key := range []string{"obj0", "obj1", "obj2", "obj3"} {
+		if idx.FileLatest[key].IsZero() {
+			t.Fatalf("FileLatest[%s] missing", key)
+		}
+	}
+}
+
 // TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange verifies compaction
 // cannot silently rewrite a range that has been archived.
 func TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange(t *testing.T) {

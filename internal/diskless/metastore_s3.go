@@ -288,8 +288,24 @@ func (m *S3MetaStore) ArchiveCommitted(ctx context.Context, topic string, partit
 			return 0, err
 		}
 		chkKey := s3ArchiveKey(topic, partition, runEnd)
-		if err := m.s3.Put(ctx, chkKey, encodedChk, storage.PutOpts{}); err != nil {
-			return 0, fmt.Errorf("write checkpoint %s: %w", chkKey, err)
+		// Checkpoints are immutable, so publish with create-if-not-exists: two
+		// racing archive runs for the same range must never silently overwrite
+		// each other. A conflict means the object already exists — either the
+		// identical range from a concurrent run, or an orphan from a run whose
+		// head CAS lost. Adopt it when it covers the same range; otherwise
+		// retry against a fresh head.
+		if _, err := m.s3.ConditionalPut(ctx, chkKey, encodedChk, ""); err != nil {
+			if errors.Is(err, storage.ErrConflict) {
+				existing, gerr := m.readCheckpoint(ctx, chkKey)
+				if gerr != nil {
+					return 0, gerr
+				}
+				if existing == nil || existing.End != runEnd || existing.PrevKey != prevKey || existing.PrevEnd != prevEnd {
+					continue
+				}
+			} else {
+				return 0, fmt.Errorf("write checkpoint %s: %w", chkKey, err)
+			}
 		}
 
 		head.Version++
@@ -353,6 +369,160 @@ func (m *S3MetaStore) loadCheckpoints(ctx context.Context, head *s3UploadManifes
 		oldest = append(oldest, newestFirst[i])
 	}
 	return oldest, nil
+}
+
+// FileIndex is a single-pass snapshot of every segment reference across all
+// partitions plus the set of live archived checkpoints. The S3 metastore's
+// full-metadata checks (orphan sweep, checkpoint sweep, retention planning)
+// each previously enumerated every partition's head and checkpoint chain; build
+// the index once per maintenance pass and reuse it across those checks.
+type FileIndex struct {
+	// ByFile maps every referenced data file key to its refs.
+	ByFile map[string][]FileRef
+	// LiveCheckpoints contains every checkpoint key reachable from a head.
+	LiveCheckpoints map[string]struct{}
+	// PartitionLatest maps "topic#partition" to fileKey -> latest ref CreatedAt
+	// in that partition (for retention expiry checks).
+	PartitionLatest map[string]map[string]time.Time
+	// FileLatest maps fileKey -> latest ref CreatedAt anywhere.
+	FileLatest map[string]time.Time
+}
+
+// PartitionFileLatest returns the latest ref CreatedAt per file for one
+// partition, or nil when the partition has no refs in the index.
+func (idx *FileIndex) PartitionFileLatest(topic string, partition int) map[string]time.Time {
+	return idx.PartitionLatest[partitionKey(topic, partition)]
+}
+
+// BuildFileIndex enumerates every partition head and its archived checkpoint
+// chain once, returning a snapshot of all references. On the S3 metastore this
+// is the shared source for the orphan sweep, the checkpoint sweep, and
+// retention planning, so those checks never re-enumerate metadata per file.
+func (m *S3MetaStore) BuildFileIndex(ctx context.Context) (*FileIndex, error) {
+	idx := &FileIndex{
+		ByFile:          map[string][]FileRef{},
+		LiveCheckpoints: map[string]struct{}{},
+		PartitionLatest: map[string]map[string]time.Time{},
+		FileLatest:      map[string]time.Time{},
+	}
+	err := m.forEachPartitionHead(ctx, func(topic string, partition int, head *s3UploadManifest) error {
+		pk := partitionKey(topic, partition)
+		pl := idx.PartitionLatest[pk]
+		if pl == nil {
+			pl = make(map[string]time.Time)
+			idx.PartitionLatest[pk] = pl
+		}
+		note := func(r s3CatalogRef) {
+			idx.ByFile[r.FileKey] = append(idx.ByFile[r.FileKey], FileRef{Topic: topic, Partition: partition, Ref: SegmentRef(r)})
+			if r.CreatedAt.After(pl[r.FileKey]) {
+				pl[r.FileKey] = r.CreatedAt
+			}
+			if r.CreatedAt.After(idx.FileLatest[r.FileKey]) {
+				idx.FileLatest[r.FileKey] = r.CreatedAt
+			}
+		}
+		keys, err := m.loadCheckpointKeys(ctx, head)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			idx.LiveCheckpoints[key] = struct{}{}
+			chk, err := m.readCheckpoint(ctx, key)
+			if err != nil {
+				return err
+			}
+			if chk == nil {
+				continue
+			}
+			for _, r := range chk.Refs {
+				note(r)
+			}
+		}
+		for _, r := range head.Refs {
+			note(r)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return idx, nil
+}
+
+// loadCheckpointKeys walks the head's archive chain and returns checkpoint keys
+// oldest to newest, stopping at a missing checkpoint (retention truncation).
+func (m *S3MetaStore) loadCheckpointKeys(ctx context.Context, head *s3UploadManifest) ([]string, error) {
+	if head.Archive == nil {
+		return nil, nil
+	}
+	var newestFirst []string
+	key := head.Archive.Key
+	for key != "" {
+		newestFirst = append(newestFirst, key)
+		chk, err := m.readCheckpoint(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if chk == nil {
+			break
+		}
+		key = chk.PrevKey
+	}
+	oldest := make([]string, 0, len(newestFirst))
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		oldest = append(oldest, newestFirst[i])
+	}
+	return oldest, nil
+}
+
+// readCheckpoint reads and parses a checkpoint object, returning nil when it
+// does not exist.
+func (m *S3MetaStore) readCheckpoint(ctx context.Context, key string) (*s3Checkpoint, error) {
+	data, err := m.s3.Get(ctx, key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read checkpoint %s: %w", key, err)
+	}
+	var chk s3Checkpoint
+	if err := json.Unmarshal(data, &chk); err != nil {
+		return nil, fmt.Errorf("parse checkpoint %s: %w", key, err)
+	}
+	return &chk, nil
+}
+
+// ListOrphanedCheckpoints returns checkpoint keys under _diskless_meta/archive/
+// that no partition head's archive chain reaches. Such objects are left behind
+// when an archive run's checkpoint write succeeds but its head CAS loses (the
+// refs remain in the head and the checkpoint is never linked), or when a
+// partition was deleted without cleaning its archive.
+func (m *S3MetaStore) ListOrphanedCheckpoints(ctx context.Context) ([]string, error) {
+	referenced := make(map[string]bool)
+	err := m.forEachPartitionHead(ctx, func(_ string, _ int, head *s3UploadManifest) error {
+		keys, err := m.loadCheckpointKeys(ctx, head)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			referenced[key] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	keys, err := m.s3.List(ctx, s3ArchivePrefix)
+	if err != nil {
+		return nil, fmt.Errorf("list archive: %w", err)
+	}
+	var orphans []string
+	for _, key := range keys {
+		if !referenced[key] {
+			orphans = append(orphans, key)
+		}
+	}
+	return orphans, nil
 }
 
 func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition int,

@@ -2223,7 +2223,7 @@ func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *
 		0: {Owned: true, LeaderEpoch: 9},
 	}
 	s.assignmentsMu.Unlock()
-	s.runPartitionMaintenance(context.Background(), topics)
+	s.runPartitionMaintenance(context.Background(), topics, nil)
 
 	if _, err := s.s3Client.Get(context.Background(), oldFileKey); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected expired diskless file to be deleted by owner maintenance, got %v", err)

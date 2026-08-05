@@ -3,15 +3,16 @@ package server
 import (
 	"context"
 
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/meta"
 )
 
-func (s *Server) runPartitionMaintenance(ctx context.Context, topics []meta.TopicConfig) {
-	s.partitionLeader().runMaintenance(ctx, topics)
+func (s *Server) runPartitionMaintenance(ctx context.Context, topics []meta.TopicConfig, fileIdx *diskless.FileIndex) {
+	s.partitionLeader().runMaintenance(ctx, topics, fileIdx)
 }
 
-func (s *Server) runPartitionJobsForTopic(ctx context.Context, tc meta.TopicConfig) {
-	s.partitionLeader().runJobsForTopic(ctx, tc)
+func (s *Server) runPartitionJobsForTopic(ctx context.Context, tc meta.TopicConfig, fileIdx *diskless.FileIndex) {
+	s.partitionLeader().runJobsForTopic(ctx, tc, fileIdx)
 }
 
 func (s *Server) runClaimedPartitionJob(ctx context.Context, job PartitionJob) error {
@@ -26,5 +27,5 @@ func (s *Server) runClaimedPartitionJob(ctx context.Context, job PartitionJob) e
 // This method is not part of the production API and must not be called
 // outside tests.
 func (s *Server) RunPartitionMaintenanceForTest(topics []meta.TopicConfig) {
-	s.runPartitionMaintenance(context.Background(), topics)
+	s.runPartitionMaintenance(context.Background(), topics, nil)
 }

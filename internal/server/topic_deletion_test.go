@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,7 +46,7 @@ func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
 		}
 	}
 
-	s.sweepDisklessOrphans(ctx)
+	s.sweepDisklessOrphans(ctx, s.buildDisklessFileIndex(ctx))
 
 	if _, err := s.s3Client.Get(ctx, referenced); err != nil {
 		t.Fatalf("referenced object %s must survive the sweep, got %v", referenced, err)
@@ -53,6 +55,54 @@ func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
 		if _, err := s.s3Client.Get(ctx, key); !errors.Is(err, storage.ErrNotFound) {
 			t.Fatalf("orphan %s must be swept, got %v", key, err)
 		}
+	}
+}
+
+// TestSweepDisklessArchiveOrphansUsesIndex verifies the checkpoint sweep driven
+// by the shared per-pass index removes unreferenced checkpoint objects.
+func TestSweepDisklessArchiveOrphansUsesIndex(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	ctx := context.Background()
+
+	oldGrace := disklessOrphanGrace
+	disklessOrphanGrace = -time.Second
+	defer func() { disklessOrphanGrace = oldGrace }()
+
+	// A live checkpoint (referenced via a head's archive chain).
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "ref:0:10", FileKey: "_diskless/node1/ref.data", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 100, CreatedAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
+	}
+	// Commit enough data to exceed the head window (128KiB of refs) so the
+	// archive job rolls refs into a checkpoint.
+	for i := 0; i < 140; i++ {
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+			BatchID: fmt.Sprintf("ref-%d:0:1000", i), FileKey: fmt.Sprintf("_diskless/node1/ref-%d.data", i),
+			Topic: "t", Partition: 0, Count: 1, ByteLength: 1000, CreatedAt: time.Now(),
+		}}); err != nil {
+			t.Fatalf("CommitUploadedBatches() error = %v", err)
+		}
+	}
+	if n, err := s.disklessMeta.ArchiveCommitted(ctx, "t", 0, 10, time.Now().Add(-time.Hour)); err != nil || n == 0 {
+		t.Fatalf("ArchiveCommitted() = %d, %v; want >0", n, err)
+	}
+	// A stray checkpoint object (from a lost head CAS).
+	if err := s.s3Client.Put(ctx, "_diskless_meta/archive/t/0/00000000000000000099.json", []byte(`{"version":1,"end":99}`), storage.PutOpts{}); err != nil {
+		t.Fatalf("put stray checkpoint: %v", err)
+	}
+
+	s.sweepDisklessArchiveOrphans(ctx, s.buildDisklessFileIndex(ctx))
+
+	// The referenced checkpoint survives; the stray is deleted.
+	orphans, err := s.s3Client.List(ctx, "_diskless_meta/archive/t/0/")
+	if err != nil {
+		t.Fatalf("list archive: %v", err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("archive after sweep = %v, want only the live checkpoint", orphans)
 	}
 }
 
@@ -314,6 +364,48 @@ func TestDeleteTopicS3DataStreamsLargeTopics(t *testing.T) {
 	}
 	if len(keys) != 0 {
 		t.Fatalf("remaining keys after delete = %d, want 0", len(keys))
+	}
+}
+
+// TestPlanExpiredFilesFromIndexMatchesFallback verifies the index-based
+// retention planning agrees with the metastore's PlanExpiredFileDeletes.
+func TestPlanExpiredFilesFromIndexMatchesFallback(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	ctx := context.Background()
+	now := time.Now()
+	old := now.Add(-48 * time.Hour)
+	commit := func(fileKey string, partition int, createdAt time.Time) {
+		t.Helper()
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+			BatchID: fmt.Sprintf("%s-%d:0:100", fileKey, partition), FileKey: fileKey, Topic: "t",
+			Partition: partition, Count: 1, ByteLength: 100, CreatedAt: createdAt,
+		}}); err != nil {
+			t.Fatalf("commit %s p%d: %v", fileKey, partition, err)
+		}
+	}
+	// A: expired in p0, fresh in p1 (not deletable from p0's view)
+	// B: expired in p0 only (deletable)
+	// C: fresh in p0 (not a candidate)
+	commit("A", 0, old)
+	commit("A", 1, now)
+	commit("B", 0, old)
+	commit("C", 0, now)
+
+	idx := s.buildDisklessFileIndex(ctx)
+	if idx == nil {
+		t.Fatal("expected a file index for the S3 metastore")
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	got := planExpiredFilesFromIndex(idx, "t", 0, cutoff)
+	want, err := s.disklessMeta.PlanExpiredFileDeletes(ctx, "t", 0, cutoff)
+	if err != nil {
+		t.Fatalf("PlanExpiredFileDeletes() error = %v", err)
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("index planning = %v, fallback = %v", got, want)
 	}
 }
 
