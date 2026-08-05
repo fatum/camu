@@ -14,6 +14,47 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
+// TestSweepDisklessOrphansCoversDataAndMergePrefixes verifies the orphan sweep
+// reclaims unreferenced objects under both _diskless/ (per-flush uploads) and
+// _diskless_merge/ (compaction artifacts, including a deleted topic's merged
+// data) while keeping referenced objects.
+func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	ctx := context.Background()
+
+	oldGrace := disklessOrphanGrace
+	disklessOrphanGrace = -time.Second
+	defer func() { disklessOrphanGrace = oldGrace }()
+
+	// One referenced data object: a committed ref points at it.
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "ref:0:10", FileKey: "_diskless/node1/ref.data", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 10, CreatedAt: time.Now(),
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
+	}
+	referenced := "_diskless/node1/ref.data"
+	orphanData := "_diskless/node1/orphan.data"
+	orphanMerge := "_diskless_merge/t/0/orphan.data"
+	for _, key := range []string{referenced, orphanData, orphanMerge} {
+		if err := s.s3Client.Put(ctx, key, []byte("x"), storage.PutOpts{}); err != nil {
+			t.Fatalf("s3Client.Put(%s) error = %v", key, err)
+		}
+	}
+
+	s.sweepDisklessOrphans(ctx)
+
+	if _, err := s.s3Client.Get(ctx, referenced); err != nil {
+		t.Fatalf("referenced object %s must survive the sweep, got %v", referenced, err)
+	}
+	for _, key := range []string{orphanData, orphanMerge} {
+		if _, err := s.s3Client.Get(ctx, key); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("orphan %s must be swept, got %v", key, err)
+		}
+	}
+}
+
 func TestDeleteTopicEnqueuesAsyncDisklessCleanupAndPreservesMetaUntilS3Deleted(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()
