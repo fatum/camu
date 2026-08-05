@@ -1006,7 +1006,36 @@ func (c client) waitForSQL(ctx context.Context, cfg config, res *result, count i
 	}
 }
 
+// detectTopicStorageMode reports the storage mode of an existing topic so a
+// consume or sql run against a diskless topic skips the classic cluster
+// readiness wait even when STORAGE_MODE is not set. A missing topic returns "".
+func (c client) detectTopicStorageMode(ctx context.Context, cfg config) (string, error) {
+	var topic benchmarkTopic
+	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			return "", nil
+		}
+		return "", err
+	}
+	return topic.StorageMode, nil
+}
+
 func runSingleOperation(ctx context.Context, c client, cfg config, res *result) {
+	if cfg.StorageMode == "" {
+		// An existing diskless topic is served without cluster-wide readiness;
+		// detect it so consume/sql runs do not wait on /v1/cluster/ready, which
+		// never reports ready for diskless partitions.
+		mode, err := c.detectTopicStorageMode(ctx, cfg)
+		if err != nil {
+			res.Integrity.Error = "read topic storage mode: " + err.Error()
+			benchmarkLog("read topic storage mode failed: %v", err)
+			return
+		}
+		if mode != "" {
+			cfg.StorageMode = mode
+		}
+	}
 	if err := c.waitClusterReady(ctx, cfg); err != nil {
 		res.Integrity.Error = "cluster readiness: " + err.Error()
 		benchmarkLog("cluster readiness failed: %v", err)

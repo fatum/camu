@@ -135,6 +135,12 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 		partitionExpected[partition] = expected[partition].recordsSnapshot()
 	}
 	for !kafkaPartitionsComplete(partitionRecords, partitionExpected) {
+		if err := ctx.Err(); err != nil {
+			// PollFetches returns immediately once the context is done, so the
+			// loop would otherwise spin forever instead of reporting the
+			// timeout.
+			return phaseResult{}, fmt.Errorf("consume Kafka timed out after %s: %w", time.Since(start).Round(time.Second), err)
+		}
 		reporter.beginPoll()
 		pollStarted := time.Now()
 		fetches := client.PollFetches(ctx)

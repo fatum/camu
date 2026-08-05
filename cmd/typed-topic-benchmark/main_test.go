@@ -134,6 +134,68 @@ func TestDisklessSkipsClusterReadinessAndReplicationWait(t *testing.T) {
 	}
 }
 
+func TestDetectTopicStorageMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/topics/disk":
+			_, _ = w.Write([]byte(`{"name":"disk","storage_mode":"diskless"}`))
+		case "/v1/topics/classic":
+			_, _ = w.Write([]byte(`{"name":"classic"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	ctx := context.Background()
+
+	mode, err := c.detectTopicStorageMode(ctx, config{Topic: "disk"})
+	if err != nil || mode != "diskless" {
+		t.Fatalf("diskless mode = %q, err = %v, want diskless", mode, err)
+	}
+	mode, err = c.detectTopicStorageMode(ctx, config{Topic: "classic"})
+	if err != nil || mode != "" {
+		t.Fatalf("classic mode = %q, err = %v, want empty", mode, err)
+	}
+	mode, err = c.detectTopicStorageMode(ctx, config{Topic: "missing"})
+	if err != nil || mode != "" {
+		t.Fatalf("missing mode = %q, err = %v, want empty, nil", mode, err)
+	}
+}
+
+// TestRunSingleOperationConsumeSkipsClusterReadinessForDiskless verifies that a
+// consume run against an existing diskless topic never waits on /v1/cluster/ready
+// even when STORAGE_MODE is not set: the topic's storage mode is detected and
+// readiness is skipped.
+func TestRunSingleOperationConsumeSkipsClusterReadinessForDiskless(t *testing.T) {
+	seenReady := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/topics/bench-diskless":
+			_, _ = w.Write([]byte(`{"name":"bench-diskless","partitions":4,"storage_mode":"diskless"}`))
+		case r.URL.Path == "/v1/cluster/ready":
+			seenReady = true
+			w.WriteHeader(http.StatusInternalServerError)
+		case strings.HasPrefix(r.URL.Path, "/v1/topics/bench-diskless/partitions/") && r.Method == http.MethodGet:
+			w.Header().Set("X-High-Watermark", "0")
+			_, _ = w.Write([]byte(`{"messages":[],"next_offset":0}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	cfg := config{API: "http", Operation: "consume", Topic: "bench-diskless", BaseURL: server.URL, Partitions: 4, MessageBytes: 1024, TargetBytes: 1024, ConsumeTimeout: time.Second, RequestTimeout: time.Second}
+	res := result{Topic: cfg.Topic, Operation: cfg.Operation}
+	runSingleOperation(context.Background(), c, cfg, &res)
+	if seenReady {
+		t.Fatal("benchmark polled /v1/cluster/ready for a diskless topic")
+	}
+	if res.Integrity.Error != "" {
+		t.Fatalf("consume failed: %s", res.Integrity.Error)
+	}
+}
+
 func TestNodeClientRoundRobin(t *testing.T) {
 	cfg := config{NodeURLs: []string{"http://n0:8080", "http://n1:8080", "http://n2:8080"}}
 	c := client{base: "http://default:8080"}
