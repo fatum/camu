@@ -69,10 +69,19 @@ func NewDynamoMetaStore(ctx context.Context, cfg DynamoMetaStoreConfig) (*Dynamo
 //
 // Allocations are performed sequentially with a bounded per-entry retry so a
 // transient DynamoDB failure on one partition does not fail the whole batch
-// and strand the offsets already advanced for the other partitions.
+// and strand the offsets already advanced for the other partitions. The whole
+// batch is validated before any offset state is mutated, so an invalid later
+// allocation can never strand a valid prefix as a permanent gap in the log.
 func (d *DynamoMetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error) {
 	if len(allocs) == 0 {
 		return nil, nil
+	}
+	// A single allocation cannot strand a prefix (there is none), so skip the
+	// extra validation read on the common produce path.
+	if len(allocs) > 1 {
+		if err := d.validateBatch(ctx, allocs); err != nil {
+			return nil, err
+		}
 	}
 
 	results := make([]OffsetResult, len(allocs))
@@ -84,6 +93,91 @@ func (d *DynamoMetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAl
 		results[i] = result
 	}
 	return results, nil
+}
+
+// validateBatch verifies that every allocation in a batch can be applied before
+// any offset state is mutated. It simulates the sequential application —
+// including producer-record updates made by earlier entries in the batch — so a
+// mixed valid/invalid flush is rejected up front and a valid prefix is never
+// abandoned. It performs reads only.
+func (d *DynamoMetaStore) validateBatch(ctx context.Context, allocs []OffsetAllocation) error {
+	type partState struct {
+		next      int64
+		producers map[string]*dynamoProducerBatch // producer id -> last recorded batch
+	}
+	states := make(map[string]*partState)
+	for _, alloc := range allocs {
+		pk := partitionKey(alloc.Topic, alloc.Partition)
+		st := states[pk]
+		if st == nil {
+			out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
+				TableName: &d.offsetsTable,
+				Key: map[string]ddbtypes.AttributeValue{
+					"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
+				},
+				ProjectionExpression: aws.String("next_offset, producers"),
+			})
+			if err != nil {
+				return fmt.Errorf("read alloc state for %s: %w", pk, err)
+			}
+			st = &partState{}
+			if out.Item != nil {
+				if v, ok := offsetFromItem(out.Item, "next_offset"); ok {
+					st.next = v
+				}
+				if prods, ok := out.Item["producers"].(*ddbtypes.AttributeValueMemberM); ok {
+					st.producers = make(map[string]*dynamoProducerBatch, len(prods.Value))
+					for pid, attr := range prods.Value {
+						m, ok := attr.(*ddbtypes.AttributeValueMemberM)
+						if !ok {
+							continue
+						}
+						rec := &dynamoProducerBatch{}
+						if v, ok := offsetFromItem(m.Value, "first_sequence"); ok {
+							rec.FirstSequence = v
+						}
+						if v, ok := offsetFromItem(m.Value, "base_offset"); ok {
+							rec.BaseOffset = v
+						}
+						if v, ok := offsetFromItem(m.Value, "count"); ok {
+							rec.Count = int(v)
+						}
+						st.producers[pid] = rec
+					}
+				}
+			}
+			states[pk] = st
+		}
+
+		if alloc.ProducerID != 0 {
+			pid := strconv.FormatInt(alloc.ProducerID, 10)
+			if prev, ok := st.producers[pid]; ok {
+				exact, err := checkProducerSequence(alloc.ProducerID, alloc.Sequence, alloc.Count, prev.FirstSequence, prev.Count)
+				if err != nil {
+					return err
+				}
+				if exact {
+					if prev.Count != alloc.Count {
+						return fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", alloc.ProducerID, pk, alloc.Sequence, alloc.Count, prev.Count)
+					}
+					continue // exact retry: offsets already assigned
+				}
+			}
+		}
+		st.next += int64(alloc.Count)
+		if alloc.ProducerID != 0 {
+			pid := strconv.FormatInt(alloc.ProducerID, 10)
+			if st.producers == nil {
+				st.producers = make(map[string]*dynamoProducerBatch)
+			}
+			st.producers[pid] = &dynamoProducerBatch{
+				FirstSequence: alloc.Sequence,
+				BaseOffset:    st.next - int64(alloc.Count),
+				Count:         alloc.Count,
+			}
+		}
+	}
+	return nil
 }
 
 // maxAllocateAttempts bounds retries of a single partition offset allocation.

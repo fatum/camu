@@ -195,6 +195,32 @@ func TestMemoryMetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
 	assert.Equal(t, int64(40), committed(), "closing the gap advances through the full chain")
 }
 
+// TestMemoryMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix verifies that
+// a flush containing a valid allocation followed by an invalid one is rejected
+// before any offset state advances, so the valid prefix is not abandoned.
+func TestMemoryMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemoryMetaStore()
+
+	if _, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}}); err != nil {
+		t.Fatalf("seed allocate: %v", err)
+	}
+
+	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103},
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 200},
+	})
+	require.Error(t, err, "mixed batch with invalid suffix must fail")
+
+	head, err := ms.GetPartitionHead(ctx, "t", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), head, "no stranded prefix after rejected batch")
+
+	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), next[0].BaseOffset, "subsequent valid write continues contiguously")
+}
+
 func TestMemoryMetaStore_GetPartitionStartUsesCommittedWhenNoSegmentsRemain(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()

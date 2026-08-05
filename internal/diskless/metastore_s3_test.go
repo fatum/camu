@@ -319,6 +319,83 @@ func TestS3MetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
 	}
 }
 
+// TestS3MetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix verifies that a
+// flush containing a valid allocation followed by an invalid one is rejected
+// before any offset state advances: the valid prefix is not abandoned as a
+// permanent gap, and subsequent valid writes continue contiguously.
+func TestS3MetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+
+	// Establish producer state: batch seq 100 count 3 -> offsets [0,3).
+	first, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}})
+	if err != nil {
+		t.Fatalf("seed allocate: %v", err)
+	}
+	if first[0].BaseOffset != 0 {
+		t.Fatalf("seed base = %d, want 0", first[0].BaseOffset)
+	}
+
+	// A flush with a valid continuation then an invalid gap must fail without
+	// advancing the head past the valid prefix.
+	_, err = m.AllocateOffsets(ctx, []OffsetAllocation{
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103},
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 200},
+	})
+	if err == nil {
+		t.Fatal("mixed batch with invalid suffix succeeded, want error")
+	}
+
+	head, err := m.GetPartitionHead(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head != 3 {
+		t.Fatalf("head after rejected batch = %d, want 3 (no stranded prefix)", head)
+	}
+
+	// A subsequent valid write continues from the un-stranded prefix.
+	next, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}})
+	if err != nil {
+		t.Fatalf("next allocate: %v", err)
+	}
+	if next[0].BaseOffset != 3 {
+		t.Fatalf("next base = %d, want 3", next[0].BaseOffset)
+	}
+}
+
+// TestS3MetaStore_MixedBatchDuplicateAndContinuation verifies that a valid
+// batch mixing an exact retry and a continuation is applied as a unit.
+func TestS3MetaStore_MixedBatchDuplicateAndContinuation(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+
+	if _, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}}); err != nil {
+		t.Fatalf("seed allocate: %v", err)
+	}
+
+	results, err := m.AllocateOffsets(ctx, []OffsetAllocation{
+		{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}, // exact retry
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}, // continuation
+	})
+	if err != nil {
+		t.Fatalf("mixed duplicate+continuation batch: %v", err)
+	}
+	if !results[0].Duplicate || results[0].BaseOffset != 0 {
+		t.Fatalf("results[0] = %+v, want duplicate base 0", results[0])
+	}
+	if results[1].Duplicate || results[1].BaseOffset != 3 {
+		t.Fatalf("results[1] = %+v, want base 3 non-duplicate", results[1])
+	}
+	head, err := m.GetPartitionHead(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head != 5 {
+		t.Fatalf("head = %d, want 5", head)
+	}
+}
+
 func TestS3MetaStore_RegisterIsIdempotent(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()

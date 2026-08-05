@@ -55,31 +55,41 @@ func (m *MemoryMetaStore) AllocateOffsets(_ context.Context, allocs []OffsetAllo
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Validate the whole batch against working copies of the state before
+	// mutating anything, so an invalid later allocation can never strand a
+	// valid prefix by advancing the counter before the batch is rejected.
+	heads := make(map[string]int64, len(m.offsets))
+	for k, v := range m.offsets {
+		heads[k] = v
+	}
+	records := make(map[string]map[int64]producerAlloc, len(m.producerAllocs))
+	for k, byPID := range m.producerAllocs {
+		cp := make(map[int64]producerAlloc, len(byPID))
+		for pid, r := range byPID {
+			cp[pid] = r
+		}
+		records[k] = cp
+	}
+
 	results := make([]OffsetResult, len(allocs))
 	for i, a := range allocs {
 		key := partitionKey(a.Topic, a.Partition)
-
-		if a.ProducerID != 0 {
-			byProducer := m.producerAllocs[key]
-			if prev, ok := byProducer[a.ProducerID]; ok {
-				exact, err := checkProducerSequence(a.ProducerID, a.Sequence, a.Count, prev.firstSequence, prev.count)
-				if err != nil {
-					return nil, err
-				}
-				if exact {
-					if prev.count != a.Count {
-						return nil, fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", a.ProducerID, key, a.Sequence, a.Count, prev.count)
-					}
-					results[i] = OffsetResult{BaseOffset: prev.baseOffset, Duplicate: true}
-					continue
-				}
-			}
+		res, err := simulateMemoryAlloc(heads, records, key, a)
+		if err != nil {
+			return nil, err
 		}
+		results[i] = res
+	}
 
+	// Apply every validated allocation in order.
+	for i, a := range allocs {
+		if results[i].Duplicate {
+			continue // exact retry: offsets were already assigned
+		}
+		key := partitionKey(a.Topic, a.Partition)
 		base := m.offsets[key]
-		results[i] = OffsetResult{BaseOffset: base}
+		results[i].BaseOffset = base
 		m.offsets[key] = base + int64(a.Count)
-
 		if a.ProducerID != 0 {
 			byProducer := m.producerAllocs[key]
 			if byProducer == nil {
@@ -90,6 +100,35 @@ func (m *MemoryMetaStore) AllocateOffsets(_ context.Context, allocs []OffsetAllo
 		}
 	}
 	return results, nil
+}
+
+// simulateMemoryAlloc applies a single allocation to the in-memory working
+// state for validation purposes, returning an error if the allocation is
+// invalid. An exact retry does not advance the head, mirroring the apply path.
+func simulateMemoryAlloc(heads map[string]int64, records map[string]map[int64]producerAlloc, key string, a OffsetAllocation) (OffsetResult, error) {
+	if a.ProducerID != 0 {
+		if prev, ok := records[key][a.ProducerID]; ok {
+			exact, err := checkProducerSequence(a.ProducerID, a.Sequence, a.Count, prev.firstSequence, prev.count)
+			if err != nil {
+				return OffsetResult{}, err
+			}
+			if exact {
+				if prev.count != a.Count {
+					return OffsetResult{}, fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", a.ProducerID, key, a.Sequence, a.Count, prev.count)
+				}
+				return OffsetResult{BaseOffset: prev.baseOffset, Duplicate: true}, nil
+			}
+		}
+	}
+	base := heads[key]
+	heads[key] = base + int64(a.Count)
+	if a.ProducerID != 0 {
+		if records[key] == nil {
+			records[key] = make(map[int64]producerAlloc)
+		}
+		records[key][a.ProducerID] = producerAlloc{firstSequence: a.Sequence, baseOffset: base, count: a.Count}
+	}
+	return OffsetResult{BaseOffset: base}, nil
 }
 
 // RegisterSegment records a flushed data file in the segment catalog and

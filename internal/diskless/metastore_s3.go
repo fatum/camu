@@ -85,8 +85,20 @@ func s3SegKey(topic string, partition int, baseOffset, endOffset int64) string {
 }
 
 // AllocateOffsets atomically assigns offset ranges for one or more partition
-// batches via per-partition CAS on the head object.
+// batches via per-partition CAS on the head object. The whole batch is
+// validated before any offset state is mutated, so an invalid later allocation
+// can never strand a valid prefix as a permanent gap in the log.
 func (m *S3MetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error) {
+	if len(allocs) == 0 {
+		return nil, nil
+	}
+	// A single allocation cannot strand a prefix (there is none), so skip the
+	// extra validation read on the common produce path.
+	if len(allocs) > 1 {
+		if err := m.validateBatch(ctx, allocs); err != nil {
+			return nil, err
+		}
+	}
 	results := make([]OffsetResult, len(allocs))
 	for i, alloc := range allocs {
 		result, err := m.allocateOne(ctx, alloc)
@@ -96,6 +108,72 @@ func (m *S3MetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAlloca
 		results[i] = result
 	}
 	return results, nil
+}
+
+// validateBatch verifies that every allocation in a batch can be applied before
+// any offset state is mutated. It simulates the sequential application —
+// including producer-record updates made by earlier entries in the batch — so a
+// mixed valid/invalid flush is rejected up front and a valid prefix is never
+// abandoned. It performs reads only.
+func (m *S3MetaStore) validateBatch(ctx context.Context, allocs []OffsetAllocation) error {
+	heads := make(map[string]*s3HeadState)
+	for _, alloc := range allocs {
+		key := s3HeadKey(alloc.Topic, alloc.Partition)
+		head := heads[key]
+		if head == nil {
+			head = &s3HeadState{}
+			data, _, err := m.s3.GetWithETag(ctx, key)
+			switch {
+			case err == nil:
+				if err := json.Unmarshal(data, head); err != nil {
+					return fmt.Errorf("parse head %s: %w", key, err)
+				}
+			case errors.Is(err, storage.ErrNotFound):
+				// fresh partition: start from an empty head.
+			default:
+				return fmt.Errorf("read head %s: %w", key, err)
+			}
+			heads[key] = head
+		}
+		if err := simulateS3Alloc(key, head, alloc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// simulateS3Alloc applies a single allocation to the in-memory head state for
+// validation purposes, returning an error if the allocation is invalid. An
+// exact retry does not advance the head, mirroring allocateOne.
+func simulateS3Alloc(key string, head *s3HeadState, alloc OffsetAllocation) error {
+	if alloc.ProducerID != 0 {
+		pidKey := strconv.FormatInt(alloc.ProducerID, 10)
+		if prev, ok := head.Producers[pidKey]; ok {
+			exact, err := checkProducerSequence(alloc.ProducerID, alloc.Sequence, alloc.Count, prev.FirstSequence, prev.Count)
+			if err != nil {
+				return err
+			}
+			if exact {
+				if prev.Count != alloc.Count {
+					return fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", alloc.ProducerID, key, alloc.Sequence, alloc.Count, prev.Count)
+				}
+				return nil // exact retry: offsets already assigned
+			}
+		}
+	}
+	if head.Producers == nil {
+		head.Producers = make(map[string]s3ProducerBatch)
+	}
+	head.NextOffset += int64(alloc.Count)
+	if alloc.ProducerID != 0 {
+		pidKey := strconv.FormatInt(alloc.ProducerID, 10)
+		head.Producers[pidKey] = s3ProducerBatch{
+			FirstSequence: alloc.Sequence,
+			BaseOffset:    head.NextOffset - int64(alloc.Count),
+			Count:         alloc.Count,
+		}
+	}
+	return nil
 }
 
 // allocateOne allocates a range for a single batch. For idempotent batches the
