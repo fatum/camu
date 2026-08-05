@@ -213,6 +213,42 @@ func TestDynamoMetaStore_ReplaceSegmentRefs_AtomicallyMergesRun(t *testing.T) {
 	assert.Len(t, refs, 1, "idempotent retry must not duplicate refs")
 }
 
+// TestDynamoMetaStore_ReplaceSegmentRefs_WithinTransactionLimit verifies that a
+// 99-source merge (99 deletes + 1 put after collapsing the shared base) fits
+// within DynamoDB's 100-operation transaction limit.
+func TestDynamoMetaStore_ReplaceSegmentRefs_WithinTransactionLimit(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	var remove []RefKey
+	for i := 0; i < 99; i++ {
+		remove = append(remove, RefKey{BaseOffset: int64(i), EndOffset: int64(i) + 1})
+	}
+	merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 990, BaseOffset: 0, EndOffset: 99}
+	require.NoError(t, ms.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}))
+
+	refs, err := ms.QuerySegments(ctx, "t", 0, 0, 10000)
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	assert.Equal(t, int64(99), refs[0].EndOffset)
+}
+
+// TestDynamoMetaStore_ReplaceSegmentRefs_ExceedsTransactionLimit verifies the
+// guard that bounds a single transaction to 100 operations.
+func TestDynamoMetaStore_ReplaceSegmentRefs_ExceedsTransactionLimit(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	var remove []RefKey
+	for i := 0; i < 100; i++ {
+		remove = append(remove, RefKey{BaseOffset: int64(i), EndOffset: int64(i) + 1})
+	}
+	merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 1000, BaseOffset: 0, EndOffset: 100}
+	err := ms.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged})
+	require.Error(t, err, "100-source merge must exceed the 100-operation transaction limit")
+	assert.Contains(t, err.Error(), "transaction limit")
+}
+
 func TestDynamoMetaStore_GetPartitionHead(t *testing.T) {	ctx := context.Background()
 	ms := dynamoTestStore(t)
 

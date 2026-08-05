@@ -302,3 +302,25 @@ server:
 		t.Error("Load() expected error for missing bucket, got nil")
 	}
 }
+
+func TestCompactionConfigBounds(t *testing.T) {
+	if got := (config.CompactionConfig{}).MinSegmentsValue(); got != 4 {
+		t.Fatalf("default MinSegmentsValue = %d, want 4", got)
+	}
+	if got := (config.CompactionConfig{MinSegments: 1}).MinSegmentsValue(); got != 2 {
+		t.Fatalf("MinSegmentsValue(1) = %d, want 2 (clamped to minimum)", got)
+	}
+	if got := (config.CompactionConfig{MinSegments: 5}).MinSegmentsValue(); got != 5 {
+		t.Fatalf("MinSegmentsValue(5) = %d, want 5", got)
+	}
+
+	if got := (config.CompactionConfig{}).MaxSegmentsPerMergeValue(); got != 90 {
+		t.Fatalf("default MaxSegmentsPerMergeValue = %d, want 90", got)
+	}
+	if got := (config.CompactionConfig{MaxSegmentsPerMerge: 100}).MaxSegmentsPerMergeValue(); got != 99 {
+		t.Fatalf("MaxSegmentsPerMergeValue(100) = %d, want 99 (clamped under the DynamoDB 100-op transaction limit)", got)
+	}
+	if got := (config.CompactionConfig{MaxSegmentsPerMerge: 50}).MaxSegmentsPerMergeValue(); got != 50 {
+		t.Fatalf("MaxSegmentsPerMergeValue(50) = %d, want 50", got)
+	}
+}

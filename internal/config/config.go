@@ -88,11 +88,24 @@ const (
 	defaultCompactionMaxSegmentsPerMerge = 90
 	defaultCompactionGrace               = 60 * time.Second
 	defaultCompactionDeleteGrace         = 5 * time.Minute
+
+	// minCompactionSegments is the lower bound for a merge run. A single source
+	// cannot be merged (there is nothing to combine) and would be rejected by
+	// the merge executor, so min_segments is clamped to at least 2.
+	minCompactionSegments = 2
+	// maxCompactionSegmentsPerMerge is the upper bound for a merge run. The
+	// DynamoDB metastore replaces refs in one transaction of at most 100
+	// operations (one delete per removed ref plus one put for the merged ref),
+	// so a run is clamped to 99 sources to guarantee the transaction fits.
+	maxCompactionSegmentsPerMerge = 99
 )
 
 func (c CompactionConfig) MinSegmentsValue() int {
 	if c.MinSegments <= 0 {
 		return defaultCompactionMinSegments
+	}
+	if c.MinSegments < minCompactionSegments {
+		return minCompactionSegments
 	}
 	return c.MinSegments
 }
@@ -107,6 +120,9 @@ func (c CompactionConfig) TargetBytesValue() int64 {
 func (c CompactionConfig) MaxSegmentsPerMergeValue() int {
 	if c.MaxSegmentsPerMerge <= 0 {
 		return defaultCompactionMaxSegmentsPerMerge
+	}
+	if c.MaxSegmentsPerMerge > maxCompactionSegmentsPerMerge {
+		return maxCompactionSegmentsPerMerge
 	}
 	return c.MaxSegmentsPerMerge
 }
