@@ -176,6 +176,9 @@ Polling:
 
 ```bash
 curl "http://localhost:8080/v1/topics/orders/partitions/0/messages?offset=0&limit=100"
+# `start_offset` is accepted as an alias for `offset`; providing both with
+# different values is rejected.
+curl "http://localhost:8080/v1/topics/orders/partitions/0/messages?start_offset=0&limit=100"
 ```
 
 SSE:

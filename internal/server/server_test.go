@@ -284,6 +284,73 @@ func TestHandleConsumeLowLevel_DisklessHonorsMessageLimit(t *testing.T) {
 	}
 }
 
+func TestHandleConsumeLowLevel_StartOffsetAlias(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	s.markTopicDiskless("diskless-topic")
+
+	for i := 0; i < 3; i++ {
+		_, err := s.disklessEngine.Produce(context.Background(), "diskless-topic", 0, log.EncodeRecordBatch(0, []log.Message{
+			{Key: []byte("k" + strconv.Itoa(i)), Value: []byte("v" + strconv.Itoa(i))},
+		}))
+		if err != nil {
+			t.Fatalf("disklessEngine.Produce() error = %v", err)
+		}
+	}
+
+	consume := func(query string) (*consumeResponse, int) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/topics/diskless-topic/partitions/0/messages?"+query, nil)
+		req.SetPathValue("topic", "diskless-topic")
+		req.SetPathValue("id", "0")
+		rec := httptest.NewRecorder()
+		s.handleConsumeLowLevel(rec, req)
+		var resp consumeResponse
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+		}
+		return &resp, rec.Code
+	}
+
+	// start_offset is honored like offset.
+	resp, code := consume("start_offset=1&limit=100")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(resp.Messages) != 2 || resp.Messages[0].Offset != 1 || resp.Messages[1].Offset != 2 || resp.NextOffset != 3 {
+		t.Fatalf("start_offset=1 => %+v, want offsets [1 2] next=3", resp.Messages)
+	}
+
+	// Conflicting aliases are rejected rather than silently picking one.
+	_, code = consume("offset=1&start_offset=2&limit=100")
+	if code != http.StatusBadRequest {
+		t.Fatalf("conflicting aliases status = %d, want 400", code)
+	}
+
+	// An invalid start_offset is rejected.
+	_, code = consume("start_offset=abc&limit=100")
+	if code != http.StatusBadRequest {
+		t.Fatalf("invalid start_offset status = %d, want 400", code)
+	}
+}
+
 func TestHandleProduceLowLevel_DisklessIdempotentRetryReturnsSameOffsets(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()
