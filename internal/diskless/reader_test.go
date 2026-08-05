@@ -2,6 +2,7 @@ package diskless
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -169,5 +170,88 @@ func TestReader_HighWatermarkIsCommittedNotAllocated(t *testing.T) {
 				t.Fatalf("expected nil data at committed head, got %d bytes", len(data))
 			}
 		})
+	}
+}
+
+// TestReader_HidesPartiallyRegisteredRefs verifies that a segment ref created
+// before its committed head advances (a partially-registered flush) is not
+// exposed to readers, preventing ghost reads of un-acked data.
+func TestReader_HidesPartiallyRegisteredRefs(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := NewS3MetaStore(s3)
+	ctx := context.Background()
+
+	batchA := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("a"), Value: []byte("v")}})
+	if err := log.PatchRecordBatchFirstOffset(batchA, 0); err != nil {
+		t.Fatalf("patch A: %v", err)
+	}
+	batchB := log.EncodeRecordBatch(0, []log.Message{
+		{Key: []byte("b1"), Value: []byte("v")},
+		{Key: []byte("b2"), Value: []byte("v")},
+	})
+	if err := log.PatchRecordBatchFirstOffset(batchB, 1); err != nil {
+		t.Fatalf("patch B: %v", err)
+	}
+	if err := s3.Put(ctx, "dataA", batchA, storage.PutOpts{}); err != nil {
+		t.Fatalf("put A: %v", err)
+	}
+	if err := s3.Put(ctx, "dataB", batchB, storage.PutOpts{}); err != nil {
+		t.Fatalf("put B: %v", err)
+	}
+	if _, err := meta.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3}}); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+
+	// Register A fully -> committed head = 1.
+	if err := meta.RegisterSegment(ctx, SegmentRecord{
+		FileKey:   "dataA",
+		Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 0, EndOffset: 1, ByteOffset: 0, ByteLength: int64(len(batchA))}},
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("register A: %v", err)
+	}
+
+	// Simulate a partial register: B's ref object exists but the committed head
+	// has not advanced past it yet.
+	refB, err := json.Marshal(s3SegmentRef{
+		FileKey: "dataB", ByteOffset: 0, ByteLength: int64(len(batchB)),
+		BaseOffset: 1, EndOffset: 3, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("marshal ref B: %v", err)
+	}
+	if _, err := s3.ConditionalPut(ctx, s3SegKey("t", 0, 1, 3), refB, ""); err != nil {
+		t.Fatalf("create partial ref B: %v", err)
+	}
+
+	r := NewReader(s3, meta)
+	data, hw, err := r.Fetch(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if hw != 1 {
+		t.Fatalf("hw = %d, want 1 (committed)", hw)
+	}
+	if len(data) != len(batchA) {
+		t.Fatalf("data = %d bytes, want %d (only committed A, un-acked B hidden)", len(data), len(batchA))
+	}
+
+	// Complete the register -> committed = 3; both batches are now visible.
+	if err := meta.RegisterSegment(ctx, SegmentRecord{
+		FileKey:   "dataB",
+		Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 1, EndOffset: 3, ByteOffset: 0, ByteLength: int64(len(batchB))}},
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("register B: %v", err)
+	}
+	data, hw, err = r.Fetch(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if hw != 3 {
+		t.Fatalf("hw = %d, want 3", hw)
+	}
+	if len(data) != len(batchA)+len(batchB) {
+		t.Fatalf("data = %d bytes, want %d (A+B)", len(data), len(batchA)+len(batchB))
 	}
 }

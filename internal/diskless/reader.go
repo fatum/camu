@@ -41,8 +41,14 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOff
 		return nil, committedHead, nil
 	}
 
+	// Only expose refs at or below the committed head. A flush registers its
+	// refs before advancing the committed head, so a reader querying between
+	// the two never sees a partially-registered batch (un-acked data).
 	var result []byte
 	for _, ref := range refs {
+		if ref.EndOffset > committedHead {
+			continue
+		}
 		chunk, err := r.s3.GetRange(ctx, ref.FileKey, ref.ByteOffset, ref.ByteLength)
 		if err != nil {
 			return nil, 0, fmt.Errorf("s3 get range %s [%d:%d]: %w",
