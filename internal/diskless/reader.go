@@ -69,13 +69,38 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOff
 				ref.FileKey, ref.ByteOffset, ref.ByteOffset+ref.ByteLength, err)
 		}
 		// Uploaded diskless objects deliberately contain raw RecordBatch bytes;
-		// logical offsets are assigned by the metastore commit. Patch only the
-		// returned copy, leaving immutable S3 data safe for retries/compaction.
-		if err := log.PatchRecordBatchFirstOffset(result[pos:pos+ref.ByteLength], ref.BaseOffset); err != nil {
-			return nil, 0, fmt.Errorf("patch fetched batch at offset %d: %w", ref.BaseOffset, err)
+		// logical offsets are assigned by the metastore commit. A ref can cover
+		// several batches (a compacted merge object), so walk the self-framing
+		// batches and patch each base offset into the returned copy, leaving
+		// immutable S3 data safe for retries/compaction.
+		if err := patchRefOffsets(result[pos:pos+ref.ByteLength], ref.BaseOffset); err != nil {
+			return nil, 0, fmt.Errorf("patch fetched ref at base offset %d: %w", ref.BaseOffset, err)
 		}
 		pos += ref.ByteLength
 	}
 
 	return result, committedHead, nil
+}
+
+// patchRefOffsets overwrites the stored base offset of every self-framing
+// RecordBatch in batchRange with its logical offset, starting at base. Uploaded
+// diskless objects hold raw batches whose stored base offset is 0; the ref
+// assigns the committed bases. A fresh ref spans a single batch, while a
+// compacted ref spans the concatenated source batches, so every batch must be
+// patched rather than only the first.
+func patchRefOffsets(batchRange []byte, base int64) error {
+	next := base
+	batchPos := 0
+	for batchPos < len(batchRange) {
+		hdr, err := log.ReadRecordBatchHeader(batchRange[batchPos:])
+		if err != nil {
+			return fmt.Errorf("read batch header at offset %d: %w", next, err)
+		}
+		if err := log.PatchRecordBatchFirstOffset(batchRange[batchPos:], next); err != nil {
+			return fmt.Errorf("patch batch at offset %d: %w", next, err)
+		}
+		next += int64(hdr.NumRecords)
+		batchPos += int(hdr.RecordBatchSize())
+	}
+	return nil
 }

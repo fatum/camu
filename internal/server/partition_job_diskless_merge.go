@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 // the contiguous, fully-committed run being replaced; the merged data object and
 // ref are published before the source data is deleted.
 type DisklessMergePayload struct {
-	StorageMode string               `json:"storage_mode,omitempty"`
+	StorageMode string                `json:"storage_mode,omitempty"`
 	Sources     []diskless.SegmentRef `json:"sources"`
 	MergedFile  string                `json:"merged_file,omitempty"`
 	MergedBytes int64                 `json:"merged_bytes,omitempty"`
@@ -47,7 +48,12 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		return
 	}
 	target := cfg.TargetBytesValue()
-	refs, err := s.disklessMeta.QuerySegments(ctx, tc.Name, identity.Partition, 0, int(target))
+	// Query refs from the partition start without a byte cap. A single ref can
+	// exceed target (e.g. the merged object of a prior run), and capping the
+	// query at target bytes would return only that oversized ref, hiding the
+	// small refs behind it and stalling compaction. The refs below the committed
+	// watermark stay bounded because compaction replaces whole runs with one ref.
+	refs, err := s.disklessMeta.QuerySegments(ctx, tc.Name, identity.Partition, 0, math.MaxInt)
 	if err != nil {
 		slog.Warn("diskless_merge_query_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
 		return
@@ -77,6 +83,15 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		}
 		if ref.CreatedAt.After(graceCutoff) {
 			break // too recent; stop the run
+		}
+		if ref.ByteLength >= target {
+			// Already compaction-sized: skip an oversized prefix so a prior
+			// run's merged object never blocks the small refs behind it, and
+			// terminate a run that reaches one.
+			if len(run) > 0 {
+				break
+			}
+			continue
 		}
 		if len(run) > 0 && ref.BaseOffset != run[len(run)-1].EndOffset {
 			break // gap; stop the run
