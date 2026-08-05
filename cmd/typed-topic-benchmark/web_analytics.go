@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -94,8 +93,6 @@ func webAnalyticsSchemaFields() []map[string]any {
 		{"name": "event_time", "type": "timestamp", "path": "$.event_time"},
 		{"name": "duration_ms", "type": "int64", "path": "$.duration_ms"},
 		{"name": "revenue", "type": "float64", "path": "$.revenue"},
-		{"name": "sequence", "type": "int64", "path": "$.sequence"},
-		{"name": "payload_bytes", "type": "int64", "path": "$.payload_bytes"},
 	}
 }
 
@@ -135,36 +132,74 @@ func webAnalyticsEventValue(value typedValue) webAnalyticsEvent {
 	}
 }
 
-// webAnalyticsPurchaseCount is the number of records whose sequence maps to the
-// "purchase" event type (the last residue class), which is count/4 for
-// sequences starting at zero.
-func webAnalyticsPurchaseCount(count int64) int64 {
-	if count <= 0 {
-		return 0
-	}
-	return count / 4
+// webAnalyticsDimension is a categorical schema column whose value is assigned
+// from a fixed pool as seq % poolSize, so its SQL GROUP BY distribution is
+// deterministic for a run of count records.
+type webAnalyticsDimension struct {
+	Column string
+	pool   []string
 }
 
-// verifyWebAnalyticsSQL runs a typed column predicate through /v1/sql to
-// confirm the schema columns were exported to Parquet and are queryable.
+var webAnalyticsDimensions = []webAnalyticsDimension{
+	{Column: "event_type", pool: webAnalyticsEventTypes},
+	{Column: "device_type", pool: webAnalyticsDeviceTypes},
+	{Column: "browser", pool: webAnalyticsBrowsers},
+	{Column: "os", pool: webAnalyticsOSes},
+	{Column: "country", pool: webAnalyticsCountries},
+	{Column: "city", pool: webAnalyticsCities},
+	{Column: "page_url", pool: webAnalyticsPages},
+	{Column: "referrer", pool: webAnalyticsReferrers},
+	{Column: "user_agent", pool: webAnalyticsUserAgents},
+}
+
+// verifyWebAnalyticsSQL aggregates each dimension column through /v1/sql and
+// checks the GROUP BY counts match the deterministic sequence-derived
+// distribution. This confirms every schema column reached Parquet and is
+// queryable without depending on benchmark-integrity columns.
 func verifyWebAnalyticsSQL(ctx context.Context, c client, cfg config, count int64) error {
 	quoted := `"` + strings.ReplaceAll(cfg.Topic, `"`, `""`) + `"`
-	var resp struct {
-		Rows [][]any `json:"rows"`
-	}
-	query := fmt.Sprintf("SELECT count(*)::BIGINT FROM %s WHERE event_type = 'purchase'", quoted)
-	if err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": query, "topics": []string{cfg.Topic}}, &resp); err != nil {
-		return err
-	}
-	if len(resp.Rows) == 0 || len(resp.Rows[0]) == 0 {
-		return errors.New("web analytics SQL returned no rows")
-	}
-	got := sqlRowInt64(resp.Rows[0][0])
-	want := webAnalyticsPurchaseCount(count)
-	if got != want {
-		return fmt.Errorf("web analytics event_type='purchase' count = %d, want %d", got, want)
+	for _, dim := range webAnalyticsDimensions {
+		var resp struct {
+			Rows [][]any `json:"rows"`
+		}
+		query := fmt.Sprintf("SELECT %s, count(*)::BIGINT FROM %s GROUP BY %s", dim.Column, quoted, dim.Column)
+		if err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": query, "topics": []string{cfg.Topic}}, &resp); err != nil {
+			return err
+		}
+		got := make(map[string]int64, len(resp.Rows))
+		for _, row := range resp.Rows {
+			if len(row) < 2 {
+				return fmt.Errorf("web analytics dimension %s returned a malformed row", dim.Column)
+			}
+			got[fmt.Sprintf("%v", row[0])] = sqlRowInt64(row[1])
+		}
+		poolSize := int64(len(dim.pool))
+		q, rem := count/poolSize, count%poolSize
+		for i, value := range dim.pool {
+			want := q
+			if int64(i) < rem {
+				want++
+			}
+			if got[value] != want {
+				return fmt.Errorf("web analytics dimension %s value %q count = %d, want %d", dim.Column, value, got[value], want)
+			}
+		}
+		for value := range got {
+			if !webAnalyticsDimensionValue(dim, value) {
+				return fmt.Errorf("web analytics dimension %s returned unexpected value %q", dim.Column, value)
+			}
+		}
 	}
 	return nil
+}
+
+func webAnalyticsDimensionValue(dim webAnalyticsDimension, value string) bool {
+	for _, v := range dim.pool {
+		if v == value {
+			return true
+		}
+	}
+	return false
 }
 
 func sqlRowInt64(v any) int64 {

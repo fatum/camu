@@ -39,6 +39,7 @@ type config struct {
 	RequestTimeout                                   time.Duration
 	SequenceStart                                    int64
 	RunID                                            string
+	StorageMode                                      string
 }
 
 type result struct {
@@ -283,7 +284,14 @@ func loadConfig() (config, error) {
 		}
 		runID = hex.EncodeToString(token[:])
 	}
-	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID}, nil
+	storageMode := strings.ToLower(env("STORAGE_MODE", ""))
+	if storageMode != "" && storageMode != "classic" && storageMode != "diskless" {
+		return config{}, fmt.Errorf("STORAGE_MODE must be classic or diskless")
+	}
+	if storageMode == "diskless" && exportEnabled {
+		return config{}, fmt.Errorf("STORAGE_MODE=diskless requires EXPORT_ENABLED=false")
+	}
+	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID, StorageMode: storageMode}, nil
 }
 
 type client struct {
@@ -380,8 +388,14 @@ func (c client) deleteAndWait(ctx context.Context, topic string) error {
 }
 
 func (c client) create(ctx context.Context, cfg config) error {
-	fields := benchmarkSchemaFields(cfg)
-	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled, "schema": map[string]any{"encoding": "json", "fields": fields}}
+	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled}
+	if cfg.StorageMode != "" {
+		body["storage_mode"] = cfg.StorageMode
+	}
+	if cfg.StorageMode != "diskless" {
+		// Diskless topics reject schemas and cannot export.
+		body["schema"] = map[string]any{"encoding": "json", "fields": benchmarkSchemaFields(cfg)}
+	}
 	if err := c.request(ctx, http.MethodPost, "/v1/topics", body, nil); err != nil {
 		return err
 	}
@@ -405,6 +419,7 @@ func (c client) initBenchmarkProducer(ctx context.Context) (uint64, error) {
 type benchmarkTopic struct {
 	Partitions    int  `json:"partitions"`
 	ExportEnabled bool `json:"export_enabled"`
+	StorageMode   string `json:"storage_mode,omitempty"`
 }
 
 func (c client) ensureTopic(ctx context.Context, cfg config) (bool, error) {
@@ -424,6 +439,9 @@ func (c client) ensureTopic(ctx context.Context, cfg config) (bool, error) {
 	}
 	if topic.ExportEnabled != cfg.ExportEnabled {
 		return false, fmt.Errorf("existing topic export_enabled=%t, benchmark requires %t", topic.ExportEnabled, cfg.ExportEnabled)
+	}
+	if cfg.StorageMode != "" && topic.StorageMode != "" && topic.StorageMode != cfg.StorageMode {
+		return false, fmt.Errorf("existing topic storage_mode=%q, benchmark requires %q", topic.StorageMode, cfg.StorageMode)
 	}
 	if err := c.waitForReplication(ctx, cfg); err != nil {
 		return false, err
@@ -858,15 +876,17 @@ func (c client) sql(ctx context.Context, cfg config) (sqlMetrics, float64, error
 		Rows [][]any `json:"rows"`
 	}
 	quoted := `"` + strings.ReplaceAll(cfg.Topic, `"`, `""`) + `"`
-	err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": fmt.Sprintf("SELECT count(*)::BIGINT, min(sequence)::BIGINT, max(sequence)::BIGINT, sum(payload_bytes)::BIGINT FROM %s", quoted), "topics": []string{cfg.Topic}}, &resp)
+	// event_id equals the benchmark sequence for every record, so its min/max
+	// validate that the exported Parquet covers the full contiguous range.
+	err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": fmt.Sprintf("SELECT count(*)::BIGINT, min(event_id)::BIGINT, max(event_id)::BIGINT FROM %s", quoted), "topics": []string{cfg.Topic}}, &resp)
 	if err != nil {
 		return sqlMetrics{}, time.Since(start).Seconds() * 1000, err
 	}
 	if len(resp.Rows) == 0 {
 		return sqlMetrics{}, time.Since(start).Seconds() * 1000, nil
 	}
-	if len(resp.Rows[0]) < 4 {
-		return sqlMetrics{}, time.Since(start).Seconds() * 1000, errors.New("SQL returned fewer than four integrity columns")
+	if len(resp.Rows[0]) < 3 {
+		return sqlMetrics{}, time.Since(start).Seconds() * 1000, errors.New("SQL returned fewer than three integrity columns")
 	}
 	toInt := func(v any) int64 {
 		switch n := v.(type) {
@@ -880,7 +900,7 @@ func (c client) sql(ctx context.Context, cfg config) (sqlMetrics, float64, error
 		return 0
 	}
 	row := resp.Rows[0]
-	return sqlMetrics{Count: toInt(row[0]), MinSequence: toInt(row[1]), MaxSequence: toInt(row[2]), PayloadBytes: toInt(row[3])}, time.Since(start).Seconds() * 1000, nil
+	return sqlMetrics{Count: toInt(row[0]), MinSequence: toInt(row[1]), MaxSequence: toInt(row[2])}, time.Since(start).Seconds() * 1000, nil
 }
 
 func verifyConsumeStates(expected, actual []hashState) bool {
@@ -1019,7 +1039,7 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			benchmarkLog("SQL visibility failed: %v", err)
 			return
 		}
-		res.Integrity.OK = metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && metrics.PayloadBytes == res.ExpectedBytes
+		res.Integrity.OK = metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1
 		if !res.Integrity.OK {
 			res.Integrity.Error = "SQL integrity mismatch"
 		}
@@ -1092,7 +1112,7 @@ func main() {
 			benchmarkLog("result written to %s", cfg.Output)
 		}
 	}()
-	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s run_id=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d export_enabled=%t batch_messages=%d producer_concurrency=%d", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.RunID, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.ExportEnabled, cfg.BatchMessages, cfg.ProducerConcurrency)
+	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s run_id=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d export_enabled=%t batch_messages=%d producer_concurrency=%d storage_mode=%s", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.RunID, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.ExportEnabled, cfg.BatchMessages, cfg.ProducerConcurrency, cfg.StorageMode)
 	if cleanup {
 		benchmarkLog("cleanup is enabled; topic %q will be deleted after the run", cfg.Topic)
 	} else {
@@ -1176,7 +1196,7 @@ func main() {
 					}
 					sqlMu.Lock()
 					if e == nil {
-						consistent := metrics.Count >= previous.Count && metrics.PayloadBytes == metrics.Count*cfg.MessageBytes
+						consistent := metrics.Count >= previous.Count
 						if metrics.Count > 0 {
 							consistent = consistent && metrics.MinSequence == 0 && metrics.MaxSequence == metrics.Count-1
 						}
@@ -1282,7 +1302,7 @@ func main() {
 		benchmarkLog("benchmark failed: SQL visibility wait ended with error: %v", err)
 		return
 	}
-	ok := !res.SQL.Regression && metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && metrics.PayloadBytes == res.ExpectedBytes && cr.Records == count && cr.Bytes == res.ExpectedBytes
+	ok := !res.SQL.Regression && metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && cr.Records == count && cr.Bytes == res.ExpectedBytes
 	for p := range expectedStates {
 		er, eb, ed, ee := expectedStates[p].result()
 		ar, ab, ad, ae := actualStates[p].result()

@@ -12,8 +12,8 @@ import (
 
 func TestWebAnalyticsSchemaFields(t *testing.T) {
 	fields := webAnalyticsSchemaFields()
-	if len(fields) != 17 {
-		t.Fatalf("web analytics schema has %d fields, want 17 (15 web-analytics + sequence + payload_bytes)", len(fields))
+	if len(fields) != 15 {
+		t.Fatalf("web analytics schema has %d fields, want 15", len(fields))
 	}
 	seen := map[string]bool{}
 	fixed := map[string]bool{"record_offset": true, "record_timestamp": true, "key": true, "value": true, "headers": true}
@@ -71,23 +71,17 @@ func TestWebAnalyticsEventRoundTripsThroughTypedValue(t *testing.T) {
 	}
 }
 
-func TestWebAnalyticsSchemaIncludesBenchmarkIntegrityColumns(t *testing.T) {
-	fields := map[string]string{}
+func TestWebAnalyticsDimensionsAreSchemaColumns(t *testing.T) {
+	fields := map[string]bool{}
 	for _, f := range webAnalyticsSchemaFields() {
-		fields[f["name"].(string)] = f["type"].(string)
+		fields[f["name"].(string)] = true
 	}
-	for name, want := range map[string]string{"sequence": "int64", "payload_bytes": "int64"} {
-		got, ok := fields[name]
-		if !ok || got != want {
-			t.Fatalf("schema column %q = %q (present=%t), want %q — benchmark SQL queries min/max(sequence) and sum(payload_bytes)", name, got, ok, want)
+	for _, dim := range webAnalyticsDimensions {
+		if !fields[dim.Column] {
+			t.Fatalf("dimension column %q is not a schema column — the SQL GROUP BY check would fail", dim.Column)
 		}
-	}
-}
-
-func TestWebAnalyticsPurchaseCount(t *testing.T) {
-	for count, want := range map[int64]int64{0: 0, 1: 0, 4: 1, 5: 1, 8: 2, 1000: 250} {
-		if got := webAnalyticsPurchaseCount(count); got != want {
-			t.Fatalf("webAnalyticsPurchaseCount(%d) = %d, want %d", count, got, want)
+		if len(dim.pool) == 0 {
+			t.Fatalf("dimension %q has an empty value pool", dim.Column)
 		}
 	}
 }
@@ -95,7 +89,13 @@ func TestWebAnalyticsPurchaseCount(t *testing.T) {
 func TestVerifyWebAnalyticsSQL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rows":[[250]]}`))
+		var req struct {
+			SQL string `json:"sql"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_, _ = w.Write([]byte(webAnalyticsGroupByRows(t, req.SQL, 1000)))
 	}))
 	defer server.Close()
 	cfg := config{ExportEnabled: true, Topic: "events"}
@@ -108,7 +108,7 @@ func TestVerifyWebAnalyticsSQL(t *testing.T) {
 func TestVerifyWebAnalyticsSQLMismatch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rows":[[0]]}`))
+		_, _ = w.Write([]byte(`{"rows":[]}`))
 	}))
 	defer server.Close()
 	cfg := config{ExportEnabled: true, Topic: "events"}
@@ -117,6 +117,38 @@ func TestVerifyWebAnalyticsSQLMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "want 250") {
 		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want count mismatch", err)
 	}
+}
+
+// webAnalyticsGroupByRows returns the JSON rows a correct /v1/sql GROUP BY
+// response would contain for the given query and record count, mirroring the
+// deterministic sequence-derived distribution.
+func webAnalyticsGroupByRows(t *testing.T, query string, count int64) string {
+	t.Helper()
+	body := strings.TrimPrefix(query, "SELECT ")
+	col := strings.TrimSpace(strings.SplitN(body, ",", 2)[0])
+	for _, dim := range webAnalyticsDimensions {
+		if dim.Column == col {
+			poolSize := int64(len(dim.pool))
+			q, rem := count/poolSize, count%poolSize
+			rows := [][]any{}
+			for i, value := range dim.pool {
+				n := q
+				if int64(i) < rem {
+					n++
+				}
+				if n > 0 {
+					rows = append(rows, []any{value, n})
+				}
+			}
+			b, err := json.Marshal(map[string]any{"rows": rows})
+			if err != nil {
+				t.Fatalf("marshal rows: %v", err)
+			}
+			return string(b)
+		}
+	}
+	t.Fatalf("unexpected dimension column %q in query: %s", col, query)
+	return ""
 }
 
 func TestBenchmarkEventDefaultsToTypedValue(t *testing.T) {
@@ -129,8 +161,8 @@ func TestBenchmarkEventDefaultsToTypedValue(t *testing.T) {
 
 func TestBenchmarkSchemaFieldsByExport(t *testing.T) {
 	exported := benchmarkSchemaFields(config{ExportEnabled: true})
-	if len(exported) != 17 {
-		t.Fatalf("exported topic schema has %d fields, want 17 (15 web-analytics + sequence + payload_bytes)", len(exported))
+	if len(exported) != 15 {
+		t.Fatalf("exported topic schema has %d fields, want 15", len(exported))
 	}
 	plain := benchmarkSchemaFields(config{ExportEnabled: false})
 	if len(plain) != 4 {
