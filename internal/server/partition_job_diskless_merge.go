@@ -243,20 +243,25 @@ type disklessMergeArtifact struct {
 
 // buildDisklessMergeArtifact concatenates the source byte ranges in offset
 // order into a single object. Byte-exact concatenation is safe because diskless
-// refs point at raw RecordBatch bytes.
+// refs point at raw RecordBatch bytes. The merged buffer is pre-allocated and
+// each range is read directly into it, so no intermediate copies are made.
 func (s *Server) buildDisklessMergeArtifact(ctx context.Context, topic string, partition int, sources []diskless.SegmentRef) (disklessMergeArtifact, error) {
 	for i, ref := range sources {
 		if i > 0 && ref.BaseOffset != sources[i-1].EndOffset {
 			return disklessMergeArtifact{}, fmt.Errorf("diskless merge requires contiguous sources: %s starts at %d after %d", ref.FileKey, ref.BaseOffset, sources[i-1].EndOffset)
 		}
 	}
-	var data []byte
+	var total int64
 	for _, ref := range sources {
-		chunk, err := s.s3Client.GetRange(ctx, ref.FileKey, ref.ByteOffset, ref.ByteLength)
-		if err != nil {
+		total += ref.ByteLength
+	}
+	data := make([]byte, total)
+	pos := int64(0)
+	for _, ref := range sources {
+		if err := s.s3Client.GetRangeInto(ctx, ref.FileKey, ref.ByteOffset, ref.ByteLength, data[pos:pos+ref.ByteLength]); err != nil {
 			return disklessMergeArtifact{}, fmt.Errorf("read diskless source %s [%d:%d): %w", ref.FileKey, ref.ByteOffset, ref.ByteOffset+ref.ByteLength, err)
 		}
-		data = append(data, chunk...)
+		pos += ref.ByteLength
 	}
 	first, last := sources[0], sources[len(sources)-1]
 	key := fmt.Sprintf("_diskless_merge/%s/%d/%020d-%020d.data", sanitizeTopic(topic), partition, first.BaseOffset, last.EndOffset)
