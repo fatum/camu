@@ -206,6 +206,43 @@ func TestTopicDeletionGCResumesFromMarkerAfterRestart(t *testing.T) {
 	}
 }
 
+// TestTopicDeletionGCRemovesRegistryEntryAfterCrashWindow verifies the leader
+// GC also deletes the registry entry: enqueueTopicDeletion writes the marker and
+// then deletes the registry, so a crash in between would otherwise leave a
+// registered topic whose data has been erased.
+func TestTopicDeletionGCRemovesRegistryEntryAfterCrashWindow(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	ctx := context.Background()
+
+	tc := meta.TopicConfig{
+		Name:              "crash-window",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "classic",
+	}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	// Simulate the crash: the deletion marker was written but the registry
+	// delete in enqueueTopicDeletion never ran.
+	if err := s.putTopicDeletion(ctx, topicDeletionRecord{Topic: tc, StartedAt: time.Now()}); err != nil {
+		t.Fatalf("putTopicDeletion() error = %v", err)
+	}
+
+	s.gcPendingTopicDeletions(ctx)
+
+	if _, err := s.topicStore.Get(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("topicStore.Get(after GC) error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected deletion marker to be cleared, got %v", err)
+	}
+}
+
 func TestCreateTopicRejectsPendingDeletion(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()

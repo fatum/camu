@@ -138,6 +138,13 @@ func (s *Server) gcPendingTopicDeletions(ctx context.Context) {
 	}
 
 	for _, rec := range recs {
+		// Remove the registry entry first: enqueueTopicDeletion normally deletes
+		// it, but a crash between writing the marker and that delete would
+		// otherwise leave a registered topic whose data this GC is erasing.
+		if err := s.topicStore.Delete(ctx, rec.Topic.Name); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			slog.Warn("topic_delete_cleanup_registry_failed", "topic", rec.Topic.Name, "error", err)
+			continue
+		}
 		if err := s.deleteParquetTopicMetadata(ctx, rec.Topic.Name); err != nil {
 			slog.Warn("topic_delete_cleanup_parquet_meta_failed", "topic", rec.Topic.Name, "error", err)
 			continue
