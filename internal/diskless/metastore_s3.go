@@ -645,6 +645,39 @@ func (m *S3MetaStore) PlanUnreferencedFileDeletes(ctx context.Context, fileKeys 
 	return deletable, nil
 }
 
+// ListFileRefs returns every segment reference across all partitions that
+// points at fileKey, by scanning the per-partition catalogs.
+func (m *S3MetaStore) ListFileRefs(ctx context.Context, fileKey string) ([]FileRef, error) {
+	catKeys, err := m.s3.List(ctx, s3CatalogPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("list catalogs: %w", err)
+	}
+	var refs []FileRef
+	for _, key := range catKeys {
+		topic, partition, err := parseCatalogKey(key)
+		if err != nil {
+			return nil, err
+		}
+		data, err := m.s3.Get(ctx, key)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("get catalog %s: %w", key, err)
+		}
+		var c s3Catalog
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil, fmt.Errorf("parse catalog %s: %w", key, err)
+		}
+		for _, r := range c.Refs {
+			if r.FileKey == fileKey {
+				refs = append(refs, FileRef{Topic: topic, Partition: partition, Ref: SegmentRef(r)})
+			}
+		}
+	}
+	return refs, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (m *S3MetaStore) DeleteTopic(ctx context.Context, topic string) error {
 	for _, prefix := range []string{

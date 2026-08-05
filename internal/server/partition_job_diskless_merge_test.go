@@ -143,7 +143,7 @@ func TestDisklessSegmentMergeSkipsRetentionPendingRefs(t *testing.T) {
 
 	register := func(base int64, createdAt time.Time) {
 		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", base)
-		data := bytes.Repeat([]byte{byte('a' + base)}, 100)
+		data := bytes.Repeat([]byte(fmt.Sprintf("%c", 'a'+base)), 100)
 		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
 			t.Fatalf("put source %s: %v", fileKey, err)
 		}

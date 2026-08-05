@@ -905,6 +905,42 @@ func (d *DynamoMetaStore) PlanUnreferencedFileDeletes(ctx context.Context, fileK
 	return deletable, nil
 }
 
+// ListFileRefs returns every segment reference across all partitions that
+// points at fileKey.
+func (d *DynamoMetaStore) ListFileRefs(ctx context.Context, fileKey string) ([]FileRef, error) {
+	input := &dynamodb.ScanInput{
+		TableName:        &d.segmentsTable,
+		FilterExpression: aws.String("file_key = :file_key"),
+		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
+			":file_key": &ddbtypes.AttributeValueMemberS{Value: fileKey},
+		},
+	}
+	var refs []FileRef
+	paginator := dynamodb.NewScanPaginator(d.client, input)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list file refs for %s: %w", fileKey, err)
+		}
+		for _, item := range page.Items {
+			ref, err := itemToSegmentRef(item)
+			if err != nil {
+				return nil, err
+			}
+			pk, ok := item["pk"].(*ddbtypes.AttributeValueMemberS)
+			if !ok {
+				continue
+			}
+			topic, partition, err := parsePartitionKey(pk.Value)
+			if err != nil {
+				continue
+			}
+			refs = append(refs, FileRef{Topic: topic, Partition: partition, Ref: ref})
+		}
+	}
+	return refs, nil
+}
+
 func (d *DynamoMetaStore) hasFileFreshReference(ctx context.Context, fileKey string, cutoff time.Time) (bool, error) {
 	input := &dynamodb.ScanInput{
 		TableName:        &d.segmentsTable,

@@ -2,6 +2,9 @@ package diskless
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -49,6 +52,12 @@ type MetaStore interface {
 	// DeleteFileRefs removes all segment references pointing at fileKey.
 	DeleteFileRefs(ctx context.Context, fileKey string) error
 
+	// ListFileRefs returns every segment reference across all partitions that
+	// points at fileKey. A flush can pack batches for multiple partitions into
+	// one data file, so retention must account for every reference before
+	// deleting the object.
+	ListFileRefs(ctx context.Context, fileKey string) ([]FileRef, error)
+
 	// PlanUnreferencedFileDeletes returns the subset of fileKeys that are no
 	// longer referenced by any partition, so their data objects can be deleted.
 	PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error)
@@ -76,4 +85,19 @@ func contiguousCommittedEnd(committed int64, refs []SegmentRef) int64 {
 		}
 	}
 	return committed
+}
+
+// parsePartitionKey splits a partition key of the form "topic#partition". The
+// partition is the segment after the last "#", so topic names containing "#"
+// are preserved.
+func parsePartitionKey(key string) (string, int, error) {
+	idx := strings.LastIndex(key, "#")
+	if idx < 0 {
+		return "", 0, fmt.Errorf("malformed partition key %q", key)
+	}
+	partition, err := strconv.Atoi(key[idx+1:])
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed partition key %q: %w", key, err)
+	}
+	return key[:idx], partition, nil
 }

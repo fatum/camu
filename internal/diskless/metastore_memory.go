@@ -370,6 +370,35 @@ func (m *MemoryMetaStore) PlanUnreferencedFileDeletes(_ context.Context, fileKey
 	return deletable, nil
 }
 
+// ListFileRefs returns every segment reference across all partitions that
+// points at fileKey.
+func (m *MemoryMetaStore) ListFileRefs(_ context.Context, fileKey string) ([]FileRef, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var refs []FileRef
+	for key, entries := range m.segments {
+		topic, partition, err := parsePartitionKey(key)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.fileKey != fileKey {
+				continue
+			}
+			refs = append(refs, FileRef{Topic: topic, Partition: partition, Ref: SegmentRef{
+				FileKey:    e.fileKey,
+				ByteOffset: e.byteOffset,
+				ByteLength: e.byteLength,
+				BaseOffset: e.baseOffset,
+				EndOffset:  e.endOffset,
+				CreatedAt:  e.createdAt,
+			}})
+		}
+	}
+	return refs, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	m.mu.Lock()
