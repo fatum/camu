@@ -139,13 +139,13 @@ func (d *DynamoMetaStore) allocateIdempotent(ctx context.Context, pk string, all
 	pid := strconv.FormatInt(alloc.ProducerID, 10)
 	var lastErr error
 	for attempt := 0; attempt < maxAllocateAttempts; attempt++ {
-		// Validate against the producer's last recorded batch before the
-		// conditional update: exact retries are deduplicated, and anything
-		// other than the next contiguous batch is rejected up front.
-		prev, err := d.getProducerBatch(ctx, pk, pid)
+		base, prev, producersExist, err := d.readAllocState(ctx, pk, pid)
 		if err != nil {
 			return OffsetResult{}, err
 		}
+
+		// Exact retries are deduplicated using the persisted (real) base
+		// offset; anything other than the next contiguous batch is rejected.
 		if prev != nil {
 			exact, verr := checkProducerSequence(alloc.ProducerID, alloc.Sequence, alloc.Count, prev.FirstSequence, prev.Count)
 			if verr != nil {
@@ -159,46 +159,61 @@ func (d *DynamoMetaStore) allocateIdempotent(ctx context.Context, pk string, all
 			}
 		}
 
-		out, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		// Atomic allocate + record: the real base offset is stored in the same
+		// conditional write that advances the counter. The conditions pin the
+		// producer state and the counter to the values just read and validated,
+		// so any concurrent change (a different sequence from the same producer,
+		// or any counter advance) fails the update and forces a re-read/retry.
+		batch := &ddbtypes.AttributeValueMemberM{Value: map[string]ddbtypes.AttributeValue{
+			"first_sequence": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(alloc.Sequence, 10)},
+			"base_offset":    &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(base, 10)},
+			"count":          &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(alloc.Count)},
+		}}
+		values := map[string]ddbtypes.AttributeValue{
+			":count": &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(alloc.Count)},
+			":base":  &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(base, 10)},
+		}
+		var exprNames map[string]string
+		var updateExpr, producerCond string
+		if !producersExist {
+			// The producers map does not exist yet: create it with just this
+			// producer's entry (setting the whole map avoids DynamoDB's
+			// overlapping-document-path restriction).
+			updateExpr = "ADD next_offset :count SET producers = :producers"
+			producerCond = "attribute_not_exists(producers)"
+			values[":producers"] = &ddbtypes.AttributeValueMemberM{Value: map[string]ddbtypes.AttributeValue{
+				pid: batch,
+			}}
+		} else {
+			exprNames = map[string]string{"#pid": pid}
+			updateExpr = "ADD next_offset :count SET producers.#pid = :batch"
+			values[":batch"] = batch
+			if prev != nil {
+				producerCond = "producers.#pid.first_sequence = :prevFirst"
+				values[":prevFirst"] = &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(prev.FirstSequence, 10)}
+			} else {
+				producerCond = "attribute_not_exists(producers.#pid)"
+			}
+		}
+		condition := producerCond + " AND (attribute_not_exists(next_offset) OR next_offset = :base)"
+
+		_, err = d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName: &d.offsetsTable,
 			Key: map[string]ddbtypes.AttributeValue{
 				"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
 			},
-			UpdateExpression:   aws.String("ADD next_offset :count SET producers.#pid = :batch"),
-			ConditionExpression: aws.String("attribute_not_exists(producers.#pid) OR producers.#pid.first_sequence <> :seq"),
-			ExpressionAttributeNames: map[string]string{
-				"#pid": pid,
-			},
-			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-				":count": &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(alloc.Count)},
-				":seq":   &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(alloc.Sequence, 10)},
-				":batch": &ddbtypes.AttributeValueMemberM{Value: map[string]ddbtypes.AttributeValue{
-					"first_sequence": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(alloc.Sequence, 10)},
-					"base_offset":    &ddbtypes.AttributeValueMemberN{Value: "0"},
-					"count":          &ddbtypes.AttributeValueMemberN{Value: strconv.Itoa(alloc.Count)},
-				}},
-			},
-			ReturnValues: ddbtypes.ReturnValueUpdatedOld,
+			UpdateExpression:          aws.String(updateExpr),
+			ConditionExpression:       aws.String(condition),
+			ExpressionAttributeNames:  exprNames,
+			ExpressionAttributeValues: values,
 		})
 		if err == nil {
-			var base int64
-			if v, ok := out.Attributes["next_offset"]; ok {
-				if nv, ok := v.(*ddbtypes.AttributeValueMemberN); ok {
-					base, err = strconv.ParseInt(nv.Value, 10, 64)
-					if err != nil {
-						return OffsetResult{}, fmt.Errorf("parse next_offset for %s: %w", pk, err)
-					}
-				}
-			}
-			if err := d.setProducerBaseOffset(ctx, pk, pid, alloc.Sequence, base); err != nil {
-				return OffsetResult{}, fmt.Errorf("record producer base offset for %s: %w", pk, err)
-			}
 			return OffsetResult{BaseOffset: base}, nil
 		}
 		var condErr *ddbtypes.ConditionalCheckFailedException
 		if errors.As(err, &condErr) {
-			// A concurrent update changed the producer's batch after our
-			// pre-check; re-read and re-validate on the next attempt.
+			// A concurrent allocation changed the producer record or advanced
+			// the counter; re-read and re-validate on the next attempt.
 			lastErr = err
 			if derr := allocateRetryDelay(ctx, attempt); derr != nil {
 				return OffsetResult{}, derr
@@ -219,55 +234,38 @@ type dynamoProducerBatch struct {
 	Count         int
 }
 
-// setProducerBaseOffset fills in the real base offset for a freshly allocated
-// idempotent batch. It only overwrites the placeholder (base_offset = 0) so a
-// concurrent writer that already committed the value is left untouched.
-func (d *DynamoMetaStore) setProducerBaseOffset(ctx context.Context, pk, pid string, seq, base int64) error {
-	_, err := d.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: &d.offsetsTable,
-		Key: map[string]ddbtypes.AttributeValue{
-			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
-		},
-		UpdateExpression:     aws.String("SET producers.#pid.base_offset = :base"),
-		ConditionExpression:  aws.String("producers.#pid.first_sequence = :seq AND producers.#pid.base_offset = :zero"),
-		ExpressionAttributeNames: map[string]string{
-			"#pid": pid,
-		},
-		ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-			":seq":  &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(seq, 10)},
-			":base": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(base, 10)},
-			":zero": &ddbtypes.AttributeValueMemberN{Value: "0"},
-		},
-	})
-	return err
-}
-
-func (d *DynamoMetaStore) getProducerBatch(ctx context.Context, pk, pid string) (*dynamoProducerBatch, error) {
+// readAllocState reads the partition's counter, whether the producers map
+// exists, and the producer's last recorded batch in a single GetItem so the
+// subsequent conditional update can pin all of them.
+func (d *DynamoMetaStore) readAllocState(ctx context.Context, pk, pid string) (int64, *dynamoProducerBatch, bool, error) {
 	out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: &d.offsetsTable,
 		Key: map[string]ddbtypes.AttributeValue{
 			"pk": &ddbtypes.AttributeValueMemberS{Value: pk},
 		},
-		ProjectionExpression:     aws.String("producers.#pid"),
-		ExpressionAttributeNames: map[string]string{"#pid": pid},
+		ProjectionExpression:     aws.String("next_offset, producers"),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get producer batch for %s: %w", pk, err)
+		return 0, nil, false, fmt.Errorf("read alloc state for %s: %w", pk, err)
 	}
 	if out.Item == nil {
-		return nil, nil
+		return 0, nil, false, nil
+	}
+	var base int64
+	if v, ok := out.Item["next_offset"].(*ddbtypes.AttributeValueMemberN); ok {
+		base, _ = strconv.ParseInt(v.Value, 10, 64)
 	}
 	producers, ok := out.Item["producers"].(*ddbtypes.AttributeValueMemberM)
 	if !ok {
-		return nil, nil
+		return base, nil, false, nil
 	}
 	batch, ok := producers.Value[pid]
 	if !ok {
-		return nil, nil
+		return base, nil, true, nil
 	}
 	m, ok := batch.(*ddbtypes.AttributeValueMemberM)
 	if !ok {
-		return nil, nil
+		return base, nil, true, nil
 	}
 	record := &dynamoProducerBatch{}
 	if v, ok := m.Value["first_sequence"].(*ddbtypes.AttributeValueMemberN); ok {
@@ -279,7 +277,7 @@ func (d *DynamoMetaStore) getProducerBatch(ctx context.Context, pk, pid string) 
 	if v, ok := m.Value["count"].(*ddbtypes.AttributeValueMemberN); ok {
 		record.Count, _ = strconv.Atoi(v.Value)
 	}
-	return record, nil
+	return base, record, true, nil
 }
 
 func allocateRetryDelay(ctx context.Context, attempt int) error {

@@ -1413,7 +1413,8 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 
 	if topicCfg.ReplicationFactor > 1 {
 		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
-		// The guarded update refuses to clobber a higher-epoch leader's state.
+		// The guarded update refuses to clobber a higher-epoch leader's state;
+		// a stale-epoch rejection aborts the promotion entirely.
 		if err := s.isrStore.Update(ctx, topic, pid, pa.LeaderEpoch, func(_ replication.ISRState) (replication.ISRState, error) {
 			return replication.ISRState{
 				ISR:           []string{s.instanceID},
@@ -1421,7 +1422,9 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 				HighWatermark: recoveredHW,
 			}, nil
 		}); err != nil {
-			s.onISRWriteError(topic, pid, err)
+			if s.abortPromotionOnStaleISR(ctx, topic, pid, err, ps) {
+				return
+			}
 		}
 	}
 
@@ -1761,6 +1764,31 @@ func (s *Server) onISRWriteError(topic string, pid int, err error) {
 		return
 	}
 	slog.Warn("isr_write_failed", "topic", topic, "partition", pid, "error", err)
+}
+
+// abortPromotionOnStaleISR handles an ISR write failure during a promotion.
+// When the write was rejected because a newer leader epoch already owns the
+// partition (ErrISRStaleEpoch), the promotion is stale: this node must not
+// become leader. The helper rolls back the local leader state and ownership,
+// and returns true so the caller aborts the promotion instead of continuing to
+// re-add its own ownership-cache entry. Transient errors are logged and return
+// false so the caller can proceed with best-effort recovery.
+func (s *Server) abortPromotionOnStaleISR(ctx context.Context, topic string, pid int, err error, ps *partitionState) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, replication.ErrISRStaleEpoch) {
+		slog.Warn("promotion_aborted_stale_isr", "topic", topic, "partition", pid, "error", err)
+		ps.mu.Lock()
+		ps.isLeader = false
+		ps.replicaState = nil
+		ps.leaderID = ""
+		ps.mu.Unlock()
+		s.revokePartition(topic, pid)
+		return true
+	}
+	s.onISRWriteError(topic, pid, err)
+	return false
 }
 
 // verifyProduceLeadership fences stale leaders on the write path using the

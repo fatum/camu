@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,8 +111,7 @@ func TestDynamoMetaStore_RegisterAndQuery(t *testing.T) {
 	assert.Equal(t, int64(600), refs[0].ByteOffset)
 }
 
-func TestDynamoMetaStore_GetPartitionHead(t *testing.T) {
-	ctx := context.Background()
+func TestDynamoMetaStore_GetPartitionHead(t *testing.T) {	ctx := context.Background()
 	ms := dynamoTestStore(t)
 
 	head, err := ms.GetPartitionHead(ctx, "events", 0)
@@ -156,4 +156,61 @@ func TestDynamoMetaStore_DeleteTopic(t *testing.T) {
 	refs, err := ms.QuerySegments(ctx, "events", 0, 0, 10000)
 	require.NoError(t, err)
 	assert.Empty(t, refs)
+}
+
+func TestDynamoMetaStore_IdempotentAllocation(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	alloc := OffsetAllocation{Topic: "t", Partition: 0, Count: 3, ProducerID: 7, Sequence: 10}
+	first, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), first[0].BaseOffset)
+	assert.False(t, first[0].Duplicate)
+
+	retry, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), retry[0].BaseOffset)
+	assert.True(t, retry[0].Duplicate)
+
+	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 7, Sequence: 13}})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), next[0].BaseOffset)
+	assert.False(t, next[0].Duplicate)
+
+	// Gap and out-of-order sequences must be rejected.
+	_, err = ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 1, ProducerID: 7, Sequence: 16}})
+	require.Error(t, err, "gap sequence must be rejected")
+	_, err = ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 1, ProducerID: 7, Sequence: 12}})
+	require.Error(t, err, "out-of-order sequence must be rejected")
+}
+
+// TestDynamoMetaStore_IdempotentConcurrentRejection verifies the atomic
+// allocation: two concurrent first-batch allocations from the same producer
+// with different sequences may not both advance the counter. The conditional
+// update pins the producer state, so exactly one succeeds and the other is
+// rejected as a gap or out-of-order sequence.
+func TestDynamoMetaStore_IdempotentConcurrentRejection(t *testing.T) {
+	ctx := context.Background()
+	ms := dynamoTestStore(t)
+
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+	seqs := []int64{0, 5}
+	for i, s := range seqs {
+		wg.Add(1)
+		go func(idx int, seq int64) {
+			defer wg.Done()
+			_, results[idx] = ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 1, ProducerID: 7, Sequence: seq}})
+		}(i, s)
+	}
+	wg.Wait()
+
+	successes := 0
+	for _, err := range results {
+		if err == nil {
+			successes++
+		}
+	}
+	require.Equal(t, 1, successes, "exactly one of two concurrent first-batch allocations must succeed")
 }

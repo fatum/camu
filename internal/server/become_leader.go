@@ -141,7 +141,8 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 		ps.mu.Unlock()
 
 		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
-		// The guarded update refuses to clobber a higher-epoch leader's state.
+		// The guarded update refuses to clobber a higher-epoch leader's state;
+		// a stale-epoch rejection aborts the promotion entirely.
 		if err := s.isrStore.Update(ctx, topic, pid, req.Epoch, func(_ replication.ISRState) (replication.ISRState, error) {
 			return replication.ISRState{
 				ISR:           []string{s.instanceID},
@@ -149,7 +150,9 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 				HighWatermark: recoveredHW,
 			}, nil
 		}); err != nil {
-			s.onISRWriteError(topic, pid, err)
+			if s.abortPromotionOnStaleISR(ctx, topic, pid, err, ps) {
+				return fmt.Errorf("becomeLeader: %w", err)
+			}
 		}
 	}
 

@@ -272,7 +272,9 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 			HighWatermark: recoveredHW,
 		}, nil
 	}); err != nil {
-		p.server.onISRWriteError(topic, pid, err)
+		if p.server.abortPromotionOnStaleISR(ctx, topic, pid, err, ps) {
+			return fmt.Errorf("attemptPartitionLeadership: %w", err)
+		}
 	}
 
 	checkpointKey := fmt.Sprintf("%s/%d/producers.checkpoint", topic, pid)
