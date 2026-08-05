@@ -54,6 +54,15 @@ Diskless coordination:
   same-producer requests cannot bypass sequence validation or duplicate
   offsets. The DynamoDB metastore is exercised against a real DynamoDB in CI
   (`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` set).
+- Idempotency follows the Kafka contract: an exact retry of an idempotent batch
+  (same producer ID, first sequence, and count) is deduplicated against the
+  producer's recent commit history (last 5 per producer, matching Kafka's
+  in-flight limit) and returns its original offset without a second ref — the
+  retried physical upload is retroactively excluded from reads, like a
+  tombstone. Non-idempotent batches are **not** deduplicated, so a retried
+  non-idempotent produce may duplicate records, matching Kafka. Unreferenced
+  uploads (a commit that permanently failed after upload, or a tombstoned
+  retry) are swept by the leader after a grace period.
 - Diskless topics support typed schemas, `export_enabled`, and Parquet/SQL
   exactly like classic topics: the partition leader exports the committed
   diskless log (bounded by the diskless committed watermark) through the same
