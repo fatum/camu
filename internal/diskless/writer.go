@@ -41,7 +41,7 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 		return nil
 	}
 
-	// 1. Read NumRecords from each entry's RecordBatch header.
+	// 1. Read NumRecords and producer metadata from each entry's RecordBatch header.
 	allocs := make([]OffsetAllocation, len(entries))
 	for i, e := range entries {
 		hdr, err := log.ReadRecordBatchHeader(e.Batch)
@@ -49,10 +49,17 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 			w.sendError(entries, fmt.Errorf("read header for entry %d: %w", i, err))
 			return err
 		}
+		producerID := hdr.ProducerID
+		if producerID <= 0 {
+			// Non-idempotent batches are encoded with ProducerID = -1.
+			producerID = 0
+		}
 		allocs[i] = OffsetAllocation{
-			Topic:     e.Topic,
-			Partition: e.Partition,
-			Count:     int(hdr.NumRecords),
+			Topic:      e.Topic,
+			Partition:  e.Partition,
+			Count:      int(hdr.NumRecords),
+			ProducerID: producerID,
+			Sequence:   int64(hdr.FirstSequence),
 		}
 	}
 
@@ -123,7 +130,7 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 
 	// 6. Notify success.
 	for i, e := range entries {
-		e.Done <- FlushResult{BaseOffset: results[i].BaseOffset}
+		e.Done <- FlushResult{BaseOffset: results[i].BaseOffset, Duplicate: results[i].Duplicate}
 	}
 	return nil
 }

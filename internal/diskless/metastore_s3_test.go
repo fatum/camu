@@ -134,6 +134,60 @@ func TestS3MetaStore_ConcurrentAllocation(t *testing.T) {
 	}
 }
 
+func TestS3MetaStore_IdempotentAllocation(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+
+	alloc := OffsetAllocation{Topic: "t", Partition: 0, Count: 4, ProducerID: 42, Sequence: 100}
+	first, err := m.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	if err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if first[0].BaseOffset != 0 || first[0].Duplicate {
+		t.Fatalf("first allocation = %+v, want base 0 non-duplicate", first[0])
+	}
+
+	// Exact retry must be deduplicated and must not advance the counter.
+	retry, err := m.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if !retry[0].Duplicate || retry[0].BaseOffset != 0 {
+		t.Fatalf("retry = %+v, want duplicate base 0", retry[0])
+	}
+
+	// A new batch from the same producer advances the counter.
+	next, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 4, ProducerID: 42, Sequence: 104}})
+	if err != nil {
+		t.Fatalf("next batch: %v", err)
+	}
+	if next[0].Duplicate || next[0].BaseOffset != 4 {
+		t.Fatalf("next batch = %+v, want base 4", next[0])
+	}
+
+	// An overlapping retry with a different record count is rejected.
+	if _, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 5, ProducerID: 42, Sequence: 100}}); err == nil {
+		t.Fatal("overlapping retry with mismatched count succeeded, want error")
+	}
+
+	// Non-idempotent allocations are unaffected.
+	plain, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2}})
+	if err != nil {
+		t.Fatalf("plain allocate: %v", err)
+	}
+	if plain[0].BaseOffset != 8 {
+		t.Fatalf("plain base = %d, want 8", plain[0].BaseOffset)
+	}
+
+	head, err := m.GetPartitionHead(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head != 10 {
+		t.Fatalf("head = %d, want 10 (4+4+2, retry not counted)", head)
+	}
+}
+
 func TestS3MetaStore_RegisterIsIdempotent(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()

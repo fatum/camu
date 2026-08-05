@@ -26,6 +26,34 @@ func TestMemoryMetaStore_AllocateOffsets_SinglePartition(t *testing.T) {
 	assert.Equal(t, int64(3), results[0].BaseOffset)
 }
 
+func TestMemoryMetaStore_IdempotentAllocation(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemoryMetaStore()
+
+	alloc := OffsetAllocation{Topic: "events", Partition: 0, Count: 3, ProducerID: 7, Sequence: 10}
+	first, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), first[0].BaseOffset)
+	assert.False(t, first[0].Duplicate)
+
+	retry, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.NoError(t, err)
+	assert.True(t, retry[0].Duplicate)
+	assert.Equal(t, int64(0), retry[0].BaseOffset)
+
+	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 2, ProducerID: 7, Sequence: 13}})
+	require.NoError(t, err)
+	assert.False(t, next[0].Duplicate)
+	assert.Equal(t, int64(3), next[0].BaseOffset)
+
+	_, err = ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 4, ProducerID: 7, Sequence: 10}})
+	require.Error(t, err, "overlapping retry with mismatched count must fail")
+
+	head, err := ms.GetPartitionHead(ctx, "events", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), head, "retry must not advance the counter")
+}
+
 func TestMemoryMetaStore_AllocateOffsets_MultiPartition(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()

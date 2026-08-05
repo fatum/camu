@@ -13,6 +13,7 @@ type BufferEntry struct {
 // FlushResult is sent on the Done channel after a flush attempt.
 type FlushResult struct {
 	BaseOffset int64
+	Duplicate  bool // true when the batch was an idempotent retry of an allocated range
 	Err        error
 }
 

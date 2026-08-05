@@ -284,6 +284,81 @@ func TestHandleConsumeLowLevel_DisklessHonorsMessageLimit(t *testing.T) {
 	}
 }
 
+func TestHandleProduceLowLevel_DisklessIdempotentRetryReturnsSameOffsets(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	s.markTopicDiskless("diskless-topic")
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	body := `{"producer_id":7,"sequence":100,"messages":[{"key":"k1","value":"v1"},{"key":"k2","value":"v2"}]}`
+	produce := func() *produceResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/topics/diskless-topic/partitions/0/messages", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.SetPathValue("topic", "diskless-topic")
+		req.SetPathValue("id", "0")
+		rec := httptest.NewRecorder()
+		s.handleProduceLowLevel(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var resp produceResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		return &resp
+	}
+
+	first := produce()
+	if len(first.Offsets) != 2 || first.Offsets[0].Offset != 0 || first.Offsets[1].Offset != 1 {
+		t.Fatalf("first produce offsets = %+v, want [0 1]", first.Offsets)
+	}
+
+	// An exact retry of the same producer/sequence must return the same offsets
+	// and must not append duplicate records.
+	retry := produce()
+	if len(retry.Offsets) != 2 || retry.Offsets[0].Offset != 0 || retry.Offsets[1].Offset != 1 {
+		t.Fatalf("retry produce offsets = %+v, want [0 1]", retry.Offsets)
+	}
+
+	// Consume must see exactly the two records at offsets 0..1.
+	creq := httptest.NewRequest(http.MethodGet, "/v1/topics/diskless-topic/partitions/0/messages?offset=0&limit=100", nil)
+	creq.SetPathValue("topic", "diskless-topic")
+	creq.SetPathValue("id", "0")
+	crec := httptest.NewRecorder()
+	s.handleConsumeLowLevel(crec, creq)
+	if crec.Code != http.StatusOK {
+		t.Fatalf("consume status = %d, want 200; body=%s", crec.Code, crec.Body.String())
+	}
+	var cresp consumeResponse
+	if err := json.Unmarshal(crec.Body.Bytes(), &cresp); err != nil {
+		t.Fatalf("json.Unmarshal(consume) error = %v", err)
+	}
+	if len(cresp.Messages) != 2 || cresp.Messages[0].Offset != 0 || cresp.Messages[1].Offset != 1 {
+		t.Fatalf("consumed = %+v, want two records at offsets 0..1", cresp.Messages)
+	}
+	if hw := crec.Header().Get("X-High-Watermark"); hw != "2" {
+		t.Fatalf("X-High-Watermark = %q, want \"2\"", hw)
+	}
+}
+
 func TestHandleConsumeLowLevel_DisklessBeyondEndReturnsRequestedOffset(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()
