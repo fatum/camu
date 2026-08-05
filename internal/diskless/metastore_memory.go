@@ -17,20 +17,31 @@ type segmentEntry struct {
 	createdAt  time.Time
 }
 
+// producerAlloc records the last idempotent batch allocated by a producer
+// within a partition. Only the latest batch is kept: sequences must advance
+// contiguously, so any earlier batch is no longer retryable.
+type producerAlloc struct {
+	firstSequence int64
+	baseOffset    int64
+	count         int
+}
+
 // MemoryMetaStore is an in-memory implementation of MetaStore for testing and development.
 type MemoryMetaStore struct {
-	mu        sync.Mutex
-	offsets   map[string]int64
-	committed map[string]int64
-	segments  map[string][]segmentEntry
+	mu             sync.Mutex
+	offsets        map[string]int64
+	committed      map[string]int64
+	segments       map[string][]segmentEntry
+	producerAllocs map[string]map[int64]producerAlloc // partition key -> producerID -> last batch
 }
 
 // NewMemoryMetaStore creates a new in-memory MetaStore.
 func NewMemoryMetaStore() *MemoryMetaStore {
 	return &MemoryMetaStore{
-		offsets:   make(map[string]int64),
-		committed: make(map[string]int64),
-		segments:  make(map[string][]segmentEntry),
+		offsets:        make(map[string]int64),
+		committed:      make(map[string]int64),
+		segments:       make(map[string][]segmentEntry),
+		producerAllocs: make(map[string]map[int64]producerAlloc),
 	}
 }
 
@@ -46,21 +57,53 @@ func (m *MemoryMetaStore) AllocateOffsets(_ context.Context, allocs []OffsetAllo
 	results := make([]OffsetResult, len(allocs))
 	for i, a := range allocs {
 		key := partitionKey(a.Topic, a.Partition)
+
+		if a.ProducerID != 0 {
+			byProducer := m.producerAllocs[key]
+			if prev, ok := byProducer[a.ProducerID]; ok {
+				exact, err := checkProducerSequence(a.ProducerID, a.Sequence, a.Count, prev.firstSequence, prev.count)
+				if err != nil {
+					return nil, err
+				}
+				if exact {
+					if prev.count != a.Count {
+						return nil, fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", a.ProducerID, key, a.Sequence, a.Count, prev.count)
+					}
+					results[i] = OffsetResult{BaseOffset: prev.baseOffset, Duplicate: true}
+					continue
+				}
+			}
+		}
+
 		base := m.offsets[key]
 		results[i] = OffsetResult{BaseOffset: base}
 		m.offsets[key] = base + int64(a.Count)
+
+		if a.ProducerID != 0 {
+			byProducer := m.producerAllocs[key]
+			if byProducer == nil {
+				byProducer = make(map[int64]producerAlloc)
+				m.producerAllocs[key] = byProducer
+			}
+			byProducer[a.ProducerID] = producerAlloc{firstSequence: a.Sequence, baseOffset: base, count: a.Count}
+		}
 	}
 	return results, nil
 }
 
 // RegisterSegment records a flushed data file in the segment catalog and
 // advances the partition's committed head to the highest materialized end.
+// Registering an already-registered offset range is a no-op so an idempotent
+// produce retry that re-materializes a batch does not create duplicate refs.
 func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for _, b := range seg.Batches {
 		key := partitionKey(b.Topic, b.Partition)
+		if m.rangeRegistered(key, b.BaseOffset, b.EndOffset) {
+			continue
+		}
 		m.segments[key] = append(m.segments[key], segmentEntry{
 			fileKey:    seg.FileKey,
 			baseOffset: b.BaseOffset,
@@ -74,6 +117,17 @@ func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) 
 		}
 	}
 	return nil
+}
+
+// rangeRegistered reports whether a batch for the same offset range is already
+// present in the partition's segment list.
+func (m *MemoryMetaStore) rangeRegistered(key string, base, end int64) bool {
+	for _, e := range m.segments[key] {
+		if e.baseOffset == base && e.endOffset == end {
+			return true
+		}
+	}
+	return false
 }
 
 // QuerySegments returns segment references covering [fromOffset, ...) for a
@@ -206,6 +260,11 @@ func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	for k := range m.segments {
 		if strings.HasPrefix(k, prefix) {
 			delete(m.segments, k)
+		}
+	}
+	for k := range m.producerAllocs {
+		if strings.HasPrefix(k, prefix) {
+			delete(m.producerAllocs, k)
 		}
 	}
 	return nil

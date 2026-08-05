@@ -35,8 +35,18 @@ const (
 )
 
 type s3HeadState struct {
-	Version    int   `json:"version"`
-	NextOffset int64 `json:"next_offset"`
+	Version    int                       `json:"version"`
+	NextOffset int64                     `json:"next_offset"`
+	Producers  map[string]s3ProducerBatch `json:"producers,omitempty"`
+}
+
+// s3ProducerBatch records the most recent idempotent allocation for a producer
+// in a partition, keyed by producer ID. Idempotency follows the Kafka contract:
+// a retried batch is deduplicated only when it is the producer's latest batch.
+type s3ProducerBatch struct {
+	FirstSequence int64 `json:"first_sequence"`
+	BaseOffset    int64 `json:"base_offset"`
+	Count         int   `json:"count"`
 }
 
 type s3CommittedState struct {
@@ -79,44 +89,80 @@ func s3SegKey(topic string, partition int, baseOffset, endOffset int64) string {
 func (m *S3MetaStore) AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error) {
 	results := make([]OffsetResult, len(allocs))
 	for i, alloc := range allocs {
-		base, err := m.allocateOne(ctx, alloc.Topic, alloc.Partition, alloc.Count)
+		result, err := m.allocateOne(ctx, alloc)
 		if err != nil {
 			return nil, err
 		}
-		results[i] = OffsetResult{BaseOffset: base}
+		results[i] = result
 	}
 	return results, nil
 }
 
-func (m *S3MetaStore) allocateOne(ctx context.Context, topic string, partition, count int) (int64, error) {
-	key := s3HeadKey(topic, partition)
+// allocateOne allocates a range for a single batch. For idempotent batches the
+// head records the producer's latest allocation; an exact retry (same first
+// sequence and record count) returns the prior base offset without advancing
+// the counter.
+func (m *S3MetaStore) allocateOne(ctx context.Context, alloc OffsetAllocation) (OffsetResult, error) {
+	key := s3HeadKey(alloc.Topic, alloc.Partition)
+	var pidKey string
+	if alloc.ProducerID != 0 {
+		pidKey = strconv.FormatInt(alloc.ProducerID, 10)
+	}
 	for {
 		data, etag, err := m.s3.GetWithETag(ctx, key)
+		var head s3HeadState
 		var next int64
 		switch {
 		case err == nil:
-			var head s3HeadState
 			if err := json.Unmarshal(data, &head); err != nil {
-				return 0, fmt.Errorf("parse head %s: %w", key, err)
+				return OffsetResult{}, fmt.Errorf("parse head %s: %w", key, err)
 			}
 			next = head.NextOffset
 		case errors.Is(err, storage.ErrNotFound):
 			next = 0
 		default:
-			return 0, fmt.Errorf("read head %s: %w", key, err)
+			return OffsetResult{}, fmt.Errorf("read head %s: %w", key, err)
 		}
 
-		newHead, err := json.Marshal(s3HeadState{Version: s3HeadStateVersion, NextOffset: next + int64(count)})
+		if pidKey != "" {
+			if prev, ok := head.Producers[pidKey]; ok {
+				exact, err := checkProducerSequence(alloc.ProducerID, alloc.Sequence, alloc.Count, prev.FirstSequence, prev.Count)
+				if err != nil {
+					return OffsetResult{}, err
+				}
+				if exact {
+					if prev.Count == alloc.Count {
+						return OffsetResult{BaseOffset: prev.BaseOffset, Duplicate: true}, nil
+					}
+					return OffsetResult{}, fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", alloc.ProducerID, key, alloc.Sequence, alloc.Count, prev.Count)
+				}
+			}
+		}
+
+		base := next
+		if head.Producers == nil {
+			head.Producers = make(map[string]s3ProducerBatch)
+		}
+		head.NextOffset = next + int64(alloc.Count)
+		if pidKey != "" {
+			head.Producers[pidKey] = s3ProducerBatch{
+				FirstSequence: alloc.Sequence,
+				BaseOffset:    base,
+				Count:         alloc.Count,
+			}
+		}
+
+		newHead, err := json.Marshal(head)
 		if err != nil {
-			return 0, err
+			return OffsetResult{}, err
 		}
 		if _, err := m.s3.ConditionalPut(ctx, key, newHead, etag); err != nil {
 			if errors.Is(err, storage.ErrConflict) {
 				continue // another writer advanced the head; retry with a fresh read.
 			}
-			return 0, fmt.Errorf("update head %s: %w", key, err)
+			return OffsetResult{}, fmt.Errorf("update head %s: %w", key, err)
 		}
-		return next, nil
+		return OffsetResult{BaseOffset: base}, nil
 	}
 }
 

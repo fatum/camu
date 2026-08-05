@@ -2,15 +2,19 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/producer"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -349,17 +353,26 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var assignedOffsets []uint64
+	var duplicate bool
 	if producerID != 0 {
-		assignedOffsets, err = s.partitionManager.appendBatchWithMetaToPS(ps, topicName, partitionID, log.Batch{
-			ProducerID: producerID,
-			Sequence:   sequence,
-			Messages:   batch,
-		}, &IdempotencyOpts{
-			Sequence: sequence,
-		})
-		if errors.Is(err, idempotency.ErrDuplicateSequence) {
-			s.handleDuplicateSequence(w, r, ps, partitionID, producerID)
-			return
+		if tc.StorageMode == meta.StorageModeDiskless {
+			assignedOffsets, duplicate, err = s.appendDisklessMessagesWithMeta(r.Context(), topicName, partitionID, log.Batch{
+				ProducerID: producerID,
+				Sequence:   sequence,
+				Messages:   batch,
+			})
+		} else {
+			assignedOffsets, err = s.partitionManager.appendBatchWithMetaToPS(ps, topicName, partitionID, log.Batch{
+				ProducerID: producerID,
+				Sequence:   sequence,
+				Messages:   batch,
+			}, &IdempotencyOpts{
+				Sequence: sequence,
+			})
+			if errors.Is(err, idempotency.ErrDuplicateSequence) {
+				s.handleDuplicateSequence(w, r, ps, partitionID, producerID)
+				return
+			}
 		}
 	} else {
 		assignedOffsets, err = s.appendHTTPMessagesAsRecordBatch(r.Context(), ps, topicName, partitionID, batch)
@@ -370,12 +383,26 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "backpressure: buffer full")
 			return
 		}
-		if errors.Is(err, idempotency.ErrSequenceGap) || errors.Is(err, idempotency.ErrUnknownProducer) {
+		if errors.Is(err, idempotency.ErrSequenceGap) || errors.Is(err, idempotency.ErrUnknownProducer) ||
+			errors.Is(err, diskless.ErrSequenceGap) || errors.Is(err, diskless.ErrOutOfOrderSequence) {
 			writeError(w, 422, err.Error())
 			return
 		}
 		slog.Error("produce_failed", "topic", topicName, "partition", partitionID, "error", err)
 		writeError(w, http.StatusInternalServerError, "append failed: "+err.Error())
+		return
+	}
+	if duplicate {
+		// An idempotent retry of a batch that was already allocated: the data
+		// was re-materialized at the original offsets, so confirm them.
+		offsets := make([]offsetInfo, len(assignedOffsets))
+		for i, o := range assignedOffsets {
+			offsets[i] = offsetInfo{Partition: partitionID, Offset: o}
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Duplicate bool         `json:"duplicate"`
+			Offsets   []offsetInfo `json:"offsets"`
+		}{Duplicate: true, Offsets: offsets})
 		return
 	}
 
@@ -399,6 +426,29 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, produceResponse{Offsets: offsets})
+}
+
+// appendDisklessMessagesWithMeta appends an idempotent batch to a diskless
+// topic, encoding the producer metadata into the RecordBatch so the metastore
+// can deduplicate retried batches. Duplicate reports whether the batch was an
+// exact retry of a previously allocated range.
+func (s *Server) appendDisklessMessagesWithMeta(ctx context.Context, topic string, partitionID int, batch log.Batch) ([]uint64, bool, error) {
+	now := time.Now().UnixMilli()
+	for i := range batch.Messages {
+		if batch.Messages[i].Timestamp == 0 {
+			batch.Messages[i].Timestamp = now
+		}
+	}
+	rawBatch := log.EncodeRecordBatchWithMeta(0, batch)
+	result, err := s.disklessEngine.Produce(ctx, topic, partitionID, rawBatch)
+	if err != nil {
+		return nil, false, err
+	}
+	offsets := make([]uint64, len(batch.Messages))
+	for i := range offsets {
+		offsets[i] = uint64(result.BaseOffset) + uint64(i)
+	}
+	return offsets, result.Duplicate, nil
 }
 
 // handleDuplicateSequence handles the ErrDuplicateSequence case for idempotent
