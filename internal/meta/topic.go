@@ -161,9 +161,6 @@ func (ts *TopicStore) Create(ctx context.Context, cfg TopicConfig) error {
 	if cfg.MinInsyncReplicas == 0 {
 		cfg.MinInsyncReplicas = 1
 	}
-	if cfg.StorageMode == StorageModeDiskless && cfg.ExportEnabled {
-		return fmt.Errorf("Create: export_enabled is unsupported for diskless topics")
-	}
 
 	data, err := json.Marshal(cfg.toJSON())
 	if err != nil {
@@ -198,9 +195,6 @@ func (ts *TopicStore) Update(ctx context.Context, cfg TopicConfig) error {
 	}
 	if cfg.MinInsyncReplicas == 0 {
 		cfg.MinInsyncReplicas = 1
-	}
-	if cfg.StorageMode == StorageModeDiskless && cfg.ExportEnabled {
-		return fmt.Errorf("Update: export_enabled is unsupported for diskless topics")
 	}
 
 	data, err := json.Marshal(cfg.toJSON())

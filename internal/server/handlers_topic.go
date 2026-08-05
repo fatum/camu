@@ -139,12 +139,6 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	if storageMode != meta.StorageModeClassic && storageMode != meta.StorageModeDiskless {
 		return meta.TopicConfig{}, fmt.Errorf("invalid storage_mode, must be classic or diskless")
 	}
-	if storageMode == meta.StorageModeDiskless && req.Schema != nil {
-		return meta.TopicConfig{}, fmt.Errorf("typed schemas are unsupported for diskless topics")
-	}
-	if storageMode == meta.StorageModeDiskless && req.ExportEnabled {
-		return meta.TopicConfig{}, fmt.Errorf("export_enabled is unsupported for diskless topics")
-	}
 
 	tc := meta.TopicConfig{
 		Name:                  req.Name,

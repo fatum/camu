@@ -70,10 +70,10 @@ limitations.
 
 ## SQL analytics
 
-Set `export_enabled: true` on a classic topic to project its committed records
-to Parquet. Export runs on the partition leader and does not delay produce.
-`POST /v1/sql` exposes those manifest-published files through read-only DuckDB
-SQL:
+Set `export_enabled: true` on a topic (classic or diskless) to project its
+committed records to Parquet. Export runs on the partition leader and does not
+delay produce. `POST /v1/sql` exposes those manifest-published files through
+read-only DuckDB SQL:
 
 ```bash
 curl -X POST http://localhost:8080/v1/sql \

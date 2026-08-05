@@ -69,20 +69,37 @@ func parquetManifestErrorDetails(err error) (category, key string, attempts int)
 }
 
 func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, cp *pipeline.Checkpoint) {
-	if !tc.ExportEnabled || identity.Role != PartitionRoleLeader || tc.StorageMode == meta.StorageModeDiskless || tc.UncleanLeaderElection {
+	if !tc.ExportEnabled || identity.Role != PartitionRoleLeader || tc.UncleanLeaderElection {
 		return
 	}
-	ps := s.partitionManager.GetPartitionState(tc.Name, identity.Partition)
-	if ps == nil {
-		return
+	// Determine the committed source high watermark and, for classic topics,
+	// the in-memory partition index. Diskless topics have no index: the shared
+	// metastore's committed head is the readable boundary.
+	var index *log.Index
+	var highWatermark uint64
+	if tc.StorageMode == meta.StorageModeDiskless {
+		if s.disklessMeta == nil {
+			return
+		}
+		committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, identity.Partition)
+		if err != nil {
+			slog.Warn("parquet_pipeline_diskless_committed_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			return
+		}
+		highWatermark = uint64(committed)
+	} else {
+		ps := s.partitionManager.GetPartitionState(tc.Name, identity.Partition)
+		if ps == nil {
+			return
+		}
+		ps.mu.RLock()
+		index = ps.index.Clone()
+		if index != nil {
+			highWatermark = index.HighWatermark()
+		}
+		ps.mu.RUnlock()
 	}
-	ps.mu.RLock()
-	index, highWatermark := ps.index.Clone(), uint64(0)
-	if index != nil {
-		highWatermark = index.HighWatermark()
-	}
-	ps.mu.RUnlock()
-	if index == nil || highWatermark == 0 {
+	if highWatermark == 0 {
 		return
 	}
 	labels := map[string]string{"topic": tc.Name, "partition": strconv.Itoa(identity.Partition)}
@@ -91,7 +108,6 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	s.metricSet("camu_parquet_export_pipeline_lag_records", "Committed source records not yet checkpointed by the Parquet export pipeline", labels, float64(pipelineLagRecords(highWatermark, cp.NextOffset)))
 
 	fence := serverPipelineFence{server: s}
-	reader := pipeline.NewReader(s.fetcher, fence)
 	checkpoints := pipeline.NewCheckpointStore(s.s3Client, fence)
 	if cp.NextOffset >= highWatermark {
 		return
@@ -110,7 +126,15 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	}
 	passCtx, cancel := context.WithTimeout(ctx, s.cfg.Maintenance.ParquetExport.MaxDurationValue())
 	defer cancel()
-	messages, next, err := reader.Read(passCtx, index, tc.Name, identity.Partition, cp.NextOffset, highWatermark, identity.LeaderEpoch, maxRecords)
+	var messages []log.Message
+	var next uint64
+	var err error
+	if tc.StorageMode == meta.StorageModeDiskless {
+		messages, next, err = s.readDisklessCommittedBatch(passCtx, tc, identity.Partition, cp.NextOffset, highWatermark, maxRecords)
+	} else {
+		reader := pipeline.NewReader(s.fetcher, fence)
+		messages, next, err = reader.Read(passCtx, index, tc.Name, identity.Partition, cp.NextOffset, highWatermark, identity.LeaderEpoch, maxRecords)
+	}
 	if err != nil {
 		if !errors.Is(err, pipeline.ErrFenced) {
 			result = "read_error"
@@ -202,6 +226,51 @@ func checkpointMetricOffset(nextOffset uint64) float64 {
 		return -1
 	}
 	return float64(nextOffset - 1)
+}
+
+// disklessExportFetchBytes bounds how much raw diskless data one export pass
+// decodes; the pass itself is bounded by the checkpoint record limit.
+const disklessExportFetchBytes = 16 << 20
+
+// readDisklessCommittedBatch reads a batch of committed diskless messages
+// starting at start, up to limit records and strictly below highWatermark. The
+// diskless engine serves raw RecordBatch bytes from the shared metastore, which
+// is read by the partition leader exactly like the classic pipeline reader.
+func (s *Server) readDisklessCommittedBatch(ctx context.Context, tc meta.TopicConfig, partition int, start, highWatermark uint64, limit int) ([]log.Message, uint64, error) {
+	if start >= highWatermark || limit <= 0 {
+		return nil, start, nil
+	}
+	if s.disklessEngine == nil {
+		return nil, start, errors.New("diskless export: engine unavailable")
+	}
+	data, _, err := s.disklessEngine.Fetch(ctx, tc.Name, partition, int64(start), disklessExportFetchBytes)
+	if err != nil {
+		return nil, start, fmt.Errorf("diskless export fetch: %w", err)
+	}
+	msgs, err := log.ReadSegmentBatchesAsMessages(data, start, limit)
+	if err != nil {
+		return nil, start, fmt.Errorf("diskless export decode: %w", err)
+	}
+	// Fetch takes its own committed-head snapshot, which can be newer than the
+	// watermark captured by the caller when records commit concurrently. Never
+	// export offsets at or above the captured watermark: they would be exported
+	// again on the following pass, duplicating records.
+	kept := msgs[:0]
+	for _, m := range msgs {
+		if m.Offset >= highWatermark {
+			break // messages are ordered; the remainder is beyond the watermark
+		}
+		kept = append(kept, m)
+	}
+	msgs = kept
+	if len(msgs) == 0 {
+		return nil, start, nil
+	}
+	next := msgs[len(msgs)-1].Offset + 1
+	if next > highWatermark {
+		next = highWatermark
+	}
+	return msgs, next, nil
 }
 
 func pipelineLagRecords(highWatermark, nextOffset uint64) uint64 {

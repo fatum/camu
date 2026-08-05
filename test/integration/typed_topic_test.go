@@ -292,3 +292,53 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing
 	}
 	t.Fatal("malformed opaque record did not advance the Parquet pipeline checkpoint")
 }
+
+// TestIntegrationDisklessTypedTopicExportSQL verifies that a diskless topic with
+// export_enabled and a typed schema is exported to Parquet and queryable via SQL.
+func TestIntegrationDisklessTypedTopicExportSQL(t *testing.T) {
+	enabled := true
+	env := camutest.New(t, camutest.WithInstances(1), camutest.WithConfigMutator(func(cfg *config.Config) {
+		cfg.Coordination.HeartbeatInterval = "500ms"
+		cfg.Segments.MaxAge = "1s"
+		cfg.SQL.Enabled = &enabled
+		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
+		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
+	}))
+	defer env.Cleanup()
+	c := env.Client()
+	topic := "diskless-typed-orders"
+	body, _ := json.Marshal(map[string]any{"name": topic, "partitions": 1, "retention": "1h", "export_enabled": true, "storage_mode": "diskless", "schema": map[string]any{"encoding": "json", "fields": []map[string]any{{"name": "id", "type": "int64", "path": "$.id"}}}})
+	resp, err := http.Post(c.BaseURL()+"/v1/topics", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create diskless typed topic status %d, want 201", resp.StatusCode)
+	}
+	if _, err := c.ProduceToPartition(topic, 0, []camutest.ProduceMessage{{Key: "a", Value: `{"id":7}`}}); err != nil {
+		t.Fatal(err)
+	}
+	// A malformed typed produce must be rejected even for diskless topics.
+	bad, _ := json.Marshal([]camutest.ProduceMessage{{Key: "bad", Value: `{"id":"not-an-int"}`}})
+	badResp, err := http.Post(c.BaseURL()+"/v1/topics/"+topic+"/partitions/0/messages", "application/json", bytes.NewReader(bad))
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed diskless typed produce status %d, want 400", badResp.StatusCode)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		r, e := c.SQLQuery(camutest.SQLQueryRequest{SQL: `select id from "` + topic + `"`, Topics: []string{topic}})
+		if e == nil && len(r.Rows) == 1 && len(r.Columns) == 1 && r.Columns[0].Name == "id" && r.Columns[0].Type != "" {
+			if got, ok := r.Rows[0][0].(float64); !ok || got != 7 {
+				t.Fatalf("diskless typed id = %#v, want 7", r.Rows[0][0])
+			}
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatal("diskless typed record was not exported and queryable")
+}

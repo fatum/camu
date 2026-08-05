@@ -232,19 +232,15 @@ func TestLoadConfigRejectsSQLWithoutExport(t *testing.T) {
 	}
 }
 
-func TestLoadConfigDisklessRequiresNoExport(t *testing.T) {
+func TestLoadConfigAllowsDisklessWithExport(t *testing.T) {
 	t.Setenv("STORAGE_MODE", "diskless")
 	t.Setenv("EXPORT_ENABLED", "true")
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("loadConfig() succeeded with diskless + export, want an error")
-	}
-	t.Setenv("EXPORT_ENABLED", "false")
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.StorageMode != "diskless" {
-		t.Fatalf("StorageMode = %q, want diskless", cfg.StorageMode)
+	if cfg.StorageMode != "diskless" || !cfg.ExportEnabled {
+		t.Fatalf("StorageMode = %q, ExportEnabled = %t, want diskless/true", cfg.StorageMode, cfg.ExportEnabled)
 	}
 }
 
@@ -255,7 +251,7 @@ func TestLoadConfigRejectsInvalidStorageMode(t *testing.T) {
 	}
 }
 
-func TestCreateOmitsSchemaForDisklessTopic(t *testing.T) {
+func TestCreateCarriesSchemaForDisklessTopic(t *testing.T) {
 	var got map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/topics/events/routing" {
@@ -288,8 +284,8 @@ func TestCreateOmitsSchemaForDisklessTopic(t *testing.T) {
 	if got["storage_mode"] != "diskless" {
 		t.Fatalf("storage_mode = %v, want diskless", got["storage_mode"])
 	}
-	if _, ok := got["schema"]; ok {
-		t.Fatal("diskless topic must not carry a schema")
+	if _, ok := got["schema"]; !ok {
+		t.Fatal("diskless topic must carry a schema (schemas are supported for diskless)")
 	}
 	if got["export_enabled"] != false {
 		t.Fatalf("export_enabled = %v, want false", got["export_enabled"])

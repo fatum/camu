@@ -106,6 +106,24 @@ verification, and the `sql` operation is unavailable.
 `REQUEST_TIMEOUT` bounds every HTTP request (default `30s`); `CONSUME_TIMEOUT`
 bounds the whole consume operation (default `10m`).
 
+### Diskless topics
+
+Run the diskless storage mode with `STORAGE_MODE=diskless`. Diskless topics can
+carry a typed schema and use `export_enabled`/SQL just like classic topics, so
+`produce`, `consume`, and `sql` all work with `STORAGE_MODE=diskless`:
+
+```bash
+TOPIC=bench-diskless STORAGE_MODE=diskless ./run.sh produce 5GiB
+TOPIC=bench-diskless STORAGE_MODE=diskless ./run.sh consume 5GiB
+TOPIC=bench-diskless STORAGE_MODE=diskless ./run.sh sql 5GiB
+```
+
+`EXPORT_ENABLED=false` with `STORAGE_MODE=diskless` still creates a non-exporting
+topic for pure produce/consume runs. Diskless nodes use the shared S3 metastore
+(`diskless.metastore: s3`) and the benchmark enables background compaction
+(`diskless.compaction.enabled: true`) so small flushed segments are merged into
+`target_bytes`-sized objects.
+
 ## Heap profiles
 
 Set `TF_VAR_benchmark_auth_token` in the ignored `.env`, provision or deploy

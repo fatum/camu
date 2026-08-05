@@ -20,10 +20,11 @@ func parquetConsumerKey(topic string, partition int) string {
 }
 
 // ensureParquetConsumer starts (or replaces) the consumer owned by the local
-// partition leader. The consumer uses the partition's local committed log;
+// partition leader. The consumer uses the partition's local committed log
+// (classic partition index, or the diskless metastore for diskless topics);
 // Camu assignment epochs provide ownership/fencing, so no Kafka group is used.
 func (s *Server) ensureParquetConsumer(tc meta.TopicConfig, identity PartitionIdentity) {
-	if !tc.ExportEnabled || tc.StorageMode == meta.StorageModeDiskless || tc.UncleanLeaderElection || identity.Role != PartitionRoleLeader {
+	if !tc.ExportEnabled || tc.UncleanLeaderElection || identity.Role != PartitionRoleLeader {
 		s.stopParquetConsumer(tc.Name, identity.Partition)
 		return
 	}

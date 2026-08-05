@@ -45,14 +45,20 @@ Diskless coordination:
   so diskless topics run on any S3-compatible service without DynamoDB), or
   `dynamodb`.
 - With `s3`, offset allocation uses a per-partition head object and
-  conditional-write CAS, and the segment catalog is immutable per-batch-ref
-  objects; both work against any S3-compatible store.
+  conditional-write CAS, and segment references live in a single per-partition
+  catalog object read-modify-written with a CAS, so background compaction can
+  atomically replace a run of refs. Both work against any S3-compatible store.
 - With `dynamodb`, idempotent offset allocation is atomic: the producer's last
   batch and the real base offset are stored in the same conditional write that
   advances the counter, pinned to the previously read state, so concurrent
   same-producer requests cannot bypass sequence validation or duplicate
   offsets. The DynamoDB metastore is exercised against a real DynamoDB in CI
   (`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` set).
+- Diskless topics support typed schemas, `export_enabled`, and Parquet/SQL
+  exactly like classic topics: the partition leader exports the committed
+  diskless log (bounded by the diskless committed watermark) through the same
+  Parquet pipeline. Background small-segment compaction (`diskless.compaction`)
+  merges committed refs below the watermark without moving it.
 
 ## Query Mode
 
