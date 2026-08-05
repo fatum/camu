@@ -93,6 +93,28 @@ Pass `--faults` as a comma-separated list or use `run.sh <faults> <seconds>`.
 | `s3-partition` | Block MinIO access on one node | Object-store isolation handling |
 | `clock-skew` | Inject clock drift | Lease timing assumptions |
 | `leader-kill` | Kill the active leader for busy partitions | Promoted-leader recovery and readable failover |
+| `leader-pause-then-ack` | Pause the active leader past lease expiry, let a new leader be elected, then resume the stale leader | Stale-leader fencing: a resumed leader must not acknowledge a write the current ISR quorum does not hold |
+
+## Kafka API Status
+
+The `--api kafka` path uses an `acks=all` + idempotent Java producer and the
+same checker suite (minus the HTTP-only `single-leader` checker). The existing
+HTTP matrix above is HTTP-API only.
+
+- `leader-pause-then-ack` (Kafka, `rf=3`, `minISR=2`): **Pass** — 390 acked, 0
+  lost. This verifies the Kafka produce path waits for the ISR quorum: a stale
+  leader resumed after lease expiry does not acknowledge uncommitted writes.
+- `leader-kill` (Kafka, `rf=3`, `minISR=2`): **Pass** — 337 acked, 0 lost, 0
+  missing. Previously this failed (35 lost): a demoted leader's local epoch
+  sidecar lagged its actual leader epoch (promotions never persisted it), so a
+  later state reload reported a stale epoch and the new leader's divergence
+  check fenced the demoted leader's committed tail. The fix persists the leader
+  epoch to the sidecar on the failover-time promotion paths
+  (`become_leader`, `attemptPartitionLeadership`); the startup
+  `initPartitionAsLeader` path is deliberately excluded because a synchronous
+  write there perturbed a timing-sensitive rf=2/minISR=1 integration test. The
+  base branch loses 81 records under the identical run. See
+  `store/camu-kafka/20260804T190713.515Z` for the passing run.
 
 ## Checkers
 

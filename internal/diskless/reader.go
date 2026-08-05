@@ -19,15 +19,18 @@ func NewReader(s3 *storage.S3Client, meta MetaStore) *Reader {
 }
 
 // Fetch returns concatenated RecordBatch bytes for [fromOffset, ...) up to maxBytes,
-// along with the high watermark (partition head). Returns (nil, head, nil) if
-// fromOffset >= head or no segments match.
+// along with the committed high watermark (the highest offset durably
+// materialized for the partition). Returns (nil, committedHead, nil) if
+// fromOffset >= committedHead or no segments match. The committed head is
+// distinct from the allocation counter: it only reflects registered segments,
+// so a reader never sees offsets that were allocated but not yet persisted.
 func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOffset int64, maxBytes int) ([]byte, int64, error) {
-	head, err := r.meta.GetPartitionHead(ctx, topic, partition)
+	committedHead, err := r.meta.GetCommittedHead(ctx, topic, partition)
 	if err != nil {
-		return nil, 0, fmt.Errorf("get partition head: %w", err)
+		return nil, 0, fmt.Errorf("get committed head: %w", err)
 	}
-	if fromOffset >= head {
-		return nil, head, nil
+	if fromOffset >= committedHead {
+		return nil, committedHead, nil
 	}
 
 	refs, err := r.meta.QuerySegments(ctx, topic, partition, fromOffset, maxBytes)
@@ -35,11 +38,17 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOff
 		return nil, 0, fmt.Errorf("query segments: %w", err)
 	}
 	if len(refs) == 0 {
-		return nil, head, nil
+		return nil, committedHead, nil
 	}
 
+	// Only expose refs at or below the committed head. A flush registers its
+	// refs before advancing the committed head, so a reader querying between
+	// the two never sees a partially-registered batch (un-acked data).
 	var result []byte
 	for _, ref := range refs {
+		if ref.EndOffset > committedHead {
+			continue
+		}
 		chunk, err := r.s3.GetRange(ctx, ref.FileKey, ref.ByteOffset, ref.ByteLength)
 		if err != nil {
 			return nil, 0, fmt.Errorf("s3 get range %s [%d:%d]: %w",
@@ -48,5 +57,5 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOff
 		result = append(result, chunk...)
 	}
 
-	return result, head, nil
+	return result, committedHead, nil
 }

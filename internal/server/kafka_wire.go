@@ -83,7 +83,7 @@ func (ks *KafkaServer) HandleRequest(ctx context.Context, req kmsg.Request) (res
 	case *kmsg.DeleteACLsRequest:
 		return ks.handleDeleteACLs(req)
 	case *kmsg.ProduceRequest:
-		return ks.handleProduce(req)
+		return ks.handleProduce(ctx, req)
 	case *kmsg.FetchRequest:
 		return ks.handleFetch(ctx, req)
 	default:

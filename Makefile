@@ -31,6 +31,17 @@ test-unit: ## Run unit tests
 test-integration: ## Run integration tests (requires running MinIO/S3)
 	go test -race -tags integration -timeout 300s -v ./test/integration/
 
+test-dynamodb: ## Run DynamoDB metastore tests (requires DynamoDB Local at localhost:8000)
+	AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+	DYNAMODB_ENDPOINT=http://localhost:8000 \
+	go test -race -tags dynamodb -count=1 -timeout 300s -v ./internal/diskless/
+
+dynamodb-up: ## Start DynamoDB Local in Docker
+	@docker start camu-dynamodb-local >/dev/null 2>&1 || docker run -d --name camu-dynamodb-local -p 8000:8000 amazon/dynamodb-local
+
+dynamodb-down: ## Stop and remove the DynamoDB Local container
+	docker rm -f camu-dynamodb-local
+
 test-bench: ## Run benchmarks
 	go test -tags integration -bench=. -benchmem -timeout 300s ./test/bench/
 

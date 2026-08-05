@@ -85,6 +85,7 @@ type KafkaServerCfg struct {
 	AppendRawBatchFunc          func(ctx context.Context, topic string, partition int, batch []byte) (int64, error)
 	AppendBatchFunc             func(topic string, partition int, batch log.Batch) ([]uint64, error)
 	AppendFunc                  func(topic string, partition int, msgs []log.Message) ([]uint64, error)
+	WaitForReplicatedFunc       func(ctx context.Context, topic string, partition int, offset uint64) error
 	FetchRawBatchesFunc         func(ctx context.Context, topic string, partition int, startOffset int64, maxBytes int) ([]byte, int64, error)
 	FetchFunc                   func(topic string, partition int, startOffset uint64, maxBytes int32) (KafkaFetchResult, error)
 	RequestHandler              func(req kmsg.Request) (kmsg.Response, error)

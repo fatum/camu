@@ -8,7 +8,7 @@ type OffsetAllocation struct {
 	Partition  int
 	Count      int
 	ProducerID int64 // 0 = non-idempotent
-	Sequence   int64 // -1 = non-idempotent
+	Sequence   int64 // first batch sequence; only meaningful when ProducerID != 0
 }
 
 // OffsetResult is the result of an offset allocation.

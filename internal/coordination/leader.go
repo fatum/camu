@@ -12,11 +12,21 @@ import (
 
 const leaderKey = "_coordination/leader.json"
 
+// ErrLeaseFenced is returned by Renew when the stored lease has advanced past
+// the caller's held lease epoch. The caller is a stale leader and must stop
+// acting as the cluster controller regardless of wall-clock lease expiry.
+var ErrLeaseFenced = errors.New("leader lease fenced by a higher-epoch holder")
+
 // LeaderLease represents the current leader's lease.
 type LeaderLease struct {
 	InstanceID string    `json:"instance_id"`
 	ExpiresAt  time.Time `json:"expires_at"`
-	ETag       string    `json:"-"`
+	// LeaseEpoch is a monotonic generation counter of the lease object. It is
+	// bumped on every successful acquire or renew, so the highest epoch is
+	// always the most recent writer. Fencing decisions compare epochs first;
+	// wall-clock expiry only bounds renewal.
+	LeaseEpoch uint64 `json:"lease_epoch"`
+	ETag       string `json:"-"`
 }
 
 // LeaderElection manages leader election via S3 ConditionalPut.
@@ -45,6 +55,7 @@ func (le *LeaderElection) TryAcquire(ctx context.Context) (LeaderLease, bool, er
 	}
 
 	var existingETag string
+	var nextEpoch uint64
 
 	if err == nil {
 		// Lease file exists — check if still valid.
@@ -62,14 +73,16 @@ func (le *LeaderElection) TryAcquire(ctx context.Context) (LeaderLease, bool, er
 			existing.ETag = etag
 			return existing, false, nil
 		}
-		// Lease expired — try to take over.
+		// Lease expired — try to take over, bumping past the prior generation.
 		existingETag = etag
+		nextEpoch = existing.LeaseEpoch + 1
 	}
 	// No lease or expired lease — try to acquire.
 
 	newLease := LeaderLease{
 		InstanceID: le.instanceID,
 		ExpiresAt:  time.Now().Add(le.ttl),
+		LeaseEpoch: nextEpoch,
 	}
 	encoded, err := json.Marshal(newLease)
 	if err != nil {
@@ -94,11 +107,24 @@ func (le *LeaderElection) TryAcquire(ctx context.Context) (LeaderLease, bool, er
 }
 
 // Renew extends the leader lease TTL. Only works if this instance is the
-// current leader (verified via ETag).
+// current leader (verified via ETag). As defense-in-depth beyond the CAS, Renew
+// re-reads the stored lease and rejects with ErrLeaseFenced when the stored
+// epoch has advanced past the caller's held epoch.
 func (le *LeaderElection) Renew(ctx context.Context, lease LeaderLease) (LeaderLease, error) {
+	cur, _, err := le.s3Client.GetWithETag(ctx, leaderKey)
+	if err == nil {
+		var curLease LeaderLease
+		if jsonErr := json.Unmarshal(cur, &curLease); jsonErr == nil && curLease.LeaseEpoch > lease.LeaseEpoch {
+			return LeaderLease{}, fmt.Errorf("%w: stored epoch %d, held epoch %d", ErrLeaseFenced, curLease.LeaseEpoch, lease.LeaseEpoch)
+		}
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return LeaderLease{}, fmt.Errorf("leader: renew get: %w", err)
+	}
+
 	renewed := LeaderLease{
 		InstanceID: le.instanceID,
 		ExpiresAt:  time.Now().Add(le.ttl),
+		LeaseEpoch: lease.LeaseEpoch + 1,
 	}
 	encoded, err := json.Marshal(renewed)
 	if err != nil {

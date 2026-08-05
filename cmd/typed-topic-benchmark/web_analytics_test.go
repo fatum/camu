@@ -71,10 +71,17 @@ func TestWebAnalyticsEventRoundTripsThroughTypedValue(t *testing.T) {
 	}
 }
 
-func TestWebAnalyticsPurchaseCount(t *testing.T) {
-	for count, want := range map[int64]int64{0: 0, 1: 0, 4: 1, 5: 1, 8: 2, 1000: 250} {
-		if got := webAnalyticsPurchaseCount(count); got != want {
-			t.Fatalf("webAnalyticsPurchaseCount(%d) = %d, want %d", count, got, want)
+func TestWebAnalyticsDimensionsAreSchemaColumns(t *testing.T) {
+	fields := map[string]bool{}
+	for _, f := range webAnalyticsSchemaFields() {
+		fields[f["name"].(string)] = true
+	}
+	for _, dim := range webAnalyticsDimensions {
+		if !fields[dim.Column] {
+			t.Fatalf("dimension column %q is not a schema column — the SQL GROUP BY check would fail", dim.Column)
+		}
+		if len(dim.pool) == 0 {
+			t.Fatalf("dimension %q has an empty value pool", dim.Column)
 		}
 	}
 }
@@ -82,7 +89,17 @@ func TestWebAnalyticsPurchaseCount(t *testing.T) {
 func TestVerifyWebAnalyticsSQL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rows":[[250]]}`))
+		var req struct {
+			SQL string `json:"sql"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if strings.Contains(req.SQL, "distinct event_id") {
+			_, _ = w.Write([]byte(`{"rows":[[1000,1000]]}`))
+			return
+		}
+		_, _ = w.Write([]byte(webAnalyticsGroupByRows(t, req.SQL, 1000)))
 	}))
 	defer server.Close()
 	cfg := config{ExportEnabled: true, Topic: "events"}
@@ -92,18 +109,78 @@ func TestVerifyWebAnalyticsSQL(t *testing.T) {
 	}
 }
 
-func TestVerifyWebAnalyticsSQLMismatch(t *testing.T) {
+func TestVerifyWebAnalyticsSQLRejectsDuplicates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rows":[[0]]}`))
+		_, _ = w.Write([]byte(`{"rows":[[1000,999]]}`))
 	}))
 	defer server.Close()
 	cfg := config{ExportEnabled: true, Topic: "events"}
 	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
 	err := verifyWebAnalyticsSQL(context.Background(), c, cfg, 1000)
-	if err == nil || !strings.Contains(err.Error(), "want 250") {
-		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want count mismatch", err)
+	if err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want duplicate detection", err)
 	}
+}
+
+func TestVerifyWebAnalyticsSQLRejectsUnexpectedDimensionValue(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var req struct {
+			SQL string `json:"sql"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if strings.Contains(req.SQL, "distinct event_id") {
+			_, _ = w.Write([]byte(`{"rows":[[1000,1000]]}`))
+			return
+		}
+		if strings.Contains(req.SQL, "event_type") {
+			_, _ = w.Write([]byte(`{"rows":[["bogus",1000]]}`))
+			return
+		}
+		_, _ = w.Write([]byte(webAnalyticsGroupByRows(t, req.SQL, 1000)))
+	}))
+	defer server.Close()
+	cfg := config{ExportEnabled: true, Topic: "events"}
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	err := verifyWebAnalyticsSQL(context.Background(), c, cfg, 1000)
+	if err == nil || !strings.Contains(err.Error(), "unexpected value") {
+		t.Fatalf("verifyWebAnalyticsSQL() error = %v, want unexpected-value rejection", err)
+	}
+}
+
+// webAnalyticsGroupByRows returns the JSON rows a correct /v1/sql GROUP BY
+// response would contain for the given query and record count, mirroring the
+// deterministic sequence-derived distribution.
+func webAnalyticsGroupByRows(t *testing.T, query string, count int64) string {
+	t.Helper()
+	body := strings.TrimPrefix(query, "SELECT ")
+	col := strings.TrimSpace(strings.SplitN(body, ",", 2)[0])
+	for _, dim := range webAnalyticsDimensions {
+		if dim.Column == col {
+			poolSize := int64(len(dim.pool))
+			q, rem := count/poolSize, count%poolSize
+			rows := [][]any{}
+			for i, value := range dim.pool {
+				n := q
+				if int64(i) < rem {
+					n++
+				}
+				if n > 0 {
+					rows = append(rows, []any{value, n})
+				}
+			}
+			b, err := json.Marshal(map[string]any{"rows": rows})
+			if err != nil {
+				t.Fatalf("marshal rows: %v", err)
+			}
+			return string(b)
+		}
+	}
+	t.Fatalf("unexpected dimension column %q in query: %s", col, query)
+	return ""
 }
 
 func TestBenchmarkEventDefaultsToTypedValue(t *testing.T) {

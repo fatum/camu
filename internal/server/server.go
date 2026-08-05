@@ -59,7 +59,9 @@ type Server struct {
 	leaderElection  *coordination.LeaderElection
 	assignmentStore *coordination.AssignmentStore
 	isrStore        *replication.ISRStore
-	leaderLease     coordination.LeaderLease
+	// leaderLease is atomic because renewLeases replaces it while Kafka
+	// metadata/offset handlers read it concurrently.
+	leaderLease     atomic.Pointer[coordination.LeaderLease]
 	readAssignments func(ctx context.Context, topic string) (coordination.TopicAssignments, error)
 
 	controllerState  atomic.Pointer[coordination.ControllerState]
@@ -89,6 +91,13 @@ type Server struct {
 	leaseTTL             time.Duration
 	leaseRenewalInterval time.Duration
 	replicationTimeout   time.Duration
+	fenceInterval        time.Duration
+
+	// fenceMu guards fenceVerified, the per-partition last-verified timestamps
+	// for rf=1 ack-time ownership checks.
+	fenceMu        sync.Mutex
+	fenceVerified  map[string]time.Time
+	fenceCheckFunc func(ctx context.Context, topic string, partitionID int, epoch uint64) bool
 
 	// shuttingDown is set to 1 during shutdown; produce handlers check this
 	// and reject new writes with 503 before batcher/local state are torn down.
@@ -223,6 +232,17 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	if err != nil {
 		return nil, fmt.Errorf("parsing coordination.replication_timeout: %w", err)
 	}
+	replicationReadTimeout, err := cfg.Coordination.ReplicationReadTimeoutDuration()
+	if err != nil {
+		return nil, fmt.Errorf("parsing coordination.replication_read_timeout: %w", err)
+	}
+	if replicationReadTimeout <= 0 {
+		return nil, fmt.Errorf("coordination.replication_read_timeout must be > 0")
+	}
+	fenceInterval, err := cfg.Coordination.FenceIntervalDuration()
+	if err != nil {
+		return nil, fmt.Errorf("parsing coordination.fence_interval: %w", err)
+	}
 	if leaseTTL <= 0 {
 		return nil, fmt.Errorf("coordination.lease_ttl must be > 0")
 	}
@@ -234,6 +254,9 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	}
 	if leaseRenewalInterval >= leaseTTL {
 		return nil, fmt.Errorf("coordination.heartbeat_interval (%s) must be less than coordination.lease_ttl (%s)", leaseRenewalInterval, leaseTTL)
+	}
+	if fenceInterval <= 0 {
+		return nil, fmt.Errorf("coordination.fence_interval must be > 0")
 	}
 
 	pm, err := NewPartitionManager(cfg, s3Client)
@@ -258,12 +281,14 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	s.leaseTTL = leaseTTL
 	s.leaseRenewalInterval = leaseRenewalInterval
 	s.replicationTimeout = replicationTimeout
+	s.fenceInterval = fenceInterval
+	s.fenceVerified = make(map[string]time.Time)
 	s.readAssignments = s.assignmentStore.Read
 	s.groupCoord.controllerEpoch = s.currentControllerEpoch
 
 	s.internalClient = replication.NewH2CClient(replicationTimeout)
 	s.assignmentPusher = NewAssignmentPusher(s.internalClient)
-	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown, replicationTimeout)
+	s.followerFetcher = replication.NewFollowerFetcher(s.partitionFollower().handleLeaderDown, replicationReadTimeout)
 
 	// Wire ownership check into partition manager — verifies from assignment store at flush time.
 	// If ownership lost, revokes the partition so future writes are rejected locally.
@@ -356,6 +381,8 @@ func (s *Server) startWithListener(ln net.Listener) error {
 		return fmt.Errorf("init existing topics: %w", err)
 	}
 	switch s.cfg.Diskless.MetaStore {
+	case "s3":
+		s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
 	case "dynamodb":
 		dms, err := diskless.NewDynamoMetaStore(context.Background(), diskless.DynamoMetaStoreConfig{
 			TablePrefix: s.cfg.Diskless.DynamoDB.TablePrefix,
@@ -435,6 +462,7 @@ func (s *Server) startKafkaServer(port int) {
 		AppendRawBatchFunc:          s.handleKafkaAppendRawBatch,
 		AppendBatchFunc:             s.handleKafkaAppendBatch,
 		AppendFunc:                  s.handleKafkaAppend,
+		WaitForReplicatedFunc:       s.waitForKafkaReplicated,
 		FetchRawBatchesFunc:         s.handleKafkaFetchRawBatches,
 		FetchFunc:                   s.handleKafkaFetch,
 		BrokerID:                    brokerID,
@@ -552,6 +580,18 @@ func (s *Server) handleKafkaAppendRawBatch(ctx context.Context, topic string, pa
 	}
 
 	return pm.AppendRawBatch(ctx, topic, partition, batch)
+}
+
+// waitForKafkaReplicated blocks until the given offset is readable at the high
+// watermark (ISR quorum confirmed) or the replication timeout expires. It is
+// the Kafka produce counterpart of waitForReplicatedOffset used by the HTTP
+// path, so acks=all clients get the same durability contract.
+func (s *Server) waitForKafkaReplicated(ctx context.Context, topic string, partition int, offset uint64) error {
+	ps := s.partitionManager.GetPartitionState(topic, partition)
+	if ps == nil {
+		return nil
+	}
+	return waitForReplicatedOffset(ctx, ps, offset, s.replicationTimeout)
 }
 
 func (s *Server) handleKafkaInitProducerID(ctx context.Context, req *kmsg.InitProducerIDRequest) (*kmsg.InitProducerIDResponse, error) {
@@ -931,7 +971,11 @@ func (s *Server) getOwnedEpochs(topic string) map[int]uint64 {
 
 // amLeader returns true if this instance currently holds a valid leader lease.
 func (s *Server) amLeader() bool {
-	return s.leaderLease.InstanceID == s.instanceID && time.Now().Before(s.leaderLease.ExpiresAt)
+	lease := s.leaderLease.Load()
+	if lease == nil {
+		return false
+	}
+	return lease.InstanceID == s.instanceID && time.Now().Before(lease.ExpiresAt)
 }
 
 // initialCoordination runs leader election and assignment on startup.
@@ -943,7 +987,7 @@ func (s *Server) initialCoordination() {
 	if err != nil {
 		slog.Warn("initialCoordination: leader election failed", "error", err)
 	} else if acquired {
-		s.leaderLease = lease
+		s.leaderLease.Store(&lease)
 		slog.Info("initialCoordination: became leader", "instance", s.instanceID)
 	} else {
 		slog.Info("initialCoordination: not leader", "instance", s.instanceID, "leader", lease.InstanceID)
@@ -1096,6 +1140,8 @@ func (s *Server) applyAssignmentsForTopics(ctx context.Context, topics []meta.To
 // applyDisklessAssignments reads assignments for a diskless topic and updates
 // the local ownership cache without initializing partition managers.
 func (s *Server) applyDisklessAssignments(ctx context.Context, tc meta.TopicConfig) {
+	s.markTopicDiskless(tc.Name)
+
 	assigned, err := s.readAssignments(ctx, tc.Name)
 	if err != nil {
 		// Fallback: assume we own all partitions (single-node case).
@@ -1287,7 +1333,15 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	ps.isLeader = true
 	ps.leaderID = ""
 	ps.epoch = pa.LeaderEpoch
+	// The leader can produce and read beyond its local active tail: sealed
+	// segments in the refreshed index are served from object storage. A
+	// promoted replica whose local tail is empty (or short) must continue at
+	// the index's next offset, or the recovery HW below gets capped to the
+	// stale local log end and committed S3 records become unreadable.
 	ps.nextOffset = logEnd
+	if indexNext := ps.index.NextOffset(); indexNext > ps.nextOffset {
+		ps.nextOffset = indexNext
+	}
 	ps.epochHistory = eh
 	ps.mu.Unlock()
 	if ehChanged || eh != prevEpochHistory {
@@ -1361,14 +1415,18 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 
 	if topicCfg.ReplicationFactor > 1 {
 		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
-		if err := s.isrStore.Write(ctx, topic, replication.ISRState{
-			Partition:     pid,
-			ISR:           []string{s.instanceID},
-			Leader:        s.instanceID,
-			LeaderEpoch:   pa.LeaderEpoch,
-			HighWatermark: recoveredHW,
-		}, ""); err != nil {
-			slog.Warn("initPartitionAsLeader: write ISR", "topic", topic, "partition", pid, "error", err)
+		// The guarded update refuses to clobber a higher-epoch leader's state;
+		// a stale-epoch rejection aborts the promotion entirely.
+		if err := s.isrStore.Update(ctx, topic, pid, pa.LeaderEpoch, func(_ replication.ISRState) (replication.ISRState, error) {
+			return replication.ISRState{
+				ISR:           []string{s.instanceID},
+				Leader:        s.instanceID,
+				HighWatermark: recoveredHW,
+			}, nil
+		}); err != nil {
+			if s.abortPromotionOnStaleISR(ctx, topic, pid, err, ps) {
+				return
+			}
 		}
 	}
 
@@ -1555,22 +1613,26 @@ func (s *Server) renewLeases() {
 
 	// Try to become/stay leader.
 	if s.amLeader() {
-		renewed, err := s.leaderElection.Renew(ctx, s.leaderLease)
+		cur := s.leaderLease.Load()
+		if cur == nil {
+			cur = &coordination.LeaderLease{}
+		}
+		renewed, err := s.leaderElection.Renew(ctx, *cur)
 		if err != nil {
 			slog.Warn("renewLeases: lost leadership", "error", err)
-			s.leaderLease = coordination.LeaderLease{} // zero out
+			s.leaderLease.Store(&coordination.LeaderLease{}) // zero out
 			if s.controllerState.Load() != nil {
 				s.stopController()
 			}
 		} else {
-			s.leaderLease = renewed
+			s.leaderLease.Store(&renewed)
 		}
 	} else {
 		lease, acquired, err := s.leaderElection.TryAcquire(ctx)
 		if err != nil {
 			slog.Debug("renewLeases: leader election failed", "error", err)
 		} else if acquired {
-			s.leaderLease = lease
+			s.leaderLease.Store(&lease)
 			slog.Info("renewLeases: became leader", "instance", s.instanceID)
 		}
 	}
@@ -1649,6 +1711,88 @@ func (s *Server) verifyOwnershipFromS3(topic string, partitionID int) bool {
 	return true
 }
 
+// verifyPartitionFence re-checks rf=1 partition ownership against the
+// authoritative assignment store, amortized by fenceInterval. It closes the
+// window in which a fenced leader keeps acknowledging writes: the first produce
+// after fenceInterval performs a fresh ownership read, and lost leadership
+// immediately revokes the local partition so all future produces fail closed.
+func (s *Server) verifyPartitionFence(ctx context.Context, topic string, partitionID int, epoch uint64) bool {
+	if s.fenceInterval <= 0 {
+		return true
+	}
+	fenceKey := topic + "/" + strconv.Itoa(partitionID)
+	s.fenceMu.Lock()
+	if last, ok := s.fenceVerified[fenceKey]; ok && time.Since(last) < s.fenceInterval {
+		s.fenceMu.Unlock()
+		return true
+	}
+	s.fenceMu.Unlock()
+
+	assigned, err := s.readAssignments(ctx, topic)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			// No authoritative assignment published yet — fall back to the local
+			// ownership cache (same as verifyOwnershipFromS3).
+			return s.isOwnedPartition(topic, partitionID)
+		}
+		// Cannot confirm ownership against the authoritative store — fail closed.
+		slog.Warn("verifyPartitionFence: read failed", "topic", topic, "partition", partitionID, "error", err)
+		return false
+	}
+	pa, ok := assigned.Partitions[partitionID]
+	if !ok || pa.Leader != s.instanceID || pa.LeaderEpoch != epoch {
+		slog.Warn("verifyPartitionFence: lost",
+			"topic", topic, "partition", partitionID,
+			"owner", pa.Leader, "assignment_epoch", pa.LeaderEpoch,
+			"self", s.instanceID, "local_epoch", epoch)
+		s.revokePartition(topic, partitionID)
+		return false
+	}
+
+	s.fenceMu.Lock()
+	s.fenceVerified[fenceKey] = time.Now()
+	s.fenceMu.Unlock()
+	return true
+}
+
+// onISRWriteError handles an ISR state write failure. A stale-epoch rejection
+// means this node is no longer the partition leader: ownership is revoked
+// immediately so produce stops acknowledging and the node re-converges on the
+// next assignment apply cycle.
+func (s *Server) onISRWriteError(topic string, pid int, err error) {
+	if errors.Is(err, replication.ErrISRStaleEpoch) {
+		slog.Warn("isr_write_fenced", "topic", topic, "partition", pid, "error", err)
+		s.revokePartition(topic, pid)
+		return
+	}
+	slog.Warn("isr_write_failed", "topic", topic, "partition", pid, "error", err)
+}
+
+// abortPromotionOnStaleISR handles an ISR write failure during a promotion.
+// When the write was rejected because a newer leader epoch already owns the
+// partition (ErrISRStaleEpoch), the promotion is stale: this node must not
+// become leader. The helper rolls back the local leader state and ownership,
+// and returns true so the caller aborts the promotion instead of continuing to
+// re-add its own ownership-cache entry. Transient errors are logged and return
+// false so the caller can proceed with best-effort recovery.
+func (s *Server) abortPromotionOnStaleISR(ctx context.Context, topic string, pid int, err error, ps *partitionState) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, replication.ErrISRStaleEpoch) {
+		slog.Warn("promotion_aborted_stale_isr", "topic", topic, "partition", pid, "error", err)
+		ps.mu.Lock()
+		ps.isLeader = false
+		ps.replicaState = nil
+		ps.leaderID = ""
+		ps.mu.Unlock()
+		s.revokePartition(topic, pid)
+		return true
+	}
+	s.onISRWriteError(topic, pid, err)
+	return false
+}
+
 // verifyProduceLeadership fences stale leaders on the write path using the
 // locally applied assignment epoch. This avoids an assignment-store read on
 // every produce while still rejecting any producer request that raced a
@@ -1656,8 +1800,7 @@ func (s *Server) verifyOwnershipFromS3(topic string, partitionID int) bool {
 //
 // It also checks ownership, so callers can skip a separate isOwnedPartition
 // call on the produce hot path.
-func (s *Server) verifyProduceLeadership(topic string, partitionID int, localEpoch uint64) bool {
-	s.assignmentsMu.RLock()
+func (s *Server) verifyProduceLeadership(topic string, partitionID int, localEpoch uint64) bool {	s.assignmentsMu.RLock()
 	defer s.assignmentsMu.RUnlock()
 
 	parts, ok := s.myPartitions[topic]
@@ -1788,26 +1931,34 @@ func (s *Server) checkISRLag(ctx context.Context) {
 	defer s.partitionManager.mu.RUnlock()
 	for topic, parts := range s.partitionManager.partitions {
 		for pid, ps := range parts {
-			ps.mu.RLock()
+			ps.mu.Lock()
 			isLeader := ps.isLeader
 			rs := ps.replicaState
 			epoch := ps.epoch
-			ps.mu.RUnlock()
-			if isLeader && rs != nil {
-				changed := rs.CheckISRLag(30 * time.Second)
-				if changed || rs.ISRChanged() {
-					rs.ClearISRChanged()
-					isr := rs.GetISRMembers()
-					if err := s.isrStore.Write(ctx, topic, replication.ISRState{
-						Partition:     pid,
-						ISR:           isr,
-						Leader:        s.instanceID,
-						LeaderEpoch:   epoch,
-						HighWatermark: rs.HighWatermark(),
-					}, ""); err != nil {
-						slog.Warn("checkISRExpansion: write ISR", "topic", topic, "pid", pid, "error", err)
-					}
-				}
+			if !isLeader || rs == nil {
+				ps.mu.Unlock()
+				continue
+			}
+			// CheckISRLag mutates the ISR set, so it must run under the same
+			// partition lock as the replica fetch path (UpdateFollower).
+			changed := rs.CheckISRLag(30 * time.Second) || rs.ISRChanged()
+			if !changed {
+				ps.mu.Unlock()
+				continue
+			}
+			rs.ClearISRChanged()
+			isr := rs.GetISRMembers()
+			hw := rs.HighWatermark()
+			ps.mu.Unlock()
+
+			if err := s.isrStore.Update(ctx, topic, pid, epoch, func(_ replication.ISRState) (replication.ISRState, error) {
+				return replication.ISRState{
+					ISR:           isr,
+					Leader:        s.instanceID,
+					HighWatermark: hw,
+				}, nil
+			}); err != nil {
+				s.onISRWriteError(topic, pid, err)
 			}
 		}
 	}

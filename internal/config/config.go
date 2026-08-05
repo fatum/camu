@@ -60,7 +60,7 @@ type SQLConfig struct {
 type DisklessConfig struct {
 	LingerMs      int            `yaml:"linger_ms"`       // Max buffer time before flush (default 250)
 	MaxBatchBytes int64          `yaml:"max_batch_bytes"` // Max buffer size before flush (default 8MiB)
-	MetaStore     string         `yaml:"metastore"`       // "memory" (default) or "dynamodb"
+	MetaStore     string         `yaml:"metastore"`       // "memory" (default), "s3", or "dynamodb"
 	DynamoDB      DynamoDBConfig `yaml:"dynamodb"`
 }
 
@@ -179,7 +179,9 @@ type CoordinationConfig struct {
 	InstanceTTL               string `yaml:"instance_ttl"`
 	ISRExpansionThreshold     int    `yaml:"isr_expansion_threshold"`
 	ReplicationTimeout        string `yaml:"replication_timeout"`
+	ReplicationReadTimeout    string `yaml:"replication_read_timeout"`
 	MaintenanceMaxConcurrency int    `yaml:"maintenance_max_concurrency"`
+	FenceInterval             string `yaml:"fence_interval"`
 }
 
 const (
@@ -188,7 +190,9 @@ const (
 	defaultRebalanceDelay            = 5 * time.Second
 	defaultISRExpansionThreshold     = 1000
 	defaultReplicationTimeout        = 30 * time.Second
+	defaultReplicationReadTimeout    = 10 * time.Second
 	defaultMaintenanceMaxConcurrency = 4
+	defaultFenceInterval             = 2 * time.Second
 )
 
 func parseDurationOrDefault(raw string, fallback time.Duration) (time.Duration, error) {
@@ -232,11 +236,29 @@ func (c CoordinationConfig) ReplicationTimeoutDuration() (time.Duration, error) 
 	return parseDurationOrDefault(c.ReplicationTimeout, defaultReplicationTimeout)
 }
 
+// ReplicationReadTimeoutDuration returns how long a follower waits for the
+// leader to respond to a fetch before counting it as an error toward
+// leader-down detection. It is independent of the produce purgatory timeout:
+// a healthy leader responds within its ~500ms long-poll window, so this can be
+// far shorter than replication_timeout to detect a paused or unresponsive
+// leader faster.
+func (c CoordinationConfig) ReplicationReadTimeoutDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.ReplicationReadTimeout, defaultReplicationReadTimeout)
+}
+
 func (c CoordinationConfig) MaintenanceMaxConcurrencyValue() int {
 	if c.MaintenanceMaxConcurrency <= 0 {
 		return defaultMaintenanceMaxConcurrency
 	}
 	return c.MaintenanceMaxConcurrency
+}
+
+// FenceIntervalDuration returns how often the rf=1 produce path re-verifies
+// partition ownership against the assignment store before acknowledging. A
+// shorter interval narrows the window in which a fenced leader can ack writes
+// it will later lose, at the cost of more assignment-store reads.
+func (c CoordinationConfig) FenceIntervalDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.FenceInterval, defaultFenceInterval)
 }
 
 func (s SQLConfig) CacheMaxSizeValue() int64 {
@@ -339,6 +361,8 @@ func defaults() *Config {
 			HeartbeatInterval:         defaultHeartbeatInterval.String(),
 			RebalanceDelay:            defaultRebalanceDelay.String(),
 			MaintenanceMaxConcurrency: defaultMaintenanceMaxConcurrency,
+			FenceInterval:             defaultFenceInterval.String(),
+			ReplicationReadTimeout:    defaultReplicationReadTimeout.String(),
 		},
 	}
 }

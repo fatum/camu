@@ -62,9 +62,14 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.isTopicDiskless(r.Context(), topicName) {
-		out, nextOffset, err := s.consumeDisklessMessages(r.Context(), topicName, partitionID, startOffset, limit)
+		out, nextOffset, highWatermark, err := s.consumeDisklessMessages(r.Context(), topicName, partitionID, startOffset, limit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("X-High-Watermark", strconv.FormatUint(highWatermark, 10))
+		if startOffset >= highWatermark {
+			writeJSON(w, 200, consumeResponse{Messages: nil, NextOffset: startOffset})
 			return
 		}
 		writeJSON(w, http.StatusOK, consumeResponse{Messages: out, NextOffset: nextOffset})
@@ -291,7 +296,7 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 
 const disklessConsumeFetchBytes = 64 * 1024
 
-func (s *Server) consumeDisklessMessages(ctx context.Context, topic string, partitionID int, startOffset uint64, limit int) ([]consumedMessage, uint64, error) {
+func (s *Server) consumeDisklessMessages(ctx context.Context, topic string, partitionID int, startOffset uint64, limit int) ([]consumedMessage, uint64, uint64, error) {
 	currentOffset := startOffset
 	nextOffset := startOffset
 	var highWatermark uint64
@@ -300,7 +305,7 @@ func (s *Server) consumeDisklessMessages(ctx context.Context, topic string, part
 	for len(out) < limit {
 		data, hw, err := s.disklessEngine.Fetch(ctx, topic, partitionID, int64(currentOffset), disklessConsumeFetchBytes)
 		if err != nil {
-			return nil, startOffset, fmt.Errorf("diskless fetch: %w", err)
+			return nil, startOffset, highWatermark, fmt.Errorf("diskless fetch: %w", err)
 		}
 		if hw > 0 {
 			highWatermark = uint64(hw)
@@ -311,7 +316,7 @@ func (s *Server) consumeDisklessMessages(ctx context.Context, topic string, part
 
 		msgs, err := log.ReadSegmentBatchesAsMessages(data, currentOffset, limit-len(out))
 		if err != nil {
-			return nil, startOffset, fmt.Errorf("decode diskless batches: %w", err)
+			return nil, startOffset, highWatermark, fmt.Errorf("decode diskless batches: %w", err)
 		}
 		if len(msgs) == 0 {
 			break
@@ -339,10 +344,10 @@ func (s *Server) consumeDisklessMessages(ctx context.Context, topic string, part
 
 	if len(out) == 0 {
 		if highWatermark > startOffset {
-			return nil, highWatermark, nil
+			return nil, highWatermark, highWatermark, nil
 		}
-		return nil, startOffset, nil
+		return nil, startOffset, highWatermark, nil
 	}
 
-	return out, nextOffset, nil
+	return out, nextOffset, highWatermark, nil
 }

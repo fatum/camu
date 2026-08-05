@@ -86,6 +86,7 @@ TARGET_BYTES="$target_bytes" \
 MESSAGE_BYTES="$message_bytes" \
 PARTITIONS="$partitions" \
 EXPORT_ENABLED="${EXPORT_ENABLED:-true}" \
+STORAGE_MODE="${STORAGE_MODE:-}" \
 CAMU_AUTH_TOKEN="${CAMU_AUTH_TOKEN:-${TF_VAR_benchmark_auth_token:-}}" \
 OUTPUT="$output" \
   "$repo_dir/scripts/typed-topic-benchmark.sh" &

@@ -46,13 +46,14 @@ Jepsen is the strongest evidence for distributed behavior. The repository-local
 harness runs five Camu nodes against MinIO and writes every run's
 `results.edn`, history, and node logs under `jepsen/camu/store/`.
 
-The fault matrix covers kill, leader kill, network partition, pause,
-membership changes, rejoin, object-store partition, clock skew, and selected
-combined faults. The current commands live in
+The fault matrix covers kill, leader kill, leader pause-then-ack, network
+partition, pause, membership changes, rejoin, object-store partition, clock
+skew, and selected combined faults, against both the HTTP and the Kafka
+wire-protocol API. The current commands live in
 [jepsen/camu/README.md](../jepsen/camu/README.md); rely on the persisted result
 for a specific run rather than a stale aggregate availability table.
 
-Replicated HTTP runs check:
+Replicated HTTP and Kafka runs check:
 
 | Checker | What it establishes |
 | --- | --- |
@@ -84,11 +85,13 @@ The Jepsen matrix is primarily a **durability and failover claim**, not a blanke
 | `leave` | Clean flush, deregistration, rebalance |
 | `membership` | Topology churn and reassignment correctness |
 | `partition` | Routing, stale-owner fencing, leader continuity |
+| `partition-ring` | Allow only ring-neighbor node connectivity during the fault |
 | `pause` | Lease expiry and heartbeat failure detection |
 | `rejoin` | Epoch fencing and stale-local-state rejection |
 | `s3-partition` | Object-store isolation handling |
 | `clock-skew` | Lease timing assumptions |
 | `leader-kill` | Promoted-leader recovery and readable failover |
+| `leader-pause-then-ack` | Stale-leader fencing: a resumed leader must not acknowledge a write the current ISR quorum does not hold |
 | Combined faults | Simultaneous failure modes (kill+partition, leader-kill+s3-partition) |
 
 ## Practical Limits
@@ -104,7 +107,7 @@ Camu's correctness model is grounded in native-segment durability with ISR-quoru
 
 1. Writes land in local active segments first
 2. Replicated commits advance through ISR high-watermark tracking
-3. Writes are only acknowledged after the ISR quorum confirms
+3. Writes are only acknowledged after the ISR quorum confirms — on both the HTTP API and the Kafka wire protocol (`acks=0` excepted)
 4. Sealed segments and sidecars persist shared history to object storage
-5. Restarts and failovers recover from native batch data directly
-6. Every claim is backed by a reproducible Jepsen artifact
+5. Restarts and failovers recover from native batch data directly, with promotions persisting the local leader epoch so demoted leaders report the correct epoch
+6. Every claim is backed by a reproducible Jepsen artifact, including Kafka-API leader-kill and leader-pause-then-ack runs

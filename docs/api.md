@@ -38,6 +38,22 @@ Create mode over Kafka:
 
 - `camu.storage.mode=diskless`
 
+Diskless coordination:
+
+- `diskless.metastore` selects the offset/segment-catalog backend:
+  `memory` (default, single-node dev), `s3` (backed by the same object store,
+  so diskless topics run on any S3-compatible service without DynamoDB), or
+  `dynamodb`.
+- With `s3`, offset allocation uses a per-partition head object and
+  conditional-write CAS, and the segment catalog is immutable per-batch-ref
+  objects; both work against any S3-compatible store.
+- With `dynamodb`, idempotent offset allocation is atomic: the producer's last
+  batch and the real base offset are stored in the same conditional write that
+  advances the counter, pinned to the previously read state, so concurrent
+  same-producer requests cannot bypass sequence validation or duplicate
+  offsets. The DynamoDB metastore is exercised against a real DynamoDB in CI
+  (`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` set).
+
 ## Query Mode
 
 Camu also supports a separate runtime role:
@@ -320,10 +336,20 @@ curl -X POST http://localhost:8080/v1/topics/orders/partitions/0/messages \
 
 Current behavior:
 
-- duplicate sequence: accepted as duplicate, not appended again
-- sequence gap: rejected
+- duplicate sequence: accepted as duplicate, not appended again; the response
+  returns the original offsets, and for `diskless` topics carries
+  `"duplicate": true`
+- sequence gap (a skipped sequence number): rejected with 422
+- out-of-order or stale sequence (lower than, or overlapping, the last batch):
+  rejected with 422
 - unknown producer with non-zero sequence: rejected
 - high-level routed produce does not accept idempotent batch bodies
+
+Sequence validation applies to both `classic` and `diskless` topics. For
+`diskless`, the decision is made atomically in the metastore at offset
+allocation (per-producer last batch + the real base offset are stored in the
+same conditional write that advances the counter), so a concurrent stale
+retry is rejected rather than allocating new offsets.
 
 Operational rules:
 
@@ -403,8 +429,13 @@ Kafka admin notes:
 
 Ack semantics:
 
-- `rf=1`, `minISR=1`: durable in the local active segment on the owner
+- `rf=1`, `minISR=1`: durable in the local active segment on the owner, and the
+  ack re-verifies ownership against the assignment store on an amortized
+  `coordination.fence_interval` cadence (default `2s`)
 - `rf>1`: durable on the leader and acknowledged only after ISR quorum confirms
+  (HTTP and Kafka alike)
+- Kafka `acks=0` requests are fire-and-forget and return without waiting for a
+  quorum
 
 Important behavior:
 
@@ -412,6 +443,15 @@ Important behavior:
 - a sealed segment remains available to follower replication while it is pending publication
 - `rf=1` does not survive permanent loss of its only owner before object-store persistence
 - reads are capped by readable high watermark for replicated topics
+- for `diskless` topics, offsets are allocated before the object-store write (the
+  RecordBatch base offset is patched before persistence); a transient PUT or
+  segment-registration failure is retried idempotently so it does not strand
+  allocated offsets as a permanent gap. Only a persistent failure that outlives
+  the flush retry window surfaces an error to the producer
+- the diskless readable high watermark is the committed point (segments that
+  have been durably registered), not the allocation counter: a consumer never
+  sees offsets that were allocated but not yet persisted, and never observes a
+  partially-registered flush
 
 ## Where To Check Exact Support
 

@@ -37,6 +37,8 @@ ecosystem.
   active segment. Followers replicate those bytes without re-encoding.
 - For replicated topics, a produce succeeds only after the high watermark
   passes the written offset: the configured ISR quorum has acknowledged it.
+  This applies to both the HTTP API and the Kafka wire protocol (`acks=0`
+  requests are fire-and-forget and return immediately).
 - Segment sealing and S3 persistence happen in the background. A pending
   sealed segment remains available to follower replication until it is
   published.
@@ -45,7 +47,7 @@ ecosystem.
 
 | Produce configuration | Successful response means |
 | --- | --- |
-| `rf=1`, `minISR=1` | The owner appended the record to its local active segment. |
+| `rf=1`, `minISR=1` | The owner appended the record to its local active segment, and re-verified its ownership against the assignment store (amortized by `coordination.fence_interval`, default `2s`). |
 | `rf>1` | The leader and the configured ISR quorum have the record. |
 
 Object-store persistence is asynchronous in both cases. Do not treat an
@@ -170,8 +172,14 @@ produce, consumer offsets, SQL, and Kafka behavior.
 Core distributed behavior is covered by integration tests and a five-node
 Jepsen harness backed by MinIO. The harness checks acknowledged-write
 durability, leader safety, ordering, high-watermark monotonicity, and replica
-convergence under faults. Its exact scope and latest reproducible runs are in
-[docs/reliability.md](docs/reliability.md).
+convergence under faults. The Jepsen matrix covers both the HTTP and the Kafka
+wire-protocol API, including leader-kill, leader-pause-then-ack, partition,
+pause, clock-skew, and object-store isolation faults; its exact scope and latest
+reproducible runs are in [docs/reliability.md](docs/reliability.md).
+
+The `dynamodb` diskless metastore is exercised against a real DynamoDB in CI
+(`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT`
+pointing at DynamoDB Local).
 
 ## License
 

@@ -108,6 +108,12 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	}
 	ps.mu.Unlock()
 
+	// Persist the leader epoch locally so a later state reload (on demotion or
+	// restart) reports the correct epoch of this node's active tail instead of a
+	// stale follower epoch. This is a failover-time promotion, not the startup
+	// path.
+	s.partitionManager.PersistLocalEpoch(topic, pid, req.Epoch)
+
 	// Persist epoch history locally and to S3.
 	ehPath := s.partitionManager.EpochHistoryPath(topic, pid)
 	if err := eh.SaveToFile(ehPath); err != nil {
@@ -135,14 +141,18 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 		ps.mu.Unlock()
 
 		// Write ISR = [self] to S3 so recovery has a consistent source of truth.
-		if err := s.isrStore.Write(ctx, topic, replication.ISRState{
-			Partition:     pid,
-			ISR:           []string{s.instanceID},
-			Leader:        s.instanceID,
-			LeaderEpoch:   req.Epoch,
-			HighWatermark: recoveredHW,
-		}, ""); err != nil {
-			slog.Warn("becomeLeader: write ISR", "topic", topic, "partition", pid, "error", err)
+		// The guarded update refuses to clobber a higher-epoch leader's state;
+		// a stale-epoch rejection aborts the promotion entirely.
+		if err := s.isrStore.Update(ctx, topic, pid, req.Epoch, func(_ replication.ISRState) (replication.ISRState, error) {
+			return replication.ISRState{
+				ISR:           []string{s.instanceID},
+				Leader:        s.instanceID,
+				HighWatermark: recoveredHW,
+			}, nil
+		}); err != nil {
+			if s.abortPromotionOnStaleISR(ctx, topic, pid, err, ps) {
+				return fmt.Errorf("becomeLeader: %w", err)
+			}
 		}
 	}
 

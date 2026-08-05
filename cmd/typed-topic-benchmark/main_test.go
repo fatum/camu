@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -121,6 +122,97 @@ func TestParseByteSizeRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestDisklessSkipsClusterReadinessAndReplicationWait(t *testing.T) {
+	// An unreachable base proves no network request is made for diskless topics.
+	cfg := config{StorageMode: "diskless"}
+	c := client{base: "http://127.0.0.1:1", http: &http.Client{}, requestTimeout: time.Second}
+	if err := c.waitClusterReady(context.Background(), cfg); err != nil {
+		t.Fatalf("waitClusterReady() error = %v, want nil for diskless", err)
+	}
+	if err := c.waitForReplication(context.Background(), cfg); err != nil {
+		t.Fatalf("waitForReplication() error = %v, want nil for diskless", err)
+	}
+}
+
+func TestDetectTopicStorageMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/topics/disk":
+			_, _ = w.Write([]byte(`{"name":"disk","storage_mode":"diskless"}`))
+		case "/v1/topics/classic":
+			_, _ = w.Write([]byte(`{"name":"classic"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	ctx := context.Background()
+
+	mode, err := c.detectTopicStorageMode(ctx, config{Topic: "disk"})
+	if err != nil || mode != "diskless" {
+		t.Fatalf("diskless mode = %q, err = %v, want diskless", mode, err)
+	}
+	mode, err = c.detectTopicStorageMode(ctx, config{Topic: "classic"})
+	if err != nil || mode != "" {
+		t.Fatalf("classic mode = %q, err = %v, want empty", mode, err)
+	}
+	mode, err = c.detectTopicStorageMode(ctx, config{Topic: "missing"})
+	if err != nil || mode != "" {
+		t.Fatalf("missing mode = %q, err = %v, want empty, nil", mode, err)
+	}
+}
+
+// TestRunSingleOperationConsumeSkipsClusterReadinessForDiskless verifies that a
+// consume run against an existing diskless topic never waits on /v1/cluster/ready
+// even when STORAGE_MODE is not set: the topic's storage mode is detected and
+// readiness is skipped.
+func TestRunSingleOperationConsumeSkipsClusterReadinessForDiskless(t *testing.T) {
+	seenReady := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/topics/bench-diskless":
+			_, _ = w.Write([]byte(`{"name":"bench-diskless","partitions":4,"storage_mode":"diskless"}`))
+		case r.URL.Path == "/v1/cluster/ready":
+			seenReady = true
+			w.WriteHeader(http.StatusInternalServerError)
+		case strings.HasPrefix(r.URL.Path, "/v1/topics/bench-diskless/partitions/") && r.Method == http.MethodGet:
+			w.Header().Set("X-High-Watermark", "0")
+			_, _ = w.Write([]byte(`{"messages":[],"next_offset":0}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	cfg := config{API: "http", Operation: "consume", Topic: "bench-diskless", BaseURL: server.URL, Partitions: 4, MessageBytes: 1024, TargetBytes: 1024, ConsumeTimeout: time.Second, RequestTimeout: time.Second}
+	res := result{Topic: cfg.Topic, Operation: cfg.Operation}
+	runSingleOperation(context.Background(), c, cfg, &res)
+	if seenReady {
+		t.Fatal("benchmark polled /v1/cluster/ready for a diskless topic")
+	}
+	if res.Integrity.Error != "" {
+		t.Fatalf("consume failed: %s", res.Integrity.Error)
+	}
+}
+
+func TestNodeClientRoundRobin(t *testing.T) {
+	cfg := config{NodeURLs: []string{"http://n0:8080", "http://n1:8080", "http://n2:8080"}}
+	c := client{base: "http://default:8080"}
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		seen[c.nodeClient(cfg).base] = true
+	}
+	for _, url := range cfg.NodeURLs {
+		if !seen[url] {
+			t.Fatalf("node %s never selected in round-robin", url)
+		}
+	}
+	if c.base != "http://default:8080" {
+		t.Fatal("nodeClient must not mutate the receiver")
+	}
+}
+
 func TestLoadConfigExportEnabled(t *testing.T) {
 	t.Setenv("EXPORT_ENABLED", "false")
 	cfg, err := loadConfig()
@@ -137,6 +229,78 @@ func TestLoadConfigRejectsSQLWithoutExport(t *testing.T) {
 	t.Setenv("BENCHMARK_OPERATION", "sql")
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig() succeeded, want an error")
+	}
+}
+
+func TestLoadConfigDisklessRequiresNoExport(t *testing.T) {
+	t.Setenv("STORAGE_MODE", "diskless")
+	t.Setenv("EXPORT_ENABLED", "true")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig() succeeded with diskless + export, want an error")
+	}
+	t.Setenv("EXPORT_ENABLED", "false")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StorageMode != "diskless" {
+		t.Fatalf("StorageMode = %q, want diskless", cfg.StorageMode)
+	}
+}
+
+func TestLoadConfigRejectsInvalidStorageMode(t *testing.T) {
+	t.Setenv("STORAGE_MODE", "bogus")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("loadConfig() succeeded with invalid storage mode, want an error")
+	}
+}
+
+func TestCreateOmitsSchemaForDisklessTopic(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/topics/events/routing" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"partitions":{"0":{"replicas":[1]},"1":{"replicas":[1]}}}`))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/topics/events/partitions/") && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-High-Watermark", "0")
+			_, _ = w.Write([]byte(`{"messages":[],"next_offset":0}`))
+			return
+		}
+		if r.URL.Path == "/v1/topics" && r.Method == http.MethodPost {
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+	defer server.Close()
+
+	c := client{base: server.URL, http: &http.Client{}, requestTimeout: time.Second}
+	cfg := config{Topic: "events", Partitions: 2, ReplicationFactor: 1, MinInSyncReplicas: 1, ExportEnabled: false, StorageMode: "diskless"}
+	if err := c.create(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got["storage_mode"] != "diskless" {
+		t.Fatalf("storage_mode = %v, want diskless", got["storage_mode"])
+	}
+	if _, ok := got["schema"]; ok {
+		t.Fatal("diskless topic must not carry a schema")
+	}
+	if got["export_enabled"] != false {
+		t.Fatalf("export_enabled = %v, want false", got["export_enabled"])
+	}
+
+	// Exported classic topics still carry the schema.
+	if err := c.create(context.Background(), config{Topic: "events", Partitions: 2, ReplicationFactor: 1, MinInSyncReplicas: 1, ExportEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["schema"]; !ok {
+		t.Fatal("exported topic must carry a schema")
 	}
 }
 

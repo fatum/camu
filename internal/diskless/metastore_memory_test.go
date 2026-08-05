@@ -26,6 +26,34 @@ func TestMemoryMetaStore_AllocateOffsets_SinglePartition(t *testing.T) {
 	assert.Equal(t, int64(3), results[0].BaseOffset)
 }
 
+func TestMemoryMetaStore_IdempotentAllocation(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemoryMetaStore()
+
+	alloc := OffsetAllocation{Topic: "events", Partition: 0, Count: 3, ProducerID: 7, Sequence: 10}
+	first, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), first[0].BaseOffset)
+	assert.False(t, first[0].Duplicate)
+
+	retry, err := ms.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	require.NoError(t, err)
+	assert.True(t, retry[0].Duplicate)
+	assert.Equal(t, int64(0), retry[0].BaseOffset)
+
+	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 2, ProducerID: 7, Sequence: 13}})
+	require.NoError(t, err)
+	assert.False(t, next[0].Duplicate)
+	assert.Equal(t, int64(3), next[0].BaseOffset)
+
+	_, err = ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 4, ProducerID: 7, Sequence: 10}})
+	require.Error(t, err, "overlapping retry with mismatched count must fail")
+
+	head, err := ms.GetPartitionHead(ctx, "events", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), head, "retry must not advance the counter")
+}
+
 func TestMemoryMetaStore_AllocateOffsets_MultiPartition(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
@@ -132,14 +160,94 @@ func TestMemoryMetaStore_DeleteTopic(t *testing.T) {
 	assert.Empty(t, refs)
 }
 
-func TestMemoryMetaStore_GetPartitionStartUsesHeadWhenNoSegmentsRemain(t *testing.T) {
+// TestMemoryMetaStore_CommittedHeadOnlyAdvancesContiguously verifies that the
+// committed high watermark never advances past an unmaterialized range, even
+// when concurrent writers register adjacent ranges out of order.
+func TestMemoryMetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
 
+	committed := func() int64 {
+		t.Helper()
+		h, err := ms.GetCommittedHead(ctx, "t", 0)
+		require.NoError(t, err)
+		return h
+	}
+	register := func(base, end int64) {
+		t.Helper()
+		require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
+			FileKey:   "f.data",
+			Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: end, ByteLength: end - base}},
+			CreatedAt: time.Now(),
+		}))
+	}
+
+	register(10, 20)
+	assert.Equal(t, int64(0), committed(), "later range alone must not advance past missing prefix")
+
+	register(0, 10)
+	assert.Equal(t, int64(20), committed(), "filled prefix must expose the whole chain")
+
+	register(30, 40)
+	assert.Equal(t, int64(20), committed(), "abandoned range must not advance past gap")
+
+	register(20, 30)
+	assert.Equal(t, int64(40), committed(), "closing the gap advances through the full chain")
+}
+
+// TestMemoryMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix verifies that
+// a flush containing a valid allocation followed by an invalid one is rejected
+// before any offset state advances, so the valid prefix is not abandoned.
+func TestMemoryMetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemoryMetaStore()
+
+	if _, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}}); err != nil {
+		t.Fatalf("seed allocate: %v", err)
+	}
+
+	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103},
+		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 200},
+	})
+	require.Error(t, err, "mixed batch with invalid suffix must fail")
+
+	head, err := ms.GetPartitionHead(ctx, "t", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), head, "no stranded prefix after rejected batch")
+
+	next, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), next[0].BaseOffset, "subsequent valid write continues contiguously")
+}
+
+func TestMemoryMetaStore_GetPartitionStartUsesCommittedWhenNoSegmentsRemain(t *testing.T) {
+	ctx := context.Background()
+	ms := NewMemoryMetaStore()
+
+	// Allocated but never materialized offsets must not be reported as the
+	// readable start: nothing is committed, so the start is 0.
 	_, err := ms.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "events", Partition: 0, Count: 5}})
 	require.NoError(t, err)
 
 	start, err := ms.GetPartitionStart(ctx, "events", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), start)
+
+	// Once a segment is registered, the committed head becomes the start when
+	// nothing else remains.
+	require.NoError(t, ms.RegisterSegment(ctx, SegmentRecord{
+		FileKey: "seg-001.dat",
+		Batches: []BatchRef{{Topic: "events", Partition: 0, BaseOffset: 0, EndOffset: 5, ByteLength: 500}},
+	}))
+	start, err = ms.GetPartitionStart(ctx, "events", 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), start)
+
+	// After the registered segment is expired, the start advances to the
+	// committed head (which stays at 5; it never regresses).
+	require.NoError(t, ms.DeleteFileRefs(ctx, "seg-001.dat"))
+	start, err = ms.GetPartitionStart(ctx, "events", 0)
 	require.NoError(t, err)
 	assert.Equal(t, int64(5), start)
 }

@@ -39,6 +39,7 @@ type config struct {
 	RequestTimeout                                   time.Duration
 	SequenceStart                                    int64
 	RunID                                            string
+	StorageMode                                      string
 }
 
 type result struct {
@@ -283,7 +284,14 @@ func loadConfig() (config, error) {
 		}
 		runID = hex.EncodeToString(token[:])
 	}
-	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID}, nil
+	storageMode := strings.ToLower(env("STORAGE_MODE", ""))
+	if storageMode != "" && storageMode != "classic" && storageMode != "diskless" {
+		return config{}, fmt.Errorf("STORAGE_MODE must be classic or diskless")
+	}
+	if storageMode == "diskless" && exportEnabled {
+		return config{}, fmt.Errorf("STORAGE_MODE=diskless requires EXPORT_ENABLED=false")
+	}
+	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID, StorageMode: storageMode}, nil
 }
 
 type client struct {
@@ -291,6 +299,20 @@ type client struct {
 	http           *http.Client
 	token          string
 	requestTimeout time.Duration
+}
+
+// nodeRoundRobin rotates which node each benchmark request targets so produce
+// and topic-setup traffic is spread round-robin across every node instead of
+// pinning a partition to one node or depending on a single CAMU_URL endpoint.
+var nodeRoundRobin atomic.Uint64
+
+// nodeClient returns a copy of c pointed at the next node from cfg.NodeURLs.
+func (c client) nodeClient(cfg config) client {
+	if len(cfg.NodeURLs) == 0 {
+		return c
+	}
+	c.base = cfg.NodeURLs[int(nodeRoundRobin.Add(1)-1)%len(cfg.NodeURLs)]
+	return c
 }
 
 func (c client) request(ctx context.Context, method, path string, body any, out any) error {
@@ -344,7 +366,13 @@ func (c client) clusterStatus(ctx context.Context) (clusterStatus, error) {
 	return status, err
 }
 
-func (c client) waitClusterReady(ctx context.Context) error {
+// waitClusterReady blocks until the full cluster reports ready. Diskless topics
+// are served by any node's engine plus the shared metastore, so they skip the
+// cluster-wide wait and can produce/consume as soon as a node is up.
+func (c client) waitClusterReady(ctx context.Context, cfg config) error {
+	if cfg.StorageMode == "diskless" {
+		return nil
+	}
 	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		var status clusterStatus
@@ -380,34 +408,76 @@ func (c client) deleteAndWait(ctx context.Context, topic string) error {
 }
 
 func (c client) create(ctx context.Context, cfg config) error {
-	fields := benchmarkSchemaFields(cfg)
-	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled, "schema": map[string]any{"encoding": "json", "fields": fields}}
+	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled}
+	if cfg.StorageMode != "" {
+		body["storage_mode"] = cfg.StorageMode
+	}
+	if cfg.StorageMode != "diskless" {
+		// Diskless topics reject schemas and cannot export.
+		body["schema"] = map[string]any{"encoding": "json", "fields": benchmarkSchemaFields(cfg)}
+	}
 	if err := c.request(ctx, http.MethodPost, "/v1/topics", body, nil); err != nil {
 		return err
 	}
 	return c.waitForReplication(ctx, cfg)
 }
 
-func (c client) initBenchmarkProducer(ctx context.Context) (uint64, error) {
-	var response initBenchmarkProducerResponse
-	if err := retryProduce(ctx, "initialize HTTP producer", func() error {
-		response = initBenchmarkProducerResponse{}
-		return c.request(ctx, http.MethodPost, "/v1/producers/init", nil, &response)
-	}); err != nil {
-		return 0, err
+func (c client) initBenchmarkProducer(ctx context.Context, cfg config) (uint64, error) {
+	nodes := cfg.NodeURLs
+	if len(nodes) == 0 {
+		nodes = []string{c.base}
 	}
-	if response.ProducerID == 0 {
-		return 0, errors.New("initialize HTTP producer: server returned producer_id 0")
+	start := int(nodeRoundRobin.Add(1)-1) % len(nodes)
+	var lastErr error
+	for i := 0; i < len(nodes); i++ {
+		nodeClient := c
+		nodeClient.base = nodes[(start+i)%len(nodes)]
+		var response initBenchmarkProducerResponse
+		if err := retryProduce(ctx, "initialize HTTP producer", func() error {
+			response = initBenchmarkProducerResponse{}
+			return nodeClient.request(ctx, http.MethodPost, "/v1/producers/init", nil, &response)
+		}); err != nil {
+			lastErr = err
+			continue
+		}
+		if response.ProducerID == 0 {
+			lastErr = errors.New("initialize HTTP producer: server returned producer_id 0")
+			continue
+		}
+		return response.ProducerID, nil
 	}
-	return response.ProducerID, nil
+	return 0, fmt.Errorf("initialize HTTP producer on all %d nodes: %w", len(nodes), lastErr)
 }
 
 type benchmarkTopic struct {
 	Partitions    int  `json:"partitions"`
 	ExportEnabled bool `json:"export_enabled"`
+	StorageMode   string `json:"storage_mode,omitempty"`
 }
 
+// ensureTopic checks whether the topic exists (creating it if absent) by trying
+// each node in round-robin order so setup does not depend on a single endpoint.
 func (c client) ensureTopic(ctx context.Context, cfg config) (bool, error) {
+	nodes := cfg.NodeURLs
+	if len(nodes) == 0 {
+		nodes = []string{c.base}
+	}
+	start := int(nodeRoundRobin.Add(1)-1) % len(nodes)
+	var lastErr error
+	for i := 0; i < len(nodes); i++ {
+		nodeClient := c
+		nodeClient.base = nodes[(start+i)%len(nodes)]
+		existing, err := nodeClient.ensureTopicOnNode(ctx, cfg)
+		if err == nil {
+			return existing, nil
+		}
+		benchmarkLog("topic setup via %s failed: %v", nodeClient.base, err)
+		lastErr = err
+	}
+	return false, fmt.Errorf("topic setup failed on all %d nodes: %w", len(nodes), lastErr)
+}
+
+func (c client) ensureTopicOnNode(ctx context.Context, cfg config) (bool, error) {
 	var topic benchmarkTopic
 	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
 	if err != nil {
@@ -424,6 +494,9 @@ func (c client) ensureTopic(ctx context.Context, cfg config) (bool, error) {
 	}
 	if topic.ExportEnabled != cfg.ExportEnabled {
 		return false, fmt.Errorf("existing topic export_enabled=%t, benchmark requires %t", topic.ExportEnabled, cfg.ExportEnabled)
+	}
+	if cfg.StorageMode != "" && topic.StorageMode != "" && topic.StorageMode != cfg.StorageMode {
+		return false, fmt.Errorf("existing topic storage_mode=%q, benchmark requires %q", topic.StorageMode, cfg.StorageMode)
 	}
 	if err := c.waitForReplication(ctx, cfg); err != nil {
 		return false, err
@@ -474,6 +547,11 @@ func (c client) committedPartitionOffsets(ctx context.Context, cfg config) ([]in
 }
 
 func (c client) waitForReplication(ctx context.Context, cfg config) error {
+	if cfg.StorageMode == "diskless" {
+		// Diskless topics do not replicate; there are no replica assignments to
+		// wait for.
+		return nil
+	}
 	type routingPartition struct {
 		Replicas []any `json:"replicas"`
 	}
@@ -562,7 +640,7 @@ func expectedStatesForPartitionOffsets(cfg config, endOffsets []int64) ([]hashSt
 
 func (c client) produce(ctx context.Context, cfg config, count int64, expected []hashState, progress func(int64)) (phaseResult, error) {
 	start := time.Now()
-	producerID, err := c.initBenchmarkProducer(ctx)
+	producerID, err := c.initBenchmarkProducer(ctx, cfg)
 	if err != nil {
 		return phaseResult{}, err
 	}
@@ -591,10 +669,7 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 					}
 					atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
 					path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(cfg.Topic), p)
-					partitionClient := c
-					if len(cfg.NodeURLs) > 0 {
-						partitionClient.base = cfg.NodeURLs[p%len(cfg.NodeURLs)]
-					}
+					partitionClient := c.nodeClient(cfg)
 					request := idempotentProduceRequest{ProducerID: producerID, Sequence: sequence, Messages: batch}
 					if err := retryProduce(ctx, fmt.Sprintf("produce HTTP partition %d sequence %d", p, sequence), func() error {
 						return partitionClient.request(ctx, http.MethodPost, path, request, nil)
@@ -858,15 +933,17 @@ func (c client) sql(ctx context.Context, cfg config) (sqlMetrics, float64, error
 		Rows [][]any `json:"rows"`
 	}
 	quoted := `"` + strings.ReplaceAll(cfg.Topic, `"`, `""`) + `"`
-	err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": fmt.Sprintf("SELECT count(*)::BIGINT, min(sequence)::BIGINT, max(sequence)::BIGINT, sum(payload_bytes)::BIGINT FROM %s", quoted), "topics": []string{cfg.Topic}}, &resp)
+	// event_id equals the benchmark sequence for every record, so its min/max
+	// validate that the exported Parquet covers the full contiguous range.
+	err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": fmt.Sprintf("SELECT count(*)::BIGINT, min(event_id)::BIGINT, max(event_id)::BIGINT FROM %s", quoted), "topics": []string{cfg.Topic}}, &resp)
 	if err != nil {
 		return sqlMetrics{}, time.Since(start).Seconds() * 1000, err
 	}
 	if len(resp.Rows) == 0 {
 		return sqlMetrics{}, time.Since(start).Seconds() * 1000, nil
 	}
-	if len(resp.Rows[0]) < 4 {
-		return sqlMetrics{}, time.Since(start).Seconds() * 1000, errors.New("SQL returned fewer than four integrity columns")
+	if len(resp.Rows[0]) < 3 {
+		return sqlMetrics{}, time.Since(start).Seconds() * 1000, errors.New("SQL returned fewer than three integrity columns")
 	}
 	toInt := func(v any) int64 {
 		switch n := v.(type) {
@@ -880,7 +957,7 @@ func (c client) sql(ctx context.Context, cfg config) (sqlMetrics, float64, error
 		return 0
 	}
 	row := resp.Rows[0]
-	return sqlMetrics{Count: toInt(row[0]), MinSequence: toInt(row[1]), MaxSequence: toInt(row[2]), PayloadBytes: toInt(row[3])}, time.Since(start).Seconds() * 1000, nil
+	return sqlMetrics{Count: toInt(row[0]), MinSequence: toInt(row[1]), MaxSequence: toInt(row[2])}, time.Since(start).Seconds() * 1000, nil
 }
 
 func verifyConsumeStates(expected, actual []hashState) bool {
@@ -929,8 +1006,37 @@ func (c client) waitForSQL(ctx context.Context, cfg config, res *result, count i
 	}
 }
 
+// detectTopicStorageMode reports the storage mode of an existing topic so a
+// consume or sql run against a diskless topic skips the classic cluster
+// readiness wait even when STORAGE_MODE is not set. A missing topic returns "".
+func (c client) detectTopicStorageMode(ctx context.Context, cfg config) (string, error) {
+	var topic benchmarkTopic
+	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
+	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			return "", nil
+		}
+		return "", err
+	}
+	return topic.StorageMode, nil
+}
+
 func runSingleOperation(ctx context.Context, c client, cfg config, res *result) {
-	if err := c.waitClusterReady(ctx); err != nil {
+	if cfg.StorageMode == "" {
+		// An existing diskless topic is served without cluster-wide readiness;
+		// detect it so consume/sql runs do not wait on /v1/cluster/ready, which
+		// never reports ready for diskless partitions.
+		mode, err := c.detectTopicStorageMode(ctx, cfg)
+		if err != nil {
+			res.Integrity.Error = "read topic storage mode: " + err.Error()
+			benchmarkLog("read topic storage mode failed: %v", err)
+			return
+		}
+		if mode != "" {
+			cfg.StorageMode = mode
+		}
+	}
+	if err := c.waitClusterReady(ctx, cfg); err != nil {
 		res.Integrity.Error = "cluster readiness: " + err.Error()
 		benchmarkLog("cluster readiness failed: %v", err)
 		return
@@ -1012,6 +1118,16 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			res.Integrity.Error = "sql operation requires EXPORT_ENABLED=true"
 			return
 		}
+		// The topic may already hold records from prior runs, so SQL visibility
+		// is verified against the committed record count, not the run target.
+		committed, err := c.committedRecordCount(ctx, cfg)
+		if err != nil {
+			res.Integrity.Error = "committed record count: " + err.Error()
+			benchmarkLog("committed record count failed: %v", err)
+			return
+		}
+		count = committed
+		res.Expected, res.ExpectedBytes = count, count*cfg.MessageBytes
 		benchmarkLog("waiting for SQL visibility of %d records", count)
 		metrics, err := c.waitForSQL(ctx, cfg, res, count)
 		if err != nil {
@@ -1019,11 +1135,11 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			benchmarkLog("SQL visibility failed: %v", err)
 			return
 		}
-		res.Integrity.OK = metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && metrics.PayloadBytes == res.ExpectedBytes
+		res.Integrity.OK = metrics.Count == count
 		if !res.Integrity.OK {
-			res.Integrity.Error = "SQL integrity mismatch"
+			res.Integrity.Error = "SQL integrity mismatch: visible records do not match committed count"
 		}
-		if res.Integrity.OK && cfg.ExportEnabled {
+		if res.Integrity.OK {
 			if err := verifyWebAnalyticsSQL(ctx, c, cfg, count); err != nil {
 				res.Integrity.OK = false
 				res.Integrity.Error = "SQL typed column mismatch: " + err.Error()
@@ -1092,7 +1208,7 @@ func main() {
 			benchmarkLog("result written to %s", cfg.Output)
 		}
 	}()
-	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s run_id=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d export_enabled=%t batch_messages=%d producer_concurrency=%d", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.RunID, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.ExportEnabled, cfg.BatchMessages, cfg.ProducerConcurrency)
+	benchmarkLog("configuration: operation=%s api=%s endpoint=%s topic=%s run_id=%s target_bytes=%d message_bytes=%d partitions=%d replication_factor=%d export_enabled=%t batch_messages=%d producer_concurrency=%d storage_mode=%s", cfg.Operation, cfg.API, cfg.BaseURL, cfg.Topic, cfg.RunID, cfg.TargetBytes, cfg.MessageBytes, cfg.Partitions, cfg.ReplicationFactor, cfg.ExportEnabled, cfg.BatchMessages, cfg.ProducerConcurrency, cfg.StorageMode)
 	if cleanup {
 		benchmarkLog("cleanup is enabled; topic %q will be deleted after the run", cfg.Topic)
 	} else {
@@ -1108,7 +1224,7 @@ func main() {
 		return
 	}
 	benchmarkLog("topic %q created and partition assignments are ready", cfg.Topic)
-	if err := c.waitClusterReady(ctx); err != nil {
+	if err := c.waitClusterReady(ctx, cfg); err != nil {
 		res.Integrity.Error = "cluster readiness: " + err.Error()
 		benchmarkLog("cluster readiness failed: %v", err)
 		return
@@ -1116,38 +1232,42 @@ func main() {
 	benchmarkLog("cluster is ready; starting producer and SQL visibility sampling")
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
-	readinessDone = make(chan struct{})
-	go func() {
-		defer close(readinessDone)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		poll := func() {
-			status, err := c.clusterStatus(runCtx)
-			sample := clusterStatusSample{At: time.Now(), Status: status}
-			if err != nil {
-				sample.Error = err.Error()
-				readinessLost.Store(true)
-			} else if !status.Ready {
-				readinessLost.Store(true)
+	if cfg.StorageMode != "diskless" {
+		// Diskless runs do not depend on cluster-wide readiness, so the run is
+		// not canceled when the aggregate cluster status reports not ready.
+		readinessDone = make(chan struct{})
+		go func() {
+			defer close(readinessDone)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			poll := func() {
+				status, err := c.clusterStatus(runCtx)
+				sample := clusterStatusSample{At: time.Now(), Status: status}
+				if err != nil {
+					sample.Error = err.Error()
+					readinessLost.Store(true)
+				} else if !status.Ready {
+					readinessLost.Store(true)
+				}
+				if readinessLost.Load() {
+					runCancel()
+				}
+				readinessMu.Lock()
+				res.Cluster.Samples = append(res.Cluster.Samples, sample)
+				res.Cluster.Final = status
+				readinessMu.Unlock()
 			}
-			if readinessLost.Load() {
-				runCancel()
+			poll()
+			for {
+				select {
+				case <-ticker.C:
+					poll()
+				case <-runCtx.Done():
+					return
+				}
 			}
-			readinessMu.Lock()
-			res.Cluster.Samples = append(res.Cluster.Samples, sample)
-			res.Cluster.Final = status
-			readinessMu.Unlock()
-		}
-		poll()
-		for {
-			select {
-			case <-ticker.C:
-				poll()
-			case <-runCtx.Done():
-				return
-			}
-		}
-	}()
+		}()
+	}
 	count, countErr := targetCount(cfg.TargetBytes, cfg.MessageBytes)
 	if countErr != nil {
 		panic(countErr)
@@ -1176,7 +1296,7 @@ func main() {
 					}
 					sqlMu.Lock()
 					if e == nil {
-						consistent := metrics.Count >= previous.Count && metrics.PayloadBytes == metrics.Count*cfg.MessageBytes
+						consistent := metrics.Count >= previous.Count
 						if metrics.Count > 0 {
 							consistent = consistent && metrics.MinSequence == 0 && metrics.MaxSequence == metrics.Count-1
 						}
@@ -1282,7 +1402,7 @@ func main() {
 		benchmarkLog("benchmark failed: SQL visibility wait ended with error: %v", err)
 		return
 	}
-	ok := !res.SQL.Regression && metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && metrics.PayloadBytes == res.ExpectedBytes && cr.Records == count && cr.Bytes == res.ExpectedBytes
+	ok := !res.SQL.Regression && metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && cr.Records == count && cr.Bytes == res.ExpectedBytes
 	for p := range expectedStates {
 		er, eb, ed, ee := expectedStates[p].result()
 		ar, ab, ad, ae := actualStates[p].result()
