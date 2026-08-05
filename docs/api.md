@@ -45,9 +45,12 @@ Diskless coordination:
   so diskless topics run on any S3-compatible service without DynamoDB), or
   `dynamodb`.
 - With `s3`, offset allocation uses a per-partition head object and
-  conditional-write CAS, and segment references live in a single per-partition
-  catalog object read-modify-written with a CAS, so background compaction can
-  atomically replace a run of refs. Both work against any S3-compatible store.
+  conditional-write CAS. The head is a *bounded window*: a background job rolls
+  old compaction-sized refs into immutable archived checkpoints, so the hot
+  object stays small regardless of history and commits cost O(window) rather
+  than O(all refs). Reads of recent data touch only the head; reads of older
+  data walk the immutable checkpoint chain. Both work against any S3-compatible
+  store.
 - With `dynamodb`, idempotent offset allocation is atomic: the producer's last
   batch and the real base offset are stored in the same conditional write that
   advances the counter, pinned to the previously read state, so concurrent

@@ -494,6 +494,12 @@ func (d *DynamoMetaStore) DeleteFileRefs(ctx context.Context, fileKey string) er
 	return nil
 }
 
+// ArchiveCommitted is a no-op: the DynamoDB metastore stores segment refs as
+// individual rows, so no bounded head object needs archiving.
+func (d *DynamoMetaStore) ArchiveCommitted(_ context.Context, _ string, _ int, _ int64, _ time.Time) (int, error) {
+	return 0, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (d *DynamoMetaStore) DeleteTopic(ctx context.Context, topic string) error {
 	// Delete segments: scan for all partition keys matching this topic.

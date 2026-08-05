@@ -332,6 +332,11 @@ func (m *MemoryMetaStore) ListFileRefs(_ context.Context, fileKey string) ([]Fil
 	return refs, nil
 }
 
+// ArchiveCommitted is a no-op: the memory metastore has no bounded head object.
+func (m *MemoryMetaStore) ArchiveCommitted(_ context.Context, _ string, _ int, _ int64, _ time.Time) (int, error) {
+	return 0, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	m.mu.Lock()

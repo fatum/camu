@@ -63,6 +63,15 @@ type MetaStore interface {
 	// longer referenced by any partition, so their data objects can be deleted.
 	PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error)
 
+	// ArchiveCommitted rolls the oldest compaction-final refs of a partition out
+	// of the backend's hot head window into immutable archived storage, bounding
+	// the head object regardless of history. targetBytes is the size at which a
+	// ref is considered compaction-final (<= 0 means archive anything);
+	// retentionCutoff excludes refs older than it so retention, not archiving,
+	// drops them. Returns the number of refs archived. Backends whose metadata
+	// is not a single bounded object (memory, DynamoDB) no-op.
+	ArchiveCommitted(ctx context.Context, topic string, partition int, targetBytes int64, retentionCutoff time.Time) (int, error)
+
 	// DeleteTopic removes all MetaStore state for a topic.
 	DeleteTopic(ctx context.Context, topic string) error
 

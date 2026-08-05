@@ -26,6 +26,22 @@ type DisklessMergePayload struct {
 	PublishedAt time.Time             `json:"published_at,omitempty"`
 }
 
+// rollDisklessMetadata bounds the S3 metastore's hot head object by archiving
+// compaction-final refs into immutable checkpoints. Run by the partition leader
+// each maintenance tick; no-ops when there is nothing to archive.
+func (s *Server) rollDisklessMetadata(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity) {
+	if s.disklessMeta == nil {
+		return
+	}
+	targetBytes := int64(0)
+	if s.cfg.Diskless.Compaction.Enabled {
+		targetBytes = s.cfg.Diskless.Compaction.TargetBytesValue()
+	}
+	if _, err := s.disklessMeta.ArchiveCommitted(ctx, tc.Name, identity.Partition, targetBytes, time.Now().Add(-tc.Retention)); err != nil {
+		slog.Warn("diskless_archive_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+	}
+}
+
 // discoverDisklessSegmentMergeJobs merges contiguous runs of small committed
 // segments below the committed watermark. It never advances the watermark and
 // only touches refs older than the grace period.

@@ -58,6 +58,7 @@ func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc
 
 	if tc.StorageMode == meta.StorageModeDiskless {
 		p.server.discoverDisklessRetentionJobs(ctx, tc, identity)
+		p.server.rollDisklessMetadata(ctx, tc, identity)
 	} else {
 		p.server.discoverClassicRetentionJobs(ctx, tc, identity)
 	}
