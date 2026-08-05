@@ -101,13 +101,20 @@ const (
 )
 
 func (c CompactionConfig) MinSegmentsValue() int {
-	if c.MinSegments <= 0 {
-		return defaultCompactionMinSegments
+	min := defaultCompactionMinSegments
+	if c.MinSegments > 0 {
+		min = c.MinSegments
 	}
-	if c.MinSegments < minCompactionSegments {
-		return minCompactionSegments
+	if min < minCompactionSegments {
+		min = minCompactionSegments
 	}
-	return c.MinSegments
+	// Clamp the minimum to the effective maximum so the two bounds never become
+	// unreachable (a run is capped at the maximum, so it must be able to reach
+	// the minimum).
+	if max := c.MaxSegmentsPerMergeValue(); min > max {
+		min = max
+	}
+	return min
 }
 
 func (c CompactionConfig) TargetBytesValue() int64 {
@@ -118,13 +125,17 @@ func (c CompactionConfig) TargetBytesValue() int64 {
 }
 
 func (c CompactionConfig) MaxSegmentsPerMergeValue() int {
-	if c.MaxSegmentsPerMerge <= 0 {
-		return defaultCompactionMaxSegmentsPerMerge
+	max := defaultCompactionMaxSegmentsPerMerge
+	if c.MaxSegmentsPerMerge > 0 {
+		max = c.MaxSegmentsPerMerge
 	}
-	if c.MaxSegmentsPerMerge > maxCompactionSegmentsPerMerge {
+	if max < minCompactionSegments {
+		return minCompactionSegments
+	}
+	if max > maxCompactionSegmentsPerMerge {
 		return maxCompactionSegmentsPerMerge
 	}
-	return c.MaxSegmentsPerMerge
+	return max
 }
 
 func (c CompactionConfig) GraceDuration() (time.Duration, error) {

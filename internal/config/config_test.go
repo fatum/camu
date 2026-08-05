@@ -323,4 +323,36 @@ func TestCompactionConfigBounds(t *testing.T) {
 	if got := (config.CompactionConfig{MaxSegmentsPerMerge: 50}).MaxSegmentsPerMergeValue(); got != 50 {
 		t.Fatalf("MaxSegmentsPerMergeValue(50) = %d, want 50", got)
 	}
+	if got := (config.CompactionConfig{MaxSegmentsPerMerge: 1}).MaxSegmentsPerMergeValue(); got != 2 {
+		t.Fatalf("MaxSegmentsPerMergeValue(1) = %d, want 2 (clamped to minimum)", got)
+	}
+
+	// The minimum must never exceed the effective maximum: discovery caps a run
+	// at the maximum, so an unreachable minimum would disable compaction.
+	cases := []struct {
+		min, max, wantMin, wantMax int
+	}{
+		{100, 0, 90, 90},   // min above the default max: clamp min to the max
+		{100, 150, 99, 99}, // both above bounds: min == max == 99
+		{95, 0, 90, 90},    // min above default max (90), max unset
+		{3, 2, 2, 2},       // min above a configured max: clamp min to the max
+	}
+	for _, tc := range cases {
+		cfg := config.CompactionConfig{MinSegments: tc.min, MaxSegmentsPerMerge: tc.max}
+		gotMin, gotMax := cfg.MinSegmentsValue(), cfg.MaxSegmentsPerMergeValue()
+		if gotMin != tc.wantMin || gotMax != tc.wantMax {
+			t.Fatalf("min=%d max=%d -> Min=%d Max=%d, want Min=%d Max=%d", tc.min, tc.max, gotMin, gotMax, tc.wantMin, tc.wantMax)
+		}
+	}
+
+	// The invariant 2 <= min <= max <= 99 must hold for every configuration.
+	for min := 0; min <= 200; min++ {
+		for max := 0; max <= 200; max++ {
+			cfg := config.CompactionConfig{MinSegments: min, MaxSegmentsPerMerge: max}
+			gotMin, gotMax := cfg.MinSegmentsValue(), cfg.MaxSegmentsPerMergeValue()
+			if gotMin < 2 || gotMax < 2 || gotMin > gotMax || gotMax > 99 {
+				t.Fatalf("invariant violated for min=%d max=%d: Min=%d Max=%d", min, max, gotMin, gotMax)
+			}
+		}
+	}
 }
