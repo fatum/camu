@@ -188,6 +188,50 @@ func (m *MemoryMetaStore) rangeRegistered(key string, base, end int64) bool {
 	return false
 }
 
+// ReplaceSegmentRefs atomically removes the refs identified by remove and
+// inserts add into the partition's segment list, so readers never observe a gap
+// or duplicate for the covered range. The committed watermark is not modified.
+func (m *MemoryMetaStore) ReplaceSegmentRefs(_ context.Context, topic string, partition int, remove []RefKey, add []SegmentRef) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := partitionKey(topic, partition)
+	removeSet := make(map[RefKey]bool, len(remove))
+	for _, rk := range remove {
+		removeSet[rk] = true
+	}
+	entries := m.segments[key]
+	kept := make([]segmentEntry, 0, len(entries))
+	changed := false
+	for _, e := range entries {
+		if removeSet[RefKey{BaseOffset: e.baseOffset, EndOffset: e.endOffset}] {
+			changed = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	for _, ref := range add {
+		if m.rangeRegistered(key, ref.BaseOffset, ref.EndOffset) {
+			continue
+		}
+		kept = append(kept, segmentEntry{
+			fileKey:    ref.FileKey,
+			baseOffset: ref.BaseOffset,
+			endOffset:  ref.EndOffset,
+			byteOffset: ref.ByteOffset,
+			byteLength: ref.ByteLength,
+			createdAt:  time.Now(),
+		})
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].baseOffset < kept[j].baseOffset })
+	m.segments[key] = kept
+	return nil
+}
+
 // QuerySegments returns segment references covering [fromOffset, ...) for a
 // given topic-partition, up to maxBytes of data.
 func (m *MemoryMetaStore) QuerySegments(_ context.Context, topic string, partition int,
@@ -198,9 +242,14 @@ func (m *MemoryMetaStore) QuerySegments(_ context.Context, topic string, partiti
 	key := partitionKey(topic, partition)
 	entries := m.segments[key]
 
+	// Keep refs in offset order so compaction selection and the read path see a
+	// consistent view regardless of registration order.
+	sorted := append([]segmentEntry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].baseOffset < sorted[j].baseOffset })
+
 	var refs []SegmentRef
 	var totalBytes int64
-	for _, e := range entries {
+	for _, e := range sorted {
 		if e.endOffset <= fromOffset {
 			continue
 		}
@@ -213,6 +262,7 @@ func (m *MemoryMetaStore) QuerySegments(_ context.Context, topic string, partiti
 			ByteLength: e.byteLength,
 			BaseOffset: e.baseOffset,
 			EndOffset:  e.endOffset,
+			CreatedAt:  e.createdAt,
 		})
 		totalBytes += e.byteLength
 	}
@@ -299,6 +349,27 @@ func (m *MemoryMetaStore) DeleteFileRefs(_ context.Context, fileKey string) erro
 	return nil
 }
 
+// PlanUnreferencedFileDeletes returns the subset of fileKeys that appear in no
+// partition's segment list, so their data objects can be deleted.
+func (m *MemoryMetaStore) PlanUnreferencedFileDeletes(_ context.Context, fileKeys []string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	referenced := make(map[string]bool, len(fileKeys))
+	for _, entries := range m.segments {
+		for _, e := range entries {
+			referenced[e.fileKey] = true
+		}
+	}
+	var deletable []string
+	for _, fileKey := range fileKeys {
+		if !referenced[fileKey] {
+			deletable = append(deletable, fileKey)
+		}
+	}
+	return deletable, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	m.mu.Lock()
@@ -326,17 +397,6 @@ func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 		}
 	}
 	return nil
-}
-
-func (m *MemoryMetaStore) fileReferencedLocked(fileKey string) bool {
-	for _, entries := range m.segments {
-		for _, e := range entries {
-			if e.fileKey == fileKey {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func (m *MemoryMetaStore) fileHasFreshRefLocked(fileKey string, cutoff time.Time) bool {

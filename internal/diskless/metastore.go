@@ -18,6 +18,13 @@ type MetaStore interface {
 	QuerySegments(ctx context.Context, topic string, partition int,
 		fromOffset int64, maxBytes int) ([]SegmentRef, error)
 
+	// ReplaceSegmentRefs atomically removes the references identified by remove
+	// and inserts add into the partition's segment catalog. Readers must never
+	// observe a gap or a duplicate for the affected range: add must exactly
+	// cover the union of the removed ranges (compaction of a contiguous run).
+	// The committed watermark is never modified by this call.
+	ReplaceSegmentRefs(ctx context.Context, topic string, partition int, remove []RefKey, add []SegmentRef) error
+
 	// GetPartitionHead returns the next offset that will be allocated for a partition.
 	GetPartitionHead(ctx context.Context, topic string, partition int) (int64, error)
 
@@ -41,6 +48,10 @@ type MetaStore interface {
 
 	// DeleteFileRefs removes all segment references pointing at fileKey.
 	DeleteFileRefs(ctx context.Context, fileKey string) error
+
+	// PlanUnreferencedFileDeletes returns the subset of fileKeys that are no
+	// longer referenced by any partition, so their data objects can be deleted.
+	PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error)
 
 	// DeleteTopic removes all MetaStore state for a topic.
 	DeleteTopic(ctx context.Context, topic string) error

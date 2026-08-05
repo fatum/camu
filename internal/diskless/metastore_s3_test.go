@@ -396,6 +396,130 @@ func TestS3MetaStore_MixedBatchDuplicateAndContinuation(t *testing.T) {
 	}
 }
 
+// TestReplaceSegmentRefs_AtomicallyMergesRun verifies that replacing a
+// contiguous committed run with a single merged ref never exposes a gap or
+// duplicate to readers and never moves the committed watermark.
+func TestReplaceSegmentRefs_AtomicallyMergesRun(t *testing.T) {
+	for name, meta := range map[string]MetaStore{
+		"memory": NewMemoryMetaStore(),
+		"s3":     NewS3MetaStore(testS3Client(t)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now()
+			for i := int64(0); i < 3; i++ {
+				if err := meta.RegisterSegment(ctx, SegmentRecord{
+					FileKey:   fmt.Sprintf("f%d.data", i),
+					Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: i, EndOffset: i + 1, ByteLength: 10}},
+					CreatedAt: now,
+				}); err != nil {
+					t.Fatalf("register [%d,%d): %v", i, i+1, err)
+				}
+			}
+			committed, err := meta.GetCommittedHead(ctx, "t", 0)
+			if err != nil {
+				t.Fatalf("committed head: %v", err)
+			}
+			if committed != 3 {
+				t.Fatalf("committed = %d, want 3", committed)
+			}
+
+			merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 30, BaseOffset: 0, EndOffset: 3}
+			remove := []RefKey{{BaseOffset: 0, EndOffset: 1}, {BaseOffset: 1, EndOffset: 2}, {BaseOffset: 2, EndOffset: 3}}
+			if err := meta.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}); err != nil {
+				t.Fatalf("replace: %v", err)
+			}
+
+			refs, err := meta.QuerySegments(ctx, "t", 0, 0, 1<<20)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			if len(refs) != 1 || refs[0].FileKey != "merged.data" || refs[0].BaseOffset != 0 || refs[0].EndOffset != 3 {
+				t.Fatalf("refs after merge = %+v, want single merged [0,3)", refs)
+			}
+
+			committed, err = meta.GetCommittedHead(ctx, "t", 0)
+			if err != nil {
+				t.Fatalf("committed head: %v", err)
+			}
+			if committed != 3 {
+				t.Fatalf("committed after compaction = %d, want 3 (compaction must not move the watermark)", committed)
+			}
+			start, err := meta.GetPartitionStart(ctx, "t", 0)
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			if start != 0 {
+				t.Fatalf("start = %d, want 0", start)
+			}
+
+			// An idempotent retry of the same replacement must be a no-op.
+			if err := meta.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}); err != nil {
+				t.Fatalf("idempotent replace: %v", err)
+			}
+			refs, err = meta.QuerySegments(ctx, "t", 0, 0, 1<<20)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			if len(refs) != 1 {
+				t.Fatalf("refs after idempotent replace = %d, want 1", len(refs))
+			}
+		})
+	}
+}
+
+// TestReplaceSegmentRefs_NewWritesContinueAfterMerge verifies that registering
+// a new segment after compaction still advances the committed head across the
+// merged ref, keeping reads contiguous.
+func TestReplaceSegmentRefs_NewWritesContinueAfterMerge(t *testing.T) {
+	for name, meta := range map[string]MetaStore{
+		"memory": NewMemoryMetaStore(),
+		"s3":     NewS3MetaStore(testS3Client(t)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now()
+			for i := int64(0); i < 3; i++ {
+				if err := meta.RegisterSegment(ctx, SegmentRecord{
+					FileKey:   fmt.Sprintf("f%d.data", i),
+					Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: i, EndOffset: i + 1, ByteLength: 10}},
+					CreatedAt: now,
+				}); err != nil {
+					t.Fatalf("register [%d,%d): %v", i, i+1, err)
+				}
+			}
+			if err := meta.ReplaceSegmentRefs(ctx, "t", 0, []RefKey{
+				{BaseOffset: 0, EndOffset: 1}, {BaseOffset: 1, EndOffset: 2}, {BaseOffset: 2, EndOffset: 3},
+			}, []SegmentRef{{FileKey: "merged.data", ByteOffset: 0, ByteLength: 30, BaseOffset: 0, EndOffset: 3}}); err != nil {
+				t.Fatalf("replace: %v", err)
+			}
+
+			// A new flush after the merged ref continues the log.
+			if err := meta.RegisterSegment(ctx, SegmentRecord{
+				FileKey:   "f3.data",
+				Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 3, EndOffset: 4, ByteLength: 10}},
+				CreatedAt: now,
+			}); err != nil {
+				t.Fatalf("register [3,4): %v", err)
+			}
+			committed, err := meta.GetCommittedHead(ctx, "t", 0)
+			if err != nil {
+				t.Fatalf("committed head: %v", err)
+			}
+			if committed != 4 {
+				t.Fatalf("committed = %d, want 4", committed)
+			}
+			refs, err := meta.QuerySegments(ctx, "t", 0, 0, 1<<20)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			if len(refs) != 2 || refs[0].EndOffset != 3 || refs[1].EndOffset != 4 {
+				t.Fatalf("refs = %+v, want merged [0,3) then [3,4)", refs)
+			}
+		})
+	}
+}
+
 func TestS3MetaStore_RegisterIsIdempotent(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()

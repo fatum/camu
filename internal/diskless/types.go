@@ -42,4 +42,13 @@ type SegmentRef struct {
 	ByteLength int64
 	BaseOffset int64
 	EndOffset  int64
+	// CreatedAt is when the ref was materialized; used by compaction and
+	// retention to decide eligibility. Ignored by the read path.
+	CreatedAt time.Time
+}
+
+// RefKey identifies a segment reference by its offset range within a partition.
+type RefKey struct {
+	BaseOffset int64
+	EndOffset  int64
 }

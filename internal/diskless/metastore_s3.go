@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,9 +18,10 @@ import (
 //
 // Offset allocation uses a per-partition head object with a conditional-write
 // CAS loop (read ETag -> If-Match increment). Concurrent allocations are safe:
-// a lost CAS retries with a fresh head. Segment references are immutable
-// create-only objects keyed by padded base offset, so a query lists the
-// partition's refs in offset order.
+// a lost CAS retries with a fresh head. Segment references live in a single
+// per-partition catalog object that is read-modify-written with a CAS, so
+// compaction can atomically replace a run of refs without exposing a gap or a
+// duplicate to readers.
 type S3MetaStore struct {
 	s3 *storage.S3Client
 }
@@ -28,9 +30,9 @@ const (
 	s3MetaPrefix       = "_diskless_meta/"
 	s3HeadPrefix       = s3MetaPrefix + "head/"
 	s3CommittedPrefix  = s3MetaPrefix + "committed/"
+	s3CatalogPrefix    = s3MetaPrefix + "catalog/"
 	s3SegmentPrefix    = s3MetaPrefix + "seg/"
 	s3HeadFile         = ".json"
-	s3SegmentFile      = ".json"
 	s3HeadStateVersion = 1
 )
 
@@ -54,13 +56,22 @@ type s3CommittedState struct {
 	CommittedOffset int64 `json:"committed_offset"`
 }
 
-type s3SegmentRef struct {
+// s3CatalogRef is one materialized segment reference within a partition catalog.
+type s3CatalogRef struct {
 	FileKey    string    `json:"file_key"`
 	ByteOffset int64     `json:"byte_offset"`
 	ByteLength int64     `json:"byte_length"`
 	BaseOffset int64     `json:"base_offset"`
 	EndOffset  int64     `json:"end_offset"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// s3Catalog is the per-partition source of truth for segment references, kept
+// sorted by base offset. Refs are immutable once written; compaction replaces a
+// contiguous run with a single merged ref via a read-modify-write CAS.
+type s3Catalog struct {
+	Version int64          `json:"version"`
+	Refs    []s3CatalogRef `json:"refs"`
 }
 
 // NewS3MetaStore creates a MetaStore backed by s3.
@@ -76,12 +87,66 @@ func s3CommittedKey(topic string, partition int) string {
 	return fmt.Sprintf("%s%s/%d%s", s3CommittedPrefix, topic, partition, s3HeadFile)
 }
 
-func s3SegPrefix(topic string, partition int) string {
-	return fmt.Sprintf("%s%s/%d/", s3SegmentPrefix, topic, partition)
+func s3CatalogKey(topic string, partition int) string {
+	return fmt.Sprintf("%s%s/%d%s", s3CatalogPrefix, topic, partition, s3HeadFile)
 }
 
-func s3SegKey(topic string, partition int, baseOffset, endOffset int64) string {
-	return fmt.Sprintf("%s%020d-%020d%s", s3SegPrefix(topic, partition), baseOffset, endOffset, s3SegmentFile)
+func s3CatalogPrefixForTopic(topic string) string {
+	return s3CatalogPrefix + topic + "/"
+}
+
+func s3SegPrefixForTopic(topic string) string {
+	return s3SegmentPrefix + topic + "/"
+}
+
+func s3HeadPrefixForTopic(topic string) string {
+	return s3HeadPrefix + topic + "/"
+}
+
+// hasRef reports whether the catalog already holds a ref with the given range.
+func (c *s3Catalog) hasRef(baseOffset, endOffset int64) bool {
+	for _, r := range c.Refs {
+		if r.BaseOffset == baseOffset && r.EndOffset == endOffset {
+			return true
+		}
+	}
+	return false
+}
+
+// sortRefs keeps the catalog ordered by base offset (stable for equal bases).
+func (c *s3Catalog) sortRefs() {
+	sort.SliceStable(c.Refs, func(i, j int) bool { return c.Refs[i].BaseOffset < c.Refs[j].BaseOffset })
+}
+
+// readCatalog returns the partition catalog and its current etag.
+func (m *S3MetaStore) readCatalog(ctx context.Context, topic string, partition int) (*s3Catalog, string, error) {
+	data, etag, err := m.s3.GetWithETag(ctx, s3CatalogKey(topic, partition))
+	switch {
+	case err == nil:
+		var c s3Catalog
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil, "", fmt.Errorf("parse catalog %s/%d: %w", topic, partition, err)
+		}
+		return &c, etag, nil
+	case errors.Is(err, storage.ErrNotFound):
+		return &s3Catalog{}, "", nil
+	default:
+		return nil, "", fmt.Errorf("read catalog %s/%d: %w", topic, partition, err)
+	}
+}
+
+// writeCatalog CAS-writes the catalog, returning storage.ErrConflict when a
+// concurrent writer changed it first.
+func (m *S3MetaStore) writeCatalog(ctx context.Context, topic string, partition int, cat *s3Catalog, etag string) error {
+	cat.Version++
+	data, err := json.Marshal(cat)
+	if err != nil {
+		return err
+	}
+	if _, err := m.s3.ConditionalPut(ctx, s3CatalogKey(topic, partition), data, etag); err != nil {
+		return fmt.Errorf("update catalog %s/%d: %w", topic, partition, err)
+	}
+	return nil
 }
 
 // AllocateOffsets atomically assigns offset ranges for one or more partition
@@ -244,12 +309,24 @@ func (m *S3MetaStore) allocateOne(ctx context.Context, alloc OffsetAllocation) (
 	}
 }
 
-// RegisterSegment records a flushed data file in the segment catalog as
-// immutable per-batch reference objects.
+// RegisterSegment records a flushed data file in the partition catalog as
+// immutable per-batch references, advancing each partition's committed head.
 func (m *S3MetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) error {
+	// Group batch refs by partition so each catalog is updated once.
+	type catalogBatch struct {
+		topic     string
+		partition int
+		refs      []s3CatalogRef
+	}
+	groups := make(map[string]*catalogBatch)
 	for _, b := range seg.Batches {
-		key := s3SegKey(b.Topic, b.Partition, b.BaseOffset, b.EndOffset)
-		ref, err := json.Marshal(s3SegmentRef{
+		key := partitionKey(b.Topic, b.Partition)
+		g := groups[key]
+		if g == nil {
+			g = &catalogBatch{topic: b.Topic, partition: b.Partition}
+			groups[key] = g
+		}
+		g.refs = append(g.refs, s3CatalogRef{
 			FileKey:    seg.FileKey,
 			ByteOffset: b.ByteOffset,
 			ByteLength: b.ByteLength,
@@ -257,15 +334,13 @@ func (m *S3MetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) er
 			EndOffset:  b.EndOffset,
 			CreatedAt:  seg.CreatedAt,
 		})
-		if err != nil {
+	}
+	for _, g := range groups {
+		if err := m.appendCatalogRefs(ctx, g.topic, g.partition, g.refs); err != nil {
 			return err
 		}
-		// Create-only: retries after a partial registration must not fail on
-		// refs that were already written with identical content.
-		if _, err := m.s3.ConditionalPut(ctx, key, ref, ""); err != nil && !errors.Is(err, storage.ErrConflict) {
-			return fmt.Errorf("register segment ref %s: %w", key, err)
-		}
 	}
+
 	// Advance each partition's committed head so reads never report
 	// allocated-but-unpersisted offsets as committed. The head only moves
 	// through contiguous materialized ranges, so out-of-order registrations
@@ -282,6 +357,37 @@ func (m *S3MetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) er
 		}
 	}
 	return nil
+}
+
+// appendCatalogRefs idempotently appends refs to a partition catalog via a
+// read-modify-write CAS. Refs already present (by offset range) are skipped so
+// a retried registration never creates duplicates.
+func (m *S3MetaStore) appendCatalogRefs(ctx context.Context, topic string, partition int, refs []s3CatalogRef) error {
+	for {
+		cat, etag, err := m.readCatalog(ctx, topic, partition)
+		if err != nil {
+			return err
+		}
+		changed := false
+		for _, ref := range refs {
+			if cat.hasRef(ref.BaseOffset, ref.EndOffset) {
+				continue
+			}
+			cat.Refs = append(cat.Refs, ref)
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		cat.sortRefs()
+		if err := m.writeCatalog(ctx, topic, partition, cat, etag); err != nil {
+			if errors.Is(err, storage.ErrConflict) {
+				continue
+			}
+			return fmt.Errorf("append catalog refs %s/%d: %w", topic, partition, err)
+		}
+		return nil
+	}
 }
 
 // advanceCommitted raises a partition's committed offset to the end of the
@@ -336,31 +442,16 @@ func (m *S3MetaStore) contiguousCommitted(ctx context.Context, topic string, par
 	return contiguousCommittedEnd(committed, refs), nil
 }
 
-// partitionSegmentRefs lists a partition's segment refs in offset order. Refs
-// are keyed by zero-padded base offset, so lexical listing order equals
-// numeric order.
+// partitionSegmentRefs returns a partition's segment refs in offset order from
+// its catalog.
 func (m *S3MetaStore) partitionSegmentRefs(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
-	keys, err := m.s3.List(ctx, s3SegPrefix(topic, partition))
+	cat, _, err := m.readCatalog(ctx, topic, partition)
 	if err != nil {
-		return nil, fmt.Errorf("list segment refs %s/%d: %w", topic, partition, err)
+		return nil, err
 	}
-	refs := make([]SegmentRef, 0, len(keys))
-	for _, key := range keys {
-		data, err := m.s3.Get(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("get segment ref %s: %w", key, err)
-		}
-		var r s3SegmentRef
-		if err := json.Unmarshal(data, &r); err != nil {
-			return nil, fmt.Errorf("parse segment ref %s: %w", key, err)
-		}
-		refs = append(refs, SegmentRef{
-			FileKey:    r.FileKey,
-			ByteOffset: r.ByteOffset,
-			ByteLength: r.ByteLength,
-			BaseOffset: r.BaseOffset,
-			EndOffset:  r.EndOffset,
-		})
+	refs := make([]SegmentRef, 0, len(cat.Refs))
+	for _, r := range cat.Refs {
+		refs = append(refs, SegmentRef(r))
 	}
 	return refs, nil
 }
@@ -369,32 +460,18 @@ func (m *S3MetaStore) partitionSegmentRefs(ctx context.Context, topic string, pa
 // given topic-partition, up to maxBytes of data.
 func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition int,
 	fromOffset int64, maxBytes int) ([]SegmentRef, error) {
-	keys, err := m.s3.List(ctx, s3SegPrefix(topic, partition))
+	cat, _, err := m.readCatalog(ctx, topic, partition)
 	if err != nil {
-		return nil, fmt.Errorf("list segment refs %s/%d: %w", topic, partition, err)
+		return nil, err
 	}
 
 	var refs []SegmentRef
 	var totalBytes int64
-	for _, key := range keys {
-		data, err := m.s3.Get(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("get segment ref %s: %w", key, err)
-		}
-		var r s3SegmentRef
-		if err := json.Unmarshal(data, &r); err != nil {
-			return nil, fmt.Errorf("parse segment ref %s: %w", key, err)
-		}
+	for _, r := range cat.Refs {
 		if r.EndOffset <= fromOffset {
 			continue
 		}
-		refs = append(refs, SegmentRef{
-			FileKey:    r.FileKey,
-			ByteOffset: r.ByteOffset,
-			ByteLength: r.ByteLength,
-			BaseOffset: r.BaseOffset,
-			EndOffset:  r.EndOffset,
-		})
+		refs = append(refs, SegmentRef(r))
 		totalBytes += r.ByteLength
 		if totalBytes >= int64(maxBytes) {
 			break
@@ -439,39 +516,27 @@ func (m *S3MetaStore) GetCommittedHead(ctx context.Context, topic string, partit
 // GetPartitionStart returns the first readable offset for a partition, or the
 // current head if all prior segments have been expired.
 func (m *S3MetaStore) GetPartitionStart(ctx context.Context, topic string, partition int) (int64, error) {
-	keys, err := m.s3.List(ctx, s3SegPrefix(topic, partition))
-	if err != nil {
-		return 0, fmt.Errorf("list segment refs %s/%d: %w", topic, partition, err)
-	}
-	if len(keys) == 0 {
-		return m.GetCommittedHead(ctx, topic, partition)
-	}
-	base, err := s3SegBaseOffset(keys[0])
+	cat, _, err := m.readCatalog(ctx, topic, partition)
 	if err != nil {
 		return 0, err
 	}
-	return base, nil
+	if len(cat.Refs) == 0 {
+		return m.GetCommittedHead(ctx, topic, partition)
+	}
+	return cat.Refs[0].BaseOffset, nil
 }
 
 // PlanExpiredFileDeletes returns file keys whose refs for the given
 // topic-partition are expired and whose remaining refs, if any, are also
 // expired.
 func (m *S3MetaStore) PlanExpiredFileDeletes(ctx context.Context, topic string, partition int, cutoff time.Time) ([]string, error) {
-	keys, err := m.s3.List(ctx, s3SegPrefix(topic, partition))
+	cat, _, err := m.readCatalog(ctx, topic, partition)
 	if err != nil {
-		return nil, fmt.Errorf("list segment refs %s/%d: %w", topic, partition, err)
+		return nil, err
 	}
 
 	candidates := make(map[string]struct{})
-	for _, key := range keys {
-		data, err := m.s3.Get(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("get segment ref %s: %w", key, err)
-		}
-		var r s3SegmentRef
-		if err := json.Unmarshal(data, &r); err != nil {
-			return nil, fmt.Errorf("parse segment ref %s: %w", key, err)
-		}
+	for _, r := range cat.Refs {
 		if !r.CreatedAt.After(cutoff) {
 			candidates[r.FileKey] = struct{}{}
 		}
@@ -490,61 +555,112 @@ func (m *S3MetaStore) PlanExpiredFileDeletes(ctx context.Context, topic string, 
 	return deletable, nil
 }
 
-// DeleteFileRefs removes all segment references pointing at fileKey.
+// DeleteFileRefs removes all segment references pointing at fileKey from every
+// partition catalog.
 func (m *S3MetaStore) DeleteFileRefs(ctx context.Context, fileKey string) error {
-	prefix := s3SegmentPrefix
-	keys, err := m.s3.List(ctx, prefix)
+	catKeys, err := m.s3.List(ctx, s3CatalogPrefix)
 	if err != nil {
-		return fmt.Errorf("list segment refs: %w", err)
+		return fmt.Errorf("list catalogs: %w", err)
 	}
-	for _, key := range keys {
-		data, err := m.s3.Get(ctx, key)
+	for _, key := range catKeys {
+		topic, partition, err := parseCatalogKey(key)
 		if err != nil {
-			return fmt.Errorf("get segment ref %s: %w", key, err)
+			return err
 		}
-		var r s3SegmentRef
-		if err := json.Unmarshal(data, &r); err != nil {
-			return fmt.Errorf("parse segment ref %s: %w", key, err)
-		}
-		if r.FileKey == fileKey {
-			if err := m.s3.Delete(ctx, key); err != nil {
-				return fmt.Errorf("delete segment ref %s: %w", key, err)
+		for {
+			cat, etag, err := m.readCatalog(ctx, topic, partition)
+			if err != nil {
+				return err
 			}
+			kept := cat.Refs[:0]
+			changed := false
+			for _, r := range cat.Refs {
+				if r.FileKey == fileKey {
+					changed = true
+					continue
+				}
+				kept = append(kept, r)
+			}
+			if !changed {
+				break
+			}
+			cat.Refs = kept
+			if err := m.writeCatalog(ctx, topic, partition, cat, etag); err != nil {
+				if errors.Is(err, storage.ErrConflict) {
+					continue
+				}
+				return fmt.Errorf("delete file refs %s: %w", fileKey, err)
+			}
+			break
 		}
 	}
 	return nil
 }
 
+// parseCatalogKey extracts the topic and partition from a catalog key of the
+// form _diskless_meta/catalog/{topic}/{partition}.json.
+func parseCatalogKey(key string) (string, int, error) {
+	rest := strings.TrimSuffix(strings.TrimPrefix(key, s3CatalogPrefix), s3HeadFile)
+	idx := strings.LastIndex(rest, "/")
+	if idx < 0 {
+		return "", 0, fmt.Errorf("malformed catalog key %q", key)
+	}
+	partition, err := strconv.Atoi(rest[idx+1:])
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed catalog key %q: %w", key, err)
+	}
+	return rest[:idx], partition, nil
+}
+
+// PlanUnreferencedFileDeletes returns the subset of fileKeys that appear in no
+// partition catalog, so their data objects can be deleted after compaction.
+func (m *S3MetaStore) PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error) {
+	referenced := make(map[string]bool, len(fileKeys))
+	catKeys, err := m.s3.List(ctx, s3CatalogPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("list catalogs: %w", err)
+	}
+	for _, key := range catKeys {
+		data, err := m.s3.Get(ctx, key)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("get catalog %s: %w", key, err)
+		}
+		var c s3Catalog
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil, fmt.Errorf("parse catalog %s: %w", key, err)
+		}
+		for _, r := range c.Refs {
+			referenced[r.FileKey] = true
+		}
+	}
+	var deletable []string
+	for _, fileKey := range fileKeys {
+		if !referenced[fileKey] {
+			deletable = append(deletable, fileKey)
+		}
+	}
+	return deletable, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (m *S3MetaStore) DeleteTopic(ctx context.Context, topic string) error {
-	prefix := s3SegPrefixForTopic(topic)
-	keys, err := m.s3.List(ctx, prefix)
-	if err != nil {
-		return fmt.Errorf("list segment refs for %s: %w", topic, err)
-	}
-	for _, key := range keys {
-		if err := m.s3.Delete(ctx, key); err != nil {
-			return fmt.Errorf("delete segment ref %s: %w", key, err)
+	for _, prefix := range []string{
+		s3CatalogPrefixForTopic(topic),
+		s3HeadPrefixForTopic(topic),
+		s3CommittedPrefix + topic + "/",
+		s3SegPrefixForTopic(topic), // legacy per-batch refs, if any remain
+	} {
+		keys, err := m.s3.List(ctx, prefix)
+		if err != nil {
+			return fmt.Errorf("list %s: %w", prefix, err)
 		}
-	}
-	headPrefix := s3HeadPrefixForTopic(topic)
-	keys, err = m.s3.List(ctx, headPrefix)
-	if err != nil {
-		return fmt.Errorf("list heads for %s: %w", topic, err)
-	}
-	for _, key := range keys {
-		if err := m.s3.Delete(ctx, key); err != nil {
-			return fmt.Errorf("delete head %s: %w", key, err)
-		}
-	}
-	committedPrefix := s3CommittedPrefix + topic + "/"
-	keys, err = m.s3.List(ctx, committedPrefix)
-	if err != nil {
-		return fmt.Errorf("list committed heads for %s: %w", topic, err)
-	}
-	for _, key := range keys {
-		if err := m.s3.Delete(ctx, key); err != nil {
-			return fmt.Errorf("delete committed %s: %w", key, err)
+		for _, key := range keys {
+			if err := m.s3.Delete(ctx, key); err != nil {
+				return fmt.Errorf("delete %s: %w", key, err)
+			}
 		}
 	}
 	return nil
@@ -556,41 +672,96 @@ func (m *S3MetaStore) Close() error {
 }
 
 func (m *S3MetaStore) fileHasFreshRef(ctx context.Context, fileKey string, cutoff time.Time) (bool, error) {
-	keys, err := m.s3.List(ctx, s3SegmentPrefix)
+	catKeys, err := m.s3.List(ctx, s3CatalogPrefix)
 	if err != nil {
-		return false, fmt.Errorf("list segment refs: %w", err)
+		return false, fmt.Errorf("list catalogs: %w", err)
 	}
-	for _, key := range keys {
+	for _, key := range catKeys {
 		data, err := m.s3.Get(ctx, key)
 		if err != nil {
-			return false, fmt.Errorf("get segment ref %s: %w", key, err)
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			return false, fmt.Errorf("get catalog %s: %w", key, err)
 		}
-		var r s3SegmentRef
-		if err := json.Unmarshal(data, &r); err != nil {
-			return false, fmt.Errorf("parse segment ref %s: %w", key, err)
+		var c s3Catalog
+		if err := json.Unmarshal(data, &c); err != nil {
+			return false, fmt.Errorf("parse catalog %s: %w", key, err)
 		}
-		if r.FileKey == fileKey && r.CreatedAt.After(cutoff) {
-			return true, nil
+		for _, r := range c.Refs {
+			if r.FileKey == fileKey && r.CreatedAt.After(cutoff) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
 }
 
-func s3SegPrefixForTopic(topic string) string {
-	return s3SegmentPrefix + topic + "/"
-}
-
-func s3HeadPrefixForTopic(topic string) string {
-	return s3HeadPrefix + topic + "/"
-}
-
-// s3SegBaseOffset parses the padded base offset from a segment ref key of the
-// form _diskless_meta/seg/{topic}/{partition}/{base:020d}-{end:020d}.json.
-func s3SegBaseOffset(key string) (int64, error) {
-	name := key[strings.LastIndex(key, "/")+1:]
-	idx := strings.Index(name, "-")
-	if idx < 0 {
-		return 0, fmt.Errorf("malformed segment ref key %q", key)
+// ReplaceSegmentRefs atomically removes the refs identified by remove and
+// inserts add into the partition catalog via a read-modify-write CAS, so
+// readers never observe a gap or a duplicate for the covered range. The added
+// refs must exactly cover the union of the removed ranges (compaction of a
+// contiguous run); the committed watermark is never modified. Retries are
+// idempotent: an added ref already present is skipped, and already-removed refs
+// are simply absent.
+func (m *S3MetaStore) ReplaceSegmentRefs(ctx context.Context, topic string, partition int, remove []RefKey, add []SegmentRef) error {
+	removeSet := make(map[RefKey]bool, len(remove))
+	for _, rk := range remove {
+		removeSet[rk] = true
 	}
-	return strconv.ParseInt(name[:idx], 10, 64)
+	for {
+		cat, etag, err := m.readCatalog(ctx, topic, partition)
+		if err != nil {
+			return err
+		}
+
+		kept := make([]s3CatalogRef, 0, len(cat.Refs))
+		changed := false
+		for _, r := range cat.Refs {
+			if removeSet[RefKey{BaseOffset: r.BaseOffset, EndOffset: r.EndOffset}] {
+				changed = true
+				continue
+			}
+			kept = append(kept, r)
+		}
+		for _, ref := range add {
+			cr := s3CatalogRef{
+				FileKey:    ref.FileKey,
+				ByteOffset: ref.ByteOffset,
+				ByteLength: ref.ByteLength,
+				BaseOffset: ref.BaseOffset,
+				EndOffset:  ref.EndOffset,
+				CreatedAt:  time.Now(),
+			}
+			if cat.hasRef(cr.BaseOffset, cr.EndOffset) {
+				continue
+			}
+			if !overlapsAny(kept, cr.BaseOffset, cr.EndOffset) {
+				kept = append(kept, cr)
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		cat.Refs = kept
+		cat.sortRefs()
+		if err := m.writeCatalog(ctx, topic, partition, cat, etag); err != nil {
+			if errors.Is(err, storage.ErrConflict) {
+				continue
+			}
+			return fmt.Errorf("replace refs %s/%d: %w", topic, partition, err)
+		}
+		return nil
+	}
+}
+
+// overlapsAny reports whether the range [base,end) overlaps any of refs.
+func overlapsAny(refs []s3CatalogRef, baseOffset, endOffset int64) bool {
+	for _, r := range refs {
+		if baseOffset < r.EndOffset && r.BaseOffset < endOffset {
+			return true
+		}
+	}
+	return false
 }
