@@ -35,8 +35,13 @@ func TestKafkaConsumeProgressLogsAtBoundedCadence(t *testing.T) {
 		lines = append(lines, fmt.Sprintf(format, args...))
 	})
 	reporter.startup()
-	if len(lines) != 3 || !strings.Contains(lines[0], "brokers=broker-a:9092,broker-b:9092") {
+	if len(lines) != 3 || !strings.Contains(lines[0], "brokers=broker-a:9092,broker-b:9092") || !strings.Contains(lines[0], "start_offset=0") {
 		t.Fatalf("startup lines = %v", lines)
+	}
+	for _, line := range lines[1:] {
+		if !strings.Contains(line, "start_offset=0") {
+			t.Fatalf("startup partition line lacks start_offset=0: %q", line)
+		}
 	}
 
 	reporter.beginPoll()
@@ -50,7 +55,7 @@ func TestKafkaConsumeProgressLogsAtBoundedCadence(t *testing.T) {
 	reporter.record(0, 11)
 	reporter.record(0, 12)
 	reporter.poll(started.Add(time.Second), 10*time.Millisecond, 2, 2048, []int64{2, 0})
-	if len(lines) != 5 || !strings.Contains(lines[3], "records=2/5 bytes=2048") || !strings.Contains(lines[4], "partition=0") || !strings.Contains(lines[4], "last_offset=12 fetch_records=2") {
+	if len(lines) != 5 || !strings.Contains(lines[3], "records=2/5 bytes=2048") || !strings.Contains(lines[4], "partition=0") || !strings.Contains(lines[4], "consumed_through=12 fetch_records=2") {
 		t.Fatalf("progress lines = %v", lines)
 	}
 	reporter.beginPoll()

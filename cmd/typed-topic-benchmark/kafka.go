@@ -67,9 +67,9 @@ func produceKafka(ctx context.Context, cfg config, count int64, expected []hashS
 				for first := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
 					records := make([]*kgo.Record, 0, cfg.BatchMessages)
 					for sequence := first; sequence < cfg.SequenceStart+count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
-						value := typedValue{RunID: cfg.RunID, ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
-						key := cfg.RunID + ":" + strconv.FormatInt(sequence, 10)
-						valueBytes := mustJSON(value)
+					value := typedValue{RunID: cfg.RunID, ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
+					key := cfg.RunID + ":" + strconv.FormatInt(sequence, 10)
+					valueBytes := mustJSON(benchmarkEvent(cfg, value))
 						records = append(records, &kgo.Record{Topic: cfg.Topic, Partition: int32(partition), Key: []byte(key), Value: valueBytes})
 						expected[partition].add(value)
 						atomic.AddInt64(&serialized, int64(len(key)+len(valueBytes)))
@@ -265,9 +265,9 @@ func newKafkaConsumeProgress(cfg config, expected []hashState, totalExpected int
 }
 
 func (p *kafkaConsumeProgress) startup() {
-	p.logf("kafka consume starting brokers=%s topic=%s partitions=%d expected_records=%d", strings.Join(p.cfg.KafkaBrokers, ","), p.cfg.Topic, p.cfg.Partitions, p.totalExpected)
+	p.logf("kafka consume starting brokers=%s topic=%s partitions=%d expected_records=%d start_offset=0", strings.Join(p.cfg.KafkaBrokers, ","), p.cfg.Topic, p.cfg.Partitions, p.totalExpected)
 	for partition, expected := range p.expected {
-		p.logf("kafka consume partition=%d expected_records=%d", partition, expected)
+		p.logf("kafka consume partition=%d expected_records=%d start_offset=0", partition, expected)
 	}
 }
 
@@ -306,7 +306,7 @@ func (p *kafkaConsumeProgress) poll(now time.Time, pollDuration time.Duration, r
 		if now.Sub(p.lastPartitionLogs[partition]) < kafkaConsumeLogInterval {
 			continue
 		}
-		p.logf("kafka consume partition=%d records=%d expected=%d last_offset=%d fetch_records=%d", partition, partitionRecords[partition], p.expected[partition], p.lastOffsets[partition], fetchCount)
+		p.logf("kafka consume partition=%d records=%d expected=%d consumed_through=%d fetch_records=%d", partition, partitionRecords[partition], p.expected[partition], p.lastOffsets[partition], fetchCount)
 		p.lastPartitionLogs[partition] = now
 	}
 	if len(p.activePartitions) == 0 && now.Sub(p.lastEmpty) >= kafkaConsumeLogInterval {
