@@ -380,7 +380,7 @@ func (c client) deleteAndWait(ctx context.Context, topic string) error {
 }
 
 func (c client) create(ctx context.Context, cfg config) error {
-	fields := []map[string]any{{"name": "id", "type": "int64", "path": "$.id"}, {"name": "payload", "type": "string", "path": "$.payload"}, {"name": "payload_bytes", "type": "int64", "path": "$.payload_bytes"}, {"name": "sequence", "type": "int64", "path": "$.sequence"}}
+	fields := benchmarkSchemaFields(cfg)
 	body := map[string]any{"name": cfg.Topic, "partitions": cfg.Partitions, "replication_factor": cfg.ReplicationFactor, "min_insync_replicas": cfg.MinInSyncReplicas, "retention": "24h", "export_enabled": cfg.ExportEnabled, "schema": map[string]any{"encoding": "json", "fields": fields}}
 	if err := c.request(ctx, http.MethodPost, "/v1/topics", body, nil); err != nil {
 		return err
@@ -586,7 +586,7 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 					batch := make([]map[string]any, 0, cfg.BatchMessages)
 					for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
 						v := typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
-						batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(v))})
+						batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(benchmarkEvent(cfg, v)))})
 						expected[p].add(v)
 					}
 					atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
@@ -766,22 +766,22 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 			if len(cfg.NodeURLs) > 0 {
 				partitionClient.base = cfg.NodeURLs[p%len(cfg.NodeURLs)]
 			}
-			benchmarkLog("consume partition=%d endpoint=%s expected_records=%d", p, partitionClient.base, expected[p].recordsSnapshot())
+			benchmarkLog("consume partition=%d endpoint=%s expected_records=%d start_offset=0", p, partitionClient.base, expected[p].recordsSnapshot())
 			for {
 				var resp consumeResponse
 				started := time.Now()
 				err := partitionClient.request(ctx, http.MethodGet, fmt.Sprintf("/v1/topics/%s/partitions/%d/messages?offset=%d&limit=1000", url.PathEscape(cfg.Topic), p, off), nil, &resp)
 				if err != nil {
-					benchmarkLog("consume partition=%d endpoint=%s offset=%d failed after=%s error=%v", p, partitionClient.base, off, time.Since(started), err)
+					benchmarkLog("consume partition=%d endpoint=%s next_offset=%d failed after=%s error=%v", p, partitionClient.base, off, time.Since(started), err)
 					errs <- err
 					return
 				}
 				if len(resp.Messages) == 0 {
 					if actual[p].recordsSnapshot() >= expected[p].recordsSnapshot() {
-						benchmarkLog("consume partition=%d complete records=%d offset=%d", p, actual[p].recordsSnapshot(), off)
+						benchmarkLog("consume partition=%d complete records=%d next_offset=%d", p, actual[p].recordsSnapshot(), off)
 						return
 					}
-					benchmarkLog("consume partition=%d endpoint=%s offset=%d empty records=%d expected=%d duration=%s", p, partitionClient.base, off, actual[p].recordsSnapshot(), expected[p].recordsSnapshot(), time.Since(started))
+					benchmarkLog("consume partition=%d endpoint=%s next_offset=%d empty records=%d expected=%d duration=%s", p, partitionClient.base, off, actual[p].recordsSnapshot(), expected[p].recordsSnapshot(), time.Since(started))
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
@@ -814,7 +814,7 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 					progress(1)
 				}
 				if ignoredLiveSuffix {
-					benchmarkLog("consume partition=%d complete records=%d offset=%d", p, actual[p].recordsSnapshot(), off)
+					benchmarkLog("consume partition=%d complete records=%d next_offset=%d", p, actual[p].recordsSnapshot(), off)
 					return
 				}
 				if resp.NextOffset != uint64(actual[p].recordsSnapshot()) {
@@ -1022,6 +1022,13 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 		res.Integrity.OK = metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && metrics.PayloadBytes == res.ExpectedBytes
 		if !res.Integrity.OK {
 			res.Integrity.Error = "SQL integrity mismatch"
+		}
+		if res.Integrity.OK && cfg.ExportEnabled {
+			if err := verifyWebAnalyticsSQL(ctx, c, cfg, count); err != nil {
+				res.Integrity.OK = false
+				res.Integrity.Error = "SQL typed column mismatch: " + err.Error()
+				benchmarkLog("SQL typed column check failed: %v", err)
+			}
 		}
 		benchmarkLog("SQL complete: integrity_ok=%t", res.Integrity.OK)
 	}
@@ -1281,6 +1288,13 @@ func main() {
 		ar, ab, ad, ae := actualStates[p].result()
 		if ee != nil || ae != nil || er != ar || eb != ab || ed != ad {
 			ok = false
+		}
+	}
+	if ok && cfg.ExportEnabled {
+		if err := verifyWebAnalyticsSQL(ctx, c, cfg, count); err != nil {
+			ok = false
+			res.Integrity.Error = "SQL typed column mismatch: " + err.Error()
+			benchmarkLog("SQL typed column check failed: %v", err)
 		}
 	}
 	res.Integrity = integrityResult{OK: ok && !readinessLost.Load()}
