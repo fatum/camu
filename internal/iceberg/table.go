@@ -44,8 +44,26 @@ func NewTableStore(objects ObjectStore, fencer Fencer, warehouse string) *TableS
 	return &TableStore{objects: objects, fencer: fencer, warehouse: strings.TrimSuffix(warehouse, "/") + "/"}
 }
 
+// sanitizeTable maps a topic name to a safe, injective table name so distinct
+// topics never share a table root. Underscores are doubled and slashes become
+// a single underscore (see sanitizeSchemaTopic in the server's schema
+// registry for the same scheme), so a_b and a/b map to different tables.
 func sanitizeTable(topic string) string {
-	return strings.ReplaceAll(topic, "/", "_")
+	if !strings.ContainsAny(topic, "_/") {
+		return topic
+	}
+	var b strings.Builder
+	for i := 0; i < len(topic); i++ {
+		switch topic[i] {
+		case '_':
+			b.WriteString("__")
+		case '/':
+			b.WriteByte('_')
+		default:
+			b.WriteByte(topic[i])
+		}
+	}
+	return b.String()
 }
 
 func (ts *TableStore) tableRoot(topic string) string {
@@ -338,6 +356,7 @@ func (ts *TableStore) commitSnapshot(ctx context.Context, topic string, snapshot
 		next := current.clone()
 		next.Snapshots = append(next.Snapshots, snap)
 		next.CurrentSnapshotID = &snap.SnapshotID
+		next.LastSequenceNumber = snap.SequenceNumber
 		next.Refs["main"] = SnapshotRef{SnapshotID: snap.SnapshotID, Type: "branch"}
 		next.SnapshotLog = append(next.SnapshotLog, SnapshotLogEntry{SnapshotID: snap.SnapshotID, TimestampMS: snap.TimestampMS})
 		next.LastUpdatedMS = snap.TimestampMS

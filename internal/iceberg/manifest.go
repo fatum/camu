@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 
@@ -256,7 +257,10 @@ func encodeManifestListRows(manifests []ManifestFile) ([][]byte, error) {
 }
 
 // storeOCF writes an Avro OCF under a content-addressed key with
-// create-if-not-exists semantics and returns the number of bytes stored.
+// create-if-not-exists semantics and returns the number of bytes stored. The
+// key is derived from the content, so an existing object is necessarily the
+// same bytes: a create conflict (a concurrent commit of identical manifests)
+// is treated as success, not an error.
 func (ts *TableStore) storeOCF(ctx context.Context, key, schemaJSON string, records [][]byte) (int64, error) {
 	var buf bytes.Buffer
 	n, err := writeOCF(&buf, schemaJSON, records)
@@ -264,6 +268,9 @@ func (ts *TableStore) storeOCF(ctx context.Context, key, schemaJSON string, reco
 		return 0, err
 	}
 	if _, err := ts.objects.ConditionalPut(ctx, key, buf.Bytes(), ""); err != nil {
+		if errors.Is(err, ErrConflict) {
+			return n, nil // already stored, identical bytes
+		}
 		return 0, fmt.Errorf("write iceberg metadata file %q: %w", key, err)
 	}
 	return n, nil

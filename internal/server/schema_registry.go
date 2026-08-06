@@ -41,8 +41,26 @@ func (r *schemaRegistry) schemaKey(topic string, id int) string {
 	return schemaRegistryPrefix + sanitizeSchemaTopic(topic) + "/" + strconv.Itoa(id) + ".json"
 }
 
+// sanitizeSchemaTopic maps a topic name to a safe, injective key component so
+// distinct names never collide under _meta/schemas/<topic>/. Underscores are
+// doubled and slashes become a single underscore: a_b maps to a__b and a/b
+// maps to a_b, so they use different prefixes.
 func sanitizeSchemaTopic(topic string) string {
-	return strings.ReplaceAll(topic, "/", "_")
+	if !strings.ContainsAny(topic, "_/") {
+		return topic
+	}
+	var b strings.Builder
+	for i := 0; i < len(topic); i++ {
+		switch topic[i] {
+		case '_':
+			b.WriteString("__")
+		case '/':
+			b.WriteByte('_')
+		default:
+			b.WriteByte(topic[i])
+		}
+	}
+	return b.String()
 }
 
 // RegisterTopicSchema registers the initial (version 0) schema for a topic and

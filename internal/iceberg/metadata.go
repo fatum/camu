@@ -324,11 +324,11 @@ func (m *TableMetadata) sortedSnapshots() []*Snapshot {
 	return out
 }
 
-// nextSequenceNumber returns the sequence number for the next snapshot.
+// nextSequenceNumber returns the sequence number the next snapshot would
+// receive. It does not mutate the receiver; callers set LastSequenceNumber on
+// the committed copy they build.
 func (m *TableMetadata) nextSequenceNumber() int64 {
-	seq := m.LastSequenceNumber + 1
-	m.LastSequenceNumber = seq
-	return seq
+	return m.LastSequenceNumber + 1
 }
 
 // clone deep-copies the metadata so a commit can mutate a copy without

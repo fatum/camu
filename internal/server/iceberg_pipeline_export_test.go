@@ -2,6 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,7 +188,7 @@ func TestIcebergExportPassBatchesRangesIntoOneSnapshot(t *testing.T) {
 	s.assignmentsMu.Unlock()
 
 	for _, id := range []int{1, 2, 3} {
-		raw := log.EncodeRecordBatch(0, []log.Message{{Value: []byte(`{"id":` + string(rune(0+id)) + `}`)}})
+		raw := log.EncodeRecordBatch(0, []log.Message{{Value: []byte(fmt.Sprintf(`{"id":%d}`, id))}})
 		if _, err := s.disklessEngine.Produce(ctx, tc.Name, 0, raw); err != nil {
 			t.Fatalf("diskless produce: %v", err)
 		}
@@ -394,5 +398,83 @@ func TestIcebergExportPassProtobufValue(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].RecordCount != 1 {
 		t.Fatalf("data files = %+v, want 1 file with 1 protobuf record", files)
+	}
+}
+
+// TestIcebergExportPassClassic verifies the Iceberg sink reads committed
+// records from a classic (replicated) partition index — the source path used
+// by classic-mode retention cleanup — end to end.
+func TestIcebergExportPassClassic(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.cfg.Maintenance.ParquetExport.Warehouse = "warehouse/"
+
+	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeClassic, ExportEnabled: true}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(ctx, tc, map[int]uint64{0: 1}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+	s.initPartitionAsLeader(ctx, tc.Name, 0, coordination.PartitionAssignment{Replicas: []string{s.instanceID}, Leader: s.instanceID, LeaderEpoch: 1})
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	for _, id := range []int{1, 2} {
+		body := fmt.Sprintf(`[{"key":"k%d","value":"{\"id\":%d}"}]`, id, id)
+		req := httptest.NewRequest(http.MethodPost, "/v1/topics/orders/partitions/0/messages", strings.NewReader(body))
+		req.SetPathValue("topic", "orders")
+		req.SetPathValue("id", "0")
+		rec := httptest.NewRecorder()
+		s.handleProduceLowLevel(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("produce status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+	}
+
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	if ps == nil {
+		t.Fatal("no partition state")
+	}
+	ps.mu.RLock()
+	high := uint64(0)
+	if ps.index != nil {
+		high = ps.index.HighWatermark()
+	}
+	ps.mu.RUnlock()
+	if high != 2 {
+		t.Fatalf("high watermark = %d, want 2", high)
+	}
+	// Seal and publish the active segment so the export reader can fetch the
+	// records (a classic partition's committed records live in sealed segments).
+	if err := s.partitionManager.onFlushActiveSegment(tc.Name, 0); err != nil {
+		t.Fatalf("onFlushActiveSegment() error = %v", err)
+	}
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	cp := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion}
+	s.runIcebergExportPass(ctx, tc, identity, &cp)
+	if cp.NextOffset != 2 {
+		t.Fatalf("checkpoint next offset = %d, want 2", cp.NextOffset)
+	}
+
+	table := s.icebergTableStoreFor()
+	loaded, err := table.Load(ctx, tc.Name)
+	if err != nil {
+		t.Fatalf("iceberg table load: %v", err)
+	}
+	if loaded.CurrentSnapshotID == nil {
+		t.Fatal("iceberg table has no current snapshot")
+	}
+	files, err := table.CurrentDataFiles(ctx, tc.Name)
+	if err != nil {
+		t.Fatalf("CurrentDataFiles() error = %v", err)
+	}
+	if len(files) != 1 || files[0].RecordCount != 2 || files[0].Content != 0 {
+		t.Fatalf("data files = %+v, want 1 file with 2 DATA records", files)
+	}
+	if _, err := s.s3Client.Get(ctx, files[0].FilePath); err != nil {
+		t.Fatalf("exported data file %s missing: %v", files[0].FilePath, err)
 	}
 }

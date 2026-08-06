@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/hamba/avro/v2"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/storage"
 )
 
 // This file adds Avro as a topic value encoding alongside JSON. The topic
@@ -131,6 +133,13 @@ func (p *decodePlan) decodeAvroInto(ctx context.Context, topic string, resolver 
 		if resolver != nil {
 			resolved, err := resolver.SchemaForID(ctx, topic, schemaID)
 			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					// The schema id is not registered: the value is a raw Avro
+					// payload that coincidentally starts with the Confluent
+					// magic byte (a false positive from AvroUnwrap). Decode the
+					// full input against the topic's own schema instead.
+					return p.decodeAvroWire(input, p.avro, values)
+				}
 				return fmt.Errorf("resolve schema id %d: %w", schemaID, err)
 			}
 			writer, err = decodePlanFor(resolved)

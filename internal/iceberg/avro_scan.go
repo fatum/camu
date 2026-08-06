@@ -248,10 +248,29 @@ func readAvroProjected(r *avroReader, f meta.SchemaField, wireType avro.Schema) 
 		if err != nil {
 			return parquet.Value{}, false, err
 		}
-		return parquet.Int64Value(v * int64(1_000_000)), true, nil
+		return parquet.Int64Value(v * avroTimestampScale(wireType)), true, nil
 	default:
 		return parquet.Value{}, false, fmt.Errorf("unsupported schema field type %q", f.Type)
 	}
+}
+
+// avroTimestampScale returns the Unix-nanosecond multiplier for a timestamp
+// value written under the given (already union-resolved) wire schema. The scale
+// is chosen from the writer's timestamp logical type; a plain long defaults to
+// epoch millis (camu's writer), so an external value written as micros or
+// seconds is not misread by 1000x or 1,000,000x.
+func avroTimestampScale(wireType avro.Schema) int64 {
+	if prim, ok := wireType.(*avro.PrimitiveSchema); ok {
+		if ls := prim.Logical(); ls != nil {
+			switch ls.Type() {
+			case avro.TimestampMicros, avro.LocalTimestampMicros:
+				return 1_000
+			case avro.TimestampMillis, avro.LocalTimestampMillis:
+				return 1_000_000
+			}
+		}
+	}
+	return 1_000_000
 }
 
 // decodeAvroWire decodes an Avro record value by walking the writer schema's

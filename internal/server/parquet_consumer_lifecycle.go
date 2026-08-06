@@ -76,7 +76,7 @@ func (s *Server) ensureParquetConsumer(tc meta.TopicConfig, identity PartitionId
 		s.parquetConsumersMu.Unlock()
 
 		go s.runParquetConsumer(ctx, done, tc, identity)
-		slog.Info("parquet_export_consumer_started", "topic", tc.Name, "partition", identity.Partition, "epoch", identity.LeaderEpoch)
+		slog.Info("iceberg_export_consumer_started", "topic", tc.Name, "partition", identity.Partition, "epoch", identity.LeaderEpoch)
 		return
 	}
 }
@@ -94,7 +94,7 @@ func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc 
 		if ctx.Err() != nil {
 			return
 		}
-		slog.Warn("parquet_pipeline_checkpoint_load_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		slog.Warn("iceberg_pipeline_checkpoint_load_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
 		select {
 		case <-ctx.Done():
 			return
@@ -102,6 +102,16 @@ func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc 
 		}
 	}
 	for {
+		// Re-read the topic config each pass so a schema update (or an export
+		// toggle) takes effect within one poll interval, rather than waiting for
+		// ensureParquetConsumer's DeepEqual restart during the next maintenance
+		// pass. A deleted topic keeps the last known config; the pass is a no-op
+		// for it and the next maintenance pass stops the consumer.
+		if fresh, err := s.topicStore.Get(ctx, tc.Name); err == nil {
+			tc = fresh
+		} else if ctx.Err() == nil {
+			slog.Warn("iceberg_export_consumer_config_reload_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		}
 		before := cp.NextOffset
 		s.runIcebergExportPass(ctx, tc, identity, &cp)
 		// Back off when the pass exported nothing: the partition is caught up,
@@ -168,7 +178,7 @@ func (s *Server) stopParquetConsumer(topic string, partition int) {
 		delete(s.parquetConsumers, key)
 	}
 	s.parquetConsumersMu.Unlock()
-	slog.Info("parquet_export_consumer_stopped", "topic", topic, "partition", partition)
+	slog.Info("iceberg_export_consumer_stopped", "topic", topic, "partition", partition)
 }
 
 func (s *Server) stopAllParquetConsumers() {

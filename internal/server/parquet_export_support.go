@@ -20,7 +20,7 @@ var waitForReplicatedOffsetFn = waitForReplicatedOffset
 func (s *Server) handleSchemaDecodeFailures(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, failures []iceberg.SchemaFailure) error {
 	if tc.Schema == nil || tc.Schema.DeadLetterTopic == "" {
 		for _, f := range failures {
-			slog.Warn("parquet_schema_decode_skipped", "topic", tc.Name, "partition", identity.Partition, "offset", f.Message.Offset, "error", f.Err)
+			slog.Warn("iceberg_schema_decode_skipped", "topic", tc.Name, "partition", identity.Partition, "offset", f.Message.Offset, "error", f.Err)
 		}
 		return nil
 	}

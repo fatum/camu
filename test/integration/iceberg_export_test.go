@@ -21,6 +21,21 @@ import (
 // package's own sentinels.
 type testIcebergObjectStore struct{ c *storage.S3Client }
 
+// enableTopicExport flips export_enabled on the stored topic config so the
+// export consumer (which re-reads the authoritative config each pass) exports
+// the topic. There is no public API to toggle export after creation.
+func enableTopicExport(t *testing.T, s3c *storage.S3Client, name string) error {
+	t.Helper()
+	ctx := context.Background()
+	store := meta.NewTopicStore(s3c)
+	cfg, err := store.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+	cfg.ExportEnabled = true
+	return store.Update(ctx, cfg)
+}
+
 func (a testIcebergObjectStore) Get(ctx context.Context, key string) ([]byte, error) {
 	data, err := a.c.Get(ctx, key)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -73,6 +88,13 @@ func TestIntegrationIcebergExportRoundTrip(t *testing.T) {
 	client := env.Client()
 	topic := "iceberg-e2e"
 	createDisklessTopic(t, client, topic, 1)
+
+	// Enable export on the stored topic config: the export consumer re-reads
+	// the authoritative config each pass, so driving maintenance with an
+	// in-memory config alone is not enough.
+	if err := enableTopicExport(t, env.S3Client(), topic); err != nil {
+		t.Fatalf("enableTopicExport: %v", err)
+	}
 
 	produced := []camutest.ProduceMessage{
 		{Key: "k1", Value: "alpha"},

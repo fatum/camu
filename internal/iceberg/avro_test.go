@@ -9,6 +9,7 @@ import (
 
 	"github.com/hamba/avro/v2"
 	"github.com/maksim/camu/internal/meta"
+	"github.com/maksim/camu/internal/storage"
 )
 
 func testAvroSchema(t *testing.T) *meta.TopicSchema {
@@ -174,5 +175,75 @@ func TestDecodeAvroTypedFieldsReadSideEvolution(t *testing.T) {
 	// An unresolvable schema id is an error.
 	if _, err := DecodeAvroTypedFields(context.Background(), "t", v1, resolver, AvroWrap(99, payload)); err == nil {
 		t.Fatal("DecodeAvroTypedFields() with unknown schema id error = nil, want error")
+	}
+}
+
+type notFoundResolver struct{}
+
+func (notFoundResolver) SchemaForID(context.Context, string, int) (*meta.TopicSchema, error) {
+	return nil, storage.ErrNotFound
+}
+
+// TestDecodeAvroUnwrapFalsePositive verifies that a raw (unwrapped) Avro value
+// whose first byte happens to be the Confluent magic byte is not mis-decoded:
+// the bogus schema id fails to resolve, and the full input is decoded against
+// the topic schema instead of being truncated by 5 bytes.
+func TestDecodeAvroUnwrapFalsePositive(t *testing.T) {
+	schema := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{
+		{Name: "a", Type: "int64", Path: "$.a"},
+		{Name: "s", Type: "string", Path: "$.s"},
+	}}
+	// a=0 encodes to a leading 0x00 (the magic byte) and the value is longer
+	// than 5 bytes, so AvroUnwrap falsely reports a schema-id envelope.
+	raw, err := EncodeAvroValue(schema, map[string]any{"a": int64(0), "s": "hello"})
+	if err != nil {
+		t.Fatalf("EncodeAvroValue() error = %v", err)
+	}
+	if _, _, wrapped := AvroUnwrap(raw); !wrapped {
+		t.Fatalf("test premise broken: AvroUnwrap(%x) did not report wrapped", raw)
+	}
+	values, err := DecodeAvroTypedFields(context.Background(), "t", schema, notFoundResolver{}, raw)
+	if err != nil {
+		t.Fatalf("DecodeAvroTypedFields() on a false positive = %v, want fallback decode", err)
+	}
+	if !values[0].Present || values[0].Value.Int64() != 0 {
+		t.Fatalf("a = %+v, want 0", values[0])
+	}
+	if !values[1].Present || values[1].Value.String() != "hello" {
+		t.Fatalf("s = %+v, want hello", values[1])
+	}
+}
+
+// TestAvroTimestampScale verifies the Unix-nanosecond scale honors the writer
+// schema's timestamp logical type, so a value declared as micros is not
+// misread as millis; a plain long defaults to millis (camu's writer).
+func TestAvroTimestampScale(t *testing.T) {
+	millis, err := avro.Parse(`{"type":"long","logicalType":"timestamp-millis"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := avroTimestampScale(millis); got != 1_000_000 {
+		t.Fatalf("timestamp-millis scale = %d, want 1_000_000", got)
+	}
+	micros, err := avro.Parse(`{"type":"long","logicalType":"timestamp-micros"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := avroTimestampScale(micros); got != 1_000 {
+		t.Fatalf("timestamp-micros scale = %d, want 1_000", got)
+	}
+	localMicros, err := avro.Parse(`{"type":"long","logicalType":"local-timestamp-micros"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := avroTimestampScale(localMicros); got != 1_000 {
+		t.Fatalf("local-timestamp-micros scale = %d, want 1_000", got)
+	}
+	plain, err := avro.Parse(`"long"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := avroTimestampScale(plain); got != 1_000_000 {
+		t.Fatalf("plain long scale = %d, want 1_000_000 (default)", got)
 	}
 }

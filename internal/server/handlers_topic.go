@@ -164,6 +164,11 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 		return meta.TopicConfig{}, err
 	}
 	if _, err := s.schemaRegistry.RegisterTopicSchema(ctx, tc.Name, tc.Schema); err != nil {
+		// Roll back the just-created topic so a failed registration does not
+		// leave a topic that is unusable for typed produce/export.
+		if derr := s.topicStore.Delete(ctx, tc.Name); derr != nil && !errors.Is(derr, storage.ErrNotFound) {
+			slog.Error("create_topic_rollback_failed", "topic", tc.Name, "error", derr)
+		}
 		return meta.TopicConfig{}, fmt.Errorf("register topic schema: %w", err)
 	}
 
