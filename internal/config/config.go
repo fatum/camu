@@ -29,7 +29,16 @@ type MaintenanceConfig struct {
 type ParquetExportConfig struct {
 	MaxRecords  int    `yaml:"max_records"`
 	MaxDuration string `yaml:"max_duration"`
+	// Iceberg writes the export as self-managed Apache Iceberg tables instead
+	// of the legacy per-bucket Parquet manifests.
+	Iceberg bool `yaml:"iceberg"`
+	// Warehouse is the object-store prefix Iceberg tables live under.
+	Warehouse string `yaml:"warehouse"`
 }
+
+// defaultExportWarehouse is the default object-store prefix for Iceberg
+// tables, matching iceberg.DefaultWarehouse.
+const defaultExportWarehouse = "warehouse/"
 
 func (p ParquetExportConfig) MaxRecordsValue() int {
 	if p.MaxRecords <= 0 {
@@ -43,6 +52,15 @@ func (p ParquetExportConfig) MaxDurationValue() time.Duration {
 		return 30 * time.Second
 	}
 	return d
+}
+
+// WarehouseValue returns the Iceberg warehouse prefix, defaulting to
+// warehouse/.
+func (p ParquetExportConfig) WarehouseValue() string {
+	if p.Warehouse == "" {
+		return defaultExportWarehouse
+	}
+	return p.Warehouse
 }
 
 type SQLConfig struct {

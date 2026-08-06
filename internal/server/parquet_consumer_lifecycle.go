@@ -83,10 +83,11 @@ func (s *Server) ensureParquetConsumer(tc meta.TopicConfig, identity PartitionId
 
 func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc meta.TopicConfig, identity PartitionIdentity) {
 	defer close(done)
+	sinkName, sinkVersion, useIceberg := s.exportSinkFor(tc)
 	var cp pipeline.Checkpoint
 	for {
 		var err error
-		cp, err = s.loadParquetCheckpoint(ctx, tc.Name, identity.Partition)
+		cp, err = s.loadParquetCheckpoint(ctx, tc.Name, identity.Partition, sinkName, sinkVersion)
 		if err == nil {
 			break
 		}
@@ -102,7 +103,11 @@ func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc 
 	}
 	for {
 		before := cp.NextOffset
-		s.runParquetExportPass(ctx, tc, identity, &cp)
+		if useIceberg {
+			s.runIcebergExportPass(ctx, tc, identity, &cp)
+		} else {
+			s.runParquetExportPass(ctx, tc, identity, &cp)
+		}
 		// Back off when the pass exported nothing: the partition is caught up,
 		// so an idle pass only re-reads the committed head / index. Once new
 		// data appears the next pass advances the checkpoint and the loop
@@ -126,13 +131,13 @@ func parquetConsumerPollIntervalFor(before, after uint64) time.Duration {
 	return parquetConsumerPollInterval
 }
 
-func (s *Server) loadParquetCheckpoint(ctx context.Context, topic string, partition int) (pipeline.Checkpoint, error) {
+func (s *Server) loadParquetCheckpoint(ctx context.Context, topic string, partition int, sinkName, sinkVersion string) (pipeline.Checkpoint, error) {
 	store := pipeline.NewCheckpointStore(s.s3Client, serverPipelineFence{server: s})
-	cp, err := store.Load(ctx, parquetPipelineName, topic, partition)
+	cp, err := store.Load(ctx, sinkName, topic, partition)
 	if errors.Is(err, storage.ErrNotFound) {
-		return pipeline.Checkpoint{SourceTopic: topic, Partition: partition, Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion}, nil
+		return pipeline.Checkpoint{SourceTopic: topic, Partition: partition, Sink: sinkName, SinkVersion: sinkVersion}, nil
 	}
-	if err == nil && (cp.Sink != parquetPipelineName || cp.SinkVersion != parquetPipelineVersion) {
+	if err == nil && (cp.Sink != sinkName || cp.SinkVersion != sinkVersion) {
 		return pipeline.Checkpoint{}, errors.New("parquet pipeline checkpoint has incompatible sink version")
 	}
 	return cp, err

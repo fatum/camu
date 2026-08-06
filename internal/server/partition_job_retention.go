@@ -336,7 +336,7 @@ func (s *Server) ensureClassicRetentionExported(ctx context.Context, job Partiti
 }
 
 func (s *Server) getParquetPipelineCheckpoint(ctx context.Context, topic string, partition int) (pipeline.Checkpoint, error) {
-	return pipeline.NewCheckpointStore(s.s3Client, serverPipelineFence{server: s}).Load(ctx, parquetPipelineName, topic, partition)
+	return pipeline.NewCheckpointStore(s.s3Client, serverPipelineFence{server: s}).Load(ctx, s.getExportCheckpointSink(topic), topic, partition)
 }
 
 func (s *Server) classicRetentionEndOffset(ctx context.Context, payload ClassicRetentionPayload) (uint64, error) {

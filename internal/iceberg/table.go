@@ -90,6 +90,16 @@ func (ts *TableStore) dataFileKey(topic, id string) string {
 	return ts.dataDir(topic) + id + ".parquet"
 }
 
+// ExportDataFileKey returns the deterministic data-file key for one exported
+// source range. ingestTime is the partition leader's segment-flush time (see
+// ExportObjectKey) and sourceIdentity must identify the immutable native
+// segment being exported; together they make retries converge on one object.
+func (ts *TableStore) ExportDataFileKey(topic string, partition int, ingestTime time.Time, base, end int64, sourceIdentity string) string {
+	dt, hour := BucketDateHour(ingestTime)
+	id := exportFileID(topic, partition, dt, hour, base, end, 1, sourceIdentity)
+	return ts.dataFileKey(topic, id)
+}
+
 // Create initializes a new table with no snapshots. It fails with ErrConflict
 // if the table already exists.
 func (ts *TableStore) Create(ctx context.Context, topic string, topicSchema *meta.TopicSchema) (*TableMetadata, error) {
@@ -351,6 +361,36 @@ func (ts *TableStore) writeManifestListFile(ctx context.Context, key string, man
 		return 0, fmt.Errorf("write iceberg manifest list %q: %w", key, err)
 	}
 	return n, nil
+}
+
+// CurrentDataFiles returns the data files referenced by the current snapshot,
+// resolved through the snapshot's manifest list and manifests.
+func (ts *TableStore) CurrentDataFiles(ctx context.Context, topic string) ([]DataFile, error) {
+	current, err := ts.Load(ctx, topic)
+	if err != nil {
+		return nil, err
+	}
+	manifests, err := ts.readParentManifestList(ctx, current)
+	if err != nil {
+		return nil, err
+	}
+	var files []DataFile
+	for _, mf := range manifests {
+		data, err := ts.objects.Get(ctx, mf.ManifestPath)
+		if err != nil {
+			return nil, fmt.Errorf("read manifest %q: %w", mf.ManifestPath, err)
+		}
+		entries, err := readManifestEntries(data)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.Status != manifestEntryDeleted {
+				files = append(files, e.DataFile)
+			}
+		}
+	}
+	return files, nil
 }
 
 // readParentManifestList returns the current snapshot's manifest list entries,
