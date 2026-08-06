@@ -50,10 +50,13 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 	if !cfg.Enabled || s.disklessMeta == nil {
 		return
 	}
-	for _, job := range jobs {
-		if job.Type == PartitionJobTypeSegmentMerge {
-			return
-		}
+	active, err := s.hasActiveSegmentMergeJob(ctx, identity, jobs)
+	if err != nil {
+		slog.Warn("diskless_merge_stale_cleanup_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		return
+	}
+	if active {
+		return
 	}
 	committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, identity.Partition)
 	if err != nil {

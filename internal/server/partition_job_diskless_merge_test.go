@@ -109,7 +109,92 @@ func TestDisklessSegmentMerge(t *testing.T) {
 	}
 }
 
-// TestDisklessSegmentMergeAdvancesPastOversizedRef verifies that discovery does
+// TestDisklessSegmentMergeStaleJobUnblocksDiscovery verifies that an orphaned
+// merge job whose expected owner or epoch no longer matches the current leader
+// (e.g. leadership moved after a restart) is deleted during discovery instead
+// of permanently blocking compaction, and that a fresh job is created. A valid
+// merge job for the current leader still blocks discovery.
+func TestDisklessSegmentMergeStaleJobUnblocksDiscovery(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 4
+	s.cfg.Diskless.Compaction.TargetBytes = 1 << 20
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	// The current leader identity is (self, epoch 2) — higher than the stale
+	// job's epoch to model leadership having moved after a restart.
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 2},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 2}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	for i := 0; i < 4; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
+		data := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+	refs, err := s.disklessMeta.QuerySegments(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 4 {
+		t.Fatalf("setup: expected 4 refs, got %d", len(refs))
+	}
+
+	// Seed a stale merge job owned by an old leader at an old epoch.
+	stale, err := buildDisklessMergeJob("t", 0, PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: "old-leader", LeaderEpoch: 1}, refs)
+	if err != nil {
+		t.Fatalf("build stale merge job: %v", err)
+	}
+	if err := s.putPartitionJob(ctx, stale); err != nil {
+		t.Fatalf("seed stale job: %v", err)
+	}
+
+	// Discovery with the current identity must delete the stale job and create
+	// a fresh one owned by the current leader.
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 2}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, []PartitionJob{stale})
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 fresh merge job after stale cleanup, got %d", len(jobs))
+	}
+	if jobs[0].ExpectedOwner != s.instanceID || jobs[0].ExpectedEpoch != 2 {
+		t.Fatalf("fresh job owner = %s/%d, want %s/2", jobs[0].ExpectedOwner, jobs[0].ExpectedEpoch, s.instanceID)
+	}
+
+	// A now-current merge job must block further discovery (no duplicate job).
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
+	jobs, err = s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 merge job while one is in flight, got %d", len(jobs))
+	}
+}
 // not stall when a ref already exceeds the target size (the merged object of a
 // prior run, for instance): the oversized ref is treated as a boundary and the
 // small refs behind it are still merged.
