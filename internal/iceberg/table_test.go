@@ -415,3 +415,47 @@ func TestTableCommitSnapshotMergesManifests(t *testing.T) {
 		t.Fatalf("data files = %d, want %d (merged manifest must keep every file)", len(files), commits)
 	}
 }
+
+func TestValidateTablePassesForCommittedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	files := []DataFile{
+		{Content: DataFileContentData, FilePath: "warehouse/events/data/dt=2026-08-06/hour=13/a.parquet", FileFormat: DataFileFormatParquet, DT: "2026-08-06", Hour: 13, RecordCount: 1, FileSizeBytes: 100},
+	}
+	if _, err := ts.objects.ConditionalPut(ctx, files[0].FilePath, []byte("parquet"), ""); err != nil {
+		t.Fatalf("put data file: %v", err)
+	}
+	if _, err := ts.CommitSnapshot(ctx, "events", files); err != nil {
+		t.Fatalf("CommitSnapshot() error = %v", err)
+	}
+	if err := ts.ValidateTable(ctx, "events"); err != nil {
+		t.Fatalf("ValidateTable() error = %v", err)
+	}
+}
+
+func TestValidateTableDetectsMissingDataFile(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	files := []DataFile{
+		{Content: DataFileContentData, FilePath: "warehouse/events/data/dt=2026-08-06/hour=13/a.parquet", FileFormat: DataFileFormatParquet, DT: "2026-08-06", Hour: 13, RecordCount: 1, FileSizeBytes: 100},
+	}
+	if _, err := ts.objects.ConditionalPut(ctx, files[0].FilePath, []byte("parquet"), ""); err != nil {
+		t.Fatalf("put data file: %v", err)
+	}
+	if _, err := ts.CommitSnapshot(ctx, "events", files); err != nil {
+		t.Fatalf("CommitSnapshot() error = %v", err)
+	}
+	// Delete the data file behind the manifest's back.
+	if err := ts.objects.Delete(ctx, files[0].FilePath); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if err := ts.ValidateTable(ctx, "events"); err == nil {
+		t.Fatal("ValidateTable() error = nil, want missing data file detection")
+	}
+}

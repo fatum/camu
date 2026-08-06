@@ -448,6 +448,69 @@ func (ts *TableStore) CurrentDataFiles(ctx context.Context, topic string) ([]Dat
 	return files, nil
 }
 
+// ValidateTable walks the current table state and verifies its structure is a
+// consistent Iceberg table: metadata.json invariants, the current snapshot's
+// manifest list resolves to existing manifests, every manifest entry has a
+// valid status and the dt/hour partition values declared by the spec, and
+// every referenced data file exists. It is a diagnostic for tooling and a
+// spec-fidelity check before engines read the table.
+func (ts *TableStore) ValidateTable(ctx context.Context, topic string) error {
+	current, err := ts.Load(ctx, topic)
+	if err != nil {
+		return fmt.Errorf("validate table %q: %w", topic, err)
+	}
+	if err := current.validate(); err != nil {
+		return fmt.Errorf("validate table %q metadata: %w", topic, err)
+	}
+	snap := current.currentSnapshot()
+	if snap == nil {
+		return nil // empty table is valid
+	}
+	if snap.ManifestList == "" {
+		return fmt.Errorf("validate table %q: snapshot %d has no manifest list", topic, snap.SnapshotID)
+	}
+	listData, err := ts.objects.Get(ctx, snap.ManifestList)
+	if err != nil {
+		return fmt.Errorf("validate table %q: read manifest list %q: %w", topic, snap.ManifestList, err)
+	}
+	manifests, err := readManifestList(listData)
+	if err != nil {
+		return fmt.Errorf("validate table %q: parse manifest list %q: %w", topic, snap.ManifestList, err)
+	}
+	spec := current.currentPartitionSpec()
+	if len(manifests) > 0 && len(spec.Fields) != 2 {
+		return fmt.Errorf("validate table %q: manifest list references manifests but partition spec has %d fields", topic, len(spec.Fields))
+	}
+	for _, mf := range manifests {
+		if mf.PartitionSpecID != current.DefaultSpecID {
+			return fmt.Errorf("validate table %q: manifest %q uses spec %d, want %d", topic, mf.ManifestPath, mf.PartitionSpecID, current.DefaultSpecID)
+		}
+		if len(mf.Partitions) != 2 {
+			return fmt.Errorf("validate table %q: manifest %q has %d partition summaries, want 2", topic, mf.ManifestPath, len(mf.Partitions))
+		}
+		data, err := ts.objects.Get(ctx, mf.ManifestPath)
+		if err != nil {
+			return fmt.Errorf("validate table %q: read manifest %q: %w", topic, mf.ManifestPath, err)
+		}
+		entries, err := readManifestEntries(data)
+		if err != nil {
+			return fmt.Errorf("validate table %q: parse manifest %q: %w", topic, mf.ManifestPath, err)
+		}
+		for _, e := range entries {
+			if e.Status != manifestEntryExisting && e.Status != manifestEntryAdded {
+				return fmt.Errorf("validate table %q: manifest %q entry for %q has invalid status %d", topic, mf.ManifestPath, e.DataFile.FilePath, e.Status)
+			}
+			if e.DataFile.DT == "" {
+				return fmt.Errorf("validate table %q: manifest %q data file %q has no dt partition value", topic, mf.ManifestPath, e.DataFile.FilePath)
+			}
+			if _, err := ts.objects.Get(ctx, e.DataFile.FilePath); err != nil {
+				return fmt.Errorf("validate table %q: manifest %q references missing data file %q: %w", topic, mf.ManifestPath, e.DataFile.FilePath, err)
+			}
+		}
+	}
+	return nil
+}
+
 // readParentManifestList returns the current snapshot's manifest list entries,
 // which a new snapshot carries forward so its manifest list covers the full
 // table state.

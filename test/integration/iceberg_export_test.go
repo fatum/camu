@@ -122,7 +122,15 @@ func TestIntegrationIcebergExportRoundTrip(t *testing.T) {
 		if _, err := env.S3Client().Get(ctx, f.FilePath); err != nil {
 			t.Fatalf("data file %s missing: %v", f.FilePath, err)
 		}
+		if f.DT == "" {
+			t.Fatalf("data file %s has no dt partition value", f.FilePath)
+		}
 		seen[f.FilePath] = true
+	}
+	// The committed table must be structurally valid Iceberg (spec-fidelity
+	// check before any engine reads it).
+	if err := table.ValidateTable(ctx, topic); err != nil {
+		t.Fatalf("ValidateTable: %v", err)
 	}
 	// A re-run of the maintenance pass must not duplicate files (the snapshot
 	// commit is idempotent for the same file set).
