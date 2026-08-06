@@ -103,12 +103,14 @@ func (ts *TableStore) Create(ctx context.Context, topic string, topicSchema *met
 	if err != nil {
 		return nil, err
 	}
-	if _, err := ts.objects.ConditionalPut(ctx, ts.metadataFileKey(topic, 0), encoded, ""); err != nil {
+	fileKey := ts.metadataFileKey(topic, 0)
+	if _, err := ts.objects.ConditionalPut(ctx, fileKey, encoded, ""); err != nil {
 		return nil, fmt.Errorf("create iceberg table %q: %w", topic, err)
 	}
 	if _, err := ts.objects.ConditionalPut(ctx, ts.versionHintKey(topic), []byte("0"), ""); err != nil {
 		return nil, fmt.Errorf("create iceberg table %q version hint: %w", topic, err)
 	}
+	md.metadataKey = fileKey
 	return md, nil
 }
 
@@ -139,6 +141,7 @@ func (ts *TableStore) Load(ctx context.Context, topic string) (*TableMetadata, e
 		return nil, fmt.Errorf("parse iceberg table metadata %q: %w", topic, err)
 	}
 	md.version = version
+	md.metadataKey = key
 	if err := md.validate(); err != nil {
 		return nil, fmt.Errorf("iceberg table %q: %w", topic, err)
 	}
@@ -280,7 +283,7 @@ func (ts *TableStore) EnsureSchema(ctx context.Context, topic string, topicSchem
 		next.Schemas = append(next.Schemas, buildTableSchema(next.currentSchema(), topicSchema, schemaID))
 		next.CurrentSchemaID = schemaID
 		newest := next.Schemas[len(next.Schemas)-1]
-		if last := newest.Fields[len(newest.Fields)-1].ID; last > next.LastColumnID {
+		if last := maxSchemaFieldID(newest.Fields); last > next.LastColumnID {
 			next.LastColumnID = last
 		}
 		committed, err := ts.commitCAS(ctx, topic, current, next)
@@ -353,6 +356,10 @@ func (ts *TableStore) commitSnapshot(ctx context.Context, topic string, snapshot
 
 const maxTableCommitAttempts = 6
 
+// metadataLogCap bounds the metadata-log history kept per table (matching
+// Iceberg's default metadata.previous-versions-max).
+const metadataLogCap = 100
+
 // commitCAS writes next as the new metadata version (current.version+1) and
 // atomically advances the version hint. It returns ErrConflict when a
 // concurrent writer won, in which case the caller must reload and reapply.
@@ -363,6 +370,12 @@ func (ts *TableStore) commitCAS(ctx context.Context, topic string, current, next
 	nextVersion := current.version + 1
 	next.version = nextVersion
 	next.LastUpdatedMS = time.Now().UnixMilli()
+	if current.metadataKey != "" {
+		next.MetadataLog = append(next.MetadataLog, MetadataLogEntry{TimestampMS: current.LastUpdatedMS, MetadataFile: current.metadataKey})
+		if len(next.MetadataLog) > metadataLogCap {
+			next.MetadataLog = next.MetadataLog[len(next.MetadataLog)-metadataLogCap:]
+		}
+	}
 	encoded, err := json.Marshal(next)
 	if err != nil {
 		return nil, err
@@ -385,7 +398,31 @@ func (ts *TableStore) commitCAS(ctx context.Context, topic string, current, next
 		_ = ts.objects.Delete(ctx, fileKey)
 		return nil, fmt.Errorf("commit iceberg version hint %q: %w", topic, err)
 	}
+	// The commit won: remove any sibling metadata file a concurrent loser wrote
+	// at this same version, so a reader listing by version prefix can never
+	// resolve the wrong (orphaned) file. Best-effort: a failed cleanup leaves a
+	// file that describes the same table state.
+	ts.removeOrphanMetadataFiles(ctx, topic, nextVersion, fileKey)
 	return next, nil
+}
+
+// removeOrphanMetadataFiles deletes every metadata file at a version except
+// the one the winning commit just wrote.
+func (ts *TableStore) removeOrphanMetadataFiles(ctx context.Context, topic string, version int, keep string) {
+	prefix := fmt.Sprintf("%s%05d-", ts.metadataDir(topic), version)
+	keys, err := ts.objects.List(ctx, prefix)
+	if err != nil {
+		return
+	}
+	var stale []string
+	for _, key := range keys {
+		if strings.HasSuffix(key, ".metadata.json") && key != keep {
+			stale = append(stale, key)
+		}
+	}
+	if len(stale) > 0 {
+		_ = ts.objects.DeleteMany(ctx, stale)
+	}
 }
 
 // DeleteTable removes the entire table (metadata, manifest lists, manifests,

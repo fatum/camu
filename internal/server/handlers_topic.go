@@ -331,21 +331,39 @@ func (s *Server) handleUpdateTopicSchema(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"version": version})
 }
 
-// updateTopicSchema registers a new schema version and updates the topic's
-// current schema, returning the new version id.
+// updateTopicSchema registers a new schema version, updates the topic's
+// current schema, and advances the Iceberg table schema, returning the new
+// version id.
 func (s *Server) updateTopicSchema(ctx context.Context, topic string, schema *meta.TopicSchema) (int, error) {
-	version, err := s.schemaRegistry.RegisterSchemaVersion(ctx, topic, schema)
-	if err != nil {
-		return 0, err
-	}
 	tc, err := s.topicStore.Get(ctx, topic)
 	if err != nil {
 		return 0, err
 	}
-	schema.Version = version
-	tc.Schema = schema
-	if err := s.topicStore.Update(ctx, tc); err != nil {
+	version, err := s.schemaRegistry.RegisterSchemaVersion(ctx, topic, schema)
+	if err != nil {
 		return 0, err
+	}
+	next := meta.TopicConfig{
+		Name:                  tc.Name,
+		Partitions:            tc.Partitions,
+		Retention:             tc.Retention,
+		CreatedAt:             tc.CreatedAt,
+		ReplicationFactor:     tc.ReplicationFactor,
+		MinInsyncReplicas:     tc.MinInsyncReplicas,
+		UncleanLeaderElection: tc.UncleanLeaderElection,
+		ExportEnabled:         tc.ExportEnabled,
+		StorageMode:           tc.StorageMode,
+		Schema:                meta.CloneSchema(schema),
+	}
+	next.Schema.Version = version
+	if err := s.topicStore.UpdateSchema(ctx, next); err != nil {
+		return 0, err
+	}
+	// Advance the Iceberg table schema now so the exported table reflects the
+	// new version immediately; a failure here is best-effort because the export
+	// pipeline re-runs EnsureSchema on every pass.
+	if err := s.ensureIcebergTable(ctx, next); err != nil {
+		slog.Warn("topic_schema_iceberg_update_failed", "topic", topic, "version", version, "error", err)
 	}
 	return version, nil
 }

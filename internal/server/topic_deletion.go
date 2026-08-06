@@ -178,6 +178,9 @@ func (s *Server) processTopicDeletion(ctx context.Context, rec topicDeletionReco
 	if err := s.icebergTableStoreFor().DeleteTable(ctx, rec.Topic.Name); err != nil {
 		return fmt.Errorf("clean iceberg table: %w", err)
 	}
+	if err := s.schemaRegistry.DeleteTopicSchemas(ctx, rec.Topic.Name); err != nil {
+		return fmt.Errorf("delete schema registry: %w", err)
+	}
 	if err := s.deleteTopicS3Data(ctx, rec.Topic.Name); err != nil {
 		return fmt.Errorf("delete topic s3 data: %w", err)
 	}

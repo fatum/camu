@@ -116,7 +116,12 @@ type TableMetadata struct {
 	MetadataLog        []MetadataLogEntry     `json:"metadata-log,omitempty"`
 	Refs               map[string]SnapshotRef `json:"refs,omitempty"`
 
-	version int `json:"-"`
+	// version and metadataKey are bookkeeping, not part of the Iceberg spec:
+	// version is the file-version used for naming and CAS, and metadataKey is
+	// the exact object key the metadata was loaded from (used to populate the
+	// metadata-log chain on the next commit).
+	version     int    `json:"-"`
+	metadataKey string `json:"-"`
 }
 
 // tableFormatVersion is the Iceberg format-version Camu writes.
@@ -221,7 +226,7 @@ func icebergFieldType(t string) string {
 // are partitioned by identity(dt), identity(hour) on the ingest-time columns.
 func NewTableMetadata(tableLocation string, topicSchema *meta.TopicSchema) *TableMetadata {
 	schema := SchemaFromTopic(topicSchema)
-	lastColumnID := schema.Fields[len(schema.Fields)-1].ID
+	lastColumnID := maxSchemaFieldID(schema.Fields)
 	now := time.Now().UnixMilli()
 	return &TableMetadata{
 		FormatVersion:      tableFormatVersion,
@@ -249,6 +254,18 @@ func NewTableMetadata(tableLocation string, topicSchema *meta.TopicSchema) *Tabl
 		MetadataLog:        []MetadataLogEntry{},
 		Refs:               map[string]SnapshotRef{},
 	}
+}
+
+// maxSchemaFieldID returns the highest column id in a schema, which is what
+// last-column-id must reflect regardless of field ordering.
+func maxSchemaFieldID(fields []SchemaField) int {
+	max := 0
+	for _, f := range fields {
+		if f.ID > max {
+			max = f.ID
+		}
+	}
+	return max
 }
 
 // currentSchema returns the current schema, falling back to schemas[0].
@@ -342,6 +359,7 @@ func (m *TableMetadata) clone() *TableMetadata {
 	for k, v := range m.Refs {
 		c.Refs[k] = v
 	}
+	c.metadataKey = m.metadataKey
 	return &c
 }
 
