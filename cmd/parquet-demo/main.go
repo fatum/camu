@@ -1,8 +1,8 @@
-// parquet-demo is a standalone binary that uses internal/parquet and
+// parquet-demo is a standalone binary that uses internal/iceberg and
 // internal/jobqueue WITHOUT importing internal/server or
 // internal/storage. It exists to prove the two packages are actually
 // extractable: a consumer only has to implement two small interfaces
-// (parquet.ObjectStore, jobqueue.ObjectStore) and can drive the full
+// (iceberg.ObjectStore, jobqueue.ObjectStore) and can drive the full
 // manifest-publish / compaction / queue-put / queue-list pipeline.
 //
 // Run with: go run ./cmd/parquet-demo
@@ -16,12 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/jobqueue"
-	"github.com/maksim/camu/internal/parquet"
 )
 
 // memStore is an in-memory ObjectStore that satisfies BOTH
-// parquet.ObjectStore and jobqueue.ObjectStore. It has zero dependency
+// iceberg.ObjectStore and jobqueue.ObjectStore. It has zero dependency
 // on storage.S3Client — it is plain Go maps.
 type memStore struct {
 	mu      sync.Mutex
@@ -36,14 +36,14 @@ type memObject struct {
 
 func newMemStore() *memStore { return &memStore{objects: map[string]memObject{}} }
 
-// --- parquet.ObjectStore ---
+// --- iceberg.ObjectStore ---
 
 func (m *memStore) Get(_ context.Context, key string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	obj, ok := m.objects[key]
 	if !ok {
-		return nil, parquet.ErrNotFound
+		return nil, iceberg.ErrNotFound
 	}
 	return append([]byte(nil), obj.data...), nil
 }
@@ -53,7 +53,7 @@ func (m *memStore) GetWithETag(_ context.Context, key string) ([]byte, string, e
 	defer m.mu.Unlock()
 	obj, ok := m.objects[key]
 	if !ok {
-		return nil, "", parquet.ErrNotFound
+		return nil, "", iceberg.ErrNotFound
 	}
 	return append([]byte(nil), obj.data...), obj.etag, nil
 }
@@ -64,11 +64,11 @@ func (m *memStore) ConditionalPut(_ context.Context, key string, data []byte, et
 	existing, exists := m.objects[key]
 	switch {
 	case etag == "" && exists:
-		return "", parquet.ErrConflict
+		return "", iceberg.ErrConflict
 	case etag != "" && !exists:
-		return "", parquet.ErrConflict
+		return "", iceberg.ErrConflict
 	case etag != "" && existing.etag != etag:
-		return "", parquet.ErrConflict
+		return "", iceberg.ErrConflict
 	}
 	m.counter++
 	newETag := fmt.Sprintf("etag-%d", m.counter)
@@ -133,14 +133,14 @@ func main() {
 	store := newMemStore()
 
 	// ---- Parquet Store ----
-	pStore := parquet.NewStore(store, parquet.NoFencer{})
+	pStore := iceberg.NewStore(store, iceberg.NoFencer{})
 	ts := time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC)
 
-	manifest := parquet.Manifest{
+	manifest := iceberg.Manifest{
 		Topic: "events", Partition: 0, Date: "2026-04-11", Hour: "13", SchemaVersion: 1,
-		Entries: []parquet.Entry{
-			{ObjectKey: parquet.ExportObjectKey("events", 0, ts, 0, 9, 1, "events/0/0-9-1.segment|epoch=1"), BaseOffset: 0, EndOffset: 9, SchemaVersion: 1, SourceKey: "events/0/0-9-1.segment", SourceEpoch: 1},
-			{ObjectKey: parquet.ExportObjectKey("events", 0, ts, 10, 19, 1, "events/0/10-19-1.segment|epoch=1"), BaseOffset: 10, EndOffset: 19, SchemaVersion: 1, SourceKey: "events/0/10-19-1.segment", SourceEpoch: 1},
+		Entries: []iceberg.Entry{
+			{ObjectKey: iceberg.ExportObjectKey("events", 0, ts, 0, 9, 1, "events/0/0-9-1.segment|epoch=1"), BaseOffset: 0, EndOffset: 9, SchemaVersion: 1, SourceKey: "events/0/0-9-1.segment", SourceEpoch: 1},
+			{ObjectKey: iceberg.ExportObjectKey("events", 0, ts, 10, 19, 1, "events/0/10-19-1.segment|epoch=1"), BaseOffset: 10, EndOffset: 19, SchemaVersion: 1, SourceKey: "events/0/10-19-1.segment", SourceEpoch: 1},
 		},
 	}
 
@@ -157,12 +157,12 @@ func main() {
 	fmt.Printf("[parquet] idempotent retry gen=%d (unchanged)\n", retry.Generation)
 
 	// Compaction: replace the two smalls with one big.
-	big := parquet.Entry{
-		ObjectKey: parquet.ExportObjectKey("events", 0, ts, 0, 19, 1, "events/0/0-19-1.segment|epoch=1"), BaseOffset: 0, EndOffset: 19, SchemaVersion: 1, SourceKey: "compaction/events/0/0-19", SourceEpoch: 0,
+	big := iceberg.Entry{
+		ObjectKey: iceberg.ExportObjectKey("events", 0, ts, 0, 19, 1, "events/0/0-19-1.segment|epoch=1"), BaseOffset: 0, EndOffset: 19, SchemaVersion: 1, SourceKey: "compaction/events/0/0-19", SourceEpoch: 0,
 	}
 	compacted, err := pStore.CompactBucket(ctx, "events", 0, "2026-04-11", "13",
 		[]string{manifest.Entries[0].ObjectKey, manifest.Entries[1].ObjectKey},
-		[]parquet.Entry{big})
+		[]iceberg.Entry{big})
 	must("compact", err)
 	if len(compacted.Entries) != 1 || compacted.Entries[0].ObjectKey != big.ObjectKey {
 		panic(fmt.Sprintf("compaction did not converge: %+v", compacted.Entries))
@@ -172,7 +172,7 @@ func main() {
 	// Idempotent compaction retry — generation must not bump.
 	retryC, err := pStore.CompactBucket(ctx, "events", 0, "2026-04-11", "13",
 		[]string{manifest.Entries[0].ObjectKey, manifest.Entries[1].ObjectKey},
-		[]parquet.Entry{big})
+		[]iceberg.Entry{big})
 	must("compact retry", err)
 	if retryC.Generation != compacted.Generation {
 		panic(fmt.Sprintf("compact retry bumped generation: %d -> %d", compacted.Generation, retryC.Generation))

@@ -21,9 +21,9 @@ import (
 	_ "github.com/marcboeker/go-duckdb"
 
 	"github.com/maksim/camu/internal/config"
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
-	"github.com/maksim/camu/internal/parquet"
 	"github.com/maksim/camu/internal/server"
 	"github.com/maksim/camu/internal/storage"
 	"github.com/maksim/camu/pkg/camutest"
@@ -60,11 +60,11 @@ func createTopicWithExport(c *camutest.Client, name string, partitions int, rete
 //  4. wait for the native segment to flush to S3
 //  5. simulate the parquet-export step by writing a parquet file that
 //     mirrors the produced records and publishing a manifest via the
-//     extracted internal/parquet package
+//     extracted internal/iceberg package
 //  6. query the data back through POST /v1/sql
 //  7. assert each produced record appears in the result set
 //
-// Step 5 uses internal/parquet directly against env.S3Client(), which
+// Step 5 uses internal/iceberg directly against env.S3Client(), which
 // also proves the extracted package is usable without any hand-holding
 // from internal/server.
 func TestIntegrationProduceThenSQLQuery(t *testing.T) {
@@ -110,7 +110,7 @@ func TestIntegrationProduceThenSQLQuery(t *testing.T) {
 	// the same payload (what matters is that the SQL path can find and
 	// serve it).
 	ingestTime := time.Now().UTC()
-	objectKey := parquet.ExportObjectKey(topic, 0, ingestTime, 0, int64(len(produced)-1), 1, "integration/events/0/0-2.segment|epoch=1")
+	objectKey := iceberg.ExportObjectKey(topic, 0, ingestTime, 0, int64(len(produced)-1), 1, "integration/events/0/0-2.segment|epoch=1")
 
 	parquetBytes := writeTestParquetFromRecords(t, produced)
 	if err := env.S3Client().Put(ctx, objectKey, parquetBytes, storage.PutOpts{
@@ -119,14 +119,14 @@ func TestIntegrationProduceThenSQLQuery(t *testing.T) {
 		t.Fatalf("S3 Put parquet: %v", err)
 	}
 
-	// 4. Publish the manifest using the EXTRACTED parquet package
+	// 4. Publish the manifest using the EXTRACTED iceberg package
 	// directly, through a local adapter over env.S3Client(). No
 	// dependency on internal/server is needed to do this.
-	pStore := parquet.NewStore(&integrationParquetAdapter{client: env.S3Client()}, parquet.NoFencer{})
-	date, hour := parquet.BucketDateHour(ingestTime)
-	_, err := pStore.PublishManifest(ctx, parquet.Manifest{
+	pStore := iceberg.NewStore(&integrationParquetAdapter{client: env.S3Client()}, iceberg.NoFencer{})
+	date, hour := iceberg.BucketDateHour(ingestTime)
+	_, err := pStore.PublishManifest(ctx, iceberg.Manifest{
 		Topic: topic, Partition: 0, Date: date, Hour: hour, SchemaVersion: 1,
-		Entries: []parquet.Entry{
+		Entries: []iceberg.Entry{
 			{ObjectKey: objectKey, BaseOffset: 0, EndOffset: int64(len(produced) - 1), SchemaVersion: 1, SourceKey: "integration/events/0/0-2.segment", SourceEpoch: 1},
 		},
 	})
@@ -161,10 +161,10 @@ func TestIntegrationProduceThenSQLQuery(t *testing.T) {
 
 	// 6. Idempotent republish of the SAME manifest must not bump the
 	// generation — this is the crash-recovery guarantee built into the
-	// extracted parquet package, exercised end-to-end here.
-	retry, err := pStore.PublishManifest(ctx, parquet.Manifest{
+	// extracted iceberg package, exercised end-to-end here.
+	retry, err := pStore.PublishManifest(ctx, iceberg.Manifest{
 		Topic: topic, Partition: 0, Date: date, Hour: hour, SchemaVersion: 1,
-		Entries: []parquet.Entry{
+		Entries: []iceberg.Entry{
 			{ObjectKey: objectKey, BaseOffset: 0, EndOffset: int64(len(produced) - 1), SchemaVersion: 1, SourceKey: "integration/events/0/0-2.segment", SourceEpoch: 1},
 		},
 	})
@@ -216,15 +216,15 @@ func TestIntegrationSQLPaginationDrainsMoreThanDefaultLimit(t *testing.T) {
 	}
 
 	ingestTime := time.Now().UTC()
-	objectKey := parquet.ExportObjectKey(topic, 0, ingestTime, 0, int64(total-1), 1, "integration/events/0/0-1004.segment|epoch=1")
+	objectKey := iceberg.ExportObjectKey(topic, 0, ingestTime, 0, int64(total-1), 1, "integration/events/0/0-1004.segment|epoch=1")
 	if err := env.S3Client().Put(ctx, objectKey, writeTestParquetFromRecords(t, produced), storage.PutOpts{ContentType: "application/octet-stream"}); err != nil {
 		t.Fatalf("S3 Put parquet: %v", err)
 	}
-	pStore := parquet.NewStore(&integrationParquetAdapter{client: env.S3Client()}, parquet.NoFencer{})
-	date, hour := parquet.BucketDateHour(ingestTime)
-	if _, err := pStore.PublishManifest(ctx, parquet.Manifest{
+	pStore := iceberg.NewStore(&integrationParquetAdapter{client: env.S3Client()}, iceberg.NoFencer{})
+	date, hour := iceberg.BucketDateHour(ingestTime)
+	if _, err := pStore.PublishManifest(ctx, iceberg.Manifest{
 		Topic: topic, Partition: 0, Date: date, Hour: hour, SchemaVersion: 1,
-		Entries: []parquet.Entry{{ObjectKey: objectKey, BaseOffset: 0, EndOffset: int64(total - 1), SchemaVersion: 1, SourceKey: "integration/events/0/0-1004.segment", SourceEpoch: 1}},
+		Entries: []iceberg.Entry{{ObjectKey: objectKey, BaseOffset: 0, EndOffset: int64(total - 1), SchemaVersion: 1, SourceKey: "integration/events/0/0-1004.segment", SourceEpoch: 1}},
 	}); err != nil {
 		t.Fatalf("PublishManifest: %v", err)
 	}
@@ -564,16 +564,16 @@ func TestIntegrationSQLQueryAggregation(t *testing.T) {
 
 	// Simulate export.
 	ingestTime := time.Now().UTC()
-	objectKey := parquet.ExportObjectKey(topic, 0, ingestTime, 0, int64(len(produced)-1), 1, "integration/events-agg/0/0-9.segment|epoch=1")
+	objectKey := iceberg.ExportObjectKey(topic, 0, ingestTime, 0, int64(len(produced)-1), 1, "integration/events-agg/0/0-9.segment|epoch=1")
 	if err := env.S3Client().Put(ctx, objectKey, writeTestParquetFromRecords(t, produced),
 		storage.PutOpts{ContentType: "application/octet-stream"}); err != nil {
 		t.Fatalf("S3 Put: %v", err)
 	}
-	pStore := parquet.NewStore(&integrationParquetAdapter{client: env.S3Client()}, parquet.NoFencer{})
-	date, hour := parquet.BucketDateHour(ingestTime)
-	if _, err := pStore.PublishManifest(ctx, parquet.Manifest{
+	pStore := iceberg.NewStore(&integrationParquetAdapter{client: env.S3Client()}, iceberg.NoFencer{})
+	date, hour := iceberg.BucketDateHour(ingestTime)
+	if _, err := pStore.PublishManifest(ctx, iceberg.Manifest{
 		Topic: topic, Partition: 0, Date: date, Hour: hour, SchemaVersion: 1,
-		Entries: []parquet.Entry{
+		Entries: []iceberg.Entry{
 			{ObjectKey: objectKey, BaseOffset: 0, EndOffset: int64(len(produced) - 1), SchemaVersion: 1, SourceKey: "integration/events-agg/0/0-9.segment", SourceEpoch: 1},
 		},
 	}); err != nil {
@@ -627,11 +627,11 @@ func TestIntegrationSQLQueryAggregation(t *testing.T) {
 
 // TestIntegrationSQLQueryCompactionRoundTrip produces records, exports
 // them into MULTIPLE small parquet files in one bucket, then runs
-// parquet.Store.CompactBucket to replace them with a single large file,
+// iceberg.Store.CompactBucket to replace them with a single large file,
 // and proves queries keep returning the same result set throughout.
 //
 // This end-to-end covers the full idempotency story of the extracted
-// parquet package: native produce -> multi-file export -> compaction ->
+// iceberg package: native produce -> multi-file export -> compaction ->
 // idempotent compaction retry -> query consistency at every step.
 func TestIntegrationSQLQueryCompactionRoundTrip(t *testing.T) {
 	enabled := true
@@ -669,25 +669,25 @@ func TestIntegrationSQLQueryCompactionRoundTrip(t *testing.T) {
 	// Simulate the export by writing one parquet file per batch. Each
 	// small file carries a slice of the global offsets.
 	ingestTime := time.Now().UTC()
-	date, hour := parquet.BucketDateHour(ingestTime)
-	pStore := parquet.NewStore(&integrationParquetAdapter{client: env.S3Client()}, parquet.NoFencer{})
+	date, hour := iceberg.BucketDateHour(ingestTime)
+	pStore := iceberg.NewStore(&integrationParquetAdapter{client: env.S3Client()}, iceberg.NoFencer{})
 
-	var smallEntries []parquet.Entry
+	var smallEntries []iceberg.Entry
 	var smallKeys []string
 	offset := int64(0)
 	for _, b := range batches {
 		base := offset
 		end := offset + int64(len(b)) - 1
 		offset += int64(len(b))
-		key := parquet.ExportObjectKey(topic, 0, ingestTime, base, end, 1, fmt.Sprintf("integration/%s/0/%d-%d.segment|epoch=1", topic, base, end))
+		key := iceberg.ExportObjectKey(topic, 0, ingestTime, base, end, 1, fmt.Sprintf("integration/%s/0/%d-%d.segment|epoch=1", topic, base, end))
 		if err := env.S3Client().Put(ctx, key, writeTestParquetFromRecordsWithBase(t, b, base),
 			storage.PutOpts{ContentType: "application/octet-stream"}); err != nil {
 			t.Fatalf("put small: %v", err)
 		}
-		smallEntries = append(smallEntries, parquet.Entry{ObjectKey: key, BaseOffset: base, EndOffset: end, SchemaVersion: 1, SourceKey: fmt.Sprintf("integration/%s/0/%d-%d.segment", topic, base, end), SourceEpoch: 1})
+		smallEntries = append(smallEntries, iceberg.Entry{ObjectKey: key, BaseOffset: base, EndOffset: end, SchemaVersion: 1, SourceKey: fmt.Sprintf("integration/%s/0/%d-%d.segment", topic, base, end), SourceEpoch: 1})
 		smallKeys = append(smallKeys, key)
 	}
-	if _, err := pStore.PublishManifest(ctx, parquet.Manifest{
+	if _, err := pStore.PublishManifest(ctx, iceberg.Manifest{
 		Topic: topic, Partition: 0, Date: date, Hour: hour, SchemaVersion: 1,
 		Entries: smallEntries,
 	}); err != nil {
@@ -702,15 +702,15 @@ func TestIntegrationSQLQueryCompactionRoundTrip(t *testing.T) {
 
 	// Build the compacted big file that covers the full offset span
 	// of all 5 records.
-	bigKey := parquet.ExportObjectKey(topic, 0, ingestTime, 0, int64(len(all)-1), 1, fmt.Sprintf("integration/%s/0/0-%d.compacted|epoch=1", topic, len(all)-1)) + ".big"
+	bigKey := iceberg.ExportObjectKey(topic, 0, ingestTime, 0, int64(len(all)-1), 1, fmt.Sprintf("integration/%s/0/0-%d.compacted|epoch=1", topic, len(all)-1)) + ".big"
 	if err := env.S3Client().Put(ctx, bigKey, writeTestParquetFromRecords(t, all),
 		storage.PutOpts{ContentType: "application/octet-stream"}); err != nil {
 		t.Fatalf("put big: %v", err)
 	}
-	bigEntry := parquet.Entry{ObjectKey: bigKey, BaseOffset: 0, EndOffset: int64(len(all) - 1), SchemaVersion: 1, SourceKey: fmt.Sprintf("compaction/integration/%s/0/0-%d", topic, len(all)-1), SourceEpoch: 0}
+	bigEntry := iceberg.Entry{ObjectKey: bigKey, BaseOffset: 0, EndOffset: int64(len(all) - 1), SchemaVersion: 1, SourceKey: fmt.Sprintf("compaction/integration/%s/0/0-%d", topic, len(all)-1), SourceEpoch: 0}
 
 	// Run compaction: replace the 3 small files with the 1 big file.
-	compacted, err := pStore.CompactBucket(ctx, topic, 0, date, hour, smallKeys, []parquet.Entry{bigEntry})
+	compacted, err := pStore.CompactBucket(ctx, topic, 0, date, hour, smallKeys, []iceberg.Entry{bigEntry})
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
@@ -731,7 +731,7 @@ func TestIntegrationSQLQueryCompactionRoundTrip(t *testing.T) {
 
 	// Idempotent compaction retry: the same CompactBucket call must
 	// not bump the generation.
-	retry, err := pStore.CompactBucket(ctx, topic, 0, date, hour, smallKeys, []parquet.Entry{bigEntry})
+	retry, err := pStore.CompactBucket(ctx, topic, 0, date, hour, smallKeys, []iceberg.Entry{bigEntry})
 	if err != nil {
 		t.Fatalf("compact retry: %v", err)
 	}
@@ -833,7 +833,7 @@ func writeTestParquetFromRecords(t *testing.T, msgs []camutest.ProduceMessage) [
 }
 
 // integrationParquetAdapter wraps *storage.S3Client so it satisfies
-// parquet.ObjectStore for this integration test. It deliberately does
+// iceberg.ObjectStore for this integration test. It deliberately does
 // NOT import internal/server — proving the extracted package can be
 // consumed by any caller that has a storage client and is willing to
 // write ~40 lines of translation.
@@ -881,9 +881,9 @@ func translateStorageErr(err error) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, storage.ErrNotFound):
-		return errors.Join(err, parquet.ErrNotFound)
+		return errors.Join(err, iceberg.ErrNotFound)
 	case errors.Is(err, storage.ErrConflict):
-		return errors.Join(err, parquet.ErrConflict)
+		return errors.Join(err, iceberg.ErrConflict)
 	default:
 		return err
 	}

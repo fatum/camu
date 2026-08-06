@@ -1,13 +1,13 @@
-// Package parquet provides the durable metadata layer for Camu's Parquet
-// export pipeline: manifest publication with CAS and crash-safe compaction.
-// It is decoupled from the server package and
-// depends only on a small ObjectStore interface plus a Fencer for
-// topic-deletion safety.
+// Package iceberg owns the analytical projection of Camu topics: the
+// Parquet data files and, once the Iceberg sink lands, the Iceberg table
+// metadata (manifests, manifest lists, metadata.json). It is decoupled from
+// the server package and depends only on a small ObjectStore interface plus a
+// Fencer for topic-deletion safety.
 //
 // The package is designed to be usable outside the streaming server —
 // e.g. by query-only nodes that need to resolve manifests, or by offline
 // tooling that rebuilds Parquet state from the canonical log.
-package parquet
+package iceberg
 
 import (
 	"errors"

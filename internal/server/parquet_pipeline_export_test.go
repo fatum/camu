@@ -13,9 +13,9 @@ import (
 
 	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/diskless"
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
-	"github.com/maksim/camu/internal/parquet"
 	"github.com/maksim/camu/internal/pipeline"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -122,7 +122,7 @@ func TestDisklessExportPass(t *testing.T) {
 		t.Fatalf("durable checkpoint next offset = %d, want 2", durable.NextOffset)
 	}
 	ingestTime := time.Unix(0, 0).UTC() // diskless records carry no ingest segment; fallback epoch
-	objectKey := parquet.ExportObjectKey(tc.Name, 0, ingestTime, 0, 1, 1, "pipeline")
+	objectKey := iceberg.ExportObjectKey(tc.Name, 0, ingestTime, 0, 1, 1, "pipeline")
 	if _, err := s.s3Client.Get(ctx, objectKey); err != nil {
 		t.Fatalf("expected exported parquet object %s: %v", objectKey, err)
 	}
@@ -138,16 +138,16 @@ func TestWriteParquetChunkIsReadableByDuckDB(t *testing.T) {
 		{Name: "optional_at", Type: "timestamp", Path: "$.optional_at", Nullable: true},
 		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
 	}}
-	chunk, err := encodeParquetChunk([]log.Message{
+	chunk, err := iceberg.EncodeChunk("", []log.Message{
 		{Offset: 7, Timestamp: time.Date(2026, time.August, 3, 12, 0, 0, 0, time.UTC).UnixMilli(), Key: []byte("key-7"), Value: []byte(`{"name":"alpha","count":7,"ratio":1.5,"enabled":true,"occurred_at":"2026-08-03T14:30:00+02:30","optional_at":"2026-08-03T12:30:00Z"}`)},
 		{Offset: 8, Timestamp: time.Date(2026, time.August, 3, 12, 1, 0, 0, time.UTC).UnixMilli(), Key: []byte("key-8"), Value: []byte(`{"name":"beta","count":8,"ratio":2.5,"enabled":false,"occurred_at":"2026-08-03T14:31:00+02:30"}`)},
 	}, schema)
 	if err != nil {
-		t.Fatalf("encodeParquetChunk() error = %v", err)
+		t.Fatalf("iceberg.EncodeChunk() error = %v", err)
 	}
-	defer chunk.cleanup()
-	path := chunk.file.Name()
-	if chunk.size == 0 {
+	defer chunk.Cleanup()
+	path := chunk.File.Name()
+	if chunk.Size == 0 {
 		t.Fatal("temporary Parquet file is empty")
 	}
 	db, err := sql.Open("duckdb", "")
@@ -183,33 +183,33 @@ func TestWriteParquetChunkIsReadableByDuckDB(t *testing.T) {
 
 func TestEncodeParquetChunkSeparatesSchemaFailuresFromValidRange(t *testing.T) {
 	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
-	chunk, err := encodeParquetChunk([]log.Message{
+	chunk, err := iceberg.EncodeChunk("", []log.Message{
 		{Offset: 10, Timestamp: 10, Value: []byte(`{"id":10}`)},
 		{Offset: 11, Timestamp: 11, Value: []byte(`{"id":"invalid"}`)},
 		{Offset: 12, Timestamp: 12, Value: []byte(`{"id":12}`)},
 	}, schema)
 	if err != nil {
-		t.Fatalf("encodeParquetChunk() error = %v", err)
+		t.Fatalf("iceberg.EncodeChunk() error = %v", err)
 	}
-	defer chunk.cleanup()
-	if chunk.records != 2 || chunk.start != 10 || chunk.end != 12 || chunk.startTS != 10 {
-		t.Fatalf("encoded range = records=%d start=%d end=%d startTS=%d", chunk.records, chunk.start, chunk.end, chunk.startTS)
+	defer chunk.Cleanup()
+	if chunk.Records != 2 || chunk.Start != 10 || chunk.End != 12 || chunk.StartTS != 10 {
+		t.Fatalf("encoded range = records=%d start=%d end=%d startTS=%d", chunk.Records, chunk.Start, chunk.End, chunk.StartTS)
 	}
-	if len(chunk.failures) != 1 || chunk.failures[0].message.Offset != 11 {
-		t.Fatalf("schema failures = %+v", chunk.failures)
+	if len(chunk.Failures) != 1 || chunk.Failures[0].Message.Offset != 11 {
+		t.Fatalf("schema failures = %+v", chunk.Failures)
 	}
-	if chunk.size == 0 {
+	if chunk.Size == 0 {
 		t.Fatal("encoded Parquet data is empty")
 	}
 }
 
 func TestParquetChunkCleanupRemovesTemporaryFile(t *testing.T) {
-	chunk, err := encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":1}`)}}, nil)
+	chunk, err := iceberg.EncodeChunk("", []log.Message{{Offset: 0, Value: []byte(`{"value":1}`)}}, nil)
 	if err != nil {
-		t.Fatalf("encodeParquetChunk() error = %v", err)
+		t.Fatalf("iceberg.EncodeChunk() error = %v", err)
 	}
-	path := chunk.file.Name()
-	chunk.cleanup()
+	path := chunk.File.Name()
+	chunk.Cleanup()
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("temporary Parquet file remains after cleanup: %v", err)
 	}
@@ -221,9 +221,9 @@ func TestServerEncodeParquetChunkUsesConfiguredTempDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer chunk.cleanup()
-	if filepath.Dir(chunk.file.Name()) != s.cfg.SQL.TempDirectoryValue() {
-		t.Fatalf("chunk directory = %s, want %s", filepath.Dir(chunk.file.Name()), s.cfg.SQL.TempDirectoryValue())
+	defer chunk.Cleanup()
+	if filepath.Dir(chunk.File.Name()) != s.cfg.SQL.TempDirectoryValue() {
+		t.Fatalf("chunk directory = %s, want %s", filepath.Dir(chunk.File.Name()), s.cfg.SQL.TempDirectoryValue())
 	}
 }
 
@@ -232,23 +232,23 @@ func TestPutImmutableParquetFileAcceptsEqualConflictAndRejectsDifferentFile(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":"first"}`)}}, nil)
+	first, err := iceberg.EncodeChunk("", []log.Message{{Offset: 0, Value: []byte(`{"value":"first"}`)}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.cleanup()
-	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", first.file, first.size); err != nil {
+	defer first.Cleanup()
+	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", first.File, first.Size); err != nil {
 		t.Fatalf("put immutable first file: %v", err)
 	}
-	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", first.file, first.size); err != nil {
+	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", first.File, first.Size); err != nil {
 		t.Fatalf("put immutable equal retry: %v", err)
 	}
-	different, err := encodeParquetChunk([]log.Message{{Offset: 0, Value: []byte(`{"value":"different"}`)}}, nil)
+	different, err := iceberg.EncodeChunk("", []log.Message{{Offset: 0, Value: []byte(`{"value":"different"}`)}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer different.cleanup()
-	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", different.file, different.size); err == nil {
+	defer different.Cleanup()
+	if err := putImmutableParquetFile(context.Background(), client, "parquet/events/file.parquet", different.File, different.Size); err == nil {
 		t.Fatal("put immutable different retry succeeded")
 	}
 }
@@ -273,7 +273,7 @@ func TestParquetExportDLQFailureDoesNotAdvanceCheckpoint(t *testing.T) {
 }
 
 type manifestConflictObjectStore struct {
-	parquet.ObjectStore
+	iceberg.ObjectStore
 	mu      sync.Mutex
 	puts    int
 	onFirst func()
@@ -287,7 +287,7 @@ func (s *manifestConflictObjectStore) ConditionalPut(ctx context.Context, key st
 	if first && s.onFirst != nil {
 		s.onFirst()
 	}
-	return "", parquet.ErrConflict
+	return "", iceberg.ErrConflict
 }
 
 func (s *manifestConflictObjectStore) putCount() int {
@@ -336,7 +336,7 @@ func setupParquetExportPass(t *testing.T) (*Server, meta.TopicConfig, PartitionI
 func TestParquetExportPersistentManifestConflictsDoNotAdvanceCheckpoint(t *testing.T) {
 	s, tc, identity, cp, _ := setupParquetExportPass(t)
 	objects := &manifestConflictObjectStore{ObjectStore: parquetObjectAdapter{client: s.s3Client}}
-	s.parquetStoreFactory = func() *parquet.Store { return parquet.NewStore(objects, parquet.NoFencer{}) }
+	s.parquetStoreFactory = func() *iceberg.Store { return iceberg.NewStore(objects, iceberg.NoFencer{}) }
 
 	s.runParquetExportPass(context.Background(), tc, identity, cp)
 	if cp.NextOffset != 0 || cp.Generation != 0 {
@@ -361,7 +361,7 @@ func TestParquetExportLeadershipLossDuringManifestRetryFencesOldEpoch(t *testing
 		s.myPartitions[tc.Name][0] = localPartitionAssignment{Owned: true, LeaderEpoch: identity.LeaderEpoch + 1}
 		s.assignmentsMu.Unlock()
 	}
-	s.parquetStoreFactory = func() *parquet.Store { return parquet.NewStore(objects, parquet.NoFencer{}) }
+	s.parquetStoreFactory = func() *iceberg.Store { return iceberg.NewStore(objects, iceberg.NoFencer{}) }
 
 	s.runParquetExportPass(context.Background(), tc, identity, cp)
 	if cp.NextOffset != 0 || cp.Generation != 0 {
@@ -405,7 +405,7 @@ func TestParquetSinkFailureStage(t *testing.T) {
 }
 
 func TestParquetManifestErrorDetails(t *testing.T) {
-	cause := &parquet.ManifestCASConflictError{Key: "_meta/parquet_manifests/events/dt=2026-08-02/hour=13/part-0.json", Attempts: 6}
+	cause := &iceberg.ManifestCASConflictError{Key: "_meta/parquet_manifests/events/dt=2026-08-02/hour=13/part-0.json", Attempts: 6}
 	category, key, attempts := parquetManifestErrorDetails(parquetSinkError(parquetSinkStageManifestPublish, cause))
 	if category != "cas_conflict_exhausted" || key != cause.Key || attempts != cause.Attempts {
 		t.Fatalf("manifest details = %q, %q, %d", category, key, attempts)
@@ -489,7 +489,7 @@ func TestParquetPipelineCommittedRangeBound(t *testing.T) {
 func TestParquetExportManifestConflictRetainsObjectForSuccessor(t *testing.T) {
 	s, tc, identity, cp, ingestTime := setupParquetExportPass(t)
 	conflicts := &manifestConflictObjectStore{ObjectStore: parquetObjectAdapter{client: s.s3Client}}
-	s.parquetStoreFactory = func() *parquet.Store { return parquet.NewStore(conflicts, parquet.NoFencer{}) }
+	s.parquetStoreFactory = func() *iceberg.Store { return iceberg.NewStore(conflicts, iceberg.NoFencer{}) }
 
 	s.runParquetExportPass(context.Background(), tc, identity, cp)
 	objectKey := parquetPipelineObjectKey(tc.Name, identity.Partition, ingestTime, 0, 0)
@@ -499,9 +499,9 @@ func TestParquetExportManifestConflictRetainsObjectForSuccessor(t *testing.T) {
 
 	// A successor must be able to reuse the retained deterministic object and
 	// publish it without racing a cleanup from the old epoch.
-	successor := parquet.NewStore(parquetObjectAdapter{client: s.s3Client}, parquet.NoFencer{})
-	date, hour := parquet.BucketDateHour(ingestTime)
-	if _, err := successor.ReplaceOverlappingEntries(context.Background(), tc.Name, identity.Partition, date, hour, []parquet.Entry{{ObjectKey: objectKey, BaseOffset: 0, EndOffset: 0, SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: identity.LeaderEpoch + 1}}); err != nil {
+	successor := iceberg.NewStore(parquetObjectAdapter{client: s.s3Client}, iceberg.NoFencer{})
+	date, hour := iceberg.BucketDateHour(ingestTime)
+	if _, err := successor.ReplaceOverlappingEntries(context.Background(), tc.Name, identity.Partition, date, hour, []iceberg.Entry{{ObjectKey: objectKey, BaseOffset: 0, EndOffset: 0, SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: identity.LeaderEpoch + 1}}); err != nil {
 		t.Fatalf("successor publish retained object: %v", err)
 	}
 	if _, err := s.s3Client.Get(context.Background(), objectKey); err != nil {

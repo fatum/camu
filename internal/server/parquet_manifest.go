@@ -1,8 +1,8 @@
 package server
 
-// This file delegates Parquet metadata operations to internal/parquet. All
+// This file delegates Parquet metadata operations to internal/iceberg. All
 // manifest publication and compaction logic
-// topic-scoped listing and deletion) lives in internal/parquet. The
+// topic-scoped listing and deletion) lives in internal/iceberg. The
 // server package delegates so the parquet code can be used standalone
 // by query-only nodes and offline tooling.
 
@@ -10,26 +10,26 @@ import (
 	"context"
 	"time"
 
-	"github.com/maksim/camu/internal/parquet"
+	"github.com/maksim/camu/internal/iceberg"
 )
 
 // Server-side type aliases preserve existing call sites and tests
-// verbatim while the underlying definitions live in internal/parquet.
+// verbatim while the underlying definitions live in internal/iceberg.
 type (
-	ParquetManifestEntry = parquet.Entry
-	ParquetManifest      = parquet.Manifest
+	ParquetManifestEntry = iceberg.Entry
+	ParquetManifest      = iceberg.Manifest
 )
 
 // errParquetPublishFenced is a package-local alias so existing callers
 // using `errors.Is(err, errParquetPublishFenced)` continue to work. It
-// is the same error value as parquet.ErrFenced.
-var errParquetPublishFenced = parquet.ErrFenced
+// is the same error value as iceberg.ErrFenced.
+var errParquetPublishFenced = iceberg.ErrFenced
 
-// parquetStoreFor returns a parquet.Store bound to this server's
+// parquetStoreFor returns a iceberg.Store bound to this server's
 // S3 client and topic-deletion fence. The store is lightweight and
 // safe to construct per-call; callers that invoke it frequently can
 // cache the result on *Server if desired.
-func (s *Server) parquetStoreFor() *parquet.Store {
+func (s *Server) parquetStoreFor() *iceberg.Store {
 	return s.newParquetStore()
 }
 

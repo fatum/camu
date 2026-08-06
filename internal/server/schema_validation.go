@@ -1,11 +1,7 @@
 package server
 
 import (
-	"encoding/json"
-	"fmt"
-	"strings"
-	"time"
-
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/meta"
 )
 
@@ -13,85 +9,6 @@ func validateTypedValue(schema *meta.TopicSchema, value string) error {
 	if schema == nil {
 		return nil
 	}
-	_, err := decodeTypedFields(schema, []byte(value))
+	_, err := iceberg.DecodeTypedFields(schema, []byte(value))
 	return err
-}
-
-func jsonPathValue(root map[string]any, path string) (any, bool) {
-	parts := strings.Split(strings.TrimPrefix(path, "$."), ".")
-	var cur any = root
-	for _, p := range parts {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return nil, false
-		}
-		cur, ok = m[p]
-		if !ok {
-			return nil, false
-		}
-	}
-	return cur, true
-}
-
-func validTimestamp(v any) bool {
-	_, err := parseTimestamp(v)
-	return err == nil
-}
-
-func typedValueAtPath(value string, path string) (any, bool, error) {
-	var root map[string]any
-	if err := json.Unmarshal([]byte(value), &root); err != nil {
-		return nil, false, err
-	}
-	v, ok := jsonPathValue(root, path)
-	return v, ok, nil
-}
-
-func asInt64(v any) (int64, error) {
-	n, ok := v.(float64)
-	if !ok || n != float64(int64(n)) {
-		return 0, fmt.Errorf("not int64")
-	}
-	return int64(n), nil
-}
-func asFloat64(v any) (float64, error) {
-	n, ok := v.(float64)
-	if !ok {
-		return 0, fmt.Errorf("not number")
-	}
-	return n, nil
-}
-func asString(v any) (string, error) {
-	s, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("not string")
-	}
-	return s, nil
-}
-func asBool(v any) (bool, error) {
-	b, ok := v.(bool)
-	if !ok {
-		return false, fmt.Errorf("not bool")
-	}
-	return b, nil
-}
-func parseTimestamp(v any) (time.Time, error) {
-	s, err := asString(v)
-	if err != nil {
-		return time.Time{}, err
-	}
-	timestamp, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		return time.Time{}, err
-	}
-	// time.Time.UnixNano is only defined within this interval. Reject values
-	// outside it while validating, before they can reach either Parquet export
-	// or the schema DLQ path.
-	min := time.Unix(-9223372037, 145224192).UTC()
-	max := time.Unix(9223372036, 854775807).UTC()
-	timestamp = timestamp.UTC()
-	if timestamp.Before(min) || timestamp.After(max) {
-		return time.Time{}, fmt.Errorf("timestamp outside Unix nanosecond range")
-	}
-	return timestamp, nil
 }

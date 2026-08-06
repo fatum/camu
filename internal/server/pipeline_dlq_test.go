@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maksim/camu/internal/coordination"
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/pipeline"
@@ -212,8 +213,8 @@ func TestHandleSchemaDecodeFailuresDeliversToRemoteDLQAndRetriesIdempotently(t *
 	}
 
 	identity := PartitionIdentity{Topic: events.Name, Partition: 0, Role: PartitionRoleLeader, Leader: source.instanceID, LeaderEpoch: 1}
-	failure := schemaFailure{message: log.Message{Offset: 0, Key: []byte("key"), Value: []byte(`{"id":"not-an-int"}`)}, err: validateTypedValue(events.Schema, `{"id":"not-an-int"}`)}
-	if err := source.handleSchemaDecodeFailures(ctx, events, identity, []schemaFailure{failure}); err != nil {
+	failure := iceberg.SchemaFailure{Message: log.Message{Offset: 0, Key: []byte("key"), Value: []byte(`{"id":"not-an-int"}`)}, Err: validateTypedValue(events.Schema, `{"id":"not-an-int"}`)}
+	if err := source.handleSchemaDecodeFailures(ctx, events, identity, []iceberg.SchemaFailure{failure}); err != nil {
 		t.Fatalf("initial schema DLQ delivery: %v", err)
 	}
 
@@ -232,7 +233,7 @@ func TestHandleSchemaDecodeFailuresDeliversToRemoteDLQAndRetriesIdempotently(t *
 	if err := source.s3Client.Delete(ctx, pipeline.CheckpointKey("schema-dead-letter", events.Name, 0)); err != nil {
 		t.Fatal(err)
 	}
-	if err := source.handleSchemaDecodeFailures(ctx, events, identity, []schemaFailure{failure}); err != nil {
+	if err := source.handleSchemaDecodeFailures(ctx, events, identity, []iceberg.SchemaFailure{failure}); err != nil {
 		t.Fatalf("retry schema DLQ delivery: %v", err)
 	}
 	destinationPS := destination.partitionManager.GetPartitionState(dlq.Name, 0)

@@ -1,14 +1,14 @@
 package server
 
-// Thin re-exports of path helpers from internal/parquet so existing
+// Thin re-exports of path helpers from internal/iceberg so existing
 // server-side code keeps its historical identifiers.
 
-import "github.com/maksim/camu/internal/parquet"
+import "github.com/maksim/camu/internal/iceberg"
 
-const parquetDataPrefix = parquet.DataPrefix
+const parquetDataPrefix = iceberg.DataPrefix
 
 var (
-	parquetExportObjectKey      = parquet.ExportObjectKey
-	parquetManifestKey          = parquet.ManifestKey
-	parquetQueryCatalogTopicKey = parquet.QueryCatalogTopicKey
+	parquetExportObjectKey      = iceberg.ExportObjectKey
+	parquetManifestKey          = iceberg.ManifestKey
+	parquetQueryCatalogTopicKey = iceberg.QueryCatalogTopicKey
 )

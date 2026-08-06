@@ -15,9 +15,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
-	"github.com/maksim/camu/internal/parquet"
 	"github.com/maksim/camu/internal/pipeline"
 	"github.com/maksim/camu/internal/storage"
 )
@@ -61,7 +61,7 @@ func parquetSinkFailureStage(err error) string {
 }
 
 func parquetManifestErrorDetails(err error) (category, key string, attempts int) {
-	var conflict *parquet.ManifestCASConflictError
+	var conflict *iceberg.ManifestCASConflictError
 	if errors.As(err, &conflict) {
 		return "cas_conflict_exhausted", conflict.Key, conflict.Attempts
 	}
@@ -156,11 +156,11 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		slog.Warn("parquet_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "records", len(messages), "error", err)
 		return
 	}
-	defer chunk.cleanup()
-	if len(chunk.failures) > 0 {
-		if err := s.handleSchemaDecodeFailures(passCtx, tc, identity, chunk.failures); err != nil {
+	defer chunk.Cleanup()
+	if len(chunk.Failures) > 0 {
+		if err := s.handleSchemaDecodeFailures(passCtx, tc, identity, chunk.Failures); err != nil {
 			result = "dlq_error"
-			slog.Warn("parquet_pipeline_dlq_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "failed_records", len(chunk.failures), "error", err)
+			slog.Warn("parquet_pipeline_dlq_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "failed_records", len(chunk.Failures), "error", err)
 			return
 		}
 	}
@@ -168,12 +168,12 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 	var objectKey string
 	var pendingKey string
 	var outputStart, outputEnd uint64
-	if chunk.records > 0 {
-		ingestTime := parquetExportIngestTime(index, chunk.start, chunk.startTS)
-		pendingKey = parquetPendingExportKey(tc.Name, identity.Partition, chunk.start, chunk.end)
+	if chunk.Records > 0 {
+		ingestTime := parquetExportIngestTime(index, chunk.Start, chunk.StartTS)
+		pendingKey = parquetPendingExportKey(tc.Name, identity.Partition, chunk.Start, chunk.End)
 		if persisted, err := s.loadOrCreateParquetPendingExport(passCtx, pendingKey, ingestTime); err != nil {
 			result = "pending_error"
-			slog.Warn("parquet_pipeline_pending_export_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_end_offset", chunk.end, "error", err)
+			slog.Warn("parquet_pipeline_pending_export_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "source_end_offset", chunk.End, "error", err)
 			return
 		} else {
 			ingestTime = persisted
@@ -181,14 +181,14 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 		// Epoch is deliberately not part of the object identity. A retry after
 		// leader reassignment must converge on the same immutable source-range
 		// object rather than creating one object per epoch.
-		objectKey = parquetPipelineObjectKey(tc.Name, identity.Partition, ingestTime, chunk.start, chunk.end)
-		if err := fenceWriteParquet(passCtx, s, fence, tc, identity, objectKey, chunk.file, chunk.size, ingestTime, chunk.start, chunk.end); err != nil {
+		objectKey = parquetPipelineObjectKey(tc.Name, identity.Partition, ingestTime, chunk.Start, chunk.End)
+		if err := fenceWriteParquet(passCtx, s, fence, tc, identity, objectKey, chunk.File, chunk.Size, ingestTime, chunk.Start, chunk.End); err != nil {
 			result = "sink_error"
 			stage := parquetSinkFailureStage(err)
 			sinkLabels := mergeMetricLabels(labels, "stage", stage)
 			s.metricInc("camu_parquet_export_pipeline_sink_failures_total", "Parquet export pipeline sink failures", sinkLabels)
 			s.metricSet("camu_parquet_export_pipeline_last_sink_failure_unixtime", "Unix timestamp of the latest Parquet export pipeline sink failure", sinkLabels, float64(time.Now().Unix()))
-			attributes := []any{"topic", tc.Name, "partition", identity.Partition, "leader_epoch", identity.LeaderEpoch, "checkpoint_offset", cp.NextOffset, "source_start_offset", chunk.start, "source_end_offset", chunk.end, "parquet_object_key", objectKey, "parquet_bytes", chunk.size, "stage", stage, "error", err}
+			attributes := []any{"topic", tc.Name, "partition", identity.Partition, "leader_epoch", identity.LeaderEpoch, "checkpoint_offset", cp.NextOffset, "source_start_offset", chunk.Start, "source_end_offset", chunk.End, "parquet_object_key", objectKey, "parquet_bytes", chunk.Size, "stage", stage, "error", err}
 			if stage == parquetSinkStageManifestPublish {
 				category, key, attempts := parquetManifestErrorDetails(err)
 				s.metricInc("camu_parquet_export_pipeline_manifest_failures_total", "Parquet manifest publication failures", mergeMetricLabels(labels, "category", category))
@@ -197,8 +197,8 @@ func (s *Server) runParquetExportPass(ctx context.Context, tc meta.TopicConfig, 
 			slog.Warn("parquet_pipeline_sink_failed", attributes...)
 			return
 		}
-		s.metricAdd("camu_parquet_export_pipeline_bytes_total", "Parquet bytes uploaded by the export pipeline", labels, float64(chunk.size))
-		outputStart, outputEnd = cp.OutputEnd+1, cp.OutputEnd+uint64(chunk.records)
+		s.metricAdd("camu_parquet_export_pipeline_bytes_total", "Parquet bytes uploaded by the export pipeline", labels, float64(chunk.Size))
+		outputStart, outputEnd = cp.OutputEnd+1, cp.OutputEnd+uint64(chunk.Records)
 	} else {
 		outputStart, outputEnd = cp.OutputEnd, cp.OutputEnd
 	}
@@ -341,7 +341,7 @@ func parquetExportIngestTime(index *log.Index, offset uint64, recordTimestamp in
 }
 
 func parquetPipelineObjectKey(topic string, partition int, ingestTime time.Time, start, end uint64) string {
-	return parquet.ExportObjectKey(topic, partition, ingestTime, int64(start), int64(end), 1, "pipeline")
+	return iceberg.ExportObjectKey(topic, partition, ingestTime, int64(start), int64(end), 1, "pipeline")
 }
 
 // TODO: Add server-scheduled reconciliation/GC for deterministic Parquet
@@ -351,7 +351,7 @@ func fenceWriteParquet(ctx context.Context, s *Server, fence pipeline.Fence, tc 
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
 		return parquetSinkError(parquetSinkStageFencedBeforeUpload, pipeline.ErrFenced)
 	}
-	date, hour := parquet.BucketDateHour(ingestTime)
+	date, hour := iceberg.BucketDateHour(ingestTime)
 	if err := putImmutableParquetFile(ctx, s.s3Client, objectKey, file, size); err != nil {
 		return parquetSinkError(parquetSinkStageObjectUpload, err)
 	}
@@ -362,12 +362,12 @@ func fenceWriteParquet(ctx context.Context, s *Server, fence pipeline.Fence, tc 
 		}
 		return nil
 	})
-	store.SetManifestConflictObserver(func(conflict parquet.ManifestConflict) {
+	store.SetManifestConflictObserver(func(conflict iceberg.ManifestConflict) {
 		labels := map[string]string{"topic": tc.Name, "partition": strconv.Itoa(identity.Partition), "category": "cas_conflict"}
 		s.metricInc("camu_parquet_export_pipeline_manifest_conflicts_total", "Parquet manifest conditional-write conflicts", labels)
 		slog.Warn("parquet_pipeline_manifest_cas_conflict", "topic", tc.Name, "partition", identity.Partition, "leader_epoch", identity.LeaderEpoch, "manifest_key", conflict.Key, "attempt", conflict.Attempt, "max_attempts", conflict.MaxAttempts, "error_category", "cas_conflict", "error", conflict.Err)
 	})
-	entry := parquet.Entry{ObjectKey: objectKey, BaseOffset: int64(start), EndOffset: int64(end), SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: identity.LeaderEpoch}
+	entry := iceberg.Entry{ObjectKey: objectKey, BaseOffset: int64(start), EndOffset: int64(end), SchemaVersion: 1, SourceKey: "pipeline", SourceEpoch: identity.LeaderEpoch}
 	if fence.Fenced(ctx, tc.Name, identity.Partition, identity.LeaderEpoch) {
 		// The object key is deterministic for this source range.  Do not delete
 		// it on fencing: a successor may concurrently reuse and publish this
@@ -376,7 +376,7 @@ func fenceWriteParquet(ctx context.Context, s *Server, fence pipeline.Fence, tc 
 		// mechanism.
 		return parquetSinkError(parquetSinkStageFencedAfterUpload, pipeline.ErrFenced)
 	}
-	if _, err := store.ReplaceOverlappingEntries(ctx, tc.Name, identity.Partition, date, hour, []parquet.Entry{entry}); err != nil {
+	if _, err := store.ReplaceOverlappingEntries(ctx, tc.Name, identity.Partition, date, hour, []iceberg.Entry{entry}); err != nil {
 		// A manifest outcome can be ambiguous (and a successor can publish the
 		// same deterministic object while this call returns). Retain the
 		// immutable upload safely pending a future GC mechanism rather than
