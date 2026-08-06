@@ -83,7 +83,7 @@ func (s *Server) ensureParquetConsumer(tc meta.TopicConfig, identity PartitionId
 
 func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc meta.TopicConfig, identity PartitionIdentity) {
 	defer close(done)
-	sinkName, sinkVersion, useIceberg := s.exportSinkFor(tc)
+	sinkName, sinkVersion := icebergPipelineName, icebergPipelineVersion
 	var cp pipeline.Checkpoint
 	for {
 		var err error
@@ -103,11 +103,7 @@ func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc 
 	}
 	for {
 		before := cp.NextOffset
-		if useIceberg {
-			s.runIcebergExportPass(ctx, tc, identity, &cp)
-		} else {
-			s.runParquetExportPass(ctx, tc, identity, &cp)
-		}
+		s.runIcebergExportPass(ctx, tc, identity, &cp)
 		// Back off when the pass exported nothing: the partition is caught up,
 		// so an idle pass only re-reads the committed head / index. Once new
 		// data appears the next pass advances the checkpoint and the loop

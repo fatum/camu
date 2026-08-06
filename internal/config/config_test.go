@@ -252,14 +252,11 @@ func TestCompactionIntervalDefault(t *testing.T) {
 	}
 }
 
-func TestParquetExportWarehouseAndIcebergDefaults(t *testing.T) {
+func TestParquetExportWarehouseDefaults(t *testing.T) {
 	if got := (config.ParquetExportConfig{}).WarehouseValue(); got != "warehouse/" {
 		t.Fatalf("default WarehouseValue = %q, want warehouse/", got)
 	}
 	if got := (config.ParquetExportConfig{Warehouse: "lake/"}).WarehouseValue(); got != "lake/" {
 		t.Fatalf("WarehouseValue(lake/) = %q, want lake/", got)
-	}
-	if got := (config.ParquetExportConfig{Iceberg: true}).Iceberg; !got {
-		t.Fatal("Iceberg flag not preserved")
 	}
 }

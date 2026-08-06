@@ -161,7 +161,7 @@ func TestIntegrationTypedTopicOpaqueKafkaValidValuePhysicalParquet(t *testing.T)
 	store := pipeline.NewCheckpointStore(env.S3Client(), pipeline.NoFence{})
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		cp, e := store.Load(ctx, "parquet-export", topic, 0)
+		cp, e := store.Load(ctx, "iceberg-export", topic, 0)
 		if e == nil && cp.NextOffset > 0 {
 			return
 		}
@@ -202,7 +202,7 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing
 	store := pipeline.NewCheckpointStore(env.S3Client(), pipeline.NoFence{})
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		cp, e := store.Load(ctx, "parquet-export", topic, 0)
+		cp, e := store.Load(ctx, "iceberg-export", topic, 0)
 		if e == nil && cp.NextOffset > 0 {
 			return
 		}

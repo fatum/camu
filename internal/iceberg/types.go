@@ -1,59 +1,55 @@
-// Package iceberg owns the analytical projection of Camu topics: the
-// Parquet data files and, once the Iceberg sink lands, the Iceberg table
-// metadata (manifests, manifest lists, metadata.json). It is decoupled from
-// the server package and depends only on a small ObjectStore interface plus a
-// Fencer for topic-deletion safety.
-//
-// The package is designed to be usable outside the streaming server —
-// e.g. by query-only nodes that need to resolve manifests, or by offline
-// tooling that rebuilds Parquet state from the canonical log.
+// Package iceberg owns the analytical projection of Camu topics: the Parquet
+// data files and the self-managed Iceberg table metadata (manifests, manifest
+// lists, metadata.json) that make those files queryable by external engines.
+// It is decoupled from the server package and depends only on a small
+// ObjectStore interface plus a Fencer for topic-deletion safety.
 package iceberg
 
 import (
+	"context"
 	"errors"
-	"time"
 )
 
 var (
 	// ErrNotFound is returned by an ObjectStore when the requested key
-	// does not exist. Parquet code calls errors.Is against this.
-	ErrNotFound = errors.New("parquet: not found")
+	// does not exist.
+	ErrNotFound = errors.New("iceberg: not found")
 
 	// ErrConflict is returned by an ObjectStore when a ConditionalPut
 	// precondition (ETag mismatch) fails.
-	ErrConflict = errors.New("parquet: etag conflict")
+	ErrConflict = errors.New("iceberg: etag conflict")
 
-	// ErrFenced is returned by manifest/checkpoint writers when the
-	// topic is marked for deletion. The write is refused so that a stale
-	// in-flight export job cannot resurrect state that topic cleanup is
-	// about to delete.
-	ErrFenced = errors.New("parquet: publication fenced")
+	// ErrFenced is returned by metadata writers when the topic is marked
+	// for deletion. The write is refused so that a stale in-flight export
+	// job cannot resurrect state that topic cleanup is about to delete.
+	ErrFenced = errors.New("iceberg: publication fenced")
 )
 
-// Entry is a single Parquet file reference inside a bucket manifest.
-type Entry struct {
-	ObjectKey     string `json:"object_key"`
-	BaseOffset    int64  `json:"base_offset"`
-	EndOffset     int64  `json:"end_offset"`
-	SchemaVersion int    `json:"schema_version"`
-	// SourceKey and SourceEpoch identify the immutable classic-log segment
-	// that produced this file. They let an authoritative leader replace a
-	// divergent overlapping projection without retaining duplicate rows.
-	SourceKey   string `json:"source_key"`
-	SourceEpoch uint64 `json:"source_epoch"`
+// ObjectStore is the minimal object-storage contract the Iceberg metadata
+// layer needs. Implementations must translate backend-specific errors into
+// this package's ErrNotFound / ErrConflict via error wrapping (errors.Is is
+// used by callers).
+type ObjectStore interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+	GetWithETag(ctx context.Context, key string) ([]byte, string, error)
+	ConditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error)
+	Delete(ctx context.Context, key string) error
+	List(ctx context.Context, prefix string) ([]string, error)
+	// ListEach streams keys with the given prefix to fn one page at a time so a
+	// cleanup never holds the full key set in memory. Stops at fn's first error.
+	ListEach(ctx context.Context, prefix string, fn func(key string) error) error
+	// DeleteMany deletes the given keys in batches (idempotent).
+	DeleteMany(ctx context.Context, keys []string) error
 }
 
-// Manifest describes the set of Parquet files published in a single
-// (topic, partition, dt/hour) bucket. The manifest is the atomic unit of
-// visibility — queries read it to enumerate which Parquet files to scan,
-// and compaction rewrites it to swap small files for larger ones.
-type Manifest struct {
-	Generation    uint64    `json:"generation"`
-	Topic         string    `json:"topic"`
-	Partition     int       `json:"partition"`
-	Date          string    `json:"dt"`
-	Hour          string    `json:"hour"`
-	SchemaVersion int       `json:"schema_version"`
-	Entries       []Entry   `json:"entries"`
-	UpdatedAt     time.Time `json:"updated_at"`
+// Fencer reports whether Iceberg writes for a topic must be refused because
+// topic deletion is in progress. A minimal seam so the package does not need
+// to know about server-side topic lifecycle state.
+type Fencer interface {
+	TopicDeletionPending(ctx context.Context, topic string) bool
 }
+
+// NoFencer is a Fencer that never fences. Use in tooling or tests.
+type NoFencer struct{}
+
+func (NoFencer) TopicDeletionPending(context.Context, string) bool { return false }

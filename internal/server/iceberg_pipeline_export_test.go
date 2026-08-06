@@ -21,7 +21,6 @@ func TestIcebergExportPass(t *testing.T) {
 	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
 	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
 	defer s.disklessEngine.Close()
-	s.cfg.Maintenance.ParquetExport.Iceberg = true
 	s.cfg.Maintenance.ParquetExport.Warehouse = "warehouse/"
 
 	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}
@@ -107,7 +106,6 @@ func TestIcebergExportPassIsIdempotentAcrossRetry(t *testing.T) {
 	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
 	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
 	defer s.disklessEngine.Close()
-	s.cfg.Maintenance.ParquetExport.Iceberg = true
 
 	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}
 	if err := s.topicStore.Create(ctx, tc); err != nil {
@@ -166,7 +164,6 @@ func TestIcebergExportPassBatchesRangesIntoOneSnapshot(t *testing.T) {
 	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
 	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
 	defer s.disklessEngine.Close()
-	s.cfg.Maintenance.ParquetExport.Iceberg = true
 	s.cfg.Maintenance.ParquetExport.MaxRecords = 1
 
 	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}

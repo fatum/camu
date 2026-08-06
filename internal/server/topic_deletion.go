@@ -175,8 +175,8 @@ func (s *Server) processTopicDeletion(ctx context.Context, rec topicDeletionReco
 	if err := s.topicStore.Delete(ctx, rec.Topic.Name); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("delete topic registry entry: %w", err)
 	}
-	if err := s.deleteParquetTopicMetadata(ctx, rec.Topic.Name); err != nil {
-		return fmt.Errorf("clean parquet metadata: %w", err)
+	if err := s.icebergTableStoreFor().DeleteTable(ctx, rec.Topic.Name); err != nil {
+		return fmt.Errorf("clean iceberg table: %w", err)
 	}
 	if err := s.deleteTopicS3Data(ctx, rec.Topic.Name); err != nil {
 		return fmt.Errorf("delete topic s3 data: %w", err)

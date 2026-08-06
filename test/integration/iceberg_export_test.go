@@ -64,7 +64,6 @@ func TestIntegrationIcebergExportRoundTrip(t *testing.T) {
 	env := camutest.New(t,
 		camutest.WithInstances(1),
 		camutest.WithConfigMutator(func(cfg *config.Config) {
-			cfg.Maintenance.ParquetExport.Iceberg = true
 			cfg.Coordination.HeartbeatInterval = "100ms"
 		}),
 	)

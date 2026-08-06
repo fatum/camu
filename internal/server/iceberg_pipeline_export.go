@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"time"
@@ -13,23 +14,13 @@ import (
 	"github.com/maksim/camu/internal/pipeline"
 )
 
-// The Iceberg export pipeline is a committed-record sink exactly like the
-// legacy Parquet pipeline (output-before-checkpoint), but instead of publishing
-// a per-bucket manifest it commits a standard Iceberg table: the data file is
-// written immutably and then referenced by a new snapshot whose manifest is
-// published through iceberg.TableStore. External engines read the table
-// directly; the source checkpoint still advances last.
+// The Iceberg export pipeline is the committed-record sink that projects a
+// topic into a self-managed Iceberg table: the data file is written immutably
+// and then referenced by a new snapshot whose manifest is published through
+// iceberg.TableStore. External engines read the table directly; the source
+// checkpoint still advances last (output-before-checkpoint).
 const icebergPipelineName = "iceberg-export"
 const icebergPipelineVersion = "v1"
-
-// exportSinkFor returns the checkpoint sink name/version a topic's export
-// pipeline uses, and whether the Iceberg sink is active.
-func (s *Server) exportSinkFor(tc meta.TopicConfig) (name, version string, iceberg bool) {
-	if s.cfg.Maintenance.ParquetExport.Iceberg {
-		return icebergPipelineName, icebergPipelineVersion, true
-	}
-	return parquetPipelineName, parquetPipelineVersion, false
-}
 
 // icebergTableStoreFor returns an iceberg.TableStore bound to this server's
 // object store, topic-deletion fence, and configured warehouse.
@@ -213,11 +204,81 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 	slog.Info("iceberg_pipeline_pass_completed", "topic", tc.Name, "partition", identity.Partition, "source_start_offset", startOffset, "source_end_offset", nextOffset-1, "records", nextOffset-startOffset, "checkpoint_offset", nextOffset-1, "high_watermark", highWatermark, "duration", time.Since(started))
 }
 
-// getExportCheckpointSink returns the checkpoint sink name for a topic,
-// falling back to the legacy parquet sink when Iceberg export is disabled.
-func (s *Server) getExportCheckpointSink(topic string) string {
-	if s.cfg.Maintenance.ParquetExport.Iceberg {
-		return icebergPipelineName
+// disklessExportFetchBytes bounds how much raw diskless data one export pass
+// decodes; the pass itself is bounded by the checkpoint record limit.
+const disklessExportFetchBytes = 16 << 20
+
+// readDisklessCommittedBatch reads a batch of committed diskless messages
+// starting at start, up to limit records and strictly below highWatermark. The
+// diskless engine serves raw RecordBatch bytes from the shared metastore, which
+// is read by the partition leader exactly like the classic pipeline reader.
+func (s *Server) readDisklessCommittedBatch(ctx context.Context, tc meta.TopicConfig, partition int, start, highWatermark uint64, limit int) ([]log.Message, uint64, error) {
+	if start >= highWatermark || limit <= 0 {
+		return nil, start, nil
 	}
-	return parquetPipelineName
+	if s.disklessEngine == nil {
+		return nil, start, errors.New("diskless export: engine unavailable")
+	}
+	data, _, err := s.disklessEngine.Fetch(ctx, tc.Name, partition, int64(start), disklessExportFetchBytes)
+	if err != nil {
+		return nil, start, fmt.Errorf("diskless export fetch: %w", err)
+	}
+	msgs, err := log.ReadSegmentBatchesAsMessages(data, start, limit)
+	if err != nil {
+		return nil, start, fmt.Errorf("diskless export decode: %w", err)
+	}
+	// Fetch takes its own committed-head snapshot, which can be newer than the
+	// watermark captured by the caller when records commit concurrently. Never
+	// export offsets at or above the captured watermark: they would be exported
+	// again on the following pass, duplicating records.
+	kept := msgs[:0]
+	for _, m := range msgs {
+		if m.Offset >= highWatermark {
+			break // messages are ordered; the remainder is beyond the watermark
+		}
+		kept = append(kept, m)
+	}
+	msgs = kept
+	if len(msgs) == 0 {
+		return nil, start, nil
+	}
+	next := msgs[len(msgs)-1].Offset + 1
+	if next > highWatermark {
+		next = highWatermark
+	}
+	return msgs, next, nil
+}
+
+func mergeMetricLabels(labels map[string]string, key, value string) map[string]string {
+	merged := make(map[string]string, len(labels)+1)
+	for label, labelValue := range labels {
+		merged[label] = labelValue
+	}
+	merged[key] = value
+	return merged
+}
+
+// getExportCheckpointSink returns the checkpoint sink name used for export
+// progress (Iceberg is the only export sink).
+func (s *Server) getExportCheckpointSink(string) string {
+	return icebergPipelineName
+}
+
+// parquetExportIngestTime returns the stable flush time used by the native
+// segment containing offset.  It must not use time.Now: a retry of a record
+// with a zero event timestamp would otherwise produce a different object key
+// and bucket, leaving the first upload orphaned.  The record timestamp is
+// only a fallback for indexes created without segment metadata (for example,
+// old in-memory test indexes); zero timestamps use the Unix epoch so that
+// retries remain deterministic even in that case.
+func parquetExportIngestTime(index *log.Index, offset uint64, recordTimestamp int64) time.Time {
+	if index != nil {
+		if ref, ok := index.Lookup(offset); ok && !ref.CreatedAt.IsZero() {
+			return ref.CreatedAt.UTC()
+		}
+	}
+	if recordTimestamp == 0 {
+		return time.Unix(0, 0).UTC()
+	}
+	return time.UnixMilli(recordTimestamp).UTC()
 }

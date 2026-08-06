@@ -23,7 +23,6 @@ import (
 	"github.com/maksim/camu/internal/consumer"
 	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/diskless"
-	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
@@ -139,10 +138,6 @@ type Server struct {
 	topicDeletionWG       sync.WaitGroup
 	topicDeletionCtx      context.Context
 	topicDeletionCancel   context.CancelFunc
-
-	// parquetStoreFactory is an internal test seam for faulting manifest
-	// publication independently from immutable Parquet object uploads.
-	parquetStoreFactory func() *iceberg.Store
 
 	// One local consumer runs for each partition led by this instance. Its
 	// ownership is fenced by Camu's partition epoch, not a Kafka group.

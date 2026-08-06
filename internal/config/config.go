@@ -24,16 +24,14 @@ type MaintenanceConfig struct {
 	ParquetExport ParquetExportConfig `yaml:"parquet_export"`
 }
 
-// ParquetExportConfig controls the per-partition Parquet export consumer.
+// ParquetExportConfig controls the per-partition export consumer, which
+// writes committed records as self-managed Apache Iceberg tables.
 type ParquetExportConfig struct {
 	MaxRecords  int    `yaml:"max_records"`
 	MaxDuration string `yaml:"max_duration"`
 	// TempDirectory is where the export pipeline encodes Parquet data files
 	// before uploading them.
 	TempDirectory string `yaml:"temp_directory"`
-	// Iceberg writes the export as self-managed Apache Iceberg tables instead
-	// of the legacy per-bucket Parquet manifests.
-	Iceberg bool `yaml:"iceberg"`
 	// Warehouse is the object-store prefix Iceberg tables live under.
 	Warehouse string `yaml:"warehouse"`
 	// TargetBytes bounds how much data one Iceberg snapshot commits; the

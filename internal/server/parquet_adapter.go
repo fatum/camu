@@ -69,10 +69,3 @@ type serverFencer struct{ s *Server }
 func (f serverFencer) TopicDeletionPending(ctx context.Context, topic string) bool {
 	return f.s.topicDeletionPending(ctx, topic)
 }
-
-func (s *Server) newParquetStore() *iceberg.Store {
-	if s.parquetStoreFactory != nil {
-		return s.parquetStoreFactory()
-	}
-	return iceberg.NewStore(parquetObjectAdapter{client: s.s3Client}, serverFencer{s: s})
-}
