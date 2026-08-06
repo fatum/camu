@@ -45,10 +45,10 @@ diskless:
   metastore: "memory"
 maintenance:
   parquet_export:
-    # Requires unclean_leader_election: false on every topic. Writes the
-    # export as self-managed Apache Iceberg tables (readable by external
-    # engines) under `warehouse`.
-    enabled: false
+    # The projection is per-topic: set export_enabled: true when creating a
+    # topic (requires unclean_leader_election: false). Committed records are
+    # written as self-managed Apache Iceberg tables (readable by external
+    # engines) under `warehouse`. These knobs only tune the exporter.
     max_records: 16384
     max_duration: "30s"
     temp_directory: "/var/lib/camu/export-tmp"

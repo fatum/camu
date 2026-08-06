@@ -71,11 +71,11 @@ Diskless coordination:
   duplicate records, matching Kafka. Unreferenced uploads (a commit that
   permanently failed after upload, or a tombstoned retry) are swept by the
   leader after a grace period.
-- Diskless topics support typed schemas, `export_enabled`, and Parquet/SQL
-  exactly like classic topics: the partition leader exports the committed
-  diskless log (bounded by the diskless committed watermark) through the same
-  Parquet pipeline. Background small-segment compaction (`diskless.compaction`)
-  merges committed refs below the watermark without moving it.
+- Diskless topics support typed schemas, `export_enabled`, and Iceberg export exactly like
+  classic topics: the partition leader exports the committed diskless log (bounded by the
+  diskless committed watermark) through the same export pipeline. Background
+  small-segment compaction (`diskless.compaction`) merges committed refs below the
+  watermark without moving it.
 
 ## HTTP API
 
@@ -263,21 +263,47 @@ Operational rules:
 
 ## Typed topic schemas
 
-Topics may be created with an immutable JSON schema:
+Topics may be created with a typed schema in one of three encodings: `json`, `avro`, or
+`protobuf`.
 
 ```json
 {"name":"orders","partitions":1,"schema":{"encoding":"json","fields":[{"name":"id","type":"int64","path":"$.id"}],"dead_letter_topic":"orders_dlq"}}
 ```
 
-Supported field types are `string`, `int64`, `float64`, `bool`, and
-`timestamp`; paths are simple `$.field`/`$.nested.field` selectors. HTTP
-produces are validated before append. Kafka values remain opaque until export.
-The per-partition Parquet consumer writes physical typed Parquet columns alongside offset, timestamp,
-key, value, and headers. Decode failures are published to the configured raw
-`dead_letter_topic` before the pipeline checkpoint advances; without one they
-are explicitly skipped and logged. Schema fields and DLQ configuration cannot
-be changed after topic creation. Kafka exposes the schema through the
-`camu.schema` topic config.
+Supported field types are `string`, `int64`, `float64`, `bool`, and `timestamp`; JSON paths
+are simple `$.field`/`$.nested.field` selectors. HTTP produces are validated before append.
+Kafka values remain opaque until export. The export pipeline writes physical typed Parquet
+columns alongside offset, timestamp, key, value, and headers. Decode failures are published
+to the configured raw `dead_letter_topic` before the pipeline checkpoint advances; without
+one they are explicitly skipped and logged.
+
+### Schema versions and evolution
+
+Each topic's schema is registered in the embedded schema registry (`_meta/schemas/`), which
+assigns stable ids and enforces backward compatibility. Register a new version:
+
+```text
+POST /v1/topics/{topic}/schema
+{"schema":{"encoding":"json","fields":[{"name":"id","type":"int64","path":"$.id"},{"name":"note","type":"string","path":"$.note","nullable":true}]}}
+```
+
+Evolution rules:
+
+- fields may only be **added** — never removed or retyped
+- a required field may only relax to nullable
+- the encoding cannot change
+
+The topic's current schema updates and the Iceberg table schema advances to the new version
+immediately, preserving stable column ids.
+
+### Encodings
+
+- `json` — values are JSON text; HTTP produce takes them inline.
+- `avro` / `protobuf` — values on the wire carry the Confluent-style schema-id envelope
+  (`0x00` + 4-byte big-endian id), so the exporter decodes against each value's own writer
+  schema. HTTP produce/consume uses base64; Kafka carries raw bytes.
+
+Kafka exposes the schema through the `camu.schema` topic config.
 
 Camu supports a Kafka protocol subset rather than full Kafka parity.
 
