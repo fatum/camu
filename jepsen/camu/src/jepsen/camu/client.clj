@@ -13,7 +13,6 @@
 (def default-topic "jepsen-test")
 (def http-timeout-ms 5000)
 (def drain-timeout-ms 15000)
-(def sql-drain-page-size 10000)
 
 (def default-read-mode :leader)
 (def minio-bucket "camu-data")
@@ -57,9 +56,6 @@
                          ;; SQL workloads read the asynchronous Parquet view;
                          ;; exporting is explicitly opt-in per topic.
                          :export_enabled true}
-                  (:typed opts) (assoc :schema {:encoding "json"
-                                                :fields [{:name "id" :type "int64" :path "$.id"}
-                                                         {:name "paid" :type "bool" :path "$.paid"}]})
                   (> rf 1) (assoc :replication_factor  rf
                                   :min_insync_replicas mir))
            resp (http/post (str (base-url node) "/v1/topics")
@@ -310,34 +306,6 @@
             (remove str/blank?))
        []))))
 
-(defn native-retention-state!
-  "Reads one ordered retention observation for the SQL lifecycle test.
-
-   Each partition lists native source segments first and then reads the
-   durable Parquet checkpoint. This is not a cross-object snapshot: the
-   checker only treats an absent source segment with a subsequently read,
-   insufficient checkpoint as evidence of unsafe ordering. Segment identity
-   and bounds come from the immutable segment object key."
-  [topic partitions]
-  (mc-init!)
-  (mapv
-   (fn [partition]
-     (let [segments (mc-find-lines (str topic "/" partition) "*.segment")
-           {:keys [exit out]} (mc "cat" (s3-key (str "_meta/parquet_exports/" topic "/" partition ".json")))
-           checkpoint (when (zero? exit) (json/parse-string out true))
-           parsed-segments (mapv (fn [key]
-                                   (if-let [[_ base end epoch]
-                                            (re-matches #".*/([0-9]+)-([0-9]+)-([0-9]+)\.segment" key)]
-                                     {:key key
-                                      :base-offset (Long/parseLong base)
-                                      :end-offset (Long/parseLong end)
-                                      :epoch (Long/parseLong epoch)}
-                                     {:key key :malformed true}))
-                                 segments)]
-       {:partition partition
-        :segments parsed-segments
-        :exported-through-offset (:exported_through_offset checkpoint)}))
-   (range partitions)))
 
 (defn- leader-lease-ready?
   []
@@ -486,84 +454,9 @@
                                    :offset (or offset 0)})))))
             result))))))
 
-(defn sql-query!
-  "Issues a POST /v1/sql against `node` for `topic` and returns a map of
-   {:columns [...] :rows [[..]...]}. Throws an ex-info with :type :sql-failed
-   on any non-200 response or transport error. Keys returned are keywordized."
-  [node topic sql limit]
-  (let [body (json/generate-string (cond-> {:sql    sql
-                                            :topics [topic]}
-                                     limit (assoc :limit limit)))
-        resp (http/post (str (base-url node) "/v1/sql")
-                        {:content-type      :json
-                         :body              body
-                         :socket-timeout    http-timeout-ms
-                         :connect-timeout   http-timeout-ms
-                         :throw-exceptions  false})
-        status (:status resp)]
-    (cond
-      (= 200 status)
-      (json/parse-string (:body resp) true)
 
-      :else
-      (throw (ex-info (str "sql query failed: " status)
-                      {:type   :sql-failed
-                       :status status
-                       :body   (:body resp)
-                       :sql    sql})))))
 
-(defn sql-query-with-candidates!
-  "Runs a SQL query, retrying across nodes until one answers 200 or the
-   deadline expires. Used for drain-style reads at the end of a run."
-  [nodes topic sql limit deadline-ms]
-  (let [deadline (+ (System/currentTimeMillis) deadline-ms)]
-    (loop [remaining (shuffle nodes)]
-      (if (empty? remaining)
-        (if (< (System/currentTimeMillis) deadline)
-          (do (Thread/sleep 200)
-              (recur (shuffle nodes)))
-          (throw (ex-info "sql query failed on all nodes"
-                          {:type   :sql-failed
-                           :status :no-node-available})))
-        (let [result (try
-                       (sql-query! (first remaining) topic sql limit)
-                       (catch ConnectException _ ::retry)
-                       (catch SocketTimeoutException _ ::retry)
-                       (catch clojure.lang.ExceptionInfo e
-                         (if (= :sql-failed (:type (ex-data e)))
-                           ::retry
-                           (throw e))))]
-          (if (= ::retry result)
-            (recur (rest remaining))
-            result))))))
 
-(defn sql-drain-page-query
-  "Builds one deterministic SQL drain page. The server supplies the LIMIT
-   through the request body; OFFSET remains in the user query so every page
-   sees the same stable order after the fault phase has stopped."
-  [topic offset typed?]
-  (format "SELECT %s FROM \"%s\" ORDER BY record_offset, key, value OFFSET %d"
-          (if typed? "key, id, paid" "key") topic offset))
-
-(defn sql-drain-with-candidates!
-  "Reads every row from the final SQL view in deterministic pages. A complete
-   drain is essential: the API defaults to 1,000 rows and a partial response
-   would turn a healthy history into false data-loss evidence."
-  [nodes topic deadline-ms typed?]
-  (loop [offset 0
-         columns nil
-         rows []]
-    (let [result (sql-query-with-candidates!
-                  nodes topic (sql-drain-page-query topic offset typed?)
-                  sql-drain-page-size deadline-ms)
-          page (:rows result)
-          next-rows (into rows page)]
-      (if (< (count page) sql-drain-page-size)
-        {:columns (or columns (:columns result))
-         :rows next-rows}
-        (recur (+ offset (count page))
-               (or columns (:columns result))
-               next-rows)))))
 
 (defn commit-offsets!
   "Commits the consumer offset for the given topic and consumer-id."
@@ -600,7 +493,7 @@
 (defn wait-for-topic-ready!
   "Waits until at least one node reports complete routing for all partitions,
    then verifies the produce path works with a successful probe."
-  [nodes topic num-partitions replication-factor timeout-ms typed?]
+  [nodes topic num-partitions replication-factor timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
     (loop [last-state nil]
       (let [routing-ready (some (fn [n]
@@ -619,9 +512,9 @@
             produce-ready (and routing-ready
                                s3-ready
                                (every?
-                                (fn [partition]
-                                  (let [key (str "readiness-probe-" partition)
-                                        value (if typed? (json/generate-string {:id -1 :paid true}) "ping")]
+                                 (fn [partition]
+                                   (let [key (str "readiness-probe-" partition)
+                                         value "ping"]
                                     (boolean
                                      (some (fn [n]
                                              (try
@@ -688,7 +581,7 @@
       ;; Topic names are unique per test run, so setup can be idempotent.
       (ensure-topic-created! (:nodes test) topic
                              (select-keys test [:replication-factor :min-insync-replicas
-                                                :num-partitions :topic-retention :typed])
+                                                :num-partitions :topic-retention])
                              60000)
       ;; All clients wait until routing exposes every partition and a probe produce
       ;; succeeds, so large-partition runs do not start against partial assignments.
@@ -697,7 +590,7 @@
                              (get test :num-partitions 4)
                              (get test :replication-factor 1)
                              60000
-                             (:typed test)))
+))
     this)
 
   (invoke! [this test op]
@@ -877,37 +770,7 @@
              topic  (topic-name this test)
              result (get-offsets! node topic consumer-id)]
          (assoc op :type :ok :value {:consumer-id consumer-id
-                                     :offsets result}))
-
-       :sql-query
-       (let [{:keys [sql]} (:value op)
-             topic    (topic-name this test)
-             ;; SQL queries can land on any live node — the exporter
-             ;; is per-partition-leader, but the query path just
-             ;; reads manifests + parquet. Try the local node first
-             ;; then fall back to any node.
-             nodes    (cons node (shuffle (remove #{node} (:nodes test))))
-             result   (try
-                        (if (:final (:value op))
-                          (sql-drain-with-candidates! nodes topic drain-timeout-ms (:typed test))
-                          (sql-query-with-candidates! nodes topic sql nil drain-timeout-ms))
-                        (catch clojure.lang.ExceptionInfo e
-                          (if (= :sql-failed (:type (ex-data e)))
-                            ::retry
-                            (throw e))))]
-         (if (= ::retry result)
-           (assoc op :type :fail :error :sql-failed)
-           (assoc op :type :ok
-                  :value (cond-> {:sql     sql
-                                  :columns (:columns result)
-                                  :rows    (:rows result)}
-                           (:final (:value op)) (assoc :final true)))))
-
-       :retention-state
-       (assoc op :type :ok
-              :value {:partitions (native-retention-state!
-                                   (topic-name this test)
-                                   (:num-partitions test))}))
+                                     :offsets result})))
 
      (catch ConnectException _
        (assoc op :type :fail :error :connection-refused))
