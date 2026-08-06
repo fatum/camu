@@ -75,6 +75,7 @@ type Server struct {
 
 	disklessEngine *diskless.Engine
 	disklessMeta   diskless.MetaStore
+	schemaRegistry *schemaRegistry
 
 	// assignmentsMu protects myPartitions and disklessTopics.
 	assignmentsMu  sync.RWMutex
@@ -215,6 +216,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		instanceID:       instanceID,
 		metrics:          metrics.NewRegistry(),
 		parquetConsumers: make(map[string]parquetConsumer),
+		schemaRegistry:   &schemaRegistry{s3: s3Client},
 	}
 	s3Client.SetMetrics(s.metrics)
 	s.httpServer = &http.Server{Handler: s.publicRoutes()}
