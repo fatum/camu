@@ -86,27 +86,35 @@ func protobufFieldType(t string) (descriptorpb.FieldDescriptorProto_Type, error)
 // (resolved via resolver); an unwrapped value is decoded against the topic's
 // own descriptor.
 func DecodeProtobufTypedFields(ctx context.Context, topic string, topicSchema *meta.TopicSchema, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
-	writer := topicSchema
+	plan, err := decodePlanFor(topicSchema)
+	if err != nil {
+		return nil, err
+	}
+	return plan.decodeProtobuf(ctx, topic, resolver, input)
+}
+
+func (p *decodePlan) decodeProtobuf(ctx context.Context, topic string, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
+	writer := p
 	if schemaID, payload, wrapped := AvroUnwrap(input); wrapped {
 		if resolver != nil {
 			resolved, err := resolver.SchemaForID(ctx, topic, schemaID)
 			if err != nil {
 				return nil, fmt.Errorf("resolve schema id %d: %w", schemaID, err)
 			}
-			writer = resolved
+			writer, err = decodePlanFor(resolved)
+			if err != nil {
+				return nil, err
+			}
 		}
 		input = payload
 	}
-	md, err := protobufDescriptor(writer)
-	if err != nil {
-		return nil, err
-	}
+	md := writer.proto
 	msg := dynamicpb.NewMessage(md)
 	if err := proto.Unmarshal(input, msg); err != nil {
 		return nil, fmt.Errorf("decode protobuf value: %w", err)
 	}
-	values := make([]DecodedField, len(topicSchema.Fields))
-	for i, f := range topicSchema.Fields {
+	values := make([]DecodedField, len(p.fields))
+	for i, f := range p.fields {
 		fd := md.Fields().ByNumber(protoreflect.FieldNumber(i + 1))
 		if fd == nil || !msg.Has(fd) {
 			if !f.Nullable {
@@ -127,10 +135,11 @@ func DecodeProtobufTypedFields(ctx context.Context, topic string, topicSchema *m
 // protobuf descriptor. It is the inverse of DecodeProtobufTypedFields and is
 // used by tooling and tests. Timestamp fields take a time.Time.
 func EncodeProtobufValue(topicSchema *meta.TopicSchema, record map[string]any) ([]byte, error) {
-	md, err := protobufDescriptor(topicSchema)
+	plan, err := decodePlanFor(topicSchema)
 	if err != nil {
 		return nil, err
 	}
+	md := plan.proto
 	msg := dynamicpb.NewMessage(md)
 	for _, f := range topicSchema.Fields {
 		name := protoreflect.Name(avroFieldName(f.Path))

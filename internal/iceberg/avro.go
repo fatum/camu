@@ -74,15 +74,11 @@ func avroFieldType(f meta.SchemaField) (string, error) {
 // schema. It is the inverse of DecodeAvroTypedFields and is used by tooling
 // and tests to produce values a topic will accept.
 func EncodeAvroValue(topicSchema *meta.TopicSchema, record map[string]any) ([]byte, error) {
-	schemaJSON, err := avroValueSchemaJSON(topicSchema)
+	plan, err := decodePlanFor(topicSchema)
 	if err != nil {
 		return nil, err
 	}
-	schema, err := avro.Parse(schemaJSON)
-	if err != nil {
-		return nil, fmt.Errorf("parse avro value schema: %w", err)
-	}
-	return avro.Marshal(schema, record)
+	return avro.Marshal(plan.avro, record)
 }
 
 // avroWireMagic is the Confluent Schema Registry wire-format magic byte that
@@ -124,31 +120,34 @@ type SchemaResolver interface {
 // schema. Required fields missing from the value are errors; nullable fields
 // missing or null are not present.
 func DecodeAvroTypedFields(ctx context.Context, topic string, topicSchema *meta.TopicSchema, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
-	writer := topicSchema
+	plan, err := decodePlanFor(topicSchema)
+	if err != nil {
+		return nil, err
+	}
+	return plan.decodeAvro(ctx, topic, resolver, input)
+}
+
+func (p *decodePlan) decodeAvro(ctx context.Context, topic string, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
+	writer := p
 	if schemaID, payload, wrapped := AvroUnwrap(input); wrapped {
 		if resolver != nil {
 			resolved, err := resolver.SchemaForID(ctx, topic, schemaID)
 			if err != nil {
 				return nil, fmt.Errorf("resolve schema id %d: %w", schemaID, err)
 			}
-			writer = resolved
+			writer, err = decodePlanFor(resolved)
+			if err != nil {
+				return nil, err
+			}
 		}
 		input = payload
 	}
-	schemaJSON, err := avroValueSchemaJSON(writer)
-	if err != nil {
-		return nil, err
-	}
-	schema, err := avro.Parse(schemaJSON)
-	if err != nil {
-		return nil, fmt.Errorf("parse avro value schema: %w", err)
-	}
 	var m map[string]any
-	if err := avro.Unmarshal(schema, input, &m); err != nil {
+	if err := avro.Unmarshal(writer.avro, input, &m); err != nil {
 		return nil, fmt.Errorf("decode avro value: %w", err)
 	}
-	values := make([]DecodedField, len(topicSchema.Fields))
-	for i, f := range topicSchema.Fields {
+	values := make([]DecodedField, len(p.fields))
+	for i, f := range p.fields {
 		raw, present := m[avroFieldName(f.Path)]
 		if !present || raw == nil {
 			if !f.Nullable {

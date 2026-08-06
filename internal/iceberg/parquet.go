@@ -1,13 +1,10 @@
 package iceberg
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
@@ -147,7 +144,7 @@ func parquetSchemaNode(t string) parquet.Node {
 type parquetRowEncoder struct {
 	ctx      context.Context
 	topic    string
-	schema   *meta.TopicSchema
+	plan     *decodePlan
 	resolver SchemaResolver
 	builder  *parquet.RowBuilder
 	columns  map[string]int
@@ -159,7 +156,13 @@ func newParquetRowEncoder(ctx context.Context, topic string, schema *meta.TopicS
 	for index, path := range fileSchema.Columns() {
 		columns[path[0]] = index
 	}
-	return &parquetRowEncoder{ctx: ctx, topic: topic, schema: schema, resolver: resolver, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
+	var plan *decodePlan
+	if schema != nil {
+		if p, err := decodePlanFor(schema); err == nil {
+			plan = p
+		}
+	}
+	return &parquetRowEncoder{ctx: ctx, topic: topic, plan: plan, resolver: resolver, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
 }
 
 func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.Row, error) {
@@ -176,15 +179,15 @@ func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.R
 	e.builder.Add(e.columns["headers"], parquet.ValueOf(headersJSON))
 	e.builder.Add(e.columns["dt"], parquet.ValueOf(dt))
 	e.builder.Add(e.columns["hour"], parquet.Int32Value(hour))
-	if e.schema == nil {
+	if e.plan == nil {
 		e.buffer = e.builder.AppendRow(e.buffer[:0])
 		return e.buffer, nil
 	}
-	values, err := DecodeTypedFields(e.ctx, e.topic, e.schema, e.resolver, m.Value)
+	values, err := e.plan.decode(e.ctx, e.topic, e.resolver, m.Value)
 	if err != nil {
 		return nil, err
 	}
-	for index, field := range e.schema.Fields {
+	for index, field := range e.plan.fields {
 		if !values[index].Present {
 			continue
 		}
@@ -207,193 +210,11 @@ type DecodedField struct {
 // every source field, including large payloads that are not exported as
 // columns.
 func DecodeTypedFields(ctx context.Context, topic string, schema *meta.TopicSchema, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
-	if schema != nil {
-		switch schema.Encoding {
-		case "avro":
-			return DecodeAvroTypedFields(ctx, topic, schema, resolver, input)
-		case "protobuf":
-			return DecodeProtobufTypedFields(ctx, topic, schema, resolver, input)
-		}
-	}
-	return decodeJSONTypedFields(schema, input)
-}
-
-func decodeJSONTypedFields(schema *meta.TopicSchema, input []byte) ([]DecodedField, error) {
-	decoder := json.NewDecoder(bytes.NewReader(input))
-	root, err := decoder.Token()
+	plan, err := decodePlanFor(schema)
 	if err != nil {
-		return nil, fmt.Errorf("value is not valid JSON: %w", err)
-	}
-	if delimiter, ok := root.(json.Delim); !ok || delimiter != '{' {
-		return nil, fmt.Errorf("value must be a JSON object")
-	}
-	values := make([]DecodedField, len(schema.Fields))
-	tree := newJSONFieldTree(schema)
-	if err := scanJSONFieldObject(decoder, tree, schema, values); err != nil {
 		return nil, err
 	}
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			return nil, fmt.Errorf("value is not valid JSON: multiple JSON values")
-		}
-		return nil, fmt.Errorf("value is not valid JSON: %w", err)
-	}
-	for index, field := range schema.Fields {
-		if !values[index].Present && !field.Nullable {
-			return nil, fmt.Errorf("required field %q is missing", field.Name)
-		}
-	}
-	return values, nil
-}
-
-type jsonFieldTree struct {
-	children map[string]*jsonFieldTree
-	fields   []int
-}
-
-func newJSONFieldTree(schema *meta.TopicSchema) *jsonFieldTree {
-	root := &jsonFieldTree{children: make(map[string]*jsonFieldTree)}
-	for index, field := range schema.Fields {
-		current := root
-		for _, part := range strings.Split(strings.TrimPrefix(field.Path, "$."), ".") {
-			if current.children[part] == nil {
-				current.children[part] = &jsonFieldTree{children: make(map[string]*jsonFieldTree)}
-			}
-			current = current.children[part]
-		}
-		current.fields = append(current.fields, index)
-	}
-	return root
-}
-
-// scanJSONFieldObject consumes an object after its opening delimiter. Unknown
-// fields are skipped token-by-token, so their values do not become part of a
-// decoded object graph.
-func scanJSONFieldObject(decoder *json.Decoder, tree *jsonFieldTree, schema *meta.TopicSchema, values []DecodedField) error {
-	for decoder.More() {
-		keyToken, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("value is not valid JSON: %w", err)
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return fmt.Errorf("value is not valid JSON: object key is not string")
-		}
-		next := tree.children[key]
-		if next == nil {
-			if err := skipJSONValue(decoder); err != nil {
-				return fmt.Errorf("value is not valid JSON: %w", err)
-			}
-			continue
-		}
-		if len(next.fields) > 0 {
-			var raw json.RawMessage
-			if err := decoder.Decode(&raw); err != nil {
-				return fmt.Errorf("value is not valid JSON: %w", err)
-			}
-			for _, index := range next.fields {
-				value, present, err := decodeParquetField(raw, schema.Fields[index])
-				if err != nil {
-					return err
-				}
-				values[index] = DecodedField{Present: present, Value: value}
-			}
-			continue
-		}
-		token, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("value is not valid JSON: %w", err)
-		}
-		if delimiter, ok := token.(json.Delim); ok {
-			switch delimiter {
-			case '{':
-				if err := scanJSONFieldObject(decoder, next, schema, values); err != nil {
-					return err
-				}
-			case '[':
-				if err := skipJSONContainer(decoder, delimiter); err != nil {
-					return fmt.Errorf("value is not valid JSON: %w", err)
-				}
-			}
-		}
-	}
-	if token, err := decoder.Token(); err != nil {
-		return fmt.Errorf("value is not valid JSON: %w", err)
-	} else if delimiter, ok := token.(json.Delim); !ok || delimiter != '}' {
-		return fmt.Errorf("value is not valid JSON: expected object end")
-	}
-	return nil
-}
-
-func skipJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, ok := token.(json.Delim)
-	if !ok || (delimiter != '{' && delimiter != '[') {
-		return nil
-	}
-	return skipJSONContainer(decoder, delimiter)
-}
-
-func skipJSONContainer(decoder *json.Decoder, delimiter json.Delim) error {
-	for decoder.More() {
-		if delimiter == '{' {
-			if _, err := decoder.Token(); err != nil { // object key
-				return err
-			}
-		}
-		if err := skipJSONValue(decoder); err != nil {
-			return err
-		}
-	}
-	_, err := decoder.Token() // closing delimiter
-	return err
-}
-
-func decodeParquetField(raw json.RawMessage, field meta.SchemaField) (parquet.Value, bool, error) {
-	if bytes.Equal(raw, []byte("null")) {
-		return parquet.Value{}, false, nil
-	}
-	switch field.Type {
-	case "string":
-		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return parquet.Value{}, false, fmt.Errorf("field %q must be string", field.Name)
-		}
-		return parquet.ValueOf(value), true, nil
-	case "int64":
-		var value float64
-		if err := json.Unmarshal(raw, &value); err != nil || value != float64(int64(value)) {
-			return parquet.Value{}, false, fmt.Errorf("field %q must be int64", field.Name)
-		}
-		return parquet.Int64Value(int64(value)), true, nil
-	case "float64":
-		var value float64
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return parquet.Value{}, false, fmt.Errorf("field %q must be number", field.Name)
-		}
-		return parquet.DoubleValue(value), true, nil
-	case "bool":
-		var value bool
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return parquet.Value{}, false, fmt.Errorf("field %q must be bool", field.Name)
-		}
-		return parquet.BooleanValue(value), true, nil
-	case "timestamp":
-		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return parquet.Value{}, false, fmt.Errorf("field %q must be RFC3339 timestamp", field.Name)
-		}
-		parsed, err := ParseTimestamp(value)
-		if err != nil {
-			return parquet.Value{}, false, fmt.Errorf("field %q must be RFC3339 timestamp", field.Name)
-		}
-		return parquet.Int64Value(parsed.UnixNano()), true, nil
-	default:
-		return parquet.Value{}, false, fmt.Errorf("unsupported schema field type %q", field.Type)
-	}
+	return plan.decode(ctx, topic, resolver, input)
 }
 
 // ParseTimestamp parses an RFC3339 timestamp and rejects values outside the
