@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -128,59 +127,6 @@ func TestDisklessExportPass(t *testing.T) {
 	}
 }
 
-func TestWriteParquetChunkIsReadableByDuckDB(t *testing.T) {
-	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{
-		{Name: "name", Type: "string", Path: "$.name"},
-		{Name: "count", Type: "int64", Path: "$.count"},
-		{Name: "ratio", Type: "float64", Path: "$.ratio"},
-		{Name: "enabled", Type: "bool", Path: "$.enabled"},
-		{Name: "occurred_at", Type: "timestamp", Path: "$.occurred_at"},
-		{Name: "optional_at", Type: "timestamp", Path: "$.optional_at", Nullable: true},
-		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
-	}}
-	chunk, err := iceberg.EncodeChunk("", []log.Message{
-		{Offset: 7, Timestamp: time.Date(2026, time.August, 3, 12, 0, 0, 0, time.UTC).UnixMilli(), Key: []byte("key-7"), Value: []byte(`{"name":"alpha","count":7,"ratio":1.5,"enabled":true,"occurred_at":"2026-08-03T14:30:00+02:30","optional_at":"2026-08-03T12:30:00Z"}`)},
-		{Offset: 8, Timestamp: time.Date(2026, time.August, 3, 12, 1, 0, 0, time.UTC).UnixMilli(), Key: []byte("key-8"), Value: []byte(`{"name":"beta","count":8,"ratio":2.5,"enabled":false,"occurred_at":"2026-08-03T14:31:00+02:30"}`)},
-	}, schema)
-	if err != nil {
-		t.Fatalf("iceberg.EncodeChunk() error = %v", err)
-	}
-	defer chunk.Cleanup()
-	path := chunk.File.Name()
-	if chunk.Size == 0 {
-		t.Fatal("temporary Parquet file is empty")
-	}
-	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatalf("sql.Open(duckdb) error = %v", err)
-	}
-	defer db.Close()
-
-	var records, offset, count, occurredAtNanos, optionalAtNanos int64
-	var name string
-	var ratio float64
-	var enabled, missingOptionalAt bool
-	var note *string
-	err = db.QueryRow(`SELECT count(*), min(record_offset), min(name), min("count"), min(ratio), bool_and(enabled), max(note), min(epoch_ns(occurred_at)), min(epoch_ns(optional_at)), bool_or(optional_at IS NULL) FROM read_parquet(?)`, path).Scan(&records, &offset, &name, &count, &ratio, &enabled, &note, &occurredAtNanos, &optionalAtNanos, &missingOptionalAt)
-	if err != nil {
-		t.Fatalf("read native parquet with DuckDB: %v", err)
-	}
-	if records != 2 || offset != 7 || name != "alpha" || count != 7 || ratio != 1.5 || enabled || note != nil {
-		t.Fatalf("read parquet values = records=%d offset=%d name=%q count=%d ratio=%v enabled=%v note=%v", records, offset, name, count, ratio, enabled, note)
-	}
-	wantOccurredAt, err := time.Parse(time.RFC3339Nano, "2026-08-03T14:30:00+02:30")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantOptionalAt, err := time.Parse(time.RFC3339Nano, "2026-08-03T12:30:00Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if occurredAtNanos != wantOccurredAt.UTC().UnixNano() || optionalAtNanos != wantOptionalAt.UTC().UnixNano() || !missingOptionalAt {
-		t.Fatalf("timestamp values = occurred_at=%d optional_at=%d missing_optional=%v", occurredAtNanos, optionalAtNanos, missingOptionalAt)
-	}
-}
-
 func TestEncodeParquetChunkSeparatesSchemaFailuresFromValidRange(t *testing.T) {
 	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
 	chunk, err := iceberg.EncodeChunk("", []log.Message{
@@ -222,8 +168,8 @@ func TestServerEncodeParquetChunkUsesConfiguredTempDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer chunk.Cleanup()
-	if filepath.Dir(chunk.File.Name()) != s.cfg.SQL.TempDirectoryValue() {
-		t.Fatalf("chunk directory = %s, want %s", filepath.Dir(chunk.File.Name()), s.cfg.SQL.TempDirectoryValue())
+	if filepath.Dir(chunk.File.Name()) != s.cfg.Maintenance.ParquetExport.TempDirectoryValue() {
+		t.Fatalf("chunk directory = %s, want %s", filepath.Dir(chunk.File.Name()), s.cfg.Maintenance.ParquetExport.TempDirectoryValue())
 	}
 }
 

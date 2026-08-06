@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -19,7 +18,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/consumer"
@@ -142,18 +140,6 @@ type Server struct {
 	topicDeletionCtx      context.Context
 	topicDeletionCancel   context.CancelFunc
 
-	sqlLimiter   chan struct{}
-	sqlDBMu      sync.Mutex
-	sqlDB        *sql.DB
-	sqlCtx       context.Context
-	sqlCtxCancel context.CancelFunc
-
-	// parquetFetchGroup coalesces concurrent cache fetches per cache
-	// path. Kept per-Server (not package-scoped) so two server instances
-	// in the same process (tests) do not share the group.
-	parquetFetchGroup singleflight.Group
-	parquetCacheMu    sync.Mutex
-	parquetCachePins  map[string]int
 	// parquetStoreFactory is an internal test seam for faulting manifest
 	// publication independently from immutable Parquet object uploads.
 	parquetStoreFactory func() *iceberg.Store
@@ -223,8 +209,8 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	if instanceID == "" {
 		instanceID = uuid.NewString()
 	}
-	if err := cleanupSQLFilesystem(cfg.SQL.CacheDirectoryValue(), cfg.SQL.TempDirectoryValue()); err != nil {
-		return nil, fmt.Errorf("clean local SQL filesystem: %w", err)
+	if err := cleanupExportFilesystem(cfg.Maintenance.ParquetExport.TempDirectoryValue()); err != nil {
+		return nil, fmt.Errorf("clean export filesystem: %w", err)
 	}
 
 	s := &Server{
@@ -233,20 +219,10 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 		topicStore:       meta.NewTopicStore(s3Client),
 		instanceID:       instanceID,
 		metrics:          metrics.NewRegistry(),
-		sqlLimiter:       make(chan struct{}, cfg.SQL.MaxConcurrencyValue()),
 		parquetConsumers: make(map[string]parquetConsumer),
 	}
-	s.sqlCtx, s.sqlCtxCancel = context.WithCancel(context.Background())
 	s3Client.SetMetrics(s.metrics)
 	s.httpServer = &http.Server{Handler: s.publicRoutes()}
-
-	// Query nodes only need the read-only topic and Parquet manifest stores used
-	// by SQL scope resolution. Do not construct streaming services here: doing so
-	// can allocate local log state or require coordination configuration despite
-	// query nodes never joining the stream cluster.
-	if s.isQueryMode() {
-		return s, nil
-	}
 
 	leaseTTL, err := cfg.Coordination.LeaseTTLDuration()
 	if err != nil {
@@ -335,14 +311,6 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	return s, nil
 }
 
-func (s *Server) isQueryMode() bool {
-	return s.cfg != nil && s.cfg.Server.IsQueryMode()
-}
-
-func (s *Server) isStreamMode() bool {
-	return !s.isQueryMode()
-}
-
 // Start starts the HTTP server on the configured address.
 func (s *Server) Start() error {
 	if err := s.validateParquetExportExistingTopics(context.Background()); err != nil {
@@ -378,11 +346,6 @@ func (s *Server) startWithListener(ln net.Listener) error {
 		return err
 	}
 	s.listener = ln
-	if s.isQueryMode() {
-		s.ready.Store(true)
-		go func() { _ = s.httpServer.Serve(ln) }()
-		return nil
-	}
 	internalLn, err := net.Listen("tcp", s.cfg.Server.InternalAddress)
 	if err != nil {
 		return fmt.Errorf("listen internal on %s: %w", s.cfg.Server.InternalAddress, err)
@@ -781,17 +744,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if s.kafkaServer != nil {
 		if err := s.kafkaServer.Close(); err != nil && httpErr == nil {
-			httpErr = err
-		}
-	}
-	// Cancel all in-flight SQL queries before closing the DuckDB handle.
-	// Without this, sql.DB.Close waits for connections to return, and a
-	// long-running user query would block server shutdown indefinitely.
-	if s.sqlCtxCancel != nil {
-		s.sqlCtxCancel()
-	}
-	if s.sqlDB != nil {
-		if err := s.sqlDB.Close(); err != nil && httpErr == nil {
 			httpErr = err
 		}
 	}

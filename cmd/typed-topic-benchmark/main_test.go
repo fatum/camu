@@ -224,14 +224,6 @@ func TestLoadConfigExportEnabled(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsSQLWithoutExport(t *testing.T) {
-	t.Setenv("EXPORT_ENABLED", "false")
-	t.Setenv("BENCHMARK_OPERATION", "sql")
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("loadConfig() succeeded, want an error")
-	}
-}
-
 func TestLoadConfigAllowsDisklessWithExport(t *testing.T) {
 	t.Setenv("STORAGE_MODE", "diskless")
 	t.Setenv("EXPORT_ENABLED", "true")

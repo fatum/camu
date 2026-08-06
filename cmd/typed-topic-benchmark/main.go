@@ -34,7 +34,6 @@ type config struct {
 	Partitions, ReplicationFactor, MinInSyncReplicas int
 	BatchMessages, ProducerConcurrency               int
 	ExportEnabled                                    bool
-	QueryInterval                                    time.Duration
 	ConsumeTimeout                                   time.Duration
 	RequestTimeout                                   time.Duration
 	SequenceStart                                    int64
@@ -53,7 +52,6 @@ type result struct {
 	ConsumedBytes int64                  `json:"consumed_bytes,omitempty"`
 	Producer      phaseResult            `json:"producer"`
 	Consumer      phaseResult            `json:"consumer"`
-	SQL           sqlResult              `json:"sql"`
 	Throughput    throughputResult       `json:"throughput"`
 	Integrity     integrityResult        `json:"integrity"`
 	Cleanup       bool                   `json:"cleanup"`
@@ -87,26 +85,6 @@ type phaseResult struct {
 	RecordsPerSecond float64 `json:"records_per_second"`
 	BytesPerSecond   float64 `json:"bytes_per_second"`
 	Digest           string  `json:"digest,omitempty"`
-}
-type sqlSample struct {
-	At           time.Time `json:"at"`
-	LatencyMS    float64   `json:"latency_ms"`
-	ExecutionMS  float64   `json:"execution_time_ms"`
-	Visible      int64     `json:"visible"`
-	MinSequence  int64     `json:"min_sequence"`
-	MaxSequence  int64     `json:"max_sequence"`
-	PayloadBytes int64     `json:"payload_bytes"`
-	Error        string    `json:"error,omitempty"`
-}
-type sqlResult struct {
-	Samples           []sqlSample `json:"samples"`
-	FinalLatencyMS    float64     `json:"final_latency_ms"`
-	FinalExecutionMS  float64     `json:"final_execution_time_ms"`
-	FinalVisible      int64       `json:"final_visible"`
-	FinalMinSequence  int64       `json:"final_min_sequence"`
-	FinalMaxSequence  int64       `json:"final_max_sequence"`
-	FinalPayloadBytes int64       `json:"final_payload_bytes"`
-	Regression        bool        `json:"regression"`
 }
 type throughputResult struct {
 	WriteBytesPerSecond float64 `json:"write_bytes_per_second"`
@@ -238,15 +216,12 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("KAFKA_BROKERS is required when BENCHMARK_API=kafka")
 	}
 	operation := strings.ToLower(env("BENCHMARK_OPERATION", "all"))
-	if operation != "all" && operation != "produce" && operation != "consume" && operation != "sql" {
-		return config{}, fmt.Errorf("BENCHMARK_OPERATION must be all, produce, consume, or sql")
+	if operation != "all" && operation != "produce" && operation != "consume" {
+		return config{}, fmt.Errorf("BENCHMARK_OPERATION must be all, produce, or consume")
 	}
 	exportEnabled, err := strconv.ParseBool(env("EXPORT_ENABLED", "true"))
 	if err != nil {
 		return config{}, fmt.Errorf("EXPORT_ENABLED must be true or false")
-	}
-	if !exportEnabled && operation == "sql" {
-		return config{}, errors.New("sql operation requires EXPORT_ENABLED=true")
 	}
 	targetBytes, err := parseByteSize("TARGET_BYTES", 5*1024*1024*1024)
 	if err != nil {
@@ -288,7 +263,7 @@ func loadConfig() (config, error) {
 	if storageMode != "" && storageMode != "classic" && storageMode != "diskless" {
 		return config{}, fmt.Errorf("STORAGE_MODE must be classic or diskless")
 	}
-	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, QueryInterval: d, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID, StorageMode: storageMode}, nil
+	return config{BaseURL: strings.TrimRight(env("CAMU_URL", "http://127.0.0.1:8080"), "/"), Topic: topic, Output: env("OUTPUT", "typed-topic-benchmark.json"), API: api, Operation: operation, NodeURLs: nodeURLs, KafkaBrokers: kafkaBrokers, TargetBytes: targetBytes, MessageBytes: messageBytes, Partitions: partitions, ReplicationFactor: replicationFactor, MinInSyncReplicas: minInSyncReplicas, BatchMessages: batchMessages, ProducerConcurrency: producerConcurrency, ExportEnabled: exportEnabled, ConsumeTimeout: consumeTimeout, RequestTimeout: requestTimeout, RunID: runID, StorageMode: storageMode}, nil
 }
 
 type client struct {
@@ -450,8 +425,8 @@ func (c client) initBenchmarkProducer(ctx context.Context, cfg config) (uint64, 
 }
 
 type benchmarkTopic struct {
-	Partitions    int  `json:"partitions"`
-	ExportEnabled bool `json:"export_enabled"`
+	Partitions    int    `json:"partitions"`
+	ExportEnabled bool   `json:"export_enabled"`
 	StorageMode   string `json:"storage_mode,omitempty"`
 }
 
@@ -925,41 +900,6 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 }
 func (s *hashState) recordsSnapshot() int64 { s.mu.Lock(); defer s.mu.Unlock(); return s.records }
 
-type sqlMetrics struct{ Count, MinSequence, MaxSequence, PayloadBytes int64 }
-
-func (c client) sql(ctx context.Context, cfg config) (sqlMetrics, float64, error) {
-	start := time.Now()
-	var resp struct {
-		Rows [][]any `json:"rows"`
-	}
-	quoted := `"` + strings.ReplaceAll(cfg.Topic, `"`, `""`) + `"`
-	// event_id equals the benchmark sequence for every record, so its min/max
-	// validate that the exported Parquet covers the full contiguous range.
-	err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": fmt.Sprintf("SELECT count(*)::BIGINT, min(event_id)::BIGINT, max(event_id)::BIGINT FROM %s", quoted), "topics": []string{cfg.Topic}}, &resp)
-	if err != nil {
-		return sqlMetrics{}, time.Since(start).Seconds() * 1000, err
-	}
-	if len(resp.Rows) == 0 {
-		return sqlMetrics{}, time.Since(start).Seconds() * 1000, nil
-	}
-	if len(resp.Rows[0]) < 3 {
-		return sqlMetrics{}, time.Since(start).Seconds() * 1000, errors.New("SQL returned fewer than three integrity columns")
-	}
-	toInt := func(v any) int64 {
-		switch n := v.(type) {
-		case float64:
-			return int64(n)
-		case int64:
-			return n
-		case nil:
-			return 0
-		}
-		return 0
-	}
-	row := resp.Rows[0]
-	return sqlMetrics{Count: toInt(row[0]), MinSequence: toInt(row[1]), MaxSequence: toInt(row[2])}, time.Since(start).Seconds() * 1000, nil
-}
-
 func verifyConsumeStates(expected, actual []hashState) bool {
 	for p := range expected {
 		er, eb, ed, ee := expected[p].result()
@@ -969,41 +909,6 @@ func verifyConsumeStates(expected, actual []hashState) bool {
 		}
 	}
 	return true
-}
-
-func (c client) waitForSQL(ctx context.Context, cfg config, res *result, count int64) (sqlMetrics, error) {
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		metrics, ms, err := c.sql(ctx, cfg)
-		sample := sqlSample{At: time.Now(), LatencyMS: ms, ExecutionMS: ms, Visible: metrics.Count, MinSequence: metrics.MinSequence, MaxSequence: metrics.MaxSequence, PayloadBytes: metrics.PayloadBytes}
-		if err != nil {
-			sample.Error = err.Error()
-			benchmarkLog("sql topic=%s failed latency_ms=%.2f error=%v", cfg.Topic, ms, err)
-		} else {
-			benchmarkLog("sql topic=%s visible=%d/%d min_sequence=%d max_sequence=%d payload_bytes=%d latency_ms=%.2f", cfg.Topic, metrics.Count, count, metrics.MinSequence, metrics.MaxSequence, metrics.PayloadBytes, ms)
-		}
-		res.SQL.Samples = append(res.SQL.Samples, sample)
-		res.SQL.FinalVisible = metrics.Count
-		res.SQL.FinalMinSequence = metrics.MinSequence
-		res.SQL.FinalMaxSequence = metrics.MaxSequence
-		res.SQL.FinalPayloadBytes = metrics.PayloadBytes
-		res.SQL.FinalLatencyMS = ms
-		res.SQL.FinalExecutionMS = ms
-		if err == nil && metrics.Count >= count {
-			return metrics, nil
-		}
-		if time.Now().After(deadline) {
-			if err != nil {
-				return metrics, err
-			}
-			return metrics, errors.New("timed out waiting for SQL visibility")
-		}
-		select {
-		case <-time.After(time.Second):
-		case <-ctx.Done():
-			return metrics, ctx.Err()
-		}
-	}
 }
 
 // detectTopicStorageMode reports the storage mode of an existing topic so a
@@ -1113,40 +1018,6 @@ func runSingleOperation(ctx context.Context, c client, cfg config, res *result) 
 			res.Integrity.Error = "consume integrity mismatch"
 		}
 		benchmarkLog("consume complete: records=%d bytes=%d duration=%.3fs rate=%.2f records/s %.2f bytes/s integrity_ok=%t", cr.Records, cr.Bytes, cr.DurationSeconds, cr.RecordsPerSecond, cr.BytesPerSecond, res.Integrity.OK)
-	case "sql":
-		if !cfg.ExportEnabled {
-			res.Integrity.Error = "sql operation requires EXPORT_ENABLED=true"
-			return
-		}
-		// The topic may already hold records from prior runs, so SQL visibility
-		// is verified against the committed record count, not the run target.
-		committed, err := c.committedRecordCount(ctx, cfg)
-		if err != nil {
-			res.Integrity.Error = "committed record count: " + err.Error()
-			benchmarkLog("committed record count failed: %v", err)
-			return
-		}
-		count = committed
-		res.Expected, res.ExpectedBytes = count, count*cfg.MessageBytes
-		benchmarkLog("waiting for SQL visibility of %d records", count)
-		metrics, err := c.waitForSQL(ctx, cfg, res, count)
-		if err != nil {
-			res.Integrity.Error = "sql: " + err.Error()
-			benchmarkLog("SQL visibility failed: %v", err)
-			return
-		}
-		res.Integrity.OK = metrics.Count == count
-		if !res.Integrity.OK {
-			res.Integrity.Error = "SQL integrity mismatch: visible records do not match committed count"
-		}
-		if res.Integrity.OK {
-			if err := verifyWebAnalyticsSQL(ctx, c, cfg, count); err != nil {
-				res.Integrity.OK = false
-				res.Integrity.Error = "SQL typed column mismatch: " + err.Error()
-				benchmarkLog("SQL typed column check failed: %v", err)
-			}
-		}
-		benchmarkLog("SQL complete: integrity_ok=%t", res.Integrity.OK)
 	}
 }
 
@@ -1160,9 +1031,7 @@ func main() {
 	c := client{base: cfg.BaseURL, http: &http.Client{}, token: os.Getenv("CAMU_AUTH_TOKEN"), requestTimeout: cfg.RequestTimeout}
 	res := result{Topic: cfg.Topic, Operation: cfg.Operation, ExportEnabled: cfg.ExportEnabled}
 	cleanup := env("CLEANUP", "0") == "1"
-	var queryDone chan struct{}
 	var readinessDone chan struct{}
-	var sqlMu sync.Mutex
 	var readinessMu sync.Mutex
 	var readinessLost atomic.Bool
 	defer func() {
@@ -1181,9 +1050,6 @@ func main() {
 			readinessMu.Unlock()
 		}
 		cancel()
-		if queryDone != nil {
-			<-queryDone
-		}
 		if readinessDone != nil {
 			cancel()
 			<-readinessDone
@@ -1276,45 +1142,6 @@ func main() {
 	res.ExpectedBytes = count * cfg.MessageBytes
 	expectedStates := make([]hashState, cfg.Partitions)
 	var produced int64
-	if cfg.ExportEnabled {
-		queryDone = make(chan struct{})
-		go func() {
-			defer close(queryDone)
-			var previous sqlMetrics
-			ticker := time.NewTicker(cfg.QueryInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					metrics, ms, e := c.sql(runCtx, cfg)
-					samp := sqlSample{At: time.Now(), LatencyMS: ms, ExecutionMS: ms, Visible: metrics.Count, MinSequence: metrics.MinSequence, MaxSequence: metrics.MaxSequence, PayloadBytes: metrics.PayloadBytes}
-					if e != nil {
-						samp.Error = e.Error()
-						benchmarkLog("sql sample topic=%s failed latency_ms=%.2f error=%v", cfg.Topic, ms, e)
-					} else {
-						benchmarkLog("sql sample topic=%s visible=%d min_sequence=%d max_sequence=%d payload_bytes=%d latency_ms=%.2f", cfg.Topic, metrics.Count, metrics.MinSequence, metrics.MaxSequence, metrics.PayloadBytes, ms)
-					}
-					sqlMu.Lock()
-					if e == nil {
-						consistent := metrics.Count >= previous.Count
-						if metrics.Count > 0 {
-							consistent = consistent && metrics.MinSequence == 0 && metrics.MaxSequence == metrics.Count-1
-						}
-						if metrics.MinSequence < previous.MinSequence || metrics.MaxSequence < previous.MaxSequence || !consistent {
-							res.SQL.Regression = true
-						}
-						if metrics.Count > previous.Count {
-							previous = metrics
-						}
-					}
-					res.SQL.Samples = append(res.SQL.Samples, samp)
-					sqlMu.Unlock()
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
 	produce := c.produce
 	consume := c.consume
 	if cfg.API == "kafka" {
@@ -1348,75 +1175,12 @@ func main() {
 	res.ConsumedBytes = cr.Bytes
 	res.Throughput = throughputResult{WriteBytesPerSecond: pr.BytesPerSecond, ReadBytesPerSecond: cr.BytesPerSecond}
 	benchmarkLog("consume complete: records=%d bytes=%d duration=%.3fs rate=%.2f records/s %.2f bytes/s", cr.Records, cr.Bytes, cr.DurationSeconds, cr.RecordsPerSecond, cr.BytesPerSecond)
-	if !cfg.ExportEnabled {
-		if readinessLost.Load() {
-			res.Integrity = integrityResult{Error: "cluster readiness became false during benchmark"}
-			benchmarkLog("benchmark failed: cluster readiness was lost")
-			return
-		}
-		ok := cr.Records == count && cr.Bytes == res.ExpectedBytes && verifyConsumeStates(expectedStates, actualStates)
-		res.Integrity = integrityResult{OK: ok}
-		benchmarkLog("benchmark complete: integrity_ok=%t export_enabled=false", ok)
-		return
-	}
-	benchmarkLog("waiting for SQL visibility of %d records", count)
-	var metrics sqlMetrics
-	var ms float64
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		metrics, ms, err = c.sql(ctx, cfg)
-		if err == nil && metrics.Count >= count || time.Now().After(deadline) {
-			break
-		}
-		if ctx.Err() != nil {
-			break
-		}
-		select {
-		case <-time.After(time.Second):
-		case <-ctx.Done():
-			break
-		}
-		if ctx.Err() != nil {
-			break
-		}
-	}
-	sqlMu.Lock()
-	res.SQL.FinalVisible = metrics.Count
-	res.SQL.FinalMinSequence = metrics.MinSequence
-	res.SQL.FinalMaxSequence = metrics.MaxSequence
-	res.SQL.FinalPayloadBytes = metrics.PayloadBytes
-	res.SQL.FinalLatencyMS = ms
-	res.SQL.FinalExecutionMS = ms
-	sqlMu.Unlock()
-	benchmarkLog("SQL visibility: records=%d payload_bytes=%d latency_ms=%.2f", metrics.Count, metrics.PayloadBytes, ms)
-	readinessMu.Lock()
-	res.Cluster.Lost = readinessLost.Load()
-	readinessMu.Unlock()
 	if readinessLost.Load() {
 		res.Integrity = integrityResult{Error: "cluster readiness became false during benchmark"}
 		benchmarkLog("benchmark failed: cluster readiness was lost")
 		return
 	}
-	if err != nil {
-		res.Integrity = integrityResult{Error: err.Error()}
-		benchmarkLog("benchmark failed: SQL visibility wait ended with error: %v", err)
-		return
-	}
-	ok := !res.SQL.Regression && metrics.Count == count && metrics.MinSequence == 0 && metrics.MaxSequence == count-1 && cr.Records == count && cr.Bytes == res.ExpectedBytes
-	for p := range expectedStates {
-		er, eb, ed, ee := expectedStates[p].result()
-		ar, ab, ad, ae := actualStates[p].result()
-		if ee != nil || ae != nil || er != ar || eb != ab || ed != ad {
-			ok = false
-		}
-	}
-	if ok && cfg.ExportEnabled {
-		if err := verifyWebAnalyticsSQL(ctx, c, cfg, count); err != nil {
-			ok = false
-			res.Integrity.Error = "SQL typed column mismatch: " + err.Error()
-			benchmarkLog("SQL typed column check failed: %v", err)
-		}
-	}
-	res.Integrity = integrityResult{OK: ok && !readinessLost.Load()}
-	benchmarkLog("benchmark complete: integrity_ok=%t sql_regression=%t", res.Integrity.OK, res.SQL.Regression)
+	ok := cr.Records == count && cr.Bytes == res.ExpectedBytes && verifyConsumeStates(expectedStates, actualStates)
+	res.Integrity = integrityResult{OK: ok}
+	benchmarkLog("benchmark complete: integrity_ok=%t export_enabled=%t", ok, cfg.ExportEnabled)
 }

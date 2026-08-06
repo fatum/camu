@@ -384,69 +384,6 @@ func TestCompactParquetBucketPartialCrashRecovery(t *testing.T) {
 	}
 }
 
-func TestValidateSQLQueryStatementAllowsKeywordsInsideIdentifiers(t *testing.T) {
-	// A topic or column name that contains a mutating-keyword substring
-	// (e.g. "events-real-export" → export) must not false-positive on
-	// the mutating-sql blocklist. Regression test for a real false
-	// positive we hit when running end-to-end against a topic named
-	// events-real-export: the naive \bexport\b regex matched inside
-	// the quoted identifier because `-` and `"` are non-word chars
-	// that form a word boundary.
-	cases := []string{
-		`select count(*)::BIGINT from "events-real-export"`,
-		`select * from "orders-insert-log"`,
-		`with cte as (select 1 from "events-create") select * from cte`,
-		`select value from "pragma-settings"`,
-		`select 'insert into foo values (1)' as lit`, // string literal with blocked keyword
-	}
-	for _, q := range cases {
-		if err := validateSQLQueryStatement(q); err != nil {
-			t.Errorf("validateSQLQueryStatement(%q) rejected valid query: %v", q, err)
-		}
-	}
-
-	// And the blocklist still fires on actual mutating statements
-	// outside of quoted contexts.
-	mutating := []string{
-		`select 1; drop table foo`, // multi-statement
-		`create table foo as select 1`,
-		`copy foo to 'bar.parquet'`,
-		`insert into foo values (1)`,
-		`delete from foo`,
-	}
-	for _, q := range mutating {
-		if err := validateSQLQueryStatement(q); err == nil {
-			t.Errorf("validateSQLQueryStatement(%q) accepted mutating query", q)
-		}
-	}
-}
-
-func TestValidateTopicName(t *testing.T) {
-	cases := []struct {
-		name string
-		want bool
-	}{
-		{"events", true},
-		{"events-1", true},
-		{"events.v2", true},
-		{"events_log", true},
-		{"a", true},
-		{"", false},
-		{"../etc/passwd", false},
-		{"events/../other", false},
-		{`events" OR "1"="1`, false},
-		{"events$", false},
-		{"events space", false},
-		{strings.Repeat("a", 250), false},
-	}
-	for _, c := range cases {
-		err := validateTopicName(c.name)
-		if (err == nil) != c.want {
-			t.Errorf("validateTopicName(%q) err = %v, want valid=%v", c.name, err, c.want)
-		}
-	}
-}
-
 func TestListParquetManifestsForTopicFiltersByTime(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()

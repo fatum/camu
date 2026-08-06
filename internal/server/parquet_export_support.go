@@ -116,5 +116,5 @@ func writeParquetChunk(messages []log.Message, schema *meta.TopicSchema) ([]byte
 // encodeParquetChunk encodes one committed source range under the configured
 // export temp directory. The encoding itself lives in internal/iceberg.
 func (s *Server) encodeParquetChunk(messages []log.Message, schema *meta.TopicSchema) (iceberg.Chunk, error) {
-	return iceberg.EncodeChunk(s.cfg.SQL.TempDirectoryValue(), messages, schema)
+	return iceberg.EncodeChunk(s.cfg.Maintenance.ParquetExport.TempDirectoryValue(), messages, schema)
 }

@@ -236,13 +236,10 @@ func (s *Server) validateParquetExportTopicConfig(exportEnabled, uncleanLeaderEl
 	return nil
 }
 
-// validateParquetExportExistingTopics refuses to start a stream node if an
-// existing classic topic permits unclean election. Parquet manifests cannot
-// atomically replace divergent histories across ingest-hour buckets.
+// validateParquetExportExistingTopics refuses to start if an existing classic
+// topic permits unclean election. Parquet manifests cannot atomically replace
+// divergent histories across ingest-hour buckets.
 func (s *Server) validateParquetExportExistingTopics(ctx context.Context) error {
-	if !s.isStreamMode() {
-		return nil
-	}
 	topics, err := s.topicStore.List(ctx)
 	if err != nil {
 		return fmt.Errorf("list topics for parquet export validation: %w", err)

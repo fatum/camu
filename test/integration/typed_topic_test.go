@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -21,73 +20,12 @@ import (
 	"github.com/maksim/camu/pkg/camutest"
 )
 
-func TestIntegrationTypedTopicExportSQL(t *testing.T) {
-	enabled := true
-	env := camutest.New(t, camutest.WithInstances(1), camutest.WithConfigMutator(func(cfg *config.Config) {
-		cfg.Coordination.HeartbeatInterval = "500ms"
-		cfg.Segments.MaxAge = "1s"
-		cfg.SQL.Enabled = &enabled
-		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
-		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-	}))
-	defer env.Cleanup()
-	c := env.Client()
-	dlq, topic := "typed-dlq", "typed-orders"
-	if err := c.CreateTopic(dlq, 1, time.Hour); err != nil {
-		t.Fatal(err)
-	}
-	body, _ := json.Marshal(map[string]any{"name": topic, "partitions": 1, "retention": "1h", "export_enabled": true, "schema": map[string]any{"encoding": "json", "dead_letter_topic": dlq, "fields": []map[string]any{{"name": "id", "type": "int64", "path": "$.id"}}}})
-	resp, err := http.Post(c.BaseURL()+"/v1/topics", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create typed topic status %d", resp.StatusCode)
-	}
-	if _, err := c.Produce(topic, []camutest.ProduceMessage{{Key: "a", Value: `{"id":7}`}}); err != nil {
-		t.Fatal(err)
-	}
-	bad, _ := json.Marshal([]camutest.ProduceMessage{{Key: "bad", Value: `{"id":"not-an-int"}`}})
-	badResp, err := http.Post(c.BaseURL()+"/v1/topics/"+topic+"/messages", "application/json", bytes.NewReader(bad))
-	if err != nil {
-		t.Fatal(err)
-	}
-	badResp.Body.Close()
-	if badResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("malformed typed produce status %d, want 400", badResp.StatusCode)
-	}
-	cr, err := c.Consume(topic, 0, 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cr.Messages) != 1 {
-		t.Fatalf("native typed records = %d, want 1 after rejected publish", len(cr.Messages))
-	}
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		r, e := c.SQLQuery(camutest.SQLQueryRequest{SQL: `select id from "typed-orders"`, Topics: []string{topic}})
-		if e == nil && len(r.Rows) == 1 && len(r.Columns) == 1 && r.Columns[0].Name == "id" && r.Columns[0].Type != "" {
-			if got, ok := r.Rows[0][0].(float64); !ok || got != 7 {
-				t.Fatalf("typed id = %#v, want 7", r.Rows[0][0])
-			}
-			return
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("typed record was not exported and queryable")
-}
-
 func TestIntegrationTypedTopicOpaqueKafkaDecodeFailureDLQ(t *testing.T) {
-	enabled := true
 	kafkaPort := freeTCPPort(t)
 	env := camutest.New(t, camutest.WithInstances(1), camutest.WithConfigMutator(func(cfg *config.Config) {
 		cfg.Server.KafkaPort = kafkaPort
 		cfg.Coordination.HeartbeatInterval = "500ms"
 		cfg.Segments.MaxAge = "1s"
-		cfg.SQL.Enabled = &enabled
-		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
-		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
 	}))
 	defer env.Cleanup()
 
@@ -185,15 +123,11 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeFailureDLQ(t *testing.T) {
 }
 
 func TestIntegrationTypedTopicOpaqueKafkaValidValuePhysicalParquet(t *testing.T) {
-	enabled := true
 	kafkaPort := freeTCPPort(t)
 	env := camutest.New(t, camutest.WithInstances(1), camutest.WithConfigMutator(func(cfg *config.Config) {
 		cfg.Server.KafkaPort = kafkaPort
 		cfg.Coordination.HeartbeatInterval = "500ms"
 		cfg.Segments.MaxAge = "1s"
-		cfg.SQL.Enabled = &enabled
-		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
-		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
 	}))
 	defer env.Cleanup()
 	httpClient := env.Client()
@@ -224,23 +158,11 @@ func TestIntegrationTypedTopicOpaqueKafkaValidValuePhysicalParquet(t *testing.T)
 	if result := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Key: []byte("k"), Value: []byte(`{"id":42,"paid":true}`)}); result.FirstErr() != nil {
 		t.Fatalf("opaque Kafka produce error: %v", result.FirstErr())
 	}
+	store := pipeline.NewCheckpointStore(env.S3Client(), pipeline.NoFence{})
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		r, e := httpClient.SQLQuery(camutest.SQLQueryRequest{SQL: `select id, paid from "typed-kafka-valid"`, Topics: []string{topic}})
-		if e == nil && len(r.Rows) == 1 && len(r.Columns) == 2 {
-			if got, ok := r.Rows[0][0].(float64); !ok || got != 42 {
-				t.Fatalf("typed id = %#v, want 42", r.Rows[0][0])
-			}
-			if got, ok := r.Rows[0][1].(bool); !ok || !got {
-				t.Fatalf("typed paid = %#v, want true", r.Rows[0][1])
-			}
-			if r.Columns[0].Type == "" || r.Columns[1].Type == "" {
-				t.Fatal("typed SQL columns have empty types")
-			}
-			store := pipeline.NewCheckpointStore(env.S3Client(), pipeline.NoFence{})
-			if _, e := store.Load(ctx, "parquet-export", topic, 0); e != nil {
-				t.Fatalf("Parquet pipeline checkpoint missing: %v", e)
-			}
+		cp, e := store.Load(ctx, "parquet-export", topic, 0)
+		if e == nil && cp.NextOffset > 0 {
 			return
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -249,15 +171,11 @@ func TestIntegrationTypedTopicOpaqueKafkaValidValuePhysicalParquet(t *testing.T)
 }
 
 func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing.T) {
-	enabled := true
 	kafkaPort := freeTCPPort(t)
 	env := camutest.New(t, camutest.WithInstances(1), camutest.WithConfigMutator(func(cfg *config.Config) {
 		cfg.Server.KafkaPort = kafkaPort
 		cfg.Coordination.HeartbeatInterval = "500ms"
 		cfg.Segments.MaxAge = "1s"
-		cfg.SQL.Enabled = &enabled
-		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
-		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
 	}))
 	defer env.Cleanup()
 	httpClient := env.Client()
@@ -295,50 +213,3 @@ func TestIntegrationTypedTopicOpaqueKafkaDecodeSkipAdvancesCheckpoint(t *testing
 
 // TestIntegrationDisklessTypedTopicExportSQL verifies that a diskless topic with
 // export_enabled and a typed schema is exported to Parquet and queryable via SQL.
-func TestIntegrationDisklessTypedTopicExportSQL(t *testing.T) {
-	enabled := true
-	env := camutest.New(t, camutest.WithInstances(1), camutest.WithConfigMutator(func(cfg *config.Config) {
-		cfg.Coordination.HeartbeatInterval = "500ms"
-		cfg.Segments.MaxAge = "1s"
-		cfg.SQL.Enabled = &enabled
-		cfg.SQL.CacheDirectory = filepath.Join(t.TempDir(), "cache")
-		cfg.SQL.TempDirectory = filepath.Join(t.TempDir(), "tmp")
-	}))
-	defer env.Cleanup()
-	c := env.Client()
-	topic := "diskless-typed-orders"
-	body, _ := json.Marshal(map[string]any{"name": topic, "partitions": 1, "retention": "1h", "export_enabled": true, "storage_mode": "diskless", "schema": map[string]any{"encoding": "json", "fields": []map[string]any{{"name": "id", "type": "int64", "path": "$.id"}}}})
-	resp, err := http.Post(c.BaseURL()+"/v1/topics", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create diskless typed topic status %d, want 201", resp.StatusCode)
-	}
-	if _, err := c.ProduceToPartition(topic, 0, []camutest.ProduceMessage{{Key: "a", Value: `{"id":7}`}}); err != nil {
-		t.Fatal(err)
-	}
-	// A malformed typed produce must be rejected even for diskless topics.
-	bad, _ := json.Marshal([]camutest.ProduceMessage{{Key: "bad", Value: `{"id":"not-an-int"}`}})
-	badResp, err := http.Post(c.BaseURL()+"/v1/topics/"+topic+"/partitions/0/messages", "application/json", bytes.NewReader(bad))
-	if err != nil {
-		t.Fatal(err)
-	}
-	badResp.Body.Close()
-	if badResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("malformed diskless typed produce status %d, want 400", badResp.StatusCode)
-	}
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		r, e := c.SQLQuery(camutest.SQLQueryRequest{SQL: `select id from "` + topic + `"`, Topics: []string{topic}})
-		if e == nil && len(r.Rows) == 1 && len(r.Columns) == 1 && r.Columns[0].Name == "id" && r.Columns[0].Type != "" {
-			if got, ok := r.Rows[0][0].(float64); !ok || got != 7 {
-				t.Fatalf("diskless typed id = %#v, want 7", r.Rows[0][0])
-			}
-			return
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatal("diskless typed record was not exported and queryable")
-}
