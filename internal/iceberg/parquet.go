@@ -207,8 +207,13 @@ type DecodedField struct {
 // every source field, including large payloads that are not exported as
 // columns.
 func DecodeTypedFields(ctx context.Context, topic string, schema *meta.TopicSchema, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
-	if schema != nil && schema.Encoding == "avro" {
-		return DecodeAvroTypedFields(ctx, topic, schema, resolver, input)
+	if schema != nil {
+		switch schema.Encoding {
+		case "avro":
+			return DecodeAvroTypedFields(ctx, topic, schema, resolver, input)
+		case "protobuf":
+			return DecodeProtobufTypedFields(ctx, topic, schema, resolver, input)
+		}
 	}
 	return decodeJSONTypedFields(schema, input)
 }

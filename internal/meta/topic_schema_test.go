@@ -11,8 +11,12 @@ func TestTopicSchemaValidate(t *testing.T) {
 	if err := avro.Validate(); err != nil {
 		t.Fatalf("avro encoding should be valid: %v", err)
 	}
+	protobuf := TopicSchema{Encoding: "protobuf", Fields: s.Fields}
+	if err := protobuf.Validate(); err != nil {
+		t.Fatalf("protobuf encoding should be valid: %v", err)
+	}
 	for _, bad := range []TopicSchema{
-		{Encoding: "protobuf", Fields: s.Fields},
+		{Encoding: "yaml", Fields: s.Fields},
 		{Encoding: "json", Fields: []SchemaField{{Name: "id", Type: "bytes", Path: "$.id"}}},
 		{Encoding: "json", Fields: []SchemaField{{Name: "id", Type: "int64", Path: "id"}}},
 	} {

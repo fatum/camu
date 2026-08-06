@@ -67,9 +67,9 @@ func (s *TopicSchema) Validate() error {
 		return nil
 	}
 	switch s.Encoding {
-	case "json", "avro":
+	case "json", "avro", "protobuf":
 	default:
-		return fmt.Errorf("schema encoding must be json or avro")
+		return fmt.Errorf("schema encoding must be json, avro, or protobuf")
 	}
 	if len(s.Fields) == 0 {
 		return fmt.Errorf("schema fields are required")
