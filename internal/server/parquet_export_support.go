@@ -98,7 +98,7 @@ func putImmutableParquetFile(ctx context.Context, client *storage.S3Client, obje
 }
 
 func writeParquetChunk(messages []log.Message, schema *meta.TopicSchema) ([]byte, error) {
-	chunk, err := iceberg.EncodeChunk("", messages, schema, "1970-01-01", 0)
+	chunk, err := iceberg.EncodeChunk(context.Background(), "", messages, schema, "1970-01-01", 0, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +115,6 @@ func writeParquetChunk(messages []log.Message, schema *meta.TopicSchema) ([]byte
 
 // encodeParquetChunk encodes one committed source range under the configured
 // export temp directory. The encoding itself lives in internal/iceberg.
-func (s *Server) encodeParquetChunk(messages []log.Message, schema *meta.TopicSchema, dt string, hour int32) (iceberg.Chunk, error) {
-	return iceberg.EncodeChunk(s.cfg.Maintenance.ParquetExport.TempDirectoryValue(), messages, schema, dt, hour)
+func (s *Server) encodeParquetChunk(ctx context.Context, tc meta.TopicConfig, messages []log.Message, schema *meta.TopicSchema, dt string, hour int32) (iceberg.Chunk, error) {
+	return iceberg.EncodeChunk(ctx, s.cfg.Maintenance.ParquetExport.TempDirectoryValue(), messages, schema, dt, hour, tc.Name, s.schemaRegistry)
 }

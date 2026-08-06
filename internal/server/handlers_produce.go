@@ -81,7 +81,7 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 	}
 	if topicCfg.Schema != nil {
 		for i, m := range msgs {
-			if err := validateTypedValue(topicCfg.Schema, m.Value); err != nil {
+			if err := s.validateTypedValue(r.Context(), topicCfg, m.Value); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("message %d: %v", i, err))
 				return
 			}
@@ -342,7 +342,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 	if tc.Schema != nil {
 		for i, m := range msgs {
-			if err := validateTypedValue(tc.Schema, m.Value); err != nil {
+			if err := s.validateTypedValue(r.Context(), tc, m.Value); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("message %d: %v", i, err))
 				return
 			}

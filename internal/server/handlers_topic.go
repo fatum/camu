@@ -163,6 +163,9 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	if err := s.topicStore.Create(ctx, tc); err != nil {
 		return meta.TopicConfig{}, err
 	}
+	if _, err := s.schemaRegistry.RegisterTopicSchema(ctx, tc.Name, tc.Schema); err != nil {
+		return meta.TopicConfig{}, fmt.Errorf("register topic schema: %w", err)
+	}
 
 	if tc.StorageMode == meta.StorageModeDiskless {
 		// Diskless topics skip partition manager init but still need local
@@ -285,6 +288,66 @@ func (s *Server) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, topicToResponse(tc))
+}
+
+type updateTopicSchemaRequest struct {
+	Schema *meta.TopicSchema `json:"schema"`
+}
+
+// handleUpdateTopicSchema registers a new version of a topic's schema (gated
+// by a backward-compatibility check) and makes it the current projection.
+func (s *Server) handleUpdateTopicSchema(w http.ResponseWriter, r *http.Request) {
+	var req updateTopicSchemaRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Schema == nil {
+		writeError(w, http.StatusBadRequest, "schema is required")
+		return
+	}
+	if err := req.Schema.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	version, err := s.updateTopicSchema(r.Context(), r.PathValue("topic"), req.Schema)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			writeError(w, http.StatusNotFound, "topic not found")
+		case strings.Contains(err.Error(), "no registered schema"),
+			strings.Contains(err.Error(), "backward"),
+			strings.Contains(err.Error(), "encoding cannot change"),
+			strings.Contains(err.Error(), "was removed"),
+			strings.Contains(err.Error(), "type changed"),
+			strings.Contains(err.Error(), "cannot become required"):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			slog.Error("topic_schema_update_failed", "topic", r.PathValue("topic"), "error", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"version": version})
+}
+
+// updateTopicSchema registers a new schema version and updates the topic's
+// current schema, returning the new version id.
+func (s *Server) updateTopicSchema(ctx context.Context, topic string, schema *meta.TopicSchema) (int, error) {
+	version, err := s.schemaRegistry.RegisterSchemaVersion(ctx, topic, schema)
+	if err != nil {
+		return 0, err
+	}
+	tc, err := s.topicStore.Get(ctx, topic)
+	if err != nil {
+		return 0, err
+	}
+	schema.Version = version
+	tc.Schema = schema
+	if err := s.topicStore.Update(ctx, tc); err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {

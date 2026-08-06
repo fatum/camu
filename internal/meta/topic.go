@@ -50,6 +50,7 @@ type TopicConfig struct {
 
 type TopicSchema struct {
 	Encoding        string        `json:"encoding"`
+	Version         int           `json:"version,omitempty"`
 	Fields          []SchemaField `json:"fields"`
 	DeadLetterTopic string        `json:"dead_letter_topic,omitempty"`
 }

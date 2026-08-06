@@ -146,7 +146,7 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 			slog.Warn("iceberg_pipeline_hour_parse_failed", "topic", tc.Name, "partition", identity.Partition, "hour", hourStr, "error", err)
 			return
 		}
-		chunk, err := s.encodeParquetChunk(messages, tc.Schema, dt, int32(hour))
+		chunk, err := s.encodeParquetChunk(passCtx, tc, messages, tc.Schema, dt, int32(hour))
 		if err != nil {
 			result = "encode_error"
 			slog.Warn("iceberg_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", nextOffset, "records", len(messages), "error", err)

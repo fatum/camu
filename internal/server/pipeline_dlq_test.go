@@ -213,7 +213,7 @@ func TestHandleSchemaDecodeFailuresDeliversToRemoteDLQAndRetriesIdempotently(t *
 	}
 
 	identity := PartitionIdentity{Topic: events.Name, Partition: 0, Role: PartitionRoleLeader, Leader: source.instanceID, LeaderEpoch: 1}
-	failure := iceberg.SchemaFailure{Message: log.Message{Offset: 0, Key: []byte("key"), Value: []byte(`{"id":"not-an-int"}`)}, Err: validateTypedValue(events.Schema, `{"id":"not-an-int"}`)}
+	failure := iceberg.SchemaFailure{Message: log.Message{Offset: 0, Key: []byte("key"), Value: []byte(`{"id":"not-an-int"}`)}, Err: source.validateTypedValue(ctx, events, `{"id":"not-an-int"}`)}
 	if err := source.handleSchemaDecodeFailures(ctx, events, identity, []iceberg.SchemaFailure{failure}); err != nil {
 		t.Fatalf("initial schema DLQ delivery: %v", err)
 	}

@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,11 +48,12 @@ func (c Chunk) Cleanup() {
 
 // EncodeChunk validates and encodes one committed source range into a
 // temporary Parquet file. dt and hour are the ingest-time partition values
-// written on every row (they drive the Iceberg partition spec). It does not
-// retain a second []log.Message containing every valid record: the source
-// reader's batch stays the only full in-memory source range. The chunk file is
-// removed by Cleanup.
-func EncodeChunk(dir string, messages []log.Message, schema *meta.TopicSchema, dt string, hour int32) (Chunk, error) {
+// written on every row (they drive the Iceberg partition spec). resolver
+// resolves Avro writer schemas for values wrapped in the schema-id envelope.
+// It does not retain a second []log.Message containing every valid record: the
+// source reader's batch stays the only full in-memory source range. The chunk
+// file is removed by Cleanup.
+func EncodeChunk(ctx context.Context, dir string, messages []log.Message, schema *meta.TopicSchema, dt string, hour int32, topic string, resolver SchemaResolver) (Chunk, error) {
 	if dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Chunk{}, fmt.Errorf("create parquet temp directory: %w", err)
@@ -71,7 +73,7 @@ func EncodeChunk(dir string, messages []log.Message, schema *meta.TopicSchema, d
 	}()
 	fileSchema := parquetSchema(schema)
 	writer := parquet.NewWriter(file, fileSchema, parquet.Compression(&parquet.Snappy))
-	encoder := newParquetRowEncoder(fileSchema, schema)
+	encoder := newParquetRowEncoder(ctx, topic, schema, resolver, fileSchema)
 	chunk := Chunk{}
 	for _, m := range messages {
 		row, err := encoder.row(m, dt, hour)
@@ -143,18 +145,21 @@ func parquetSchemaNode(t string) parquet.Node {
 }
 
 type parquetRowEncoder struct {
-	schema  *meta.TopicSchema
-	builder *parquet.RowBuilder
-	columns map[string]int
-	buffer  parquet.Row
+	ctx      context.Context
+	topic    string
+	schema   *meta.TopicSchema
+	resolver SchemaResolver
+	builder  *parquet.RowBuilder
+	columns  map[string]int
+	buffer   parquet.Row
 }
 
-func newParquetRowEncoder(fileSchema *parquet.Schema, schema *meta.TopicSchema) *parquetRowEncoder {
+func newParquetRowEncoder(ctx context.Context, topic string, schema *meta.TopicSchema, resolver SchemaResolver, fileSchema *parquet.Schema) *parquetRowEncoder {
 	columns := make(map[string]int, len(fileSchema.Columns()))
 	for index, path := range fileSchema.Columns() {
 		columns[path[0]] = index
 	}
-	return &parquetRowEncoder{schema: schema, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
+	return &parquetRowEncoder{ctx: ctx, topic: topic, schema: schema, resolver: resolver, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
 }
 
 func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.Row, error) {
@@ -175,7 +180,7 @@ func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.R
 		e.buffer = e.builder.AppendRow(e.buffer[:0])
 		return e.buffer, nil
 	}
-	values, err := DecodeTypedFields(e.schema, m.Value)
+	values, err := DecodeTypedFields(e.ctx, e.topic, e.schema, e.resolver, m.Value)
 	if err != nil {
 		return nil, err
 	}
@@ -196,12 +201,14 @@ type DecodedField struct {
 }
 
 // DecodeTypedFields decodes a topic value into the schema's projected fields,
-// dispatching on the topic schema encoding. The old map[string]any JSON decode
-// retained every source field, including large payloads that are not exported
-// as columns.
-func DecodeTypedFields(schema *meta.TopicSchema, input []byte) ([]DecodedField, error) {
+// dispatching on the topic schema encoding. resolver is used by Avro values
+// wrapped in the schema-id envelope to resolve the writer schema (nil decodes
+// against the topic's own schema). The old map[string]any JSON decode retained
+// every source field, including large payloads that are not exported as
+// columns.
+func DecodeTypedFields(ctx context.Context, topic string, schema *meta.TopicSchema, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
 	if schema != nil && schema.Encoding == "avro" {
-		return DecodeAvroTypedFields(schema, input)
+		return DecodeAvroTypedFields(ctx, topic, schema, resolver, input)
 	}
 	return decodeJSONTypedFields(schema, input)
 }

@@ -23,6 +23,7 @@ func (s *Server) publicAPIHandler() http.Handler {
 	mux.HandleFunc("POST /v1/topics", s.handleCreateTopic)
 	mux.HandleFunc("GET /v1/topics", s.handleListTopics)
 	mux.HandleFunc("GET /v1/topics/{topic}", s.handleGetTopic)
+	mux.HandleFunc("POST /v1/topics/{topic}/schema", s.handleUpdateTopicSchema)
 	mux.HandleFunc("DELETE /v1/topics/{topic}", s.handleDeleteTopic)
 	mux.HandleFunc("GET /v1/ready", s.handleReady)
 	mux.HandleFunc("GET /v1/cluster/status", s.handleClusterStatus)

@@ -1,6 +1,8 @@
 package iceberg
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +40,7 @@ func TestDecodeAvroTypedFieldsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("avro.Marshal() error = %v", err)
 	}
-	values, err := DecodeAvroTypedFields(schema, value)
+	values, err := DecodeAvroTypedFields(context.Background(), "t", schema, nil, value)
 	if err != nil {
 		t.Fatalf("DecodeAvroTypedFields() error = %v", err)
 	}
@@ -76,14 +78,14 @@ func TestDecodeAvroTypedFieldsRejectsTypeMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("avro.Marshal() error = %v", err)
 	}
-	if _, err := DecodeAvroTypedFields(schema, value); err == nil {
+	if _, err := DecodeAvroTypedFields(context.Background(), "t", schema, nil, value); err == nil {
 		t.Fatal("DecodeAvroTypedFields() error = nil, want type mismatch rejection")
 	}
 }
 
 func TestDecodeAvroTypedFieldsRejectsGarbage(t *testing.T) {
 	schema := testAvroSchema(t)
-	if _, err := DecodeAvroTypedFields(schema, []byte("not avro")); err == nil {
+	if _, err := DecodeAvroTypedFields(context.Background(), "t", schema, nil, []byte("not avro")); err == nil {
 		t.Fatal("DecodeAvroTypedFields() error = nil, want decode error")
 	}
 }
@@ -105,7 +107,7 @@ func TestDecodeAvroTypedFieldsTimestampMillis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("avro.Marshal() error = %v", err)
 	}
-	values, err := DecodeAvroTypedFields(schema, value)
+	values, err := DecodeAvroTypedFields(context.Background(), "t", schema, nil, value)
 	if err != nil {
 		t.Fatalf("DecodeAvroTypedFields() error = %v", err)
 	}
@@ -116,7 +118,7 @@ func TestDecodeAvroTypedFieldsTimestampMillis(t *testing.T) {
 
 func TestDecodeTypedFieldsDispatchesOnEncoding(t *testing.T) {
 	jsonSchema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
-	values, err := DecodeTypedFields(jsonSchema, []byte(`{"id":4}`))
+	values, err := DecodeTypedFields(context.Background(), "t", jsonSchema, nil, []byte(`{"id":4}`))
 	if err != nil || !values[0].Present || values[0].Value.Int64() != 4 {
 		t.Fatalf("json dispatch: values=%+v err=%v", values, err)
 	}
@@ -125,8 +127,52 @@ func TestDecodeTypedFieldsDispatchesOnEncoding(t *testing.T) {
 	schemaJSON, _ := avroValueSchemaJSON(avroSchema)
 	as, _ := avro.Parse(schemaJSON)
 	raw, _ := avro.Marshal(as, map[string]any{"id": int64(9)})
-	values, err = DecodeTypedFields(avroSchema, raw)
+	values, err = DecodeTypedFields(context.Background(), "t", avroSchema, nil, raw)
 	if err != nil || !values[0].Present || values[0].Value.Int64() != 9 {
 		t.Fatalf("avro dispatch: values=%+v err=%v", values, err)
+	}
+}
+
+type fakeResolver struct {
+	schemas map[int]*meta.TopicSchema
+}
+
+func (f *fakeResolver) SchemaForID(_ context.Context, _ string, id int) (*meta.TopicSchema, error) {
+	if s, ok := f.schemas[id]; ok {
+		return s, nil
+	}
+	return nil, fmt.Errorf("no schema %d", id)
+}
+
+// TestDecodeAvroTypedFieldsReadSideEvolution verifies that a value written
+// under an old schema version still decodes onto the current projection when
+// its schema-id envelope resolves the writer schema: fields added by newer
+// versions project as absent (nullable), existing fields keep their values.
+func TestDecodeAvroTypedFieldsReadSideEvolution(t *testing.T) {
+	v0 := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
+	payload, err := EncodeAvroValue(v0, map[string]any{"id": int64(7)})
+	if err != nil {
+		t.Fatalf("EncodeAvroValue() error = %v", err)
+	}
+	wrapped := AvroWrap(0, payload)
+	v1 := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{
+		{Name: "id", Type: "int64", Path: "$.id"},
+		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
+	}}
+	resolver := &fakeResolver{schemas: map[int]*meta.TopicSchema{0: v0}}
+	values, err := DecodeAvroTypedFields(context.Background(), "t", v1, resolver, wrapped)
+	if err != nil {
+		t.Fatalf("DecodeAvroTypedFields() error = %v", err)
+	}
+	if !values[0].Present || values[0].Value.Int64() != 7 {
+		t.Fatalf("id = %+v, want 7 from the v0 writer schema", values[0])
+	}
+	if values[1].Present {
+		t.Fatalf("note = %+v, want absent for a v0-written value", values[1])
+	}
+
+	// An unresolvable schema id is an error.
+	if _, err := DecodeAvroTypedFields(context.Background(), "t", v1, resolver, AvroWrap(99, payload)); err == nil {
+		t.Fatal("DecodeAvroTypedFields() with unknown schema id error = nil, want error")
 	}
 }

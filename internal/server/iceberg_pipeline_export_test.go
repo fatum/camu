@@ -276,3 +276,71 @@ func TestIcebergExportPassAvroValue(t *testing.T) {
 		t.Fatalf("ValidateTable() error = %v", err)
 	}
 }
+
+// TestIcebergExportPassAvroSchemaEvolution verifies read-side evolution end to
+// end: a value written under schema version 0 is exported correctly after the
+// topic schema evolves to version 1 (a nullable field added), because the
+// value's schema-id envelope resolves its writer schema.
+func TestIcebergExportPassAvroSchemaEvolution(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
+	defer s.disklessEngine.Close()
+	s.cfg.Maintenance.ParquetExport.Warehouse = "warehouse/"
+
+	v0 := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
+	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true, Schema: v0}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if _, err := s.schemaRegistry.RegisterTopicSchema(ctx, tc.Name, v0); err != nil {
+		t.Fatalf("RegisterTopicSchema() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	payload, err := iceberg.EncodeAvroValue(v0, map[string]any{"id": int64(7)})
+	if err != nil {
+		t.Fatalf("EncodeAvroValue: %v", err)
+	}
+	wrapped := iceberg.AvroWrap(0, payload)
+	raw := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k1"), Value: wrapped}})
+	if _, err := s.disklessEngine.Produce(ctx, tc.Name, 0, raw); err != nil {
+		t.Fatalf("diskless produce: %v", err)
+	}
+
+	// Evolve the projection: add a nullable field.
+	v1 := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{
+		{Name: "id", Type: "int64", Path: "$.id"},
+		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
+	}}
+	if _, err := s.schemaRegistry.RegisterSchemaVersion(ctx, tc.Name, v1); err != nil {
+		t.Fatalf("RegisterSchemaVersion() error = %v", err)
+	}
+	tc.Schema = v1
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	cp := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion}
+	s.runIcebergExportPass(ctx, tc, identity, &cp)
+	if cp.NextOffset != 1 {
+		t.Fatalf("checkpoint next offset = %d, want 1", cp.NextOffset)
+	}
+	table := s.icebergTableStoreFor()
+	files, err := table.CurrentDataFiles(ctx, tc.Name)
+	if err != nil {
+		t.Fatalf("CurrentDataFiles() error = %v", err)
+	}
+	if len(files) != 1 || files[0].RecordCount != 1 {
+		t.Fatalf("data files = %+v, want 1 file with 1 record", files)
+	}
+}
