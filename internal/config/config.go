@@ -80,6 +80,7 @@ type CompactionConfig struct {
 	MaxSegmentsPerMerge int    `yaml:"max_segments_per_merge"` // cap a single merge (DynamoDB transactions allow at most 100)
 	Grace               string `yaml:"grace"`                  // minimum age of a ref before it is eligible
 	DeleteGrace         string `yaml:"delete_grace"`           // delay before deleting compacted source data
+	Interval            string `yaml:"interval"`               // how often a node drives merge discovery and execution for the partitions it leads
 }
 
 const (
@@ -88,6 +89,13 @@ const (
 	defaultCompactionMaxSegmentsPerMerge = 90
 	defaultCompactionGrace               = 60 * time.Second
 	defaultCompactionDeleteGrace         = 5 * time.Minute
+	// DefaultCompactionInterval is how often the dedicated compaction loop
+	// drives diskless merge work. The maintenance pass runs far less often
+	// (every 10th heartbeat), which alone limits compaction to roughly one
+	// target-sized merge per pass — an order of magnitude below sustained
+	// production. The loop ticks at this interval so merges pipeline as fast
+	// as the merge executor and object store allow.
+	DefaultCompactionInterval = 2 * time.Second
 
 	// minCompactionSegments is the lower bound for a merge run. A single source
 	// cannot be merged (there is nothing to combine) and would be rejected by
@@ -144,6 +152,12 @@ func (c CompactionConfig) GraceDuration() (time.Duration, error) {
 
 func (c CompactionConfig) DeleteGraceDuration() (time.Duration, error) {
 	return parseDurationOrDefault(c.DeleteGrace, defaultCompactionDeleteGrace)
+}
+
+// IntervalDuration returns how often the dedicated diskless compaction loop
+// drives merge work, defaulting to DefaultCompactionInterval.
+func (c CompactionConfig) IntervalDuration() (time.Duration, error) {
+	return parseDurationOrDefault(c.Interval, DefaultCompactionInterval)
 }
 
 // LingerDuration returns the linger duration, defaulting to 250ms.

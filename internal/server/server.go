@@ -125,6 +125,13 @@ type Server struct {
 	maintenanceCtx    context.Context
 	maintenanceCancel context.CancelFunc
 
+	// disklessCompactionBusy prevents overlapping ticks of the dedicated
+	// diskless compaction loop. A tick (merge discovery + execution for every
+	// partition this node leads) can outlast its interval while catching up, so
+	// a tick that finds a prior one still running is skipped instead of
+	// stacking.
+	disklessCompactionBusy atomic.Bool
+
 	// topicDeletionCh is the bounded queue for async topic-deletion workers,
 	// so a long cleanup never blocks the leader's GC tick. topicDeletionInflight
 	// deduplicates markers already being cleaned.
@@ -433,6 +440,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	s.ready.Store(true)
 	s.startTopicDeletionWorkers()
 	s.startLeaseRenewal()
+	s.startDisklessCompactionLoop()
 	go func() { _ = s.httpServer.Serve(ln) }()
 	slog.Info("internal_server_started", "address", s.InternalAddress(), "protocol", "h2c")
 	go func() { _ = s.internalServer.Serve(internalLn) }()

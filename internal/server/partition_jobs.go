@@ -80,7 +80,10 @@ func (s *Server) listPartitionJobs(ctx context.Context, topic string, partition 
 }
 
 // hasActiveSegmentMergeJob reports whether a segment-merge job owned by the
-// current leader identity is already in flight for this partition. A merge job
+// current leader identity is already in flight for this partition and still
+// gates the next merge. A job in the delete_data phase has already published
+// its merged ref (publish_meta is done) and only awaits source-data deletion;
+// it must not stall the next merge, so it does not count as active. A merge job
 // whose expected owner or epoch no longer matches the current leader can never
 // run (CanRunOwnerJob requires an exact match), so it is stale: deleting it
 // unblocks compaction. Without this, a single orphaned job (e.g. after a node
@@ -92,6 +95,11 @@ func (s *Server) hasActiveSegmentMergeJob(ctx context.Context, identity Partitio
 			continue
 		}
 		if job.ExpectedOwner == identity.Leader && job.ExpectedEpoch == identity.LeaderEpoch {
+			if job.Phase == PartitionJobPhaseDeleteData {
+				// The merged ref is already authoritative; source deletion is
+				// independent of the next merge, so do not block discovery.
+				continue
+			}
 			return true, nil
 		}
 		slog.Warn("segment_merge_job_stale",
