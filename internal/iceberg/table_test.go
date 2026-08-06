@@ -90,7 +90,7 @@ func TestTableAppendSnapshotAndReload(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 	manifestList := ts.manifestListKey("events", 42, 1, 1)
-	snap, err := ts.AppendSnapshot(ctx, "events", manifestList, SnapshotSummary{"added-data-files": "2"})
+	snap, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, SnapshotSummary{"added-data-files": "2"})
 	if err != nil {
 		t.Fatalf("AppendSnapshot() error = %v", err)
 	}
@@ -123,11 +123,11 @@ func TestTableAppendSnapshotIsIdempotent(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 	manifestList := ts.manifestListKey("events", 42, 1, 1)
-	first, err := ts.AppendSnapshot(ctx, "events", manifestList, nil)
+	first, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, nil)
 	if err != nil {
 		t.Fatalf("first AppendSnapshot() error = %v", err)
 	}
-	second, err := ts.AppendSnapshot(ctx, "events", manifestList, nil)
+	second, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, nil)
 	if err != nil {
 		t.Fatalf("retry AppendSnapshot() error = %v", err)
 	}
@@ -154,7 +154,7 @@ func TestTableAppendSnapshotRetriesCASConflict(t *testing.T) {
 	// commit must reload the winner's metadata and retry at the next version.
 	objects.injectConditionalPutConflict("warehouse/events/metadata/version-hint.text", 1)
 	manifestList := ts.manifestListKey("events", 42, 1, 1)
-	snap, err := ts.AppendSnapshot(ctx, "events", manifestList, nil)
+	snap, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, nil)
 	if err != nil {
 		t.Fatalf("AppendSnapshot() after conflict error = %v", err)
 	}
@@ -179,7 +179,7 @@ func TestTableDeleteRemovesEverything(t *testing.T) {
 	if _, err := ts.Create(ctx, "events", nil); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if _, err := ts.AppendSnapshot(ctx, "events", ts.manifestListKey("events", 42, 1, 1), nil); err != nil {
+	if _, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(ts.manifestListKey("events", 42, 1, 1)), ts.manifestListKey("events", 42, 1, 1), nil); err != nil {
 		t.Fatalf("AppendSnapshot() error = %v", err)
 	}
 	if err := ts.DeleteTable(ctx, "events"); err != nil {
@@ -229,5 +229,127 @@ func TestTableRejectsInvalidMetadataFile(t *testing.T) {
 	}
 	if _, err := ts.Load(ctx, "events"); err == nil || !strings.Contains(err.Error(), "parse iceberg table metadata") {
 		t.Fatalf("Load(corrupt) error = %v, want parse error", err)
+	}
+}
+
+func TestTableCommitSnapshotWritesManifestAndList(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	files := []DataFile{
+		{Content: DataFileContentData, FilePath: "warehouse/events/data/a.parquet", FileFormat: DataFileFormatParquet, RecordCount: 4, FileSizeBytes: 1000},
+		{Content: DataFileContentData, FilePath: "warehouse/events/data/b.parquet", FileFormat: DataFileFormatParquet, RecordCount: 6, FileSizeBytes: 2000},
+	}
+	snap, err := ts.CommitSnapshot(ctx, "events", files)
+	if err != nil {
+		t.Fatalf("CommitSnapshot() error = %v", err)
+	}
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	head := loaded.currentSnapshot()
+	if head == nil || head.SnapshotID != snap.SnapshotID || head.ManifestList == "" {
+		t.Fatalf("head snapshot = %+v, want committed snapshot", head)
+	}
+	if head.SequenceNumber != 1 {
+		t.Fatalf("head sequence number = %d, want 1", head.SequenceNumber)
+	}
+
+	// The manifest list references one manifest; the manifest references the
+	// two data files.
+	listData, err := ts.objects.Get(ctx, head.ManifestList)
+	if err != nil {
+		t.Fatalf("get manifest list: %v", err)
+	}
+	manifests, err := readManifestList(listData)
+	if err != nil {
+		t.Fatalf("readManifestList() error = %v", err)
+	}
+	if len(manifests) != 1 || manifests[0].ManifestPath == "" || manifests[0].AddedFilesCount != 2 || manifests[0].AddedRowsCount != 10 {
+		t.Fatalf("manifest list = %+v, want 1 manifest with 2 files / 10 rows", manifests)
+	}
+	manifestData, err := ts.objects.Get(ctx, manifests[0].ManifestPath)
+	if err != nil {
+		t.Fatalf("get manifest: %v", err)
+	}
+	entries, err := readManifestEntries(manifestData)
+	if err != nil {
+		t.Fatalf("readManifestEntries() error = %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("manifest entries = %d, want 2", len(entries))
+	}
+	for i, e := range entries {
+		if e.Status != manifestEntryAdded || e.SnapshotID != snap.SnapshotID || e.DataFile.FilePath != files[i].FilePath {
+			t.Fatalf("entry %d = %+v, want ADDED snapshot %d file %s", i, e, snap.SnapshotID, files[i].FilePath)
+		}
+	}
+}
+
+func TestTableCommitSnapshotCarriesParentManifests(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	first, err := ts.CommitSnapshot(ctx, "events", []DataFile{{Content: DataFileContentData, FilePath: "warehouse/events/data/a.parquet", FileFormat: DataFileFormatParquet, RecordCount: 1, FileSizeBytes: 100}})
+	if err != nil {
+		t.Fatalf("first CommitSnapshot() error = %v", err)
+	}
+	second, err := ts.CommitSnapshot(ctx, "events", []DataFile{{Content: DataFileContentData, FilePath: "warehouse/events/data/b.parquet", FileFormat: DataFileFormatParquet, RecordCount: 1, FileSizeBytes: 200}})
+	if err != nil {
+		t.Fatalf("second CommitSnapshot() error = %v", err)
+	}
+	if first.SnapshotID == second.SnapshotID {
+		t.Fatalf("snapshots share id %d", first.SnapshotID)
+	}
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	head := loaded.currentSnapshot()
+	listData, err := ts.objects.Get(ctx, head.ManifestList)
+	if err != nil {
+		t.Fatalf("get manifest list: %v", err)
+	}
+	manifests, err := readManifestList(listData)
+	if err != nil {
+		t.Fatalf("readManifestList() error = %v", err)
+	}
+	if len(manifests) != 2 {
+		t.Fatalf("manifest list after two commits = %d manifests, want 2 (parent + new)", len(manifests))
+	}
+	if len(loaded.Snapshots) != 2 {
+		t.Fatalf("snapshots = %d, want 2", len(loaded.Snapshots))
+	}
+}
+
+func TestTableCommitSnapshotIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	files := []DataFile{{Content: DataFileContentData, FilePath: "warehouse/events/data/a.parquet", FileFormat: DataFileFormatParquet, RecordCount: 1, FileSizeBytes: 100}}
+	first, err := ts.CommitSnapshot(ctx, "events", files)
+	if err != nil {
+		t.Fatalf("first CommitSnapshot() error = %v", err)
+	}
+	second, err := ts.CommitSnapshot(ctx, "events", files)
+	if err != nil {
+		t.Fatalf("retry CommitSnapshot() error = %v", err)
+	}
+	if second.SnapshotID != first.SnapshotID {
+		t.Fatalf("retry snapshot id = %d, want %d", second.SnapshotID, first.SnapshotID)
+	}
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Snapshots) != 1 {
+		t.Fatalf("snapshots after idempotent retry = %d, want 1", len(loaded.Snapshots))
 	}
 }

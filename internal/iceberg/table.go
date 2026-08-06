@@ -1,12 +1,14 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -158,13 +160,89 @@ func (ts *TableStore) metadataFileKeyForVersion(ctx context.Context, topic strin
 	return "", errors.Join(ErrNotFound, fmt.Errorf("iceberg table %q metadata version %d not found", topic, version))
 }
 
+// CommitSnapshot appends the given data files to the table as a new snapshot.
+// It writes the manifest referencing the files, the manifest list (carrying
+// the parent snapshot's manifests forward), and commits the metadata with the
+// version-hint CAS. The snapshot id is derived from the file set, so a retry
+// of the same commit is idempotent: if a snapshot for those files is already
+// committed it is returned without a new commit.
+func (ts *TableStore) CommitSnapshot(ctx context.Context, topic string, files []DataFile) (*Snapshot, error) {
+	snapshotID := snapshotIDForFiles(files)
+	return ts.commitSnapshot(ctx, topic, snapshotID, func(current *TableMetadata) (string, SnapshotSummary, *Snapshot, error) {
+		seq := current.nextSequenceNumber()
+		manifestKey := ts.manifestKey(topic, snapshotID, 1)
+		entries := make([]ManifestEntry, 0, len(files))
+		var rows int64
+		for _, f := range files {
+			rows += f.RecordCount
+			entries = append(entries, ManifestEntry{
+				Status:         manifestEntryAdded,
+				SnapshotID:     snapshotID,
+				SequenceNumber: seq,
+				DataFile:       f,
+			})
+		}
+		manifestLen, err := ts.writeManifestFile(ctx, manifestKey, entries)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		parentManifests, err := ts.readParentManifestList(ctx, current)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		newList := append(parentManifests, ManifestFile{
+			ManifestPath:      manifestKey,
+			ManifestLength:    manifestLen,
+			PartitionSpecID:   current.DefaultSpecID,
+			Content:           DataFileContentData,
+			SequenceNumber:    seq,
+			MinSequenceNumber: seq,
+			AddedSnapshotID:   snapshotID,
+			AddedFilesCount:   len(files),
+			AddedRowsCount:    rows,
+		})
+		listKey := ts.manifestListKey(topic, snapshotID, 1, len(newList))
+		if _, err := ts.writeManifestListFile(ctx, listKey, newList); err != nil {
+			return "", nil, nil, err
+		}
+		summary := SnapshotSummary{
+			"added-data-files": strconv.Itoa(len(files)),
+			"added-records":    strconv.FormatInt(rows, 10),
+		}
+		return listKey, summary, &Snapshot{
+			SnapshotID:     snapshotID,
+			SequenceNumber: seq,
+			TimestampMS:    time.Now().UnixMilli(),
+			ManifestList:   listKey,
+			Summary:        summary,
+		}, nil
+	})
+}
+
 // AppendSnapshot commits a new snapshot whose manifest list is stored at
-// manifestListKey, retrying on version-hint CAS conflicts. The snapshot id is
-// derived from the manifest list key, so a retry of the same commit is
-// idempotent: if a snapshot for that manifest list is already current, it is
-// returned without a new commit.
-func (ts *TableStore) AppendSnapshot(ctx context.Context, topic string, manifestListKey string, summary SnapshotSummary) (*Snapshot, error) {
-	snapshotID := snapshotIDFor(manifestListKey)
+// manifestListKey, retrying on version-hint CAS conflicts. Idempotent: if a
+// snapshot with the given id is already committed, it is returned unchanged.
+func (ts *TableStore) AppendSnapshot(ctx context.Context, topic string, snapshotID int64, manifestListKey string, summary SnapshotSummary) (*Snapshot, error) {
+	return ts.commitSnapshot(ctx, topic, snapshotID, func(current *TableMetadata) (string, SnapshotSummary, *Snapshot, error) {
+		seq := current.nextSequenceNumber()
+		snap := &Snapshot{
+			SnapshotID:     snapshotID,
+			SequenceNumber: seq,
+			TimestampMS:    time.Now().UnixMilli(),
+			ManifestList:   manifestListKey,
+			Summary:        summary,
+		}
+		return manifestListKey, summary, snap, nil
+	})
+}
+
+// commitSnapshot runs a commit with a caller-supplied builder. The builder
+// receives the freshly loaded current metadata and returns the manifest list
+// key, the summary, and the snapshot to commit; it must derive everything it
+// needs from that single loaded state so a snapshot's sequence number matches
+// the manifest entries it references. A lost version-hint CAS reloads and
+// retries.
+func (ts *TableStore) commitSnapshot(ctx context.Context, topic string, snapshotID int64, build func(*TableMetadata) (string, SnapshotSummary, *Snapshot, error)) (*Snapshot, error) {
 	for attempt := 0; ; attempt++ {
 		current, err := ts.Load(ctx, topic)
 		if err != nil {
@@ -173,14 +251,11 @@ func (ts *TableStore) AppendSnapshot(ctx context.Context, topic string, manifest
 		if existing := current.snapshotByID(snapshotID); existing != nil {
 			return existing, nil // idempotent retry
 		}
-		next := current.clone()
-		snap := &Snapshot{
-			SnapshotID:     snapshotID,
-			SequenceNumber: current.nextSequenceNumber(),
-			TimestampMS:    time.Now().UnixMilli(),
-			ManifestList:   manifestListKey,
-			Summary:        summary,
+		_, _, snap, err := build(current)
+		if err != nil {
+			return nil, err
 		}
+		next := current.clone()
 		next.Snapshots = append(next.Snapshots, snap)
 		next.CurrentSnapshotID = &snap.SnapshotID
 		next.Refs["main"] = SnapshotRef{SnapshotID: snap.SnapshotID, Type: "branch"}
@@ -251,9 +326,68 @@ func (ts *TableStore) DeleteTable(ctx context.Context, topic string) error {
 	return nil
 }
 
+// writeManifestFile writes an Iceberg manifest referencing entries and returns
+// its size in bytes.
+func (ts *TableStore) writeManifestFile(ctx context.Context, key string, entries []ManifestEntry) (int64, error) {
+	var buf bytes.Buffer
+	n, err := WriteManifest(&buf, entries)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := ts.objects.ConditionalPut(ctx, key, buf.Bytes(), ""); err != nil {
+		return 0, fmt.Errorf("write iceberg manifest %q: %w", key, err)
+	}
+	return n, nil
+}
+
+// writeManifestListFile writes an Iceberg manifest list and returns its size.
+func (ts *TableStore) writeManifestListFile(ctx context.Context, key string, manifests []ManifestFile) (int64, error) {
+	var buf bytes.Buffer
+	n, err := WriteManifestList(&buf, manifests)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := ts.objects.ConditionalPut(ctx, key, buf.Bytes(), ""); err != nil {
+		return 0, fmt.Errorf("write iceberg manifest list %q: %w", key, err)
+	}
+	return n, nil
+}
+
+// readParentManifestList returns the current snapshot's manifest list entries,
+// which a new snapshot carries forward so its manifest list covers the full
+// table state.
+func (ts *TableStore) readParentManifestList(ctx context.Context, current *TableMetadata) ([]ManifestFile, error) {
+	snap := current.currentSnapshot()
+	if snap == nil || snap.ManifestList == "" {
+		return nil, nil
+	}
+	data, err := ts.objects.Get(ctx, snap.ManifestList)
+	if err != nil {
+		return nil, fmt.Errorf("read parent manifest list %q: %w", snap.ManifestList, err)
+	}
+	manifests, err := readManifestList(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse parent manifest list %q: %w", snap.ManifestList, err)
+	}
+	return manifests, nil
+}
+
 // snapshotIDFor derives a stable snapshot id from the manifest list key so a
 // retried commit converges on the same snapshot.
 func snapshotIDFor(key string) int64 {
 	sum := sha256.Sum256([]byte(key))
 	return int64(binary.BigEndian.Uint64(sum[:8]) & (1<<63 - 1))
+}
+
+// snapshotIDForFiles derives a stable snapshot id from the committed file set
+// (paths, sizes, record counts), independent of wall clock, so a retried
+// commit of the same data converges on the same snapshot.
+func snapshotIDForFiles(files []DataFile) int64 {
+	h := sha256.New()
+	sorted := append([]DataFile(nil), files...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FilePath < sorted[j].FilePath })
+	for _, f := range sorted {
+		fmt.Fprintf(h, "%s|%d|%d|", f.FilePath, f.RecordCount, f.FileSizeBytes)
+	}
+	return int64(binary.BigEndian.Uint64(h.Sum(nil)[:8]) & (1<<63 - 1))
 }
