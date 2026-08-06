@@ -7,6 +7,7 @@ import (
 
 	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/diskless"
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/pipeline"
@@ -217,5 +218,61 @@ func TestIcebergExportPassBatchesRangesIntoOneSnapshot(t *testing.T) {
 	}
 	if len(files) != 3 {
 		t.Fatalf("data files = %d, want 3 (one per read range)", len(files))
+	}
+}
+
+// TestIcebergExportPassAvroValue verifies an avro-encoded topic value flows
+// through the export pipeline into the Iceberg table: the committed raw Avro
+// bytes are decoded into typed columns and exported.
+func TestIcebergExportPassAvroValue(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
+	defer s.disklessEngine.Close()
+	s.cfg.Maintenance.ParquetExport.Warehouse = "warehouse/"
+
+	avroSchema := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
+	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true, Schema: avroSchema}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	value, err := iceberg.EncodeAvroValue(avroSchema, map[string]any{"id": int64(7)})
+	if err != nil {
+		t.Fatalf("EncodeAvroValue: %v", err)
+	}
+	raw := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k1"), Value: value}})
+	if _, err := s.disklessEngine.Produce(ctx, tc.Name, 0, raw); err != nil {
+		t.Fatalf("diskless produce: %v", err)
+	}
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	cp := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion}
+	s.runIcebergExportPass(ctx, tc, identity, &cp)
+	if cp.NextOffset != 1 {
+		t.Fatalf("checkpoint next offset = %d, want 1", cp.NextOffset)
+	}
+	table := s.icebergTableStoreFor()
+	files, err := table.CurrentDataFiles(ctx, tc.Name)
+	if err != nil {
+		t.Fatalf("CurrentDataFiles() error = %v", err)
+	}
+	if len(files) != 1 || files[0].RecordCount != 1 {
+		t.Fatalf("data files = %+v, want 1 file with 1 avro record", files)
+	}
+	if err := table.ValidateTable(ctx, tc.Name); err != nil {
+		t.Fatalf("ValidateTable() error = %v", err)
 	}
 }

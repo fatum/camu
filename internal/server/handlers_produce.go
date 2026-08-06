@@ -109,13 +109,18 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 	byPartition := make(map[int][]indexedMsg)
 	for i, m := range msgs {
 		key := immutableStringBytes(m.Key)
+		valueBytes, err := typedValueBytes(topicCfg.Schema, m.Value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("message %d: %v", i, err))
+			return
+		}
 		partitionID := router.Route(key)
 		byPartition[partitionID] = append(byPartition[partitionID], indexedMsg{
 			idx:       i,
 			partition: partitionID,
 			msg: log.Message{
 				Key:     key,
-				Value:   immutableStringBytes(m.Value),
+				Value:   valueBytes,
 				Headers: m.Headers,
 			},
 		})
@@ -347,9 +352,14 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 	batch := make([]log.Message, len(msgs))
 	for i, m := range msgs {
 		key := immutableStringBytes(m.Key)
+		valueBytes, err := typedValueBytes(tc.Schema, m.Value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("message %d: %v", i, err))
+			return
+		}
 		batch[i] = log.Message{
 			Key:     key,
-			Value:   immutableStringBytes(m.Value),
+			Value:   valueBytes,
 			Headers: m.Headers,
 		}
 	}

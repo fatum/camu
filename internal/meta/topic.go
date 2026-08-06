@@ -65,14 +65,16 @@ func (s *TopicSchema) Validate() error {
 	if s == nil {
 		return nil
 	}
-	if s.Encoding != "json" {
-		return fmt.Errorf("schema encoding must be json")
+	switch s.Encoding {
+	case "json", "avro":
+	default:
+		return fmt.Errorf("schema encoding must be json or avro")
 	}
 	if len(s.Fields) == 0 {
 		return fmt.Errorf("schema fields are required")
 	}
 	seen := map[string]bool{}
-	fixed := map[string]bool{"record_offset": true, "record_timestamp": true, "key": true, "value": true, "headers": true}
+	fixed := map[string]bool{"record_offset": true, "record_timestamp": true, "key": true, "value": true, "headers": true, "dt": true, "hour": true}
 	for _, f := range s.Fields {
 		if f.Name == "" || seen[strings.ToLower(f.Name)] || fixed[strings.ToLower(f.Name)] {
 			return fmt.Errorf("schema field names must be unique and non-empty")

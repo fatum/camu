@@ -195,10 +195,18 @@ type DecodedField struct {
 	Value   parquet.Value
 }
 
-// DecodeTypedFields walks the JSON token stream and only materializes values
-// named by the topic schema. The old map[string]any decode retained every
-// source field, including large payloads that are not exported as columns.
+// DecodeTypedFields decodes a topic value into the schema's projected fields,
+// dispatching on the topic schema encoding. The old map[string]any JSON decode
+// retained every source field, including large payloads that are not exported
+// as columns.
 func DecodeTypedFields(schema *meta.TopicSchema, input []byte) ([]DecodedField, error) {
+	if schema != nil && schema.Encoding == "avro" {
+		return DecodeAvroTypedFields(schema, input)
+	}
+	return decodeJSONTypedFields(schema, input)
+}
+
+func decodeJSONTypedFields(schema *meta.TopicSchema, input []byte) ([]DecodedField, error) {
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	root, err := decoder.Token()
 	if err != nil {

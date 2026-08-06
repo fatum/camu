@@ -7,8 +7,12 @@ func TestTopicSchemaValidate(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	avro := TopicSchema{Encoding: "avro", Fields: s.Fields}
+	if err := avro.Validate(); err != nil {
+		t.Fatalf("avro encoding should be valid: %v", err)
+	}
 	for _, bad := range []TopicSchema{
-		{Encoding: "avro", Fields: s.Fields},
+		{Encoding: "protobuf", Fields: s.Fields},
 		{Encoding: "json", Fields: []SchemaField{{Name: "id", Type: "bytes", Path: "$.id"}}},
 		{Encoding: "json", Fields: []SchemaField{{Name: "id", Type: "int64", Path: "id"}}},
 	} {

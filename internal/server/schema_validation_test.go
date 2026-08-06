@@ -1,8 +1,10 @@
 package server
 
 import (
+	"encoding/base64"
 	"testing"
 
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/meta"
 )
 
@@ -26,5 +28,20 @@ func TestValidateTypedValueRejectsTimestampOutsideUnixNanosecondRange(t *testing
 	}
 	if err := validateTypedValue(schema, `{"occurred_at":"1677-09-21T00:12:43.145224192Z"}`); err != nil {
 		t.Fatalf("rejected lowest representable timestamp: %v", err)
+	}
+}
+
+func TestValidateTypedValueAvro(t *testing.T) {
+	schema := &meta.TopicSchema{Encoding: "avro", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}, {Name: "ok", Type: "bool", Path: "$.ok", Nullable: true}}}
+	encoded, err := iceberg.EncodeAvroValue(schema, map[string]any{"id": int64(4), "ok": true})
+	if err != nil {
+		t.Fatalf("EncodeAvroValueForTest: %v", err)
+	}
+	b64 := base64.StdEncoding.EncodeToString(encoded)
+	if err := validateTypedValue(schema, b64); err != nil {
+		t.Fatalf("validateTypedValue(avro) error = %v", err)
+	}
+	if err := validateTypedValue(schema, "not-base64!!"); err == nil {
+		t.Fatal("validateTypedValue accepted non-base64 avro value")
 	}
 }
