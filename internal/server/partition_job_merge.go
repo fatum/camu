@@ -31,10 +31,13 @@ type mergedSegmentArtifact struct {
 }
 
 func (s *Server) discoverClassicSegmentMergeJobs(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, jobs []PartitionJob) {
-	for _, job := range jobs {
-		if job.Type == PartitionJobTypeSegmentMerge {
-			return
-		}
+	active, err := s.hasActiveSegmentMergeJob(ctx, identity, jobs)
+	if err != nil {
+		slog.Warn("classic_segment_merge_stale_cleanup_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		return
+	}
+	if active {
+		return
 	}
 
 	cutoff := time.Now().Add(-tc.Retention)

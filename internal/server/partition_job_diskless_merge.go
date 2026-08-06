@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
@@ -50,10 +51,13 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 	if !cfg.Enabled || s.disklessMeta == nil {
 		return
 	}
-	for _, job := range jobs {
-		if job.Type == PartitionJobTypeSegmentMerge {
-			return
-		}
+	active, err := s.hasActiveSegmentMergeJob(ctx, identity, jobs)
+	if err != nil {
+		slog.Warn("diskless_merge_stale_cleanup_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		return
+	}
+	if active {
+		return
 	}
 	committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, identity.Partition)
 	if err != nil {
@@ -81,7 +85,7 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 	}
 	graceCutoff := time.Now().Add(-grace)
 	retentionCutoff := time.Now().Add(-tc.Retention)
-	maxSegments := cfg.MaxSegmentsPerMergeValue()
+	maxSegments := s.effectiveDisklessMergeMaxSegments(cfg)
 
 	var run []diskless.SegmentRef
 	var total int64
@@ -129,6 +133,33 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 	if err := s.putPartitionJob(ctx, job); err != nil {
 		slog.Warn("diskless_merge_enqueue_failed", "topic", tc.Name, "partition", identity.Partition, "job", job.ID, "error", err)
 	}
+}
+
+// maxDisklessMergeSegmentsUnbounded is the per-run file-count safety cap for
+// metastores without a transaction item limit (S3 head CAS, in-memory). It sits
+// far above the default target/file-size ratio so the byte target normally
+// bounds the run and a merged chunk reaches target in one pass, while still
+// bounding pathological runs of very small files.
+const maxDisklessMergeSegmentsUnbounded = 4096
+
+// effectiveDisklessMergeMaxSegments returns the per-run file-count cap. The
+// configured default (90) exists to fit DynamoDB's 100-item TransactWriteItems
+// limit. Metastores without that limit can merge a full target-sized run in one
+// pass, which is what makes a merged chunk immediately byte-final so compaction
+// never re-reads it. An explicit config override is honored, and clamped to the
+// DynamoDB limit when that metastore is in use.
+func (s *Server) effectiveDisklessMergeMaxSegments(cfg config.CompactionConfig) int {
+	if limited, ok := s.disklessMeta.(diskless.ReplaceItemLimited); ok {
+		max := cfg.MaxSegmentsPerMergeValue()
+		if limit := limited.ReplaceItemLimit() - 1; max > limit {
+			return limit
+		}
+		return max
+	}
+	if max := cfg.MaxSegmentsPerMerge; max > 0 {
+		return max
+	}
+	return maxDisklessMergeSegmentsUnbounded
 }
 
 func buildDisklessMergeJob(topic string, partition int, identity PartitionIdentity, refs []diskless.SegmentRef) (PartitionJob, error) {

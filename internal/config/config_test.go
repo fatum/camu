@@ -356,3 +356,20 @@ func TestCompactionConfigBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactionIntervalDefault(t *testing.T) {
+	got, err := (config.CompactionConfig{}).IntervalDuration()
+	if err != nil {
+		t.Fatalf("IntervalDuration() error = %v", err)
+	}
+	if got != config.DefaultCompactionInterval {
+		t.Fatalf("default IntervalDuration = %v, want %v", got, config.DefaultCompactionInterval)
+	}
+	got, err = (config.CompactionConfig{Interval: "150ms"}).IntervalDuration()
+	if err != nil {
+		t.Fatalf("IntervalDuration(150ms) error = %v", err)
+	}
+	if got != 150*time.Millisecond {
+		t.Fatalf("IntervalDuration(150ms) = %v, want 150ms", got)
+	}
+}

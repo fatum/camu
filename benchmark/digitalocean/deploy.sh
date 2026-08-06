@@ -22,7 +22,7 @@ fi
 wait_for_ssh() {
   local ip="$1"
   for _ in {1..60}; do
-    if ssh "${ssh_opts[@]}" "${ssh_user}@${ip}" 'test -f /etc/camu/benchmark.yaml && command -v docker >/dev/null'; then
+    if ssh "${ssh_opts[@]}" "${ssh_user}@${ip}" 'test -f /etc/camu/benchmark.yaml && command -v docker >/dev/null' < /dev/null; then
       return 0
     fi
     sleep 5

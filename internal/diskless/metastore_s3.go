@@ -582,14 +582,20 @@ func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition
 // GetPartitionHead returns the next offset that will be allocated for a partition.
 func (m *S3MetaStore) GetPartitionHead(ctx context.Context, topic string, partition int) (int64, error) {
 	manifest, err := m.readUploadManifest(ctx, topic, partition)
-	return manifest.NextOffset, err
+	if err != nil {
+		return 0, err
+	}
+	return manifest.NextOffset, nil
 }
 
 // GetCommittedHead returns the highest offset durably materialized for a
 // partition, or 0 if nothing has been registered yet.
 func (m *S3MetaStore) GetCommittedHead(ctx context.Context, topic string, partition int) (int64, error) {
 	manifest, err := m.readUploadManifest(ctx, topic, partition)
-	return manifest.CommittedOffset, err
+	if err != nil {
+		return 0, err
+	}
+	return manifest.CommittedOffset, nil
 }
 
 // GetPartitionStart returns the earliest readable offset for a partition after

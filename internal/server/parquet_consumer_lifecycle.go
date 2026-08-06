@@ -13,7 +13,15 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
-const parquetConsumerPollInterval = 200 * time.Millisecond
+const (
+	parquetConsumerPollInterval = 200 * time.Millisecond
+	// parquetConsumerIdlePollInterval is used while the partition has no new
+	// committed records to export. Idle passes only re-read the committed head /
+	// clone the index, so polling at 200ms burns CPU for nothing; backing off
+	// to this interval cuts the idle cost ~10x while export latency on new data
+	// stays bounded by this interval plus one active poll.
+	parquetConsumerIdlePollInterval = 2 * time.Second
+)
 
 func parquetConsumerKey(topic string, partition int) string {
 	return topic + "\x00" + strconv.Itoa(partition)
@@ -92,16 +100,30 @@ func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc 
 		case <-time.After(parquetConsumerPollInterval):
 		}
 	}
-	ticker := time.NewTicker(parquetConsumerPollInterval)
-	defer ticker.Stop()
 	for {
+		before := cp.NextOffset
 		s.runParquetExportPass(ctx, tc, identity, &cp)
+		// Back off when the pass exported nothing: the partition is caught up,
+		// so an idle pass only re-reads the committed head / index. Once new
+		// data appears the next pass advances the checkpoint and the loop
+		// returns to the fast poll interval.
+		interval := parquetConsumerPollIntervalFor(before, cp.NextOffset)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(interval):
 		}
 	}
+}
+
+// parquetConsumerPollIntervalFor picks the poll interval for the next export
+// pass. An idle pass (checkpoint unchanged) backs off to
+// parquetConsumerIdlePollInterval; any progress returns to the fast interval.
+func parquetConsumerPollIntervalFor(before, after uint64) time.Duration {
+	if after == before {
+		return parquetConsumerIdlePollInterval
+	}
+	return parquetConsumerPollInterval
 }
 
 func (s *Server) loadParquetCheckpoint(ctx context.Context, topic string, partition int) (pipeline.Checkpoint, error) {

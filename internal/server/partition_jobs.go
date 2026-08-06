@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/maksim/camu/internal/jobqueue"
 	"github.com/maksim/camu/internal/jobs"
@@ -76,6 +77,40 @@ func (s *Server) deletePartitionJob(ctx context.Context, topic string, partition
 
 func (s *Server) listPartitionJobs(ctx context.Context, topic string, partition int) ([]PartitionJob, error) {
 	return s.partitionJobStore().List(ctx, topic, partition)
+}
+
+// hasActiveSegmentMergeJob reports whether a segment-merge job owned by the
+// current leader identity is already in flight for this partition and still
+// gates the next merge. A job in the delete_data phase has already published
+// its merged ref (publish_meta is done) and only awaits source-data deletion;
+// it must not stall the next merge, so it does not count as active. A merge job
+// whose expected owner or epoch no longer matches the current leader can never
+// run (CanRunOwnerJob requires an exact match), so it is stale: deleting it
+// unblocks compaction. Without this, a single orphaned job (e.g. after a node
+// restart moved leadership) permanently stalls every future merge for the
+// partition, because merge discovery returns early while any merge job exists.
+func (s *Server) hasActiveSegmentMergeJob(ctx context.Context, identity PartitionIdentity, jobs []PartitionJob) (bool, error) {
+	for _, job := range jobs {
+		if job.Type != PartitionJobTypeSegmentMerge {
+			continue
+		}
+		if job.ExpectedOwner == identity.Leader && job.ExpectedEpoch == identity.LeaderEpoch {
+			if job.Phase == PartitionJobPhaseDeleteData {
+				// The merged ref is already authoritative; source deletion is
+				// independent of the next merge, so do not block discovery.
+				continue
+			}
+			return true, nil
+		}
+		slog.Warn("segment_merge_job_stale",
+			"topic", job.Topic, "partition", job.Partition, "job", job.ID,
+			"expected_owner", job.ExpectedOwner, "expected_epoch", job.ExpectedEpoch,
+			"leader", identity.Leader, "epoch", identity.LeaderEpoch)
+		if err := s.deletePartitionJob(ctx, job.Topic, job.Partition, job.ID); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func partitionJobID(kind PartitionJobType, key string) string {

@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -345,6 +346,30 @@ func TestS3MetaStore_CommitMultipleBatchesAtomically(t *testing.T) {
 	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
 	if err != nil || len(refs) != 3 {
 		t.Fatalf("refs = %+v, %v; want 3", refs, err)
+	}
+}
+
+// TestS3MetaStore_HeadReadsReturnErrorOnGetFailure verifies GetCommittedHead and
+// GetPartitionHead propagate a non-NotFound S3 read error instead of panicking on
+// the nil manifest (regression: nil pointer dereference in GetCommittedHead
+// crashed every node's diskless parquet export on transient S3 errors).
+func TestS3MetaStore_HeadReadsReturnErrorOnGetFailure(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	injected := errors.New("injected get failure")
+	m.s3.SetFaultInjector(func(op string) error {
+		if op == "get" {
+			return injected
+		}
+		return nil
+	})
+	defer m.s3.SetFaultInjector(nil)
+
+	if _, err := m.GetCommittedHead(ctx, "t", 0); !errors.Is(err, injected) {
+		t.Fatalf("GetCommittedHead err = %v, want injected error", err)
+	}
+	if _, err := m.GetPartitionHead(ctx, "t", 0); !errors.Is(err, injected) {
+		t.Fatalf("GetPartitionHead err = %v, want injected error", err)
 	}
 }
 

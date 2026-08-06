@@ -76,15 +76,20 @@ func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc
 			slog.Warn("partition_maintenance_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
 			return
 		}
-	} else {
-		p.server.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
-		jobs, err = p.server.listPartitionJobs(ctx, tc.Name, partition)
-		if err != nil {
-			slog.Warn("partition_maintenance_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
-			return
+		for _, job := range jobs {
+			if err := p.runJob(ctx, job); err != nil {
+				slog.Warn("partition_job_failed", "topic", job.Topic, "partition", job.Partition, "job", job.ID, "type", job.Type, "error", err)
+			}
 		}
+		return
 	}
+	// Diskless: the dedicated compaction loop owns segment-merge discovery and
+	// execution (it runs far more often than this pass); the maintenance pass
+	// only drives retention here so a merge job is never run by two paths.
 	for _, job := range jobs {
+		if job.Type == PartitionJobTypeSegmentMerge {
+			continue
+		}
 		if err := p.runJob(ctx, job); err != nil {
 			slog.Warn("partition_job_failed", "topic", job.Topic, "partition", job.Partition, "job", job.ID, "type", job.Type, "error", err)
 		}
