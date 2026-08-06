@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -89,7 +90,7 @@ func TestTableAppendSnapshotAndReload(t *testing.T) {
 	if _, err := ts.Create(ctx, "events", nil); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	manifestList := ts.manifestListKey("events", 42, 1, 1)
+	manifestList := "warehouse/events/metadata/snap-test.avro"
 	snap, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, SnapshotSummary{"added-data-files": "2"})
 	if err != nil {
 		t.Fatalf("AppendSnapshot() error = %v", err)
@@ -122,7 +123,7 @@ func TestTableAppendSnapshotIsIdempotent(t *testing.T) {
 	if _, err := ts.Create(ctx, "events", nil); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	manifestList := ts.manifestListKey("events", 42, 1, 1)
+	manifestList := "warehouse/events/metadata/snap-test.avro"
 	first, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, nil)
 	if err != nil {
 		t.Fatalf("first AppendSnapshot() error = %v", err)
@@ -153,7 +154,7 @@ func TestTableAppendSnapshotRetriesCASConflict(t *testing.T) {
 	// The first version-hint CAS after the metadata write fails once; the
 	// commit must reload the winner's metadata and retry at the next version.
 	objects.injectConditionalPutConflict("warehouse/events/metadata/version-hint.text", 1)
-	manifestList := ts.manifestListKey("events", 42, 1, 1)
+	manifestList := "warehouse/events/metadata/snap-test.avro"
 	snap, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(manifestList), manifestList, nil)
 	if err != nil {
 		t.Fatalf("AppendSnapshot() after conflict error = %v", err)
@@ -179,7 +180,7 @@ func TestTableDeleteRemovesEverything(t *testing.T) {
 	if _, err := ts.Create(ctx, "events", nil); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if _, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor(ts.manifestListKey("events", 42, 1, 1)), ts.manifestListKey("events", 42, 1, 1), nil); err != nil {
+	if _, err := ts.AppendSnapshot(ctx, "events", snapshotIDFor("warehouse/events/metadata/snap-test.avro"), "warehouse/events/metadata/snap-test.avro", nil); err != nil {
 		t.Fatalf("AppendSnapshot() error = %v", err)
 	}
 	if err := ts.DeleteTable(ctx, "events"); err != nil {
@@ -351,5 +352,43 @@ func TestTableCommitSnapshotIsIdempotent(t *testing.T) {
 	}
 	if len(loaded.Snapshots) != 1 {
 		t.Fatalf("snapshots after idempotent retry = %d, want 1", len(loaded.Snapshots))
+	}
+}
+
+func TestTableCommitSnapshotMergesManifests(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	const commits = maxManifestsPerSnapshot + 1
+	for i := 0; i < commits; i++ {
+		files := []DataFile{{Content: DataFileContentData, FilePath: fmt.Sprintf("warehouse/events/data/f%d.parquet", i), FileFormat: DataFileFormatParquet, RecordCount: 1, FileSizeBytes: 100}}
+		if _, err := ts.CommitSnapshot(ctx, "events", files); err != nil {
+			t.Fatalf("commit %d: %v", i, err)
+		}
+	}
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	head := loaded.currentSnapshot()
+	listData, err := ts.objects.Get(ctx, head.ManifestList)
+	if err != nil {
+		t.Fatalf("get manifest list: %v", err)
+	}
+	manifests, err := readManifestList(listData)
+	if err != nil {
+		t.Fatalf("readManifestList() error = %v", err)
+	}
+	if len(manifests) != 1 {
+		t.Fatalf("manifest list after %d commits = %d manifests, want 1 (merged)", commits, len(manifests))
+	}
+	files, err := ts.CurrentDataFiles(ctx, "events")
+	if err != nil {
+		t.Fatalf("CurrentDataFiles() error = %v", err)
+	}
+	if len(files) != commits {
+		t.Fatalf("data files = %d, want %d (merged manifest must keep every file)", len(files), commits)
 	}
 }

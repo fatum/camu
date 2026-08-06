@@ -34,11 +34,22 @@ type ParquetExportConfig struct {
 	Iceberg bool `yaml:"iceberg"`
 	// Warehouse is the object-store prefix Iceberg tables live under.
 	Warehouse string `yaml:"warehouse"`
+	// TargetBytes bounds how much data one Iceberg snapshot commits; the
+	// export pass keeps appending data files until the target or MaxInterval
+	// is reached, so snapshots and manifest lists stay small at high load.
+	TargetBytes int64 `yaml:"target_bytes"`
+	// MaxInterval bounds how long an Iceberg export pass may run before it
+	// commits whatever it buffered.
+	MaxInterval string `yaml:"max_interval"`
 }
 
 // defaultExportWarehouse is the default object-store prefix for Iceberg
 // tables, matching iceberg.DefaultWarehouse.
-const defaultExportWarehouse = "warehouse/"
+const (
+	defaultExportWarehouse   = "warehouse/"
+	defaultExportTargetBytes = 64 << 20
+	defaultExportMaxInterval = 30 * time.Second
+)
 
 func (p ParquetExportConfig) MaxRecordsValue() int {
 	if p.MaxRecords <= 0 {
@@ -61,6 +72,25 @@ func (p ParquetExportConfig) WarehouseValue() string {
 		return defaultExportWarehouse
 	}
 	return p.Warehouse
+}
+
+// TargetBytesValue returns the Iceberg snapshot byte target, defaulting to
+// 64 MiB.
+func (p ParquetExportConfig) TargetBytesValue() int64 {
+	if p.TargetBytes <= 0 {
+		return defaultExportTargetBytes
+	}
+	return p.TargetBytes
+}
+
+// MaxIntervalValue returns the Iceberg snapshot commit interval, defaulting to
+// 30s.
+func (p ParquetExportConfig) MaxIntervalValue() time.Duration {
+	d, err := time.ParseDuration(p.MaxInterval)
+	if err != nil || d <= 0 {
+		return defaultExportMaxInterval
+	}
+	return d
 }
 
 type SQLConfig struct {

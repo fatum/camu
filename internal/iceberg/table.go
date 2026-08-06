@@ -1,7 +1,6 @@
 package iceberg
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -72,16 +71,6 @@ func (ts *TableStore) versionHintKey(topic string) string {
 // match the current version by the numeric prefix.
 func (ts *TableStore) metadataFileKey(topic string, version int) string {
 	return fmt.Sprintf("%s%05d-%s.metadata.json", ts.metadataDir(topic), version, uuid.NewString())
-}
-
-// manifestListKey returns the manifest-list (snapshot) Avro file key.
-func (ts *TableStore) manifestListKey(topic string, snapshotID int64, attempt, manifestCount int) string {
-	return fmt.Sprintf("%ssnap-%d-%d-%d.avro", ts.metadataDir(topic), snapshotID, attempt, manifestCount)
-}
-
-// manifestKey returns one manifest Avro file key for a snapshot.
-func (ts *TableStore) manifestKey(topic string, snapshotID int64, manifestCount int) string {
-	return fmt.Sprintf("%s%d-m%d.avro", ts.metadataDir(topic), snapshotID, manifestCount)
 }
 
 // dataFileKey returns the content-addressed data-file key under the table's
@@ -170,54 +159,94 @@ func (ts *TableStore) metadataFileKeyForVersion(ctx context.Context, topic strin
 	return "", errors.Join(ErrNotFound, fmt.Errorf("iceberg table %q metadata version %d not found", topic, version))
 }
 
+// maxManifestsPerSnapshot bounds the number of manifests a snapshot's manifest
+// list carries before a commit merges them into one (minor compaction), so the
+// manifest list never grows without bound under sustained snapshot commits.
+const maxManifestsPerSnapshot = 8
+
 // CommitSnapshot appends the given data files to the table as a new snapshot.
 // It writes the manifest referencing the files, the manifest list (carrying
-// the parent snapshot's manifests forward), and commits the metadata with the
+// the parent snapshot's manifests forward, or merging them when the list would
+// exceed maxManifestsPerSnapshot), and commits the metadata with the
 // version-hint CAS. The snapshot id is derived from the file set, so a retry
 // of the same commit is idempotent: if a snapshot for those files is already
-// committed it is returned without a new commit.
+// committed it is returned without a new commit. Manifest and manifest-list
+// keys are content-addressed, so retries after a concurrent commit never
+// collide on an existing object.
 func (ts *TableStore) CommitSnapshot(ctx context.Context, topic string, files []DataFile) (*Snapshot, error) {
 	snapshotID := snapshotIDForFiles(files)
 	return ts.commitSnapshot(ctx, topic, snapshotID, func(current *TableMetadata) (string, SnapshotSummary, *Snapshot, error) {
 		seq := current.nextSequenceNumber()
-		manifestKey := ts.manifestKey(topic, snapshotID, 1)
-		entries := make([]ManifestEntry, 0, len(files))
-		var rows int64
+		added := make([]ManifestEntry, 0, len(files))
+		var addedRows int64
 		for _, f := range files {
-			rows += f.RecordCount
-			entries = append(entries, ManifestEntry{
+			addedRows += f.RecordCount
+			added = append(added, ManifestEntry{
 				Status:         manifestEntryAdded,
 				SnapshotID:     snapshotID,
 				SequenceNumber: seq,
 				DataFile:       f,
 			})
 		}
-		manifestLen, err := ts.writeManifestFile(ctx, manifestKey, entries)
-		if err != nil {
-			return "", nil, nil, err
-		}
 		parentManifests, err := ts.readParentManifestList(ctx, current)
 		if err != nil {
 			return "", nil, nil, err
 		}
-		newList := append(parentManifests, ManifestFile{
-			ManifestPath:      manifestKey,
-			ManifestLength:    manifestLen,
-			PartitionSpecID:   current.DefaultSpecID,
-			Content:           DataFileContentData,
-			SequenceNumber:    seq,
-			MinSequenceNumber: seq,
-			AddedSnapshotID:   snapshotID,
-			AddedFilesCount:   len(files),
-			AddedRowsCount:    rows,
-		})
-		listKey := ts.manifestListKey(topic, snapshotID, 1, len(newList))
-		if _, err := ts.writeManifestListFile(ctx, listKey, newList); err != nil {
+		var entries []ManifestEntry
+		var list []ManifestFile
+		if len(parentManifests)+1 > maxManifestsPerSnapshot {
+			// Minor compaction: merge the parent manifests and the new files
+			// into a single manifest so the manifest list stays bounded.
+			entries, err = ts.mergeParentManifests(ctx, parentManifests, added)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			manifestKey, manifestLen, err := ts.writeManifestFile(ctx, topic, snapshotID, entries)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			minSeq := seq
+			for _, e := range entries {
+				if e.SequenceNumber < minSeq {
+					minSeq = e.SequenceNumber
+				}
+			}
+			list = []ManifestFile{{
+				ManifestPath:       manifestKey,
+				ManifestLength:     manifestLen,
+				PartitionSpecID:    current.DefaultSpecID,
+				Content:            DataFileContentData,
+				SequenceNumber:     seq,
+				MinSequenceNumber:  minSeq,
+				AddedSnapshotID:    snapshotID,
+				AddedFilesCount:    len(files),
+				ExistingFilesCount: len(entries) - len(files),
+				AddedRowsCount:     addedRows,
+			}}
+		} else {
+			manifestKey, manifestLen, err := ts.writeManifestFile(ctx, topic, snapshotID, added)
+			if err != nil {
+				return "", nil, nil, err
+			}
+			list = append(parentManifests, ManifestFile{
+				ManifestPath:      manifestKey,
+				ManifestLength:    manifestLen,
+				PartitionSpecID:   current.DefaultSpecID,
+				Content:           DataFileContentData,
+				SequenceNumber:    seq,
+				MinSequenceNumber: seq,
+				AddedSnapshotID:   snapshotID,
+				AddedFilesCount:   len(files),
+				AddedRowsCount:    addedRows,
+			})
+		}
+		listKey, _, err := ts.writeManifestListFile(ctx, topic, snapshotID, list)
+		if err != nil {
 			return "", nil, nil, err
 		}
 		summary := SnapshotSummary{
 			"added-data-files": strconv.Itoa(len(files)),
-			"added-records":    strconv.FormatInt(rows, 10),
+			"added-records":    strconv.FormatInt(addedRows, 10),
 		}
 		return listKey, summary, &Snapshot{
 			SnapshotID:     snapshotID,
@@ -336,31 +365,53 @@ func (ts *TableStore) DeleteTable(ctx context.Context, topic string) error {
 	return nil
 }
 
-// writeManifestFile writes an Iceberg manifest referencing entries and returns
-// its size in bytes.
-func (ts *TableStore) writeManifestFile(ctx context.Context, key string, entries []ManifestEntry) (int64, error) {
-	var buf bytes.Buffer
-	n, err := WriteManifest(&buf, entries)
+// writeManifestFile encodes entries as an Iceberg manifest and stores it under
+// a content-addressed key; it returns the key and the file size in bytes.
+func (ts *TableStore) writeManifestFile(ctx context.Context, topic string, snapshotID int64, entries []ManifestEntry) (string, int64, error) {
+	records, err := encodeManifestEntries(entries)
 	if err != nil {
-		return 0, err
+		return "", 0, err
 	}
-	if _, err := ts.objects.ConditionalPut(ctx, key, buf.Bytes(), ""); err != nil {
-		return 0, fmt.Errorf("write iceberg manifest %q: %w", key, err)
-	}
-	return n, nil
+	key := fmt.Sprintf("%s%d-m%s.avro", ts.metadataDir(topic), snapshotID, metadataContentHash(records))
+	n, err := ts.storeOCF(ctx, key, manifestEntryAvroSchema, records)
+	return key, n, err
 }
 
-// writeManifestListFile writes an Iceberg manifest list and returns its size.
-func (ts *TableStore) writeManifestListFile(ctx context.Context, key string, manifests []ManifestFile) (int64, error) {
-	var buf bytes.Buffer
-	n, err := WriteManifestList(&buf, manifests)
+// writeManifestListFile encodes manifests as an Iceberg manifest list and
+// stores it under a content-addressed key; it returns the key and file size.
+func (ts *TableStore) writeManifestListFile(ctx context.Context, topic string, snapshotID int64, manifests []ManifestFile) (string, int64, error) {
+	records, err := encodeManifestListRows(manifests)
 	if err != nil {
-		return 0, err
+		return "", 0, err
 	}
-	if _, err := ts.objects.ConditionalPut(ctx, key, buf.Bytes(), ""); err != nil {
-		return 0, fmt.Errorf("write iceberg manifest list %q: %w", key, err)
+	key := fmt.Sprintf("%ssnap-%d-%s.avro", ts.metadataDir(topic), snapshotID, metadataContentHash(records))
+	n, err := ts.storeOCF(ctx, key, manifestListAvroSchema, records)
+	return key, n, err
+}
+
+// mergeParentManifests reads every parent manifest and returns a single merged
+// entry set: carried-over entries become EXISTING with their original snapshot
+// and sequence numbers, followed by the newly added entries.
+func (ts *TableStore) mergeParentManifests(ctx context.Context, parentManifests []ManifestFile, added []ManifestEntry) ([]ManifestEntry, error) {
+	var out []ManifestEntry
+	for _, mf := range parentManifests {
+		data, err := ts.objects.Get(ctx, mf.ManifestPath)
+		if err != nil {
+			return nil, fmt.Errorf("read manifest %q for merge: %w", mf.ManifestPath, err)
+		}
+		entries, err := readManifestEntries(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse manifest %q for merge: %w", mf.ManifestPath, err)
+		}
+		for _, e := range entries {
+			if e.Status == manifestEntryDeleted {
+				continue
+			}
+			e.Status = manifestEntryExisting
+			out = append(out, e)
+		}
 	}
-	return n, nil
+	return append(out, added...), nil
 }
 
 // CurrentDataFiles returns the data files referenced by the current snapshot,

@@ -156,3 +156,69 @@ func TestIcebergExportPassIsIdempotentAcrossRetry(t *testing.T) {
 		t.Fatalf("snapshots after retry = %d, want %d (idempotent)", len(second.Snapshots), len(first.Snapshots))
 	}
 }
+
+// TestIcebergExportPassBatchesRangesIntoOneSnapshot verifies that one pass
+// buffers multiple source ranges (bounded per-read by max_records) into a
+// single snapshot instead of committing one snapshot per range.
+func TestIcebergExportPassBatchesRangesIntoOneSnapshot(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{LingerMs: 1})
+	defer s.disklessEngine.Close()
+	s.cfg.Maintenance.ParquetExport.Iceberg = true
+	s.cfg.Maintenance.ParquetExport.MaxRecords = 1
+
+	tc := meta.TopicConfig{Name: "orders", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless, ExportEnabled: true}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, tc.Name, coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	for _, id := range []int{1, 2, 3} {
+		raw := log.EncodeRecordBatch(0, []log.Message{{Value: []byte(`{"id":` + string(rune(0+id)) + `}`)}})
+		if _, err := s.disklessEngine.Produce(ctx, tc.Name, 0, raw); err != nil {
+			t.Fatalf("diskless produce: %v", err)
+		}
+	}
+	committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, 0)
+	if err != nil {
+		t.Fatalf("committed head: %v", err)
+	}
+	if committed != 3 {
+		t.Fatalf("committed head = %d, want 3", committed)
+	}
+
+	identity := PartitionIdentity{Topic: tc.Name, Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	cp := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion}
+	s.runIcebergExportPass(ctx, tc, identity, &cp)
+	if cp.NextOffset != 3 {
+		t.Fatalf("checkpoint next offset = %d, want 3", cp.NextOffset)
+	}
+
+	table := s.icebergTableStoreFor()
+	loaded, err := table.Load(ctx, tc.Name)
+	if err != nil {
+		t.Fatalf("iceberg table load: %v", err)
+	}
+	if len(loaded.Snapshots) != 1 {
+		t.Fatalf("snapshots = %d, want 1 (one snapshot covering all ranges)", len(loaded.Snapshots))
+	}
+	files, err := table.CurrentDataFiles(ctx, tc.Name)
+	if err != nil {
+		t.Fatalf("CurrentDataFiles() error = %v", err)
+	}
+	if len(files) != 3 {
+		t.Fatalf("data files = %d, want 3 (one per read range)", len(files))
+	}
+}

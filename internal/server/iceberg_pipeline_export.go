@@ -84,10 +84,10 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 		return
 	}
 	labels := map[string]string{"topic": tc.Name, "partition": strconv.Itoa(identity.Partition)}
+	startOffset := cp.NextOffset
 	if cp.NextOffset >= highWatermark {
 		return
 	}
-	startOffset := cp.NextOffset
 	started := time.Now()
 	result := "unknown"
 	defer func() {
@@ -95,101 +95,122 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 		s.metricObserve("camu_iceberg_export_pipeline_pass_duration", "Iceberg export pipeline pass duration", mergeMetricLabels(labels, "result", result), time.Since(started))
 	}()
 
+	table := s.icebergTableStoreFor()
+	if err := s.ensureIcebergTable(ctx, tc); err != nil {
+		result = "table_error"
+		slog.Warn("iceberg_pipeline_table_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		return
+	}
+
+	// Buffer source ranges into data files and commit one snapshot once the
+	// byte target or the commit interval is reached, so snapshots (and the
+	// manifest lists that carry them forward) stay bounded under sustained
+	// load instead of one snapshot per tiny export pass.
+	targetBytes := s.cfg.Maintenance.ParquetExport.TargetBytesValue()
+	commitInterval := s.cfg.Maintenance.ParquetExport.MaxIntervalValue()
+	maxDuration := s.cfg.Maintenance.ParquetExport.MaxDurationValue()
 	maxRecords := s.cfg.Maintenance.ParquetExport.MaxRecordsValue()
 	if maxRecords < 1 {
 		maxRecords = 4096
 	}
-	passCtx, cancel := context.WithTimeout(ctx, s.cfg.Maintenance.ParquetExport.MaxDurationValue())
+	fence := serverPipelineFence{server: s}
+	passCtx, cancel := context.WithTimeout(ctx, maxDuration)
 	defer cancel()
-	var messages []log.Message
-	var next uint64
-	var err error
-	if tc.StorageMode == meta.StorageModeDiskless {
-		messages, next, err = s.readDisklessCommittedBatch(passCtx, tc, identity.Partition, cp.NextOffset, highWatermark, maxRecords)
-	} else {
-		fence := serverPipelineFence{server: s}
-		reader := pipeline.NewReader(s.fetcher, fence)
-		messages, next, err = reader.Read(passCtx, index, tc.Name, identity.Partition, cp.NextOffset, highWatermark, identity.LeaderEpoch, maxRecords)
-	}
-	if err != nil {
-		if !errors.Is(err, pipeline.ErrFenced) {
-			result = "read_error"
-			slog.Warn("iceberg_pipeline_read_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "high_watermark", highWatermark, "error", err)
+
+	var files []iceberg.DataFile
+	var bufferedBytes, bufferedRecords int64
+	nextOffset := cp.NextOffset
+	for bufferedBytes < targetBytes && time.Since(started) < commitInterval {
+		if nextOffset >= highWatermark {
+			break
+		}
+		var messages []log.Message
+		var next uint64
+		var err error
+		if tc.StorageMode == meta.StorageModeDiskless {
+			messages, next, err = s.readDisklessCommittedBatch(passCtx, tc, identity.Partition, nextOffset, highWatermark, maxRecords)
 		} else {
-			result = "fenced"
+			reader := pipeline.NewReader(s.fetcher, fence)
+			messages, next, err = reader.Read(passCtx, index, tc.Name, identity.Partition, nextOffset, highWatermark, identity.LeaderEpoch, maxRecords)
 		}
-		return
-	}
-	if len(messages) == 0 || next <= cp.NextOffset {
-		result = "no_messages"
-		return
-	}
-
-	chunk, err := s.encodeParquetChunk(messages, tc.Schema)
-	if err != nil {
-		result = "encode_error"
-		slog.Warn("iceberg_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "records", len(messages), "error", err)
-		return
-	}
-	defer chunk.Cleanup()
-	if len(chunk.Failures) > 0 {
-		if err := s.handleSchemaDecodeFailures(passCtx, tc, identity, chunk.Failures); err != nil {
-			result = "dlq_error"
-			slog.Warn("iceberg_pipeline_dlq_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "failed_records", len(chunk.Failures), "error", err)
+		if err != nil {
+			if !errors.Is(err, pipeline.ErrFenced) {
+				result = "read_error"
+				slog.Warn("iceberg_pipeline_read_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", nextOffset, "high_watermark", highWatermark, "error", err)
+			} else {
+				result = "fenced"
+			}
 			return
 		}
-	}
-
-	var outputStart, outputEnd uint64
-	if chunk.Records > 0 {
-		if !s.CanRunOwnerJob(tc.Name, identity.Partition, identity.Leader, identity.LeaderEpoch) {
-			result = "fenced"
+		if len(messages) == 0 || next <= nextOffset {
+			break
+		}
+		chunk, err := s.encodeParquetChunk(messages, tc.Schema)
+		if err != nil {
+			result = "encode_error"
+			slog.Warn("iceberg_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", nextOffset, "records", len(messages), "error", err)
 			return
+		}
+		if len(chunk.Failures) > 0 {
+			if err := s.handleSchemaDecodeFailures(passCtx, tc, identity, chunk.Failures); err != nil {
+				chunk.Cleanup()
+				result = "dlq_error"
+				slog.Warn("iceberg_pipeline_dlq_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", nextOffset, "failed_records", len(chunk.Failures), "error", err)
+				return
+			}
 		}
 		ingestTime := parquetExportIngestTime(index, chunk.Start, chunk.StartTS)
-		table := s.icebergTableStoreFor()
-		if err := s.ensureIcebergTable(passCtx, tc); err != nil {
-			result = "table_error"
-			slog.Warn("iceberg_pipeline_table_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
-			return
-		}
 		objectKey := table.ExportDataFileKey(tc.Name, identity.Partition, ingestTime, int64(chunk.Start), int64(chunk.End), "iceberg")
 		if err := putImmutableParquetFile(passCtx, s.s3Client, objectKey, chunk.File, chunk.Size); err != nil {
+			chunk.Cleanup()
 			result = "sink_error"
 			slog.Warn("iceberg_pipeline_upload_failed", "topic", tc.Name, "partition", identity.Partition, "source_start_offset", chunk.Start, "source_end_offset", chunk.End, "parquet_object_key", objectKey, "parquet_bytes", chunk.Size, "error", err)
 			return
 		}
-		s.metricAdd("camu_iceberg_export_pipeline_bytes_total", "Iceberg data bytes uploaded by the export pipeline", labels, float64(chunk.Size))
-		// Commit a snapshot referencing the data file. CommitSnapshot is
-		// idempotent for the same file set, so a retry after leadership moved
-		// converges on the same snapshot even though the old leader already
-		// published it.
-		if _, err := table.CommitSnapshot(passCtx, tc.Name, []iceberg.DataFile{{
+		files = append(files, iceberg.DataFile{
 			Content:       iceberg.DataFileContentData,
 			FilePath:      objectKey,
 			FileFormat:    iceberg.DataFileFormatParquet,
 			RecordCount:   int64(chunk.Records),
 			FileSizeBytes: chunk.Size,
-		}}); err != nil {
-			result = "sink_error"
-			slog.Warn("iceberg_pipeline_commit_failed", "topic", tc.Name, "partition", identity.Partition, "source_start_offset", chunk.Start, "source_end_offset", chunk.End, "error", err)
-			return
-		}
-		outputStart, outputEnd = cp.OutputEnd+1, cp.OutputEnd+uint64(chunk.Records)
-	} else {
-		outputStart, outputEnd = cp.OutputEnd, cp.OutputEnd
+		})
+		bufferedBytes += chunk.Size
+		bufferedRecords += int64(chunk.Records)
+		nextOffset = next
+		chunk.Cleanup()
+	}
+	if len(files) == 0 {
+		result = "no_messages"
+		return
+	}
+	if !s.CanRunOwnerJob(tc.Name, identity.Partition, identity.Leader, identity.LeaderEpoch) {
+		result = "fenced"
+		return
+	}
+	// CommitSnapshot is idempotent for the same file set, so a retry after
+	// leadership moved or a crash converges on the same snapshot even though
+	// the previous leader already published it.
+	if _, err := table.CommitSnapshot(passCtx, tc.Name, files); err != nil {
+		result = "sink_error"
+		slog.Warn("iceberg_pipeline_commit_failed", "topic", tc.Name, "partition", identity.Partition, "files", len(files), "bytes", bufferedBytes, "error", err)
+		return
+	}
+	s.metricAdd("camu_iceberg_export_pipeline_bytes_total", "Iceberg data bytes uploaded by the export pipeline", labels, float64(bufferedBytes))
+	if !s.CanRunOwnerJob(tc.Name, identity.Partition, identity.Leader, identity.LeaderEpoch) {
+		result = "fenced"
+		return
 	}
 
-	nextCP := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: identity.Partition, NextOffset: next, SourceEpoch: identity.LeaderEpoch, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion, OutputStart: outputStart, OutputEnd: outputEnd, Generation: cp.Generation + 1}
+	nextCP := pipeline.Checkpoint{SourceTopic: tc.Name, Partition: identity.Partition, NextOffset: nextOffset, SourceEpoch: identity.LeaderEpoch, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion, OutputStart: cp.OutputEnd + 1, OutputEnd: cp.OutputEnd + uint64(bufferedRecords), Generation: cp.Generation + 1}
 	checkpoints := pipeline.NewCheckpointStore(s.s3Client, serverPipelineFence{server: s})
 	if err := checkpoints.Publish(passCtx, icebergPipelineName, nextCP); err != nil {
 		result = "checkpoint_error"
-		slog.Warn("iceberg_pipeline_checkpoint_publish_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "next_offset", next, "error", err)
+		slog.Warn("iceberg_pipeline_checkpoint_publish_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", cp.NextOffset, "next_offset", nextOffset, "error", err)
 		return
 	}
 	*cp = nextCP
 	result = "success"
-	slog.Info("iceberg_pipeline_pass_completed", "topic", tc.Name, "partition", identity.Partition, "source_start_offset", startOffset, "source_end_offset", next-1, "records", next-startOffset, "checkpoint_offset", next-1, "high_watermark", highWatermark, "duration", time.Since(started))
+	slog.Info("iceberg_pipeline_pass_completed", "topic", tc.Name, "partition", identity.Partition, "source_start_offset", startOffset, "source_end_offset", nextOffset-1, "records", nextOffset-startOffset, "checkpoint_offset", nextOffset-1, "high_watermark", highWatermark, "duration", time.Since(started))
 }
 
 // getExportCheckpointSink returns the checkpoint sink name for a topic,

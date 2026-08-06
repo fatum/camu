@@ -2,7 +2,10 @@ package iceberg
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 
@@ -50,15 +53,17 @@ type ManifestEntry struct {
 
 // ManifestFile is one row of a manifest list (a summary of one manifest).
 type ManifestFile struct {
-	ManifestPath      string
-	ManifestLength    int64
-	PartitionSpecID   int
-	Content           int
-	SequenceNumber    int64
-	MinSequenceNumber int64
-	AddedSnapshotID   int64
-	AddedFilesCount   int
-	AddedRowsCount    int64
+	ManifestPath       string
+	ManifestLength     int64
+	PartitionSpecID    int
+	Content            int
+	SequenceNumber     int64
+	MinSequenceNumber  int64
+	AddedSnapshotID    int64
+	AddedFilesCount    int
+	ExistingFilesCount int
+	AddedRowsCount     int64
+	ExistingRowsCount  int64
 }
 
 // manifestEntryAvroSchema is the Iceberg v2 manifest entry schema, with the
@@ -135,9 +140,17 @@ const manifestListAvroSchema = `{
 // WriteManifest serializes entries as an Iceberg manifest Avro object container
 // file and returns the number of bytes written.
 func WriteManifest(w io.Writer, entries []ManifestEntry) (int64, error) {
+	records, err := encodeManifestEntries(entries)
+	if err != nil {
+		return 0, err
+	}
+	return writeOCF(w, manifestEntryAvroSchema, records)
+}
+
+func encodeManifestEntries(entries []ManifestEntry) ([][]byte, error) {
 	schema, err := avro.Parse(manifestEntryAvroSchema)
 	if err != nil {
-		return 0, fmt.Errorf("parse manifest schema: %w", err)
+		return nil, fmt.Errorf("parse manifest schema: %w", err)
 	}
 	records := make([][]byte, 0, len(entries))
 	for _, e := range entries {
@@ -167,19 +180,27 @@ func WriteManifest(w io.Writer, entries []ManifestEntry) (int64, error) {
 		}
 		encoded, err := avro.Marshal(schema, row)
 		if err != nil {
-			return 0, fmt.Errorf("encode manifest entry: %w", err)
+			return nil, fmt.Errorf("encode manifest entry: %w", err)
 		}
 		records = append(records, encoded)
 	}
-	return writeOCF(w, manifestEntryAvroSchema, records)
+	return records, nil
 }
 
 // WriteManifestList serializes manifests as an Iceberg manifest list Avro
 // object container file and returns the number of bytes written.
 func WriteManifestList(w io.Writer, manifests []ManifestFile) (int64, error) {
+	records, err := encodeManifestListRows(manifests)
+	if err != nil {
+		return 0, err
+	}
+	return writeOCF(w, manifestListAvroSchema, records)
+}
+
+func encodeManifestListRows(manifests []ManifestFile) ([][]byte, error) {
 	schema, err := avro.Parse(manifestListAvroSchema)
 	if err != nil {
-		return 0, fmt.Errorf("parse manifest list schema: %w", err)
+		return nil, fmt.Errorf("parse manifest list schema: %w", err)
 	}
 	records := make([][]byte, 0, len(manifests))
 	for _, m := range manifests {
@@ -192,21 +213,44 @@ func WriteManifestList(w io.Writer, manifests []ManifestFile) (int64, error) {
 			"min_sequence_number":  m.MinSequenceNumber,
 			"added_snapshot_id":    m.AddedSnapshotID,
 			"added_files_count":    m.AddedFilesCount,
-			"existing_files_count": 0,
+			"existing_files_count": m.ExistingFilesCount,
 			"deleted_files_count":  0,
 			"added_rows_count":     m.AddedRowsCount,
-			"existing_rows_count":  0,
+			"existing_rows_count":  m.ExistingRowsCount,
 			"deleted_rows_count":   0,
 			"partitions":           []any{},
 			"key_metadata":         nil,
 		}
 		encoded, err := avro.Marshal(schema, row)
 		if err != nil {
-			return 0, fmt.Errorf("encode manifest list row: %w", err)
+			return nil, fmt.Errorf("encode manifest list row: %w", err)
 		}
 		records = append(records, encoded)
 	}
-	return writeOCF(w, manifestListAvroSchema, records)
+	return records, nil
+}
+
+// storeOCF writes an Avro OCF under a content-addressed key with
+// create-if-not-exists semantics and returns the number of bytes stored.
+func (ts *TableStore) storeOCF(ctx context.Context, key, schemaJSON string, records [][]byte) (int64, error) {
+	var buf bytes.Buffer
+	n, err := writeOCF(&buf, schemaJSON, records)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := ts.objects.ConditionalPut(ctx, key, buf.Bytes(), ""); err != nil {
+		return 0, fmt.Errorf("write iceberg metadata file %q: %w", key, err)
+	}
+	return n, nil
+}
+
+// metadataContentHash returns a short content hash over encoded Avro records.
+func metadataContentHash(records [][]byte) string {
+	h := sha256.New()
+	for _, r := range records {
+		h.Write(r)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:6])
 }
 
 // readManifestEntries reads every entry from an Iceberg manifest.
