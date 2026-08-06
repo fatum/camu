@@ -7,7 +7,7 @@ import (
 
 // webAnalyticsEvent is the message value used when WEB_ANALYTICS is enabled. It
 // embeds the integrity fields consumed by typedValue plus fifteen typed
-// web-analytics columns exported to Parquet and queryable through /v1/sql. All
+// web-analytics columns exported to Parquet as Iceberg table columns. All
 // fields are derived deterministically from Sequence so produce and consume
 // agree on the payload digest without extra hashing.
 type webAnalyticsEvent struct {
@@ -149,7 +149,7 @@ var webAnalyticsDimensions = []webAnalyticsDimension{
 	{Column: "user_agent", pool: webAnalyticsUserAgents},
 }
 
-// verifyWebAnalyticsSQL aggregates each dimension column through /v1/sql and
+// dimension columns are exported as Iceberg table columns;
 // checks the exported Parquet data is internally consistent. It is tolerant of
 // gap-filled retained topics (event_ids may be missing from interrupted runs)
 // but rejects duplicates and any value outside the deterministic pools:

@@ -32,8 +32,6 @@ cache:
 sql:
   cache_directory: "/tmp/sql-cache"
   cache_max_size: 268435456
-  duckdb_temp_directory: "/tmp/sql-tmp"
-  duckdb_memory_limit: "512MB"
   max_concurrency: 8
 coordination:
   lease_ttl: "20s"
