@@ -148,6 +148,7 @@ type parquetRowEncoder struct {
 	resolver SchemaResolver
 	builder  *parquet.RowBuilder
 	columns  map[string]int
+	values   []DecodedField
 	buffer   parquet.Row
 }
 
@@ -156,13 +157,14 @@ func newParquetRowEncoder(ctx context.Context, topic string, schema *meta.TopicS
 	for index, path := range fileSchema.Columns() {
 		columns[path[0]] = index
 	}
-	var plan *decodePlan
+	enc := &parquetRowEncoder{ctx: ctx, topic: topic, resolver: resolver, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
 	if schema != nil {
 		if p, err := decodePlanFor(schema); err == nil {
-			plan = p
+			enc.plan = p
+			enc.values = make([]DecodedField, len(p.fields))
 		}
 	}
-	return &parquetRowEncoder{ctx: ctx, topic: topic, plan: plan, resolver: resolver, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
+	return enc
 }
 
 func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.Row, error) {
@@ -183,10 +185,10 @@ func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.R
 		e.buffer = e.builder.AppendRow(e.buffer[:0])
 		return e.buffer, nil
 	}
-	values, err := e.plan.decode(e.ctx, e.topic, e.resolver, m.Value)
-	if err != nil {
+	if err := e.plan.decodeInto(e.ctx, e.topic, e.resolver, m.Value, e.values); err != nil {
 		return nil, err
 	}
+	values := e.values
 	for index, field := range e.plan.fields {
 		if !values[index].Present {
 			continue

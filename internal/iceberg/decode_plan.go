@@ -72,35 +72,54 @@ func decodePlanFor(schema *meta.TopicSchema) (*decodePlan, error) {
 }
 
 func (p *decodePlan) decode(ctx context.Context, topic string, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
+	values := make([]DecodedField, len(p.fields))
+	if err := p.decodeInto(ctx, topic, resolver, input, values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+// decodeInto decodes into a caller-provided buffer so hot loops (export rows)
+// reuse it instead of allocating per value. The buffer must have length
+// len(p.fields); its prior contents are cleared.
+func (p *decodePlan) decodeInto(ctx context.Context, topic string, resolver SchemaResolver, input []byte, values []DecodedField) error {
+	clear(values)
 	switch p.encoding {
 	case "avro":
-		return p.decodeAvro(ctx, topic, resolver, input)
+		return p.decodeAvroInto(ctx, topic, resolver, input, values)
 	case "protobuf":
-		return p.decodeProtobuf(ctx, topic, resolver, input)
+		return p.decodeProtobufInto(ctx, topic, resolver, input, values)
 	default:
-		return p.decodeJSON(input)
+		return p.decodeJSONInto(input, values)
 	}
 }
 
 func (p *decodePlan) decodeJSON(input []byte) ([]DecodedField, error) {
+	values := make([]DecodedField, len(p.fields))
+	if err := p.decodeJSONInto(input, values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func (p *decodePlan) decodeJSONInto(input []byte, values []DecodedField) error {
 	s := &jsonScanner{data: input}
 	s.skipSpace()
 	if s.eof() || s.peek() != '{' {
-		return nil, fmt.Errorf("value must be a JSON object")
+		return fmt.Errorf("value must be a JSON object")
 	}
 	s.pos++
-	values := make([]DecodedField, len(p.fields))
 	if err := walkJSONObject(s, p.tree, p.fields, values); err != nil {
-		return nil, err
+		return err
 	}
 	s.skipSpace()
 	if !s.eof() {
-		return nil, fmt.Errorf("value is not valid JSON: multiple JSON values")
+		return fmt.Errorf("value is not valid JSON: multiple JSON values")
 	}
 	for index, field := range p.fields {
 		if !values[index].Present && !field.Nullable {
-			return nil, fmt.Errorf("required field %q is missing", field.Name)
+			return fmt.Errorf("required field %q is missing", field.Name)
 		}
 	}
-	return values, nil
+	return nil
 }

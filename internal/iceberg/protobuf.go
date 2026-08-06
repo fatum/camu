@@ -90,20 +90,20 @@ func DecodeProtobufTypedFields(ctx context.Context, topic string, topicSchema *m
 	if err != nil {
 		return nil, err
 	}
-	return plan.decodeProtobuf(ctx, topic, resolver, input)
+	return plan.decode(ctx, topic, resolver, input)
 }
 
-func (p *decodePlan) decodeProtobuf(ctx context.Context, topic string, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
+func (p *decodePlan) decodeProtobufInto(ctx context.Context, topic string, resolver SchemaResolver, input []byte, values []DecodedField) error {
 	writer := p
 	if schemaID, payload, wrapped := AvroUnwrap(input); wrapped {
 		if resolver != nil {
 			resolved, err := resolver.SchemaForID(ctx, topic, schemaID)
 			if err != nil {
-				return nil, fmt.Errorf("resolve schema id %d: %w", schemaID, err)
+				return fmt.Errorf("resolve schema id %d: %w", schemaID, err)
 			}
 			writer, err = decodePlanFor(resolved)
 			if err != nil {
-				return nil, err
+				return err
 			}
 		}
 		input = payload
@@ -111,24 +111,23 @@ func (p *decodePlan) decodeProtobuf(ctx context.Context, topic string, resolver 
 	md := writer.proto
 	msg := dynamicpb.NewMessage(md)
 	if err := proto.Unmarshal(input, msg); err != nil {
-		return nil, fmt.Errorf("decode protobuf value: %w", err)
+		return fmt.Errorf("decode protobuf value: %w", err)
 	}
-	values := make([]DecodedField, len(p.fields))
 	for i, f := range p.fields {
 		fd := md.Fields().ByNumber(protoreflect.FieldNumber(i + 1))
 		if fd == nil || !msg.Has(fd) {
 			if !f.Nullable {
-				return nil, fmt.Errorf("required field %q is missing", f.Name)
+				return fmt.Errorf("required field %q is missing", f.Name)
 			}
 			continue
 		}
 		v, err := protobufFieldValue(f, fd.Kind(), msg.Get(fd))
 		if err != nil {
-			return nil, err
+			return err
 		}
 		values[i] = DecodedField{Present: true, Value: v}
 	}
-	return values, nil
+	return nil
 }
 
 // EncodeProtobufValue encodes a record value against a topic's derived

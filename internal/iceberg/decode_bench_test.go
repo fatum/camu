@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 )
 
@@ -88,5 +89,21 @@ func BenchmarkDecodeProtobufTypedFields(b *testing.B) {
 		if _, err := DecodeProtobufTypedFields(context.Background(), "t", schema, nil, payload); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkEncodeChunkJSON(b *testing.B) {
+	schema := benchJSONSchema()
+	messages := make([]log.Message, 64)
+	for i := range messages {
+		messages[i] = log.Message{Offset: uint64(i), Timestamp: benchTime.UnixMilli(), Key: []byte("k"), Value: []byte(benchJSONValue)}
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		chunk, err := EncodeChunk(context.Background(), b.TempDir(), messages, schema, "2026-08-06", 12, "t", nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		chunk.Cleanup()
 	}
 }
