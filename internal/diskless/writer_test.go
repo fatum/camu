@@ -3,6 +3,8 @@ package diskless
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -137,18 +139,60 @@ func TestWriter_FlushMultiPartition(t *testing.T) {
 	}
 }
 
-// flakyMetaStore wraps a MetaStore and fails a configurable number of
-// RegisterSegment calls, modeling a transient segment-catalog write failure.
-type flakyMetaStore struct {
-	MetaStore
-	registerFails atomic.Int32
-}
+func TestWriter_FlushOrdersIdempotentCommitsWhenEarlierUploadIsDelayed(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := NewMemoryMetaStore()
+	w := NewWriter(s3, meta, "node1")
+	firstPutStarted := make(chan struct{})
+	secondPutFinished := make(chan struct{})
+	releaseFirstPut := make(chan struct{})
+	var once sync.Once
+	var puts atomic.Int32
+	s3.SetFaultInjector(func(op string) error {
+		if op != "put" {
+			return nil
+		}
+		switch puts.Add(1) {
+		case 1:
+			once.Do(func() { close(firstPutStarted) })
+			<-releaseFirstPut
+		case 2:
+			close(secondPutFinished)
+		}
+		return nil
+	})
+	defer s3.SetFaultInjector(nil)
 
-func (m *flakyMetaStore) RegisterSegment(ctx context.Context, seg SegmentRecord) error {
-	if m.registerFails.Add(1) == 1 {
-		return errors.New("transient register error")
+	batch := func(sequence uint64) []byte {
+		return log.EncodeRecordBatchWithMeta(0, log.Batch{ProducerID: 7, Sequence: sequence, Messages: []log.Message{{Key: []byte("k"), Value: []byte("v")}}})
 	}
-	return m.MetaStore.RegisterSegment(ctx, seg)
+	done0, done1 := make(chan FlushResult, 1), make(chan FlushResult, 1)
+	err0 := make(chan error, 1)
+	go func() {
+		err0 <- w.Flush(context.Background(), []BufferEntry{{Topic: "t", Partition: 0, Batch: batch(0), Done: done0}})
+	}()
+	<-firstPutStarted
+	err1 := make(chan error, 1)
+	go func() {
+		err1 <- w.Flush(context.Background(), []BufferEntry{{Topic: "t", Partition: 0, Batch: batch(1), Done: done1}})
+	}()
+	<-secondPutFinished
+	close(releaseFirstPut)
+	if err := <-err0; err != nil {
+		t.Fatalf("sequence 0 flush: %v", err)
+	}
+	if err := <-err1; err != nil {
+		t.Fatalf("sequence 1 flush: %v", err)
+	}
+	if got := (<-done0).BaseOffset; got != 0 {
+		t.Fatalf("sequence 0 offset = %d, want 0", got)
+	}
+	if got := (<-done1).BaseOffset; got != 1 {
+		t.Fatalf("sequence 1 offset = %d, want 1", got)
+	}
+	if head, _ := meta.GetCommittedHead(context.Background(), "t", 0); head != 2 {
+		t.Fatalf("head = %d, want 2", head)
+	}
 }
 
 // TestWriter_Flush_RetriesTransientPutFailure verifies that a transient S3 PUT
@@ -197,40 +241,81 @@ func TestWriter_Flush_RetriesTransientPutFailure(t *testing.T) {
 	}
 }
 
-// TestWriter_Flush_RetriesTransientRegisterFailure verifies that a transient
-// segment-registration failure after a successful PUT is retried rather than
-// orphaning the materialized offsets.
-func TestWriter_Flush_RetriesTransientRegisterFailure(t *testing.T) {
+// TestWriter_FlushBatchesSamePartitionIntoOneCommit verifies that a flush
+// carrying several same-partition batches commits them together in one
+// CommitUploadedBatches call (chunked to maxBatchesPerCommit), delivering
+// contiguous offsets in submission order.
+func TestWriter_FlushBatchesSamePartitionIntoOneCommit(t *testing.T) {
 	s3 := testS3Client(t)
-	meta := &flakyMetaStore{MetaStore: NewMemoryMetaStore()}
+	meta := &countingMeta{MetaStore: NewMemoryMetaStore()}
 	w := NewWriter(s3, meta, "node1")
 	ctx := context.Background()
 
-	batch := makeTestBatch(t, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
-	done := make(chan FlushResult, 1)
-	entries := []BufferEntry{{Topic: "t1", Partition: 0, Batch: batch, Done: done}}
-
+	const n = 30 // > maxBatchesPerCommit, so chunking is exercised
+	entries := make([]BufferEntry, 0, n)
+	dones := make([]chan FlushResult, n)
+	for i := 0; i < n; i++ {
+		d := make(chan FlushResult, 1)
+		dones[i] = d
+		entries = append(entries, BufferEntry{
+			Topic:     "t",
+			Partition: 0,
+			Batch:     makeTestBatch(t, []log.Message{{Key: []byte("k"), Value: []byte(fmt.Sprintf("v%d", i))}}),
+			Done:      d,
+		})
+	}
 	if err := w.Flush(ctx, entries); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
+	for i, d := range dones {
+		r := <-d
+		if r.Err != nil {
+			t.Fatalf("entry %d error: %v", i, r.Err)
+		}
+		if r.BaseOffset != int64(i) {
+			t.Fatalf("entry %d base offset = %d, want %d", i, r.BaseOffset, i)
+		}
+	}
+	if head, _ := meta.GetPartitionHead(ctx, "t", 0); head != int64(n) {
+		t.Fatalf("head = %d, want %d", head, n)
+	}
+	if refs, _ := meta.QuerySegments(ctx, "t", 0, 0, 1<<20); len(refs) != n {
+		t.Fatalf("refs = %d, want %d", len(refs), n)
+	}
 
-	head, err := meta.GetPartitionHead(ctx, "t1", 0)
-	if err != nil {
-		t.Fatalf("get head: %v", err)
+	meta.mu.Lock()
+	calls, maxB := meta.calls, meta.maxBatches
+	meta.mu.Unlock()
+	if calls == 0 {
+		t.Fatal("no commit calls made")
 	}
-	if head != 1 {
-		t.Fatalf("head = %d, want 1", head)
+	if maxB < 2 {
+		t.Fatalf("expected same-partition batches batched into one call, max batches per call = %d", maxB)
 	}
-	refs, err := meta.QuerySegments(ctx, "t1", 0, 0, 1<<20)
-	if err != nil {
-		t.Fatalf("query segments: %v", err)
-	}
-	if len(refs) != 1 {
-		t.Fatalf("refs = %d, want 1 (register retried)", len(refs))
+	if maxB > maxBatchesPerCommit {
+		t.Fatalf("commit call exceeded chunk size: %d > %d", maxB, maxBatchesPerCommit)
 	}
 }
 
-// TestWriter_Flush_FailsAfterPersistentPutError verifies that a persistent
+type countingMeta struct {
+	MetaStore
+	mu         sync.Mutex
+	calls      int
+	maxBatches int
+}
+
+func (c *countingMeta) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
+	c.mu.Lock()
+	c.calls++
+	if len(batches) > c.maxBatches {
+		c.maxBatches = len(batches)
+	}
+	c.mu.Unlock()
+	return c.MetaStore.CommitUploadedBatches(ctx, batches)
+}
+
+// segment-registration failure after a successful PUT is retried rather than
+// orphaning the materialized offsets.
 // object-store failure surfaces to the caller once the retry budget (the
 // context) is exhausted, instead of blocking forever.
 func TestWriter_Flush_FailsAfterPersistentPutError(t *testing.T) {

@@ -10,12 +10,21 @@ import (
 
 // MetaStore coordinates offset allocation and segment discovery for diskless topics.
 type MetaStore interface {
-	// AllocateOffsets atomically assigns offset ranges for one or more partition batches.
-	AllocateOffsets(ctx context.Context, allocs []OffsetAllocation) ([]OffsetResult, error)
-
-	// RegisterSegment records a flushed data file in the segment catalog.
-	RegisterSegment(ctx context.Context, seg SegmentRecord) error
-
+	// CommitUploadedBatches atomically, per partition, validates producer
+	// sequences, assigns offsets, publishes uploaded refs, and advances the
+	// readable head. All batches in one invocation must belong to the same
+	// topic-partition, and the commit is all-or-nothing for the invocation:
+	// either every batch becomes visible or none does. Idempotency follows the
+	// Kafka contract: an exact retry of an idempotent batch (same producer,
+	// first sequence, count) is deduplicated against the producer's commit
+	// history and returns its original offset without another ref. Dedup
+	// matches any recorded sequence within the bounded history (the last
+	// `uploadedProducerHistory` batches per producer), so a retry of a
+	// non-latest but still-recorded batch is also deduplicated. An exact replay
+	// that has rotated out of that window is rejected as out-of-order rather
+	// than re-allocated, so a stale retry can never silently duplicate records
+	// at a fresh offset. Non-idempotent batches are not deduplicated.
+	CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error)
 	// QuerySegments returns segment references covering [fromOffset, ...) for a
 	// given topic-partition, up to maxBytes of data.
 	QuerySegments(ctx context.Context, topic string, partition int,
@@ -62,29 +71,20 @@ type MetaStore interface {
 	// longer referenced by any partition, so their data objects can be deleted.
 	PlanUnreferencedFileDeletes(ctx context.Context, fileKeys []string) ([]string, error)
 
+	// ArchiveCommitted rolls the oldest compaction-final refs of a partition out
+	// of the backend's hot head window into immutable archived storage, bounding
+	// the head object regardless of history. targetBytes is the size at which a
+	// ref is considered compaction-final (<= 0 means archive anything);
+	// retentionCutoff excludes refs older than it so retention, not archiving,
+	// drops them. Returns the number of refs archived. Backends whose metadata
+	// is not a single bounded object (memory, DynamoDB) no-op.
+	ArchiveCommitted(ctx context.Context, topic string, partition int, targetBytes int64, retentionCutoff time.Time) (int, error)
+
 	// DeleteTopic removes all MetaStore state for a topic.
 	DeleteTopic(ctx context.Context, topic string) error
 
 	// Close releases any resources held by the MetaStore.
 	Close() error
-}
-
-// contiguousCommittedEnd walks refs (sorted ascending by BaseOffset and
-// non-overlapping within a partition) starting at the current committed head,
-// returning the end of the longest run of refs that are contiguous with it. A
-// ref advances the watermark only when its base equals the current position, so
-// a registration that arrives before an earlier range (an in-flight or
-// abandoned prefix) never exposes a gap to readers.
-func contiguousCommittedEnd(committed int64, refs []SegmentRef) int64 {
-	for _, r := range refs {
-		if r.BaseOffset > committed {
-			break
-		}
-		if r.BaseOffset == committed {
-			committed = r.EndOffset
-		}
-	}
-	return committed
 }
 
 // parsePartitionKey splits a partition key of the form "topic#partition". The
@@ -100,4 +100,16 @@ func parsePartitionKey(key string) (string, int, error) {
 		return "", 0, fmt.Errorf("malformed partition key %q: %w", key, err)
 	}
 	return key[:idx], partition, nil
+}
+
+// samePartitionBatches enforces the atomicity boundary of a commit invocation:
+// every batch must belong to the same topic-partition so the write is
+// all-or-nothing per partition and never spans a cross-partition prefix.
+func samePartitionBatches(batches []UploadedBatch) error {
+	for i := 1; i < len(batches); i++ {
+		if batches[i].Topic != batches[0].Topic || batches[i].Partition != batches[0].Partition {
+			return fmt.Errorf("commit uploaded batches spans multiple partitions")
+		}
+	}
+	return nil
 }

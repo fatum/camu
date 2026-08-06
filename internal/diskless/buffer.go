@@ -30,12 +30,14 @@ func NewBuffer(maxBatchBytes int64) *Buffer {
 	return &Buffer{maxBatchBytes: maxBatchBytes}
 }
 
-// Append adds an entry to the buffer and updates the accumulated size.
-func (b *Buffer) Append(entry BufferEntry) {
+// Append adds an entry to the buffer, updates the accumulated size, and reports
+// whether the flush threshold has been crossed.
+func (b *Buffer) Append(entry BufferEntry) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.entries = append(b.entries, entry)
 	b.size += int64(len(entry.Batch))
+	return b.size >= b.maxBatchBytes
 }
 
 // Drain atomically removes and returns all entries, resetting the buffer.

@@ -2,8 +2,8 @@ package diskless
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,606 +19,369 @@ func newTestS3MetaStore(t *testing.T) *S3MetaStore {
 	return NewS3MetaStore(s3)
 }
 
-func TestS3MetaStore_AllocateAndRegister(t *testing.T) {
+func commitS3Batch(t *testing.T, m *S3MetaStore, fileKey string, count int, byteLength int64, createdAt time.Time) {
+	t.Helper()
+	_, err := m.CommitUploadedBatches(context.Background(), []UploadedBatch{{
+		BatchID: fmt.Sprintf("%s:0:%d", fileKey, byteLength), FileKey: fileKey, Topic: "t", Partition: 0,
+		Count: count, ByteLength: byteLength, CreatedAt: createdAt,
+	}})
+	if err != nil {
+		t.Fatalf("commit %s: %v", fileKey, err)
+	}
+}
+
+func readS3Head(t *testing.T, m *S3MetaStore) *s3UploadManifest {
+	t.Helper()
+	data, err := m.s3.Get(context.Background(), s3ManifestKey("t", 0))
+	if err != nil {
+		t.Fatalf("get head: %v", err)
+	}
+	var head s3UploadManifest
+	if err := json.Unmarshal(data, &head); err != nil {
+		t.Fatalf("parse head: %v", err)
+	}
+	return &head
+}
+
+// TestS3MetaStore_ArchiveCommittedBoundsHeadAndReadsAcrossCheckpoints verifies
+// the head window is bounded by archiving and that reads span checkpoints + the
+// head without gaps or duplicates, while the committed watermark is untouched.
+func TestS3MetaStore_ArchiveCommittedBoundsHeadAndReadsAcrossCheckpoints(t *testing.T) {
 	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	m.headMaxRefBytes = 1 << 20
 	ctx := context.Background()
-
-	results, err := m.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "t1", Partition: 0, Count: 2},
-		{Topic: "t1", Partition: 1, Count: 3},
-	})
-	if err != nil {
-		t.Fatalf("allocate: %v", err)
-	}
-	if results[0].BaseOffset != 0 || results[1].BaseOffset != 0 {
-		t.Fatalf("first allocation bases = %+v, want both 0", results)
-	}
-
-	head, err := m.GetPartitionHead(ctx, "t1", 0)
-	if err != nil {
-		t.Fatalf("head: %v", err)
-	}
-	if head != 2 {
-		t.Fatalf("head = %d, want 2", head)
-	}
-
 	now := time.Now()
-	if err := m.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "_diskless/n1/1.data",
-		Batches: []BatchRef{
-			{Topic: "t1", Partition: 0, BaseOffset: 0, EndOffset: 2, ByteOffset: 0, ByteLength: 10},
-			{Topic: "t1", Partition: 1, BaseOffset: 0, EndOffset: 3, ByteOffset: 10, ByteLength: 20},
-		},
-		CreatedAt: now,
-		SizeBytes: 30,
-	}); err != nil {
-		t.Fatalf("register: %v", err)
+	for i := 0; i < 5; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
 	}
-
-	refs, err := m.QuerySegments(ctx, "t1", 0, 0, 1<<20)
+	archived, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if archived != 5 {
+		t.Fatalf("archived = %d, want 5", archived)
+	}
+	head := readS3Head(t, m)
+	if len(head.Refs) != 0 || head.Archive == nil || head.Archive.End != 5 {
+		t.Fatalf("head after archive = %+v (want empty window, archive to 5)", head)
+	}
+	committed, err := m.GetCommittedHead(ctx, "t", 0)
+	if err != nil || committed != 5 {
+		t.Fatalf("committed = %d, %v; want 5", committed, err)
+	}
+	start, err := m.GetPartitionStart(ctx, "t", 0)
+	if err != nil || start != 0 {
+		t.Fatalf("start = %d, %v; want 0", start, err)
+	}
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	if len(refs) != 1 || refs[0].EndOffset != 2 || refs[0].FileKey != "_diskless/n1/1.data" {
-		t.Fatalf("unexpected refs: %+v", refs)
+	if len(refs) != 5 {
+		t.Fatalf("refs = %d, want 5", len(refs))
 	}
-
-	start, err := m.GetPartitionStart(ctx, "t1", 0)
-	if err != nil {
-		t.Fatalf("start: %v", err)
+	for i, r := range refs {
+		if r.BaseOffset != int64(i) || r.EndOffset != int64(i+1) {
+			t.Fatalf("ref[%d] = %+v, want [%d,%d)", i, r, i, i+1)
+		}
 	}
-	if start != 0 {
-		t.Fatalf("start = %d, want 0", start)
+	// A windowed query inside the archive region returns contiguous refs too.
+	tail, err := m.QuerySegments(ctx, "t", 0, 2, 1024)
+	if err != nil || len(tail) != 3 || tail[0].BaseOffset != 2 || tail[2].EndOffset != 5 {
+		t.Fatalf("tail query = %+v, %v; want [2,3),[3,4),[4,5)", tail, err)
 	}
 }
 
-// TestS3MetaStore_ConcurrentAllocation verifies the CAS loop: concurrent
-// allocations to the same partition yield disjoint, contiguous, non-overlapping
-// ranges covering the whole space.
-func TestS3MetaStore_ConcurrentAllocation(t *testing.T) {
-	m := newTestS3MetaStore(t)
+// TestS3MetaStore_ArchiveCommittedSkipsSmallAndRetentionPending verifies the
+// roll leaves compaction-pending small refs and retention-pending refs in the
+// head window.
+func TestS3MetaStore_ArchiveCommittedSkipsSmallAndRetentionPending(t *testing.T) {
 	ctx := context.Background()
+	now := time.Now()
 
-	const (
-		workers   = 8
-		perWorker = 10
-		count     = 3
-	)
-	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		ranges []struct{ base, end int64 }
-	)
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < perWorker; i++ {
-				res, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: count}})
-				if err != nil {
-					t.Errorf("allocate: %v", err)
-					return
-				}
-				base := res[0].BaseOffset
-				mu.Lock()
-				ranges = append(ranges, struct{ base, end int64 }{base, base + count})
-				mu.Unlock()
-			}
-		}()
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	commitS3Batch(t, m, "small", 1, 5, now)
+	commitS3Batch(t, m, "big1", 1, 100, now)
+	commitS3Batch(t, m, "big2", 1, 100, now)
+	if n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("archive with small front = %d, %v; want 0", n, err)
 	}
-	wg.Wait()
+	if head := readS3Head(t, m); len(head.Refs) != 3 || head.Archive != nil {
+		t.Fatalf("small front must block archiving; head = %+v", head)
+	}
 
-	total := workers * perWorker * count
-	if len(ranges) != workers*perWorker {
-		t.Fatalf("allocated %d ranges, want %d", len(ranges), workers*perWorker)
-	}
-	seen := make([]bool, total)
-	for _, r := range ranges {
-		for o := r.base; o < r.end; o++ {
-			if seen[o] {
-				t.Fatalf("offset %d allocated twice", o)
-			}
-			seen[o] = true
-		}
-	}
-	for i, ok := range seen {
-		if !ok {
-			t.Fatalf("offset %d never allocated (gap)", i)
-		}
-	}
-	head, err := m.GetPartitionHead(ctx, "t", 0)
-	if err != nil {
-		t.Fatalf("head: %v", err)
-	}
-	if head != int64(total) {
-		t.Fatalf("head = %d, want %d", head, total)
+	m2 := newTestS3MetaStore(t)
+	m2.headMaxRefCount = 2
+	old := now.Add(-48 * time.Hour)
+	commitS3Batch(t, m2, "old1", 1, 100, old)
+	commitS3Batch(t, m2, "old2", 1, 100, old)
+	commitS3Batch(t, m2, "fresh", 1, 100, now)
+	if n, err := m2.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-24*time.Hour)); err != nil || n != 0 {
+		t.Fatalf("archive with retention-pending front = %d, %v; want 0", n, err)
 	}
 }
 
-// TestS3MetaStore_CommittedHeadConcurrentRegistration verifies the P1 scenario:
-// concurrent writers flushing adjacent allocations in any order never expose a
-// gap to readers. After every registration the committed head is checked: every
-// offset below it must be covered by a registered ref.
-func TestS3MetaStore_CommittedHeadConcurrentRegistration(t *testing.T) {
+// TestS3MetaStore_DeleteFileRefsAcrossCheckpoints verifies retention drops refs
+// that live in archived checkpoints and relinks/clears the archive chain without
+// disturbing live refs.
+func TestS3MetaStore_DeleteFileRefsAcrossCheckpoints(t *testing.T) {
 	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
 	ctx := context.Background()
-
-	const (
-		count     = 3
-		perWorker = 20
-		workers   = 4
-	)
-	total := workers * perWorker * count
-
-	// Pre-allocate disjoint adjacent ranges: writer w registers bases
-	// w*perWorker*count, then +total, +2*total, ... so ranges from different
-	// writers are adjacent and interleave.
-	allBases := make([]int64, 0, workers*perWorker)
-	for i := 0; i < perWorker; i++ {
-		for w := 0; w < workers; w++ {
-			allBases = append(allBases, int64(i*count+ w*perWorker*count))
-		}
+	now := time.Now()
+	commitS3Batch(t, m, "a", 1, 100, now) // offset 0, archived
+	commitS3Batch(t, m, "a", 1, 100, now) // offset 1, archived
+	commitS3Batch(t, m, "b", 1, 5, now)   // offset 2, small -> stays in head
+	if _, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("archive: %v", err)
 	}
-
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			for i := 0; i < perWorker; i++ {
-				base := allBases[i*workers+worker]
-				seg := SegmentRecord{
-					FileKey:   fmt.Sprintf("f-%d.data", base),
-					Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: base + count, ByteLength: count}},
-					CreatedAt: time.Now(),
-				}
-				if err := m.RegisterSegment(ctx, seg); err != nil {
-					t.Errorf("register [%d,%d): %v", base, base+count, err)
-					return
-				}
-				committed, err := m.GetCommittedHead(ctx, "t", 0)
-				if err != nil {
-					t.Errorf("committed head: %v", err)
-					return
-				}
-				refs, err := m.partitionSegmentRefs(ctx, "t", 0)
-				if err != nil {
-					t.Errorf("list refs: %v", err)
-					return
-				}
-				covered := make([]bool, committed)
-				for _, r := range refs {
-					for o := r.BaseOffset; o < r.EndOffset && o < committed; o++ {
-						covered[o] = true
-					}
-				}
-				for o := int64(0); o < committed; o++ {
-					if !covered[o] {
-						t.Errorf("committed head %d exposes uncovered offset %d (gap)", committed, o)
-						return
-					}
-				}
-			}
-		}(w)
+	if head := readS3Head(t, m); head.Archive == nil || len(head.Refs) != 1 {
+		t.Fatalf("setup: head = %+v", head)
 	}
-	wg.Wait()
-
-	committed, err := m.GetCommittedHead(ctx, "t", 0)
+	if err := m.DeleteFileRefs(ctx, "a"); err != nil {
+		t.Fatalf("delete file refs: %v", err)
+	}
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
 	if err != nil {
-		t.Fatalf("final committed head: %v", err)
+		t.Fatalf("query: %v", err)
 	}
-	if committed != int64(total) {
-		t.Fatalf("final committed = %d, want %d", committed, total)
+	if len(refs) != 1 || refs[0].FileKey != "b" || refs[0].BaseOffset != 2 {
+		t.Fatalf("refs after delete = %+v, want [b@2]", refs)
+	}
+	head := readS3Head(t, m)
+	if head.Archive != nil || len(head.Refs) != 1 {
+		t.Fatalf("head after delete = %+v (want cleared archive, one window ref)", head)
 	}
 }
 
-func TestS3MetaStore_IdempotentAllocation(t *testing.T) {
+// TestS3MetaStore_ListOrphanedCheckpoints verifies the reaper lists archive
+// checkpoints no head chain references, while leaving linked ones alone.
+func TestS3MetaStore_ListOrphanedCheckpoints(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	if _, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	// A stray checkpoint from a run whose head CAS lost.
+	strayKey := s3ArchiveKey("t", 0, 99)
+	if err := m.s3.Put(ctx, strayKey, []byte(`{"version":1,"end":99,"refs":[]}`), storage.PutOpts{}); err != nil {
+		t.Fatalf("put stray checkpoint: %v", err)
+	}
+	orphans, err := m.ListOrphanedCheckpoints(ctx)
+	if err != nil {
+		t.Fatalf("list orphans: %v", err)
+	}
+	if len(orphans) != 1 || orphans[0] != strayKey {
+		t.Fatalf("orphans = %v, want [%s]", orphans, strayKey)
+	}
+	// Deleting the stray leaves nothing orphaned; the linked checkpoint stays.
+	if err := m.s3.Delete(ctx, strayKey); err != nil {
+		t.Fatalf("delete stray: %v", err)
+	}
+	orphans, err = m.ListOrphanedCheckpoints(ctx)
+	if err != nil {
+		t.Fatalf("list orphans: %v", err)
+	}
+	if len(orphans) != 0 {
+		t.Fatalf("orphans after cleanup = %v, want none", orphans)
+	}
+	head := readS3Head(t, m)
+	if head.Archive == nil {
+		t.Fatal("linked checkpoint must survive the orphan listing")
+	}
+}
+
+// TestS3MetaStore_ArchiveCommittedAdoptsExistingCheckpoint verifies that when a
+// racing run already published the same checkpoint range (create-if-not-exists
+// conflict) but its head CAS lost, the next run adopts the existing immutable
+// checkpoint instead of failing or livelocking.
+func TestS3MetaStore_ArchiveCommittedAdoptsExistingCheckpoint(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 1
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	// Simulate the concurrent run: the same checkpoint range already exists.
+	head := readS3Head(t, m)
+	chk := s3Checkpoint{Version: 1, End: 3, Refs: head.Refs}
+	chkData, err := json.Marshal(chk)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	chkKey := s3ArchiveKey("t", 0, 3)
+	if err := m.s3.Put(ctx, chkKey, chkData, storage.PutOpts{}); err != nil {
+		t.Fatalf("put existing checkpoint: %v", err)
+	}
+	n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour))
+	if err != nil || n != 3 {
+		t.Fatalf("archive = %d, %v; want 3, nil", n, err)
+	}
+	h := readS3Head(t, m)
+	if h.Archive == nil || h.Archive.Key != chkKey || h.Archive.End != 3 || len(h.Refs) != 0 {
+		t.Fatalf("head after adopt = %+v, want archive=%s end=3 empty window", h, chkKey)
+	}
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
+	if err != nil || len(refs) != 3 {
+		t.Fatalf("refs after adopt = %+v, %v; want 3", refs, err)
+	}
+}
+
+// TestS3MetaStore_BuildFileIndex verifies the single-pass index captures every
+// referenced file (archived + head window) and every live checkpoint key.
+func TestS3MetaStore_BuildFileIndex(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	if n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil || n != 3 {
+		t.Fatalf("archive = %d, %v; want 3", n, err)
+	}
+	commitS3Batch(t, m, "obj3", 1, 100, now) // head window
+
+	idx, err := m.BuildFileIndex(ctx)
+	if err != nil {
+		t.Fatalf("build index: %v", err)
+	}
+	for _, key := range []string{"obj0", "obj1", "obj2", "obj3"} {
+		if len(idx.ByFile[key]) != 1 {
+			t.Fatalf("ByFile[%s] = %d refs, want 1", key, len(idx.ByFile[key]))
+		}
+	}
+	if len(idx.LiveCheckpoints) != 1 {
+		t.Fatalf("LiveCheckpoints = %d, want 1 (the archived checkpoint)", len(idx.LiveCheckpoints))
+	}
+	pl := idx.PartitionFileLatest("t", 0)
+	if len(pl) != 4 {
+		t.Fatalf("PartitionFileLatest = %d files, want 4", len(pl))
+	}
+	for _, key := range []string{"obj0", "obj1", "obj2", "obj3"} {
+		if idx.FileLatest[key].IsZero() {
+			t.Fatalf("FileLatest[%s] missing", key)
+		}
+	}
+}
+
+// TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange verifies compaction
+// cannot silently rewrite a range that has been archived.
+func TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 1
+	ctx := context.Background()
+	now := time.Now()
+	commitS3Batch(t, m, "a", 1, 100, now)
+	commitS3Batch(t, m, "b", 1, 100, now)
+	if _, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	err := m.ReplaceSegmentRefs(ctx, "t", 0, []RefKey{{BaseOffset: 0, EndOffset: 1}},
+		[]SegmentRef{{FileKey: "m", ByteLength: 100, BaseOffset: 0, EndOffset: 1}})
+	if err == nil {
+		t.Fatal("expected error replacing an archived range")
+	}
+}
+
+// TestS3MetaStore_CommitUploadedBatchIsReadableAndDeduplicated verifies a
+// committed batch is readable and that an idempotent retry is deduplicated by
+// the producer-sequence history (retroactive tombstone): the retry, even as a
+// new physical upload, returns the original base without a second ref.
+func TestS3MetaStore_CommitUploadedBatchIsReadableAndDeduplicated(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()
-
-	alloc := OffsetAllocation{Topic: "t", Partition: 0, Count: 4, ProducerID: 42, Sequence: 100}
-	first, err := m.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	first, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "obj1:0:10", FileKey: "obj1", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()}})
 	if err != nil {
-		t.Fatalf("allocate: %v", err)
+		t.Fatalf("commit: %v", err)
 	}
-	if first[0].BaseOffset != 0 || first[0].Duplicate {
-		t.Fatalf("first allocation = %+v, want base 0 non-duplicate", first[0])
-	}
-
-	// Exact retry must be deduplicated and must not advance the counter.
-	retry, err := m.AllocateOffsets(ctx, []OffsetAllocation{alloc})
+	// A client retry re-uploads the same logical batch (new BatchID/file). The
+	// producer-sequence history deduplicates it: same base, no new ref.
+	retry, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "obj2:0:10", FileKey: "obj2", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()}})
 	if err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	if !retry[0].Duplicate || retry[0].BaseOffset != 0 {
-		t.Fatalf("retry = %+v, want duplicate base 0", retry[0])
+	if first[0].BaseOffset != 0 || !retry[0].Duplicate || retry[0].BaseOffset != 0 {
+		t.Fatalf("unexpected outcomes: first=%+v retry=%+v", first, retry)
 	}
-
-	// A new batch from the same producer advances the counter.
-	next, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 4, ProducerID: 42, Sequence: 104}})
-	if err != nil {
-		t.Fatalf("next batch: %v", err)
+	head, err := m.GetCommittedHead(ctx, "t", 0)
+	if err != nil || head != 2 {
+		t.Fatalf("committed head = %d, %v; want 2", head, err)
 	}
-	if next[0].Duplicate || next[0].BaseOffset != 4 {
-		t.Fatalf("next batch = %+v, want base 4", next[0])
-	}
-
-	// An overlapping retry with a different record count is rejected.
-	if _, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 5, ProducerID: 42, Sequence: 100}}); err == nil {
-		t.Fatal("overlapping retry with mismatched count succeeded, want error")
-	}
-
-	// Non-idempotent allocations are unaffected.
-	plain, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2}})
-	if err != nil {
-		t.Fatalf("plain allocate: %v", err)
-	}
-	if plain[0].BaseOffset != 8 {
-		t.Fatalf("plain base = %d, want 8", plain[0].BaseOffset)
-	}
-
-	head, err := m.GetPartitionHead(ctx, "t", 0)
-	if err != nil {
-		t.Fatalf("head: %v", err)
-	}
-	if head != 10 {
-		t.Fatalf("head = %d, want 10 (4+4+2, retry not counted)", head)
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
+	if err != nil || len(refs) != 1 || refs[0].BaseOffset != 0 {
+		t.Fatalf("refs = %+v, %v", refs, err)
 	}
 }
 
-// TestS3MetaStore_CommittedHeadOnlyAdvancesContiguously verifies that the
-// committed high watermark never advances past an unmaterialized range, even
-// when concurrent writers register adjacent ranges out of order.
-func TestS3MetaStore_CommittedHeadOnlyAdvancesContiguously(t *testing.T) {
+// TestS3MetaStore_CommitMultipleBatchesAtomically verifies a single invocation
+// carrying several same-partition batches publishes them in one head CAS with
+// contiguous offsets.
+func TestS3MetaStore_CommitMultipleBatchesAtomically(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()
-
-	committed := func() int64 {
-		t.Helper()
-		h, err := m.GetCommittedHead(ctx, "t", 0)
-		if err != nil {
-			t.Fatalf("committed head: %v", err)
-		}
-		return h
+	results, err := m.CommitUploadedBatches(ctx, []UploadedBatch{
+		{BatchID: "a:0:10", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()},
+		{BatchID: "b:10:10", FileKey: "b", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, ProducerID: 7, Sequence: 1, CreatedAt: time.Now()},
+		{BatchID: "c:20:10", FileKey: "c", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, CreatedAt: time.Now()},
+	})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
 	}
-	register := func(base, end int64) {
-		t.Helper()
-		if err := m.RegisterSegment(ctx, SegmentRecord{
-			FileKey:   fmt.Sprintf("f-%d-%d.data", base, end),
-			Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: base, EndOffset: end, ByteLength: end - base}},
-			CreatedAt: time.Now(),
-		}); err != nil {
-			t.Fatalf("register [%d,%d): %v", base, end, err)
-		}
+	if len(results) != 3 || results[0].BaseOffset != 0 || results[1].BaseOffset != 1 || results[2].BaseOffset != 3 {
+		t.Fatalf("unexpected results: %+v", results)
 	}
-
-	// A later range registering first must not advertise past the missing
-	// prefix: the consumer would otherwise skip the not-yet-materialized
-	// [0,10).
-	register(10, 20)
-	if got := committed(); got != 0 {
-		t.Fatalf("committed after [10,20) = %d, want 0 (gap at [0,10))", got)
+	if head, err := m.GetCommittedHead(ctx, "t", 0); err != nil || head != 4 {
+		t.Fatalf("committed head = %d, %v; want 4", head, err)
 	}
-
-	// Filling the prefix makes the whole chain readable.
-	register(0, 10)
-	if got := committed(); got != 20 {
-		t.Fatalf("committed after [0,10)+[10,20) = %d, want 20", got)
-	}
-
-	// An abandoned range never advances the head past the gap.
-	register(30, 40)
-	if got := committed(); got != 20 {
-		t.Fatalf("committed after [30,40) = %d, want 20 (gap at [20,30))", got)
-	}
-
-	// Closing the gap advances through the full contiguous chain.
-	register(20, 30)
-	if got := committed(); got != 40 {
-		t.Fatalf("committed after gap filled = %d, want 40", got)
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
+	if err != nil || len(refs) != 3 {
+		t.Fatalf("refs = %+v, %v; want 3", refs, err)
 	}
 }
 
-// TestS3MetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix verifies that a
-// flush containing a valid allocation followed by an invalid one is rejected
-// before any offset state advances: the valid prefix is not abandoned as a
-// permanent gap, and subsequent valid writes continue contiguously.
-func TestS3MetaStore_MixedBatchInvalidSuffixDoesNotStrandPrefix(t *testing.T) {
+// TestS3MetaStore_CommitRejectsCrossPartitionBatch verifies the one-partition
+// atomicity boundary of a commit invocation.
+func TestS3MetaStore_CommitRejectsCrossPartitionBatch(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()
-
-	// Establish producer state: batch seq 100 count 3 -> offsets [0,3).
-	first, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}})
-	if err != nil {
-		t.Fatalf("seed allocate: %v", err)
-	}
-	if first[0].BaseOffset != 0 {
-		t.Fatalf("seed base = %d, want 0", first[0].BaseOffset)
-	}
-
-	// A flush with a valid continuation then an invalid gap must fail without
-	// advancing the head past the valid prefix.
-	_, err = m.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103},
-		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 200},
+	_, err := m.CommitUploadedBatches(ctx, []UploadedBatch{
+		{BatchID: "a:0:10", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 10},
+		{BatchID: "b:0:10", FileKey: "b", Topic: "t", Partition: 1, Count: 1, ByteLength: 10},
 	})
 	if err == nil {
-		t.Fatal("mixed batch with invalid suffix succeeded, want error")
-	}
-
-	head, err := m.GetPartitionHead(ctx, "t", 0)
-	if err != nil {
-		t.Fatalf("head: %v", err)
-	}
-	if head != 3 {
-		t.Fatalf("head after rejected batch = %d, want 3 (no stranded prefix)", head)
-	}
-
-	// A subsequent valid write continues from the un-stranded prefix.
-	next, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}})
-	if err != nil {
-		t.Fatalf("next allocate: %v", err)
-	}
-	if next[0].BaseOffset != 3 {
-		t.Fatalf("next base = %d, want 3", next[0].BaseOffset)
+		t.Fatal("expected cross-partition batch to be rejected")
 	}
 }
 
-// TestS3MetaStore_MixedBatchDuplicateAndContinuation verifies that a valid
-// batch mixing an exact retry and a continuation is applied as a unit.
-func TestS3MetaStore_MixedBatchDuplicateAndContinuation(t *testing.T) {
+// TestS3MetaStore_CommitNonIdempotentRetryAppends verifies non-idempotent
+// batches are not deduplicated, matching Kafka semantics: a retried upload is a
+// fresh append.
+func TestS3MetaStore_CommitNonIdempotentRetryAppends(t *testing.T) {
 	m := newTestS3MetaStore(t)
 	ctx := context.Background()
-
-	if _, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}}); err != nil {
-		t.Fatalf("seed allocate: %v", err)
-	}
-
-	results, err := m.AllocateOffsets(ctx, []OffsetAllocation{
-		{Topic: "t", Partition: 0, Count: 3, ProducerID: 42, Sequence: 100}, // exact retry
-		{Topic: "t", Partition: 0, Count: 2, ProducerID: 42, Sequence: 103}, // continuation
-	})
+	b := UploadedBatch{BatchID: "obj:0:10", FileKey: "obj", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, CreatedAt: time.Now()}
+	first, err := m.CommitUploadedBatches(ctx, []UploadedBatch{b})
 	if err != nil {
-		t.Fatalf("mixed duplicate+continuation batch: %v", err)
+		t.Fatalf("commit: %v", err)
 	}
-	if !results[0].Duplicate || results[0].BaseOffset != 0 {
-		t.Fatalf("results[0] = %+v, want duplicate base 0", results[0])
-	}
-	if results[1].Duplicate || results[1].BaseOffset != 3 {
-		t.Fatalf("results[1] = %+v, want base 3 non-duplicate", results[1])
-	}
-	head, err := m.GetPartitionHead(ctx, "t", 0)
+	retry, err := m.CommitUploadedBatches(ctx, []UploadedBatch{b})
 	if err != nil {
-		t.Fatalf("head: %v", err)
+		t.Fatalf("retry: %v", err)
 	}
-	if head != 5 {
-		t.Fatalf("head = %d, want 5", head)
+	if first[0].BaseOffset != 0 || retry[0].Duplicate || retry[0].BaseOffset != 2 {
+		t.Fatalf("unexpected outcomes: first=%+v retry=%+v", first, retry)
 	}
-}
-
-// TestReplaceSegmentRefs_AtomicallyMergesRun verifies that replacing a
-// contiguous committed run with a single merged ref never exposes a gap or
-// duplicate to readers and never moves the committed watermark.
-func TestReplaceSegmentRefs_AtomicallyMergesRun(t *testing.T) {
-	for name, meta := range map[string]MetaStore{
-		"memory": NewMemoryMetaStore(),
-		"s3":     NewS3MetaStore(testS3Client(t)),
-	} {
-		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
-			now := time.Now()
-			for i := int64(0); i < 3; i++ {
-				if err := meta.RegisterSegment(ctx, SegmentRecord{
-					FileKey:   fmt.Sprintf("f%d.data", i),
-					Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: i, EndOffset: i + 1, ByteLength: 10}},
-					CreatedAt: now,
-				}); err != nil {
-					t.Fatalf("register [%d,%d): %v", i, i+1, err)
-				}
-			}
-			committed, err := meta.GetCommittedHead(ctx, "t", 0)
-			if err != nil {
-				t.Fatalf("committed head: %v", err)
-			}
-			if committed != 3 {
-				t.Fatalf("committed = %d, want 3", committed)
-			}
-
-			merged := SegmentRef{FileKey: "merged.data", ByteOffset: 0, ByteLength: 30, BaseOffset: 0, EndOffset: 3}
-			remove := []RefKey{{BaseOffset: 0, EndOffset: 1}, {BaseOffset: 1, EndOffset: 2}, {BaseOffset: 2, EndOffset: 3}}
-			if err := meta.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}); err != nil {
-				t.Fatalf("replace: %v", err)
-			}
-
-			refs, err := meta.QuerySegments(ctx, "t", 0, 0, 1<<20)
-			if err != nil {
-				t.Fatalf("query: %v", err)
-			}
-			if len(refs) != 1 || refs[0].FileKey != "merged.data" || refs[0].BaseOffset != 0 || refs[0].EndOffset != 3 {
-				t.Fatalf("refs after merge = %+v, want single merged [0,3)", refs)
-			}
-
-			committed, err = meta.GetCommittedHead(ctx, "t", 0)
-			if err != nil {
-				t.Fatalf("committed head: %v", err)
-			}
-			if committed != 3 {
-				t.Fatalf("committed after compaction = %d, want 3 (compaction must not move the watermark)", committed)
-			}
-			start, err := meta.GetPartitionStart(ctx, "t", 0)
-			if err != nil {
-				t.Fatalf("start: %v", err)
-			}
-			if start != 0 {
-				t.Fatalf("start = %d, want 0", start)
-			}
-
-			// An idempotent retry of the same replacement must be a no-op.
-			if err := meta.ReplaceSegmentRefs(ctx, "t", 0, remove, []SegmentRef{merged}); err != nil {
-				t.Fatalf("idempotent replace: %v", err)
-			}
-			refs, err = meta.QuerySegments(ctx, "t", 0, 0, 1<<20)
-			if err != nil {
-				t.Fatalf("query: %v", err)
-			}
-			if len(refs) != 1 {
-				t.Fatalf("refs after idempotent replace = %d, want 1", len(refs))
-			}
-		})
-	}
-}
-
-// TestReplaceSegmentRefs_NewWritesContinueAfterMerge verifies that registering
-// a new segment after compaction still advances the committed head across the
-// merged ref, keeping reads contiguous.
-func TestReplaceSegmentRefs_NewWritesContinueAfterMerge(t *testing.T) {
-	for name, meta := range map[string]MetaStore{
-		"memory": NewMemoryMetaStore(),
-		"s3":     NewS3MetaStore(testS3Client(t)),
-	} {
-		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
-			now := time.Now()
-			for i := int64(0); i < 3; i++ {
-				if err := meta.RegisterSegment(ctx, SegmentRecord{
-					FileKey:   fmt.Sprintf("f%d.data", i),
-					Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: i, EndOffset: i + 1, ByteLength: 10}},
-					CreatedAt: now,
-				}); err != nil {
-					t.Fatalf("register [%d,%d): %v", i, i+1, err)
-				}
-			}
-			if err := meta.ReplaceSegmentRefs(ctx, "t", 0, []RefKey{
-				{BaseOffset: 0, EndOffset: 1}, {BaseOffset: 1, EndOffset: 2}, {BaseOffset: 2, EndOffset: 3},
-			}, []SegmentRef{{FileKey: "merged.data", ByteOffset: 0, ByteLength: 30, BaseOffset: 0, EndOffset: 3}}); err != nil {
-				t.Fatalf("replace: %v", err)
-			}
-
-			// A new flush after the merged ref continues the log.
-			if err := meta.RegisterSegment(ctx, SegmentRecord{
-				FileKey:   "f3.data",
-				Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 3, EndOffset: 4, ByteLength: 10}},
-				CreatedAt: now,
-			}); err != nil {
-				t.Fatalf("register [3,4): %v", err)
-			}
-			committed, err := meta.GetCommittedHead(ctx, "t", 0)
-			if err != nil {
-				t.Fatalf("committed head: %v", err)
-			}
-			if committed != 4 {
-				t.Fatalf("committed = %d, want 4", committed)
-			}
-			refs, err := meta.QuerySegments(ctx, "t", 0, 0, 1<<20)
-			if err != nil {
-				t.Fatalf("query: %v", err)
-			}
-			if len(refs) != 2 || refs[0].EndOffset != 3 || refs[1].EndOffset != 4 {
-				t.Fatalf("refs = %+v, want merged [0,3) then [3,4)", refs)
-			}
-		})
-	}
-}
-
-func TestS3MetaStore_RegisterIsIdempotent(t *testing.T) {
-	m := newTestS3MetaStore(t)
-	ctx := context.Background()
-
-	seg := SegmentRecord{
-		FileKey:   "_diskless/n1/1.data",
-		Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 0, EndOffset: 2, ByteLength: 10}},
-		CreatedAt: time.Now(),
-	}
-	if err := m.RegisterSegment(ctx, seg); err != nil {
-		t.Fatalf("first register: %v", err)
-	}
-	// A retry of the same deterministic ref must not conflict.
-	if err := m.RegisterSegment(ctx, seg); err != nil {
-		t.Fatalf("retry register: %v", err)
-	}
-	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if len(refs) != 1 {
-		t.Fatalf("refs = %d, want 1 (no duplicates from idempotent register)", len(refs))
-	}
-}
-
-func TestS3MetaStore_Retention(t *testing.T) {
-	m := newTestS3MetaStore(t)
-	ctx := context.Background()
-
-	old := time.Now().Add(-time.Hour)
-	recent := time.Now()
-	if err := m.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "old.data",
-		Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 0, EndOffset: 2, ByteLength: 10}},
-		CreatedAt: old,
-	}); err != nil {
-		t.Fatalf("register old: %v", err)
-	}
-	if err := m.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "recent.data",
-		Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 2, EndOffset: 4, ByteLength: 10}},
-		CreatedAt: recent,
-	}); err != nil {
-		t.Fatalf("register recent: %v", err)
-	}
-
-	// The "old" file has only an expired ref within partition 0, but the shared
-	// catalog is per-partition; plan for partition 0 should exclude recent.data.
-	expired, err := m.PlanExpiredFileDeletes(ctx, "t", 0, time.Now().Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("plan: %v", err)
-	}
-	if len(expired) != 1 || expired[0] != "old.data" {
-		t.Fatalf("expired = %v, want [old.data]", expired)
-	}
-
-	if err := m.DeleteFileRefs(ctx, "old.data"); err != nil {
-		t.Fatalf("delete refs: %v", err)
-	}
-	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if len(refs) != 1 || refs[0].FileKey != "recent.data" {
-		t.Fatalf("refs after delete = %+v, want only recent.data", refs)
-	}
-}
-
-func TestS3MetaStore_DeleteTopic(t *testing.T) {
-	m := newTestS3MetaStore(t)
-	ctx := context.Background()
-
-	if _, err := m.AllocateOffsets(ctx, []OffsetAllocation{{Topic: "t", Partition: 0, Count: 2}}); err != nil {
-		t.Fatalf("allocate: %v", err)
-	}
-	if err := m.RegisterSegment(ctx, SegmentRecord{
-		FileKey:   "f.data",
-		Batches:   []BatchRef{{Topic: "t", Partition: 0, BaseOffset: 0, EndOffset: 2, ByteLength: 10}},
-		CreatedAt: time.Now(),
-	}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-
-	if err := m.DeleteTopic(ctx, "t"); err != nil {
-		t.Fatalf("delete topic: %v", err)
-	}
-
-	head, err := m.GetPartitionHead(ctx, "t", 0)
-	if err != nil {
-		t.Fatalf("head: %v", err)
-	}
-	if head != 0 {
-		t.Fatalf("head after delete = %d, want 0", head)
-	}
-	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if len(refs) != 0 {
-		t.Fatalf("refs after delete = %d, want 0", len(refs))
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
+	if err != nil || len(refs) != 2 {
+		t.Fatalf("refs = %+v, %v; want 2", refs, err)
 	}
 }

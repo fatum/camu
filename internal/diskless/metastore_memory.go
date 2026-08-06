@@ -10,6 +10,7 @@ import (
 )
 
 type segmentEntry struct {
+	batchID    string
 	fileKey    string
 	baseOffset int64
 	endOffset  int64
@@ -18,167 +19,97 @@ type segmentEntry struct {
 	createdAt  time.Time
 }
 
-// producerAlloc records the last idempotent batch allocated by a producer
-// within a partition. Only the latest batch is kept: sequences must advance
-// contiguously, so any earlier batch is no longer retryable.
-type producerAlloc struct {
-	firstSequence int64
-	baseOffset    int64
-	count         int
+const uploadedProducerHistory = 5
+
+type producerCommit struct {
+	firstSequence, baseOffset int64
+	count                     int
 }
 
 // MemoryMetaStore is an in-memory implementation of MetaStore for testing and development.
 type MemoryMetaStore struct {
-	mu             sync.Mutex
-	offsets        map[string]int64
-	committed      map[string]int64
-	segments       map[string][]segmentEntry
-	producerAllocs map[string]map[int64]producerAlloc // partition key -> producerID -> last batch
+	mu              sync.Mutex
+	offsets         map[string]int64
+	committed       map[string]int64
+	segments        map[string][]segmentEntry
+	producerCommits map[string]map[int64][]producerCommit
 }
 
 // NewMemoryMetaStore creates a new in-memory MetaStore.
 func NewMemoryMetaStore() *MemoryMetaStore {
 	return &MemoryMetaStore{
-		offsets:        make(map[string]int64),
-		committed:      make(map[string]int64),
-		segments:       make(map[string][]segmentEntry),
-		producerAllocs: make(map[string]map[int64]producerAlloc),
+		offsets:         make(map[string]int64),
+		committed:       make(map[string]int64),
+		segments:        make(map[string][]segmentEntry),
+		producerCommits: make(map[string]map[int64][]producerCommit),
 	}
+}
+
+// CommitUploadedBatches makes uploaded objects visible without ever reserving
+// an offset before a ref is durable. All batches in one invocation must belong
+// to the same partition; they are committed together under a single lock, so
+// the commit is an all-or-nothing validation boundary per partition.
+func (m *MemoryMetaStore) CommitUploadedBatches(_ context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := samePartitionBatches(batches); err != nil {
+		return nil, err
+	}
+	results := make([]OffsetResult, len(batches))
+	for i, b := range batches {
+		if b.BatchID == "" || b.Count <= 0 {
+			return nil, fmt.Errorf("uploaded batch %s has invalid count %d", b.FileKey, b.Count)
+		}
+		key := partitionKey(b.Topic, b.Partition)
+		var duplicate *producerCommit
+		if b.ProducerID != 0 {
+			history := m.producerCommits[key][b.ProducerID]
+			for j := len(history) - 1; j >= 0; j-- {
+				if history[j].firstSequence == b.Sequence {
+					duplicate = &history[j]
+					break
+				}
+			}
+			if duplicate != nil {
+				if duplicate.count != b.Count {
+					return nil, fmt.Errorf("producer %d retried sequence %d with %d records, want %d", b.ProducerID, b.Sequence, b.Count, duplicate.count)
+				}
+				results[i] = OffsetResult{BaseOffset: duplicate.baseOffset, Duplicate: true}
+				continue
+			}
+			if len(history) > 0 {
+				last := history[len(history)-1]
+				if _, err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.firstSequence, last.count); err != nil {
+					return nil, err
+				}
+			} else if err := checkInitialProducerSequence(b.ProducerID, b.Sequence); err != nil {
+				return nil, err
+			}
+		}
+		base := m.offsets[key]
+		end := base + int64(b.Count)
+		m.segments[key] = append(m.segments[key], segmentEntry{batchID: b.BatchID, fileKey: b.FileKey, baseOffset: base, endOffset: end, byteOffset: b.ByteOffset, byteLength: b.ByteLength, createdAt: b.CreatedAt})
+		m.offsets[key], m.committed[key] = end, end
+		if b.ProducerID != 0 {
+			if m.producerCommits[key] == nil {
+				m.producerCommits[key] = map[int64][]producerCommit{}
+			}
+			h := m.producerCommits[key][b.ProducerID]
+			h = append(h, producerCommit{b.Sequence, base, b.Count})
+			if len(h) > uploadedProducerHistory {
+				h = h[len(h)-uploadedProducerHistory:]
+			}
+			m.producerCommits[key][b.ProducerID] = h
+		}
+		results[i] = OffsetResult{BaseOffset: base}
+	}
+	return results, nil
 }
 
 func partitionKey(topic string, partition int) string {
 	return fmt.Sprintf("%s#%d", topic, partition)
 }
 
-// AllocateOffsets atomically assigns offset ranges for one or more partition batches.
-func (m *MemoryMetaStore) AllocateOffsets(_ context.Context, allocs []OffsetAllocation) ([]OffsetResult, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Validate the whole batch against working copies of the state before
-	// mutating anything, so an invalid later allocation can never strand a
-	// valid prefix by advancing the counter before the batch is rejected.
-	heads := make(map[string]int64, len(m.offsets))
-	for k, v := range m.offsets {
-		heads[k] = v
-	}
-	records := make(map[string]map[int64]producerAlloc, len(m.producerAllocs))
-	for k, byPID := range m.producerAllocs {
-		cp := make(map[int64]producerAlloc, len(byPID))
-		for pid, r := range byPID {
-			cp[pid] = r
-		}
-		records[k] = cp
-	}
-
-	results := make([]OffsetResult, len(allocs))
-	for i, a := range allocs {
-		key := partitionKey(a.Topic, a.Partition)
-		res, err := simulateMemoryAlloc(heads, records, key, a)
-		if err != nil {
-			return nil, err
-		}
-		results[i] = res
-	}
-
-	// Apply every validated allocation in order.
-	for i, a := range allocs {
-		if results[i].Duplicate {
-			continue // exact retry: offsets were already assigned
-		}
-		key := partitionKey(a.Topic, a.Partition)
-		base := m.offsets[key]
-		results[i].BaseOffset = base
-		m.offsets[key] = base + int64(a.Count)
-		if a.ProducerID != 0 {
-			byProducer := m.producerAllocs[key]
-			if byProducer == nil {
-				byProducer = make(map[int64]producerAlloc)
-				m.producerAllocs[key] = byProducer
-			}
-			byProducer[a.ProducerID] = producerAlloc{firstSequence: a.Sequence, baseOffset: base, count: a.Count}
-		}
-	}
-	return results, nil
-}
-
-// simulateMemoryAlloc applies a single allocation to the in-memory working
-// state for validation purposes, returning an error if the allocation is
-// invalid. An exact retry does not advance the head, mirroring the apply path.
-func simulateMemoryAlloc(heads map[string]int64, records map[string]map[int64]producerAlloc, key string, a OffsetAllocation) (OffsetResult, error) {
-	if a.ProducerID != 0 {
-		if prev, ok := records[key][a.ProducerID]; ok {
-			exact, err := checkProducerSequence(a.ProducerID, a.Sequence, a.Count, prev.firstSequence, prev.count)
-			if err != nil {
-				return OffsetResult{}, err
-			}
-			if exact {
-				if prev.count != a.Count {
-					return OffsetResult{}, fmt.Errorf("producer %d partition %s retried sequence %d with %d records, want %d", a.ProducerID, key, a.Sequence, a.Count, prev.count)
-				}
-				return OffsetResult{BaseOffset: prev.baseOffset, Duplicate: true}, nil
-			}
-		}
-	}
-	base := heads[key]
-	heads[key] = base + int64(a.Count)
-	if a.ProducerID != 0 {
-		if records[key] == nil {
-			records[key] = make(map[int64]producerAlloc)
-		}
-		records[key][a.ProducerID] = producerAlloc{firstSequence: a.Sequence, baseOffset: base, count: a.Count}
-	}
-	return OffsetResult{BaseOffset: base}, nil
-}
-
-// RegisterSegment records a flushed data file in the segment catalog and
-// advances the partition's committed head through the longest run of contiguous
-// materialized ranges. Registering an already-registered offset range is a
-// no-op so an idempotent produce retry that re-materializes a batch does not
-// create duplicate refs.
-func (m *MemoryMetaStore) RegisterSegment(_ context.Context, seg SegmentRecord) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	affected := make(map[string]bool)
-	for _, b := range seg.Batches {
-		key := partitionKey(b.Topic, b.Partition)
-		if m.rangeRegistered(key, b.BaseOffset, b.EndOffset) {
-			continue
-		}
-		m.segments[key] = append(m.segments[key], segmentEntry{
-			fileKey:    seg.FileKey,
-			baseOffset: b.BaseOffset,
-			endOffset:  b.EndOffset,
-			byteOffset: b.ByteOffset,
-			byteLength: b.ByteLength,
-			createdAt:  seg.CreatedAt,
-		})
-		affected[key] = true
-	}
-
-	// Advance committed heads only through contiguous materialized ranges so an
-	// out-of-order registration never exposes a gap to readers.
-	for key := range affected {
-		m.committed[key] = m.contiguousCommittedLocked(key)
-	}
-	return nil
-}
-
-// contiguousCommittedLocked returns the end of the longest run of segment refs
-// for a partition that is contiguous with its current committed head.
-func (m *MemoryMetaStore) contiguousCommittedLocked(key string) int64 {
-	entries := m.segments[key]
-	refs := make([]SegmentRef, 0, len(entries))
-	for _, e := range entries {
-		refs = append(refs, SegmentRef{BaseOffset: e.baseOffset, EndOffset: e.endOffset})
-	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i].BaseOffset < refs[j].BaseOffset })
-	return contiguousCommittedEnd(m.committed[key], refs)
-}
-
-// rangeRegistered reports whether a batch for the same offset range is already
-// present in the partition's segment list.
 func (m *MemoryMetaStore) rangeRegistered(key string, base, end int64) bool {
 	for _, e := range m.segments[key] {
 		if e.baseOffset == base && e.endOffset == end {
@@ -399,6 +330,11 @@ func (m *MemoryMetaStore) ListFileRefs(_ context.Context, fileKey string) ([]Fil
 	return refs, nil
 }
 
+// ArchiveCommitted is a no-op: the memory metastore has no bounded head object.
+func (m *MemoryMetaStore) ArchiveCommitted(_ context.Context, _ string, _ int, _ int64, _ time.Time) (int, error) {
+	return 0, nil
+}
+
 // DeleteTopic removes all MetaStore state for a topic.
 func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	m.mu.Lock()
@@ -418,11 +354,6 @@ func (m *MemoryMetaStore) DeleteTopic(_ context.Context, topic string) error {
 	for k := range m.segments {
 		if strings.HasPrefix(k, prefix) {
 			delete(m.segments, k)
-		}
-	}
-	for k := range m.producerAllocs {
-		if strings.HasPrefix(k, prefix) {
-			delete(m.producerAllocs, k)
 		}
 	}
 	return nil

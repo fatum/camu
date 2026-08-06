@@ -45,15 +45,32 @@ Diskless coordination:
   so diskless topics run on any S3-compatible service without DynamoDB), or
   `dynamodb`.
 - With `s3`, offset allocation uses a per-partition head object and
-  conditional-write CAS, and segment references live in a single per-partition
-  catalog object read-modify-written with a CAS, so background compaction can
-  atomically replace a run of refs. Both work against any S3-compatible store.
+  conditional-write CAS. The head is a *bounded window*: a background job rolls
+  old compaction-sized refs into immutable archived checkpoints, so the hot
+  object stays small regardless of history and commits cost O(window) rather
+  than O(all refs). Reads of recent data touch only the head; reads of older
+  data walk the immutable checkpoint chain. Both work against any S3-compatible
+  store.
 - With `dynamodb`, idempotent offset allocation is atomic: the producer's last
   batch and the real base offset are stored in the same conditional write that
   advances the counter, pinned to the previously read state, so concurrent
   same-producer requests cannot bypass sequence validation or duplicate
   offsets. The DynamoDB metastore is exercised against a real DynamoDB in CI
   (`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` set).
+- Idempotency follows the Kafka contract: an exact retry of an idempotent batch
+  (same producer ID, first sequence, and count) is deduplicated against the
+  producer's commit history and returns its original offset without a second
+  ref — the retried physical upload is retroactively excluded from reads, like
+  a tombstone. Dedup matches **any** recorded sequence within the bounded
+  history (the last 5 batches per producer), so a retry of a non-latest but
+  still-recorded batch is also deduplicated — broader than Kafka, which only
+  dedups the latest batch. An exact replay that has rotated out of that window
+  is rejected as out-of-order (HTTP 422) rather than re-allocated, so a stale
+  retry can never silently duplicate records at a fresh offset. Non-idempotent
+  batches are **not** deduplicated, so a retried non-idempotent produce may
+  duplicate records, matching Kafka. Unreferenced uploads (a commit that
+  permanently failed after upload, or a tombstoned retry) are swept by the
+  leader after a grace period.
 - Diskless topics support typed schemas, `export_enabled`, and Parquet/SQL
   exactly like classic topics: the partition leader exports the committed
   diskless log (bounded by the diskless committed watermark) through the same
@@ -164,6 +181,9 @@ Polling:
 
 ```bash
 curl "http://localhost:8080/v1/topics/orders/partitions/0/messages?offset=0&limit=100"
+# `start_offset` is accepted as an alias for `offset`; providing both with
+# different values is rejected.
+curl "http://localhost:8080/v1/topics/orders/partitions/0/messages?start_offset=0&limit=100"
 ```
 
 SSE:

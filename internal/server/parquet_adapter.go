@@ -41,6 +41,14 @@ func (a parquetObjectAdapter) List(ctx context.Context, prefix string) ([]string
 	return keys, translateStorageErr(err)
 }
 
+func (a parquetObjectAdapter) ListEach(ctx context.Context, prefix string, fn func(key string) error) error {
+	return translateStorageErr(a.client.ListEach(ctx, prefix, fn))
+}
+
+func (a parquetObjectAdapter) DeleteMany(ctx context.Context, keys []string) error {
+	return translateStorageErr(a.client.DeleteMany(ctx, keys))
+}
+
 func translateStorageErr(err error) error {
 	switch {
 	case err == nil:

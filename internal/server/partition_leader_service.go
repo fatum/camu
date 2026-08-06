@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/meta"
 )
 
@@ -17,7 +18,7 @@ func (s *Server) partitionLeader() partitionLeaderService {
 	return partitionLeaderService{server: s}
 }
 
-func (p partitionLeaderService) runMaintenance(ctx context.Context, topics []meta.TopicConfig) {
+func (p partitionLeaderService) runMaintenance(ctx context.Context, topics []meta.TopicConfig, fileIdx *diskless.FileIndex) {
 	type task struct {
 		tc        meta.TopicConfig
 		partition int
@@ -34,17 +35,17 @@ func (p partitionLeaderService) runMaintenance(ctx context.Context, topics []met
 		maxConcurrency = 1
 	}
 	runBoundedPartitionTasks(maxConcurrency, tasks, func(task task) {
-		p.runPartitionJobDiscovery(ctx, task.tc, task.partition)
+		p.runPartitionJobDiscovery(ctx, task.tc, task.partition, fileIdx)
 	})
 }
 
-func (p partitionLeaderService) runJobsForTopic(ctx context.Context, tc meta.TopicConfig) {
+func (p partitionLeaderService) runJobsForTopic(ctx context.Context, tc meta.TopicConfig, fileIdx *diskless.FileIndex) {
 	for partition := 0; partition < tc.Partitions; partition++ {
-		p.runPartitionJobDiscovery(ctx, tc, partition)
+		p.runPartitionJobDiscovery(ctx, tc, partition, fileIdx)
 	}
 }
 
-func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc meta.TopicConfig, partition int) {
+func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc meta.TopicConfig, partition int, fileIdx *diskless.FileIndex) {
 	identity, err := p.server.ResolvePartitionIdentity(ctx, tc.Name, partition)
 	if err != nil {
 		slog.Warn("partition_maintenance_identity_failed", "topic", tc.Name, "partition", partition, "error", err)
@@ -57,7 +58,8 @@ func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc
 	p.server.ensureParquetConsumer(tc, identity)
 
 	if tc.StorageMode == meta.StorageModeDiskless {
-		p.server.discoverDisklessRetentionJobs(ctx, tc, identity)
+		p.server.discoverDisklessRetentionJobs(ctx, tc, identity, fileIdx)
+		p.server.rollDisklessMetadata(ctx, tc, identity)
 	} else {
 		p.server.discoverClassicRetentionJobs(ctx, tc, identity)
 	}

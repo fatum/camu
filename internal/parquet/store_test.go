@@ -109,6 +109,28 @@ func (f *fakeObjectStore) List(_ context.Context, prefix string) ([]string, erro
 	return out, nil
 }
 
+func (f *fakeObjectStore) ListEach(_ context.Context, prefix string, fn func(key string) error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			if err := fn(k); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (f *fakeObjectStore) DeleteMany(_ context.Context, keys []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, key := range keys {
+		delete(f.objects, key)
+	}
+	return nil
+}
+
 func TestReplaceOverlappingEntriesReplacesOnlyIntersectingRanges(t *testing.T) {
 	ctx := context.Background()
 	objects := newFakeObjectStore()

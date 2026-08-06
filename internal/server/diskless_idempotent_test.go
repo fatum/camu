@@ -49,24 +49,24 @@ func TestProduceLowLevel_DisklessIdempotentSequenceValidation(t *testing.T) {
 		return rec.Code, rec.Body.String()
 	}
 
-	if code, _ := produce(10); code != http.StatusOK {
+	if code, _ := produce(0); code != http.StatusOK {
 		t.Fatalf("first produce status = %d, want 200", code)
 	}
-	// Sequence 12 after a 1-record batch at sequence 10 is a gap.
-	if code, body := produce(12); code != http.StatusUnprocessableEntity {
+	// Sequence 2 after a 1-record batch at sequence 0 is a gap.
+	if code, body := produce(2); code != http.StatusUnprocessableEntity {
 		t.Fatalf("gap produce status = %d, want 422; body=%s", code, body)
 	}
-	// Sequence 11 is the exact next contiguous batch.
-	if code, _ := produce(11); code != http.StatusOK {
+	// Sequence 1 is the exact next contiguous batch.
+	if code, _ := produce(1); code != http.StatusOK {
 		t.Fatalf("contiguous produce status = %d, want 200", code)
 	}
-	// Sequence 10 is now a stale retry (out of order).
-	if code, _ := produce(10); code != http.StatusUnprocessableEntity {
-		t.Fatalf("stale retry status = %d, want 422", code)
+	// Delayed retries remain valid within the retained producer history.
+	if code, _ := produce(0); code != http.StatusOK {
+		t.Fatalf("delayed retry status = %d, want 200", code)
 	}
 	// An exact retry of the latest batch (11) is deduplicated and flagged.
 	req := httptest.NewRequest(http.MethodPost, "/v1/topics/diskless-topic/partitions/0/messages",
-		bytes.NewBufferString(`{"producer_id":7,"sequence":11,"messages":[{"key":"k","value":"v"}]}`))
+		bytes.NewBufferString(`{"producer_id":7,"sequence":1,"messages":[{"key":"k","value":"v"}]}`))
 	req.SetPathValue("topic", "diskless-topic")
 	req.SetPathValue("id", "0")
 	rec := httptest.NewRecorder()

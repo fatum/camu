@@ -61,19 +61,26 @@ type PutOpts struct {
 
 // memObject is a stored object in the in-memory backend.
 type memObject struct {
-	data []byte
-	etag string
+	data      []byte
+	etag      string
+	createdAt time.Time
 }
 
 // s3Backend is the interface for storage backends.
 type s3Backend interface {
 	put(ctx context.Context, key string, data []byte, opts PutOpts) error
+	// putStream uploads exactly size bytes read from r without materializing a
+	// contiguous in-memory copy on backends that support streaming bodies.
+	putStream(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error
 	get(ctx context.Context, key string) ([]byte, error)
 	getRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	getRangeInto(ctx context.Context, key string, offset, length int64, dst []byte) error
+	stat(ctx context.Context, key string) (time.Time, error)
 	getWithETag(ctx context.Context, key string) ([]byte, string, error)
 	delete(ctx context.Context, key string) error
+	deleteMany(ctx context.Context, keys []string) error
 	list(ctx context.Context, prefix string) ([]string, error)
+	listEach(ctx context.Context, prefix string, fn func(key string) error) error
 	conditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error)
 	conditionalPutFile(ctx context.Context, key string, file io.ReadSeeker, size int64, etag string) (string, error)
 	equalsFile(ctx context.Context, key string, file io.ReadSeeker, size int64) (bool, error)
@@ -165,6 +172,22 @@ func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpt
 	return err
 }
 
+// PutReader streams exactly size bytes from r to key without first copying them
+// into a contiguous buffer, so large immutable uploads never hold two copies of
+// the payload. r must yield at least size bytes.
+func (c *S3Client) PutReader(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error {
+	if err := c.checkFault("put"); err != nil {
+		return err
+	}
+	if size < 0 {
+		return fmt.Errorf("put reader %q: negative size", key)
+	}
+	started := time.Now()
+	err := c.backend.putStream(ctx, key, r, size, opts)
+	c.observe("put", started, size, err)
+	return err
+}
+
 // Get retrieves data at key. Returns ErrNotFound if missing.
 func (c *S3Client) Get(ctx context.Context, key string) ([]byte, error) {
 	if err := c.checkFault("get"); err != nil {
@@ -200,6 +223,18 @@ func (c *S3Client) GetRangeInto(ctx context.Context, key string, offset, length 
 	return err
 }
 
+// Stat returns the object's last modification time. Returns ErrNotFound if the
+// key is missing.
+func (c *S3Client) Stat(ctx context.Context, key string) (time.Time, error) {
+	if err := c.checkFault("get"); err != nil {
+		return time.Time{}, err
+	}
+	started := time.Now()
+	t, err := c.backend.stat(ctx, key)
+	c.observe("get", started, 0, err)
+	return t, err
+}
+
 // GetWithETag retrieves data and the current ETag for key. Returns ErrNotFound if missing.
 func (c *S3Client) GetWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	if err := c.checkFault("get_etag"); err != nil {
@@ -222,6 +257,22 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+// DeleteMany deletes the given keys in batches (1000 per S3 DeleteObjects
+// call), so large cleanups issue far fewer requests than per-key Delete.
+// Deletion is idempotent: already-absent keys are not an error.
+func (c *S3Client) DeleteMany(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := c.checkFault("delete"); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := c.backend.deleteMany(ctx, keys)
+	c.observe("delete", started, int64(len(keys)), err)
+	return err
+}
+
 // List returns keys with the given prefix.
 func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
 	if err := c.checkFault("list"); err != nil {
@@ -231,6 +282,19 @@ func (c *S3Client) List(ctx context.Context, prefix string) ([]string, error) {
 	keys, err := c.backend.list(ctx, prefix)
 	c.observe("list", started, 0, err)
 	return keys, err
+}
+
+// ListEach streams keys with the given prefix to fn, one page at a time, so
+// callers never hold the full key set in memory. Iteration stops at the first
+// error returned by fn, which is propagated.
+func (c *S3Client) ListEach(ctx context.Context, prefix string, fn func(key string) error) error {
+	if err := c.checkFault("list"); err != nil {
+		return err
+	}
+	started := time.Now()
+	err := c.backend.listEach(ctx, prefix, fn)
+	c.observe("list", started, 0, err)
+	return err
 }
 
 // ConditionalPut writes data to key only if the current ETag matches etag.
@@ -301,8 +365,29 @@ func (m *memBackend) put(_ context.Context, key string, data []byte, _ PutOpts) 
 	copy(cp, data)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.objects[key] = memObject{data: cp, etag: uuid.NewString()}
+	m.objects[key] = memObject{data: cp, etag: uuid.NewString(), createdAt: time.Now()}
 	return nil
+}
+
+func (m *memBackend) putStream(_ context.Context, key string, r io.Reader, size int64, _ PutOpts) error {
+	data := make([]byte, size)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return fmt.Errorf("read streamed put: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects[key] = memObject{data: data, etag: uuid.NewString(), createdAt: time.Now()}
+	return nil
+}
+
+func (m *memBackend) stat(_ context.Context, key string) (time.Time, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	obj, ok := m.objects[key]
+	if !ok {
+		return time.Time{}, ErrNotFound
+	}
+	return obj.createdAt, nil
 }
 
 func (m *memBackend) get(_ context.Context, key string) ([]byte, error) {
@@ -368,6 +453,15 @@ func (m *memBackend) delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (m *memBackend) deleteMany(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, key := range keys {
+		delete(m.objects, key)
+	}
+	return nil
+}
+
 func (m *memBackend) list(_ context.Context, prefix string) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -381,6 +475,19 @@ func (m *memBackend) list(_ context.Context, prefix string) ([]string, error) {
 	// the diskless segment catalog) depend on that ordering.
 	sort.Strings(keys)
 	return keys, nil
+}
+
+func (m *memBackend) listEach(_ context.Context, prefix string, fn func(key string) error) error {
+	keys, err := m.list(context.Background(), prefix)
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := fn(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *memBackend) conditionalPut(_ context.Context, key string, data []byte, etag string) (string, error) {
@@ -406,7 +513,7 @@ func (m *memBackend) conditionalPut(_ context.Context, key string, data []byte, 
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	newEtag := uuid.NewString()
-	m.objects[key] = memObject{data: cp, etag: newEtag}
+	m.objects[key] = memObject{data: cp, etag: newEtag, createdAt: time.Now()}
 	return newEtag, nil
 }
 
@@ -515,6 +622,23 @@ func (b *awsS3Backend) put(ctx context.Context, key string, data []byte, opts Pu
 	return nil
 }
 
+func (b *awsS3Backend) putStream(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error {
+	input := &s3.PutObjectInput{
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(key),
+		Body:          r,
+		ContentLength: aws.Int64(size),
+	}
+	if opts.ContentType != "" {
+		input.ContentType = aws.String(opts.ContentType)
+	}
+	_, err := b.client.PutObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("s3 Put %q: %w", key, err)
+	}
+	return nil
+}
+
 func (b *awsS3Backend) get(ctx context.Context, key string) ([]byte, error) {
 	data, _, err := b.getWithETag(ctx, key)
 	return data, err
@@ -554,6 +678,23 @@ func (b *awsS3Backend) getRangeInto(ctx context.Context, key string, offset, len
 	return nil
 }
 
+func (b *awsS3Backend) stat(ctx context.Context, key string) (time.Time, error) {
+	out, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return time.Time{}, ErrNotFound
+		}
+		return time.Time{}, fmt.Errorf("s3 Stat %q: %w", key, err)
+	}
+	if out.LastModified != nil {
+		return *out.LastModified, nil
+	}
+	return time.Now(), nil
+}
+
 func (b *awsS3Backend) getWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	out, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
@@ -589,6 +730,34 @@ func (b *awsS3Backend) delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// deleteMany deletes keys in batches of up to 1000 per DeleteObjects call.
+// S3 DeleteObjects is idempotent (a missing key is not an error), matching
+// the per-key Delete semantics. A per-key error reported in the response body
+// aborts with that key named.
+func (b *awsS3Backend) deleteMany(ctx context.Context, keys []string) error {
+	const batchSize = 1000
+	for start := 0; start < len(keys); start += batchSize {
+		end := min(start+batchSize, len(keys))
+		objects := make([]s3types.ObjectIdentifier, 0, end-start)
+		for _, key := range keys[start:end] {
+			objects = append(objects, s3types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		out, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(b.bucket),
+			Delete: &s3types.Delete{Objects: objects},
+		})
+		if err != nil {
+			return fmt.Errorf("s3 DeleteObjects: %w", err)
+		}
+		for _, e := range out.Errors {
+			if e.Key != nil && e.Code != nil && aws.ToString(e.Code) != "NoSuchKey" {
+				return fmt.Errorf("s3 DeleteObjects: %s: %s", aws.ToString(e.Key), aws.ToString(e.Message))
+			}
+		}
+	}
+	return nil
+}
+
 func (b *awsS3Backend) list(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
 	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
@@ -607,6 +776,28 @@ func (b *awsS3Backend) list(ctx context.Context, prefix string) ([]string, error
 		}
 	}
 	return keys, nil
+}
+
+func (b *awsS3Backend) listEach(ctx context.Context, prefix string, fn func(key string) error) error {
+	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(b.bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("s3 List %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if err := fn(*obj.Key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (b *awsS3Backend) conditionalPut(ctx context.Context, key string, data []byte, etag string) (string, error) {

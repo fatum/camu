@@ -110,6 +110,16 @@ type Server struct {
 	// coordinationGCTick counts renewal ticks; GC runs every 10th tick.
 	coordinationGCTick uint64
 
+	// topicDeletionCh is the bounded queue for async topic-deletion workers,
+	// so a long cleanup never blocks the leader's GC tick. topicDeletionInflight
+	// deduplicates markers already being cleaned.
+	topicDeletionCh       chan topicDeletionRecord
+	topicDeletionInflight map[string]struct{}
+	topicDeletionMu       sync.Mutex
+	topicDeletionWG       sync.WaitGroup
+	topicDeletionCtx      context.Context
+	topicDeletionCancel   context.CancelFunc
+
 	sqlLimiter   chan struct{}
 	sqlDBMu      sync.Mutex
 	sqlDB        *sql.DB
@@ -405,6 +415,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	})
 	s.initialCoordination()
 	s.ready.Store(true)
+	s.startTopicDeletionWorkers()
 	s.startLeaseRenewal()
 	go func() { _ = s.httpServer.Serve(ln) }()
 	slog.Info("internal_server_started", "address", s.InternalAddress(), "protocol", "h2c")
@@ -774,6 +785,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.leaseWg.Wait()
 	}
 
+	// 5b. Stop async topic-deletion workers. In-flight cleanups abort at the
+	// next page boundary; their markers persist and a later pass resumes them.
+	s.stopTopicDeletionWorkers()
+
 	// 6. Deregister from cluster.
 	if s.registry != nil {
 		s.registry.Deregister(ctx)
@@ -1009,7 +1024,7 @@ func (s *Server) initialCoordination() {
 
 	// All instances apply assignments (acquire leases for assigned partitions).
 	s.applyAssignmentsForTopics(ctx, topics)
-	s.runPartitionMaintenance(ctx, topics)
+	s.runPartitionMaintenance(ctx, topics, nil)
 }
 
 // AcquireLeasesForTopic is called from handleCreateTopic when a new topic is
@@ -1667,13 +1682,16 @@ func (s *Server) renewLeases() {
 
 	// Partition leaders run partition-scoped maintenance on a slow cadence.
 	if s.coordinationGCTick%10 == 0 {
-		s.runPartitionMaintenance(ctx, topics)
+		s.runPartitionMaintenance(ctx, topics, s.buildDisklessFileIndex(ctx))
 	}
 
 	// Leader: periodically GC stale coordination files in S3.
 	s.coordinationGCTick++
 	if s.amLeader() && s.coordinationGCTick%10 == 0 {
+		fileIdx := s.buildDisklessFileIndex(ctx)
 		s.coordinationGC(ctx, topics)
+		s.sweepDisklessOrphans(ctx, fileIdx)
+		s.sweepDisklessArchiveOrphans(ctx, fileIdx)
 	}
 
 	// Evict stale idempotent producers every 10th tick.
@@ -1806,7 +1824,8 @@ func (s *Server) abortPromotionOnStaleISR(ctx context.Context, topic string, pid
 //
 // It also checks ownership, so callers can skip a separate isOwnedPartition
 // call on the produce hot path.
-func (s *Server) verifyProduceLeadership(topic string, partitionID int, localEpoch uint64) bool {	s.assignmentsMu.RLock()
+func (s *Server) verifyProduceLeadership(topic string, partitionID int, localEpoch uint64) bool {
+	s.assignmentsMu.RLock()
 	defer s.assignmentsMu.RUnlock()
 
 	parts, ok := s.myPartitions[topic]
@@ -1947,7 +1966,7 @@ func (s *Server) checkISRLag(ctx context.Context) {
 			}
 			// CheckISRLag mutates the ISR set, so it must run under the same
 			// partition lock as the replica fetch path (UpdateFollower).
-			changed := rs.CheckISRLag(30 * time.Second) || rs.ISRChanged()
+			changed := rs.CheckISRLag(30*time.Second) || rs.ISRChanged()
 			if !changed {
 				ps.mu.Unlock()
 				continue

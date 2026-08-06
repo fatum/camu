@@ -256,7 +256,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	partitions, err := parseIntOption("PARTITIONS", 4)
+	partitions, err := parseIntOption("PARTITIONS", 12)
 	if err != nil {
 		return config{}, err
 	}

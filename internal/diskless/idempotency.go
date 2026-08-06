@@ -39,3 +39,10 @@ func checkProducerSequence(producerID int64, allocSequence int64, allocCount int
 		return false, nil
 	}
 }
+
+func checkInitialProducerSequence(producerID, sequence int64) error {
+	if sequence != 0 {
+		return fmt.Errorf("%w: producer %d sent initial sequence %d, expected 0", ErrSequenceGap, producerID, sequence)
+	}
+	return nil
+}

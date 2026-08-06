@@ -868,6 +868,14 @@ func (a *integrationParquetAdapter) List(ctx context.Context, prefix string) ([]
 	return keys, translateStorageErr(err)
 }
 
+func (a *integrationParquetAdapter) ListEach(ctx context.Context, prefix string, fn func(key string) error) error {
+	return translateStorageErr(a.client.ListEach(ctx, prefix, fn))
+}
+
+func (a *integrationParquetAdapter) DeleteMany(ctx context.Context, keys []string) error {
+	return translateStorageErr(a.client.DeleteMany(ctx, keys))
+}
+
 func translateStorageErr(err error) error {
 	switch {
 	case err == nil:

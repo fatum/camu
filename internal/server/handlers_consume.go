@@ -14,6 +14,38 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
+// consumeStartOffset parses the requested read start offset from the query
+// string. Both `offset` and `start_offset` are accepted as aliases so clients
+// that pass `start_offset` (the name used across the codebase) are not silently
+// ignored. When both are present and disagree the request is rejected rather
+// than silently picking one.
+func consumeStartOffset(r *http.Request) (uint64, bool, error) {
+	offsetParam := r.URL.Query().Get("offset")
+	startParam := r.URL.Query().Get("start_offset")
+	var offset uint64
+	var err error
+	present := false
+	if offsetParam != "" {
+		offset, err = strconv.ParseUint(offsetParam, 10, 64)
+		if err != nil {
+			return 0, false, fmt.Errorf("invalid offset")
+		}
+		present = true
+	}
+	if startParam != "" {
+		var parsed uint64
+		parsed, err = strconv.ParseUint(startParam, 10, 64)
+		if err != nil {
+			return 0, false, fmt.Errorf("invalid start_offset")
+		}
+		if present && parsed != offset {
+			return 0, false, fmt.Errorf("offset and start_offset disagree")
+		}
+		offset, present = parsed, true
+	}
+	return offset, present, nil
+}
+
 func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	topicName := r.PathValue("topic")
 	partitionStr := r.PathValue("id")
@@ -26,13 +58,10 @@ func (s *Server) handleConsumeLowLevel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse query params.
-	var startOffset uint64
-	if v := r.URL.Query().Get("offset"); v != "" {
-		startOffset, err = strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid offset")
-			return
-		}
+	startOffset, _, err := consumeStartOffset(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	limit := 100
@@ -207,10 +236,11 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 			if parsed, err := strconv.ParseUint(lastID, 10, 64); err == nil {
 				startOffset = parsed + 1
 			}
-		} else if v := r.URL.Query().Get("offset"); v != "" {
-			if parsed, err := strconv.ParseUint(v, 10, 64); err == nil {
-				startOffset = parsed
-			}
+		} else if v, present, err := consumeStartOffset(r); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		} else if present {
+			startOffset = v
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -260,12 +290,11 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			startOffset = parsed + 1 // resume after last seen event
 		}
-	} else if v := r.URL.Query().Get("offset"); v != "" {
-		startOffset, err = strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid offset")
-			return
-		}
+	} else if v, present, err := consumeStartOffset(r); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	} else if present {
+		startOffset = v
 	}
 
 	// Get the partition index.

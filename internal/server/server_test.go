@@ -284,6 +284,73 @@ func TestHandleConsumeLowLevel_DisklessHonorsMessageLimit(t *testing.T) {
 	}
 }
 
+func TestHandleConsumeLowLevel_StartOffsetAlias(t *testing.T) {
+	s := newTestServer(t)
+	s.disklessMeta = diskless.NewMemoryMetaStore()
+	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{})
+	defer s.disklessEngine.Close()
+
+	tc := meta.TopicConfig{
+		Name:              "diskless-topic",
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		StorageMode:       "diskless",
+	}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	s.markTopicDiskless("diskless-topic")
+
+	for i := 0; i < 3; i++ {
+		_, err := s.disklessEngine.Produce(context.Background(), "diskless-topic", 0, log.EncodeRecordBatch(0, []log.Message{
+			{Key: []byte("k" + strconv.Itoa(i)), Value: []byte("v" + strconv.Itoa(i))},
+		}))
+		if err != nil {
+			t.Fatalf("disklessEngine.Produce() error = %v", err)
+		}
+	}
+
+	consume := func(query string) (*consumeResponse, int) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/topics/diskless-topic/partitions/0/messages?"+query, nil)
+		req.SetPathValue("topic", "diskless-topic")
+		req.SetPathValue("id", "0")
+		rec := httptest.NewRecorder()
+		s.handleConsumeLowLevel(rec, req)
+		var resp consumeResponse
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+		}
+		return &resp, rec.Code
+	}
+
+	// start_offset is honored like offset.
+	resp, code := consume("start_offset=1&limit=100")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(resp.Messages) != 2 || resp.Messages[0].Offset != 1 || resp.Messages[1].Offset != 2 || resp.NextOffset != 3 {
+		t.Fatalf("start_offset=1 => %+v, want offsets [1 2] next=3", resp.Messages)
+	}
+
+	// Conflicting aliases are rejected rather than silently picking one.
+	_, code = consume("offset=1&start_offset=2&limit=100")
+	if code != http.StatusBadRequest {
+		t.Fatalf("conflicting aliases status = %d, want 400", code)
+	}
+
+	// An invalid start_offset is rejected.
+	_, code = consume("start_offset=abc&limit=100")
+	if code != http.StatusBadRequest {
+		t.Fatalf("invalid start_offset status = %d, want 400", code)
+	}
+}
+
 func TestHandleProduceLowLevel_DisklessIdempotentRetryReturnsSameOffsets(t *testing.T) {
 	s := newTestServer(t)
 	s.disklessMeta = diskless.NewMemoryMetaStore()
@@ -307,7 +374,7 @@ func TestHandleProduceLowLevel_DisklessIdempotentRetryReturnsSameOffsets(t *test
 	s.myPartitions[tc.Name] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
 	s.assignmentsMu.Unlock()
 
-	body := `{"producer_id":7,"sequence":100,"messages":[{"key":"k1","value":"v1"},{"key":"k2","value":"v2"}]}`
+	body := `{"producer_id":7,"sequence":0,"messages":[{"key":"k1","value":"v1"},{"key":"k2","value":"v2"}]}`
 	produce := func() *produceResponse {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/v1/topics/diskless-topic/partitions/0/messages", strings.NewReader(body))
@@ -1884,26 +1951,11 @@ func TestHandleKafkaDeleteTopicsEnqueuesDisklessCleanup(t *testing.T) {
 		t.Fatalf("topicStore.Create() error = %v", err)
 	}
 
-	_, err := s.disklessMeta.AllocateOffsets(ctx, []diskless.OffsetAllocation{{
-		Topic:     "diskless-topic",
-		Partition: 0,
-		Count:     5,
-	}})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-	if err := s.disklessMeta.RegisterSegment(ctx, diskless.SegmentRecord{
-		FileKey: "seg-001.dat",
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  5,
-			ByteOffset: 0,
-			ByteLength: 500,
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment() error = %v", err)
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "seg-001", FileKey: "seg-001.dat", Topic: "diskless-topic", Partition: 0,
+		Count: 5, ByteLength: 500,
+	}}); err != nil {
+		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
 
 	head, err := s.disklessMeta.GetPartitionHead(ctx, "diskless-topic", 0)
@@ -2145,40 +2197,13 @@ func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *
 		t.Fatalf("s3Client.Put fresh batch error = %v", err)
 	}
 
-	_, err := s.disklessMeta.AllocateOffsets(context.Background(), []diskless.OffsetAllocation{
-		{Topic: "diskless-topic", Partition: 0, Count: 2},
-	})
-	if err != nil {
-		t.Fatalf("AllocateOffsets() error = %v", err)
-	}
-
-	if err := s.disklessMeta.RegisterSegment(context.Background(), diskless.SegmentRecord{
-		FileKey:   oldFileKey,
-		CreatedAt: time.Now().Add(-2 * time.Hour),
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 0,
-			EndOffset:  1,
-			ByteOffset: 0,
-			ByteLength: int64(len(oldBatch)),
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment(old) error = %v", err)
-	}
-	if err := s.disklessMeta.RegisterSegment(context.Background(), diskless.SegmentRecord{
-		FileKey:   freshFileKey,
-		CreatedAt: time.Now(),
-		Batches: []diskless.BatchRef{{
-			Topic:      "diskless-topic",
-			Partition:  0,
-			BaseOffset: 1,
-			EndOffset:  2,
-			ByteOffset: 0,
-			ByteLength: int64(len(freshBatch)),
-		}},
-	}); err != nil {
-		t.Fatalf("RegisterSegment(fresh) error = %v", err)
+	for _, batch := range []diskless.UploadedBatch{
+		{BatchID: "old", FileKey: oldFileKey, Topic: "diskless-topic", Partition: 0, Count: 1, ByteLength: int64(len(oldBatch)), CreatedAt: time.Now().Add(-2 * time.Hour)},
+		{BatchID: "fresh", FileKey: freshFileKey, Topic: "diskless-topic", Partition: 0, Count: 1, ByteLength: int64(len(freshBatch)), CreatedAt: time.Now()},
+	} {
+		if _, err := s.disklessMeta.CommitUploadedBatches(context.Background(), []diskless.UploadedBatch{batch}); err != nil {
+			t.Fatalf("CommitUploadedBatches() error = %v", err)
+		}
 	}
 
 	topics, err := s.topicStore.List(context.Background())
@@ -2198,7 +2223,7 @@ func TestDisklessRetentionCleanupDeletesExpiredDataAndAdvancesEarliestOffset(t *
 		0: {Owned: true, LeaderEpoch: 9},
 	}
 	s.assignmentsMu.Unlock()
-	s.runPartitionMaintenance(context.Background(), topics)
+	s.runPartitionMaintenance(context.Background(), topics, nil)
 
 	if _, err := s.s3Client.Get(context.Background(), oldFileKey); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected expired diskless file to be deleted by owner maintenance, got %v", err)

@@ -95,6 +95,28 @@ func (m *memStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (m *memStore) ListEach(_ context.Context, prefix string, fn func(key string) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range m.objects {
+		if strings.HasPrefix(k, prefix) {
+			if err := fn(k); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *memStore) DeleteMany(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, key := range keys {
+		delete(m.objects, key)
+	}
+	return nil
+}
+
 // --- jobqueue.ObjectStore: Put only (the other methods above already
 // satisfy the jobqueue interface by shape). ---
 

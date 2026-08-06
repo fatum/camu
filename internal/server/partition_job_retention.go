@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/pipeline"
@@ -101,16 +102,23 @@ func (s *Server) discoverClassicRetentionJobs(ctx context.Context, tc meta.Topic
 	}
 }
 
-func (s *Server) discoverDisklessRetentionJobs(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity) {
+func (s *Server) discoverDisklessRetentionJobs(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, fileIdx *diskless.FileIndex) {
 	if s.disklessMeta == nil {
 		return
 	}
 
 	cutoff := time.Now().Add(-tc.Retention)
-	fileKeys, err := s.disklessMeta.PlanExpiredFileDeletes(ctx, tc.Name, identity.Partition, cutoff)
-	if err != nil {
-		slog.Warn("diskless_retention_plan_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
-		return
+	var fileKeys []string
+	if fileIdx != nil {
+		// Use the shared per-pass index: no per-partition metadata scans.
+		fileKeys = planExpiredFilesFromIndex(fileIdx, tc.Name, identity.Partition, cutoff)
+	} else {
+		var err error
+		fileKeys, err = s.disklessMeta.PlanExpiredFileDeletes(ctx, tc.Name, identity.Partition, cutoff)
+		if err != nil {
+			slog.Warn("diskless_retention_plan_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			return
+		}
 	}
 
 	// A flush can pack batches for several partitions into one data file, so a
@@ -119,7 +127,7 @@ func (s *Server) discoverDisklessRetentionJobs(ctx context.Context, tc meta.Topi
 	// partition behind its Parquet checkpoint would otherwise permanently lose
 	// committed records. Mirror the classic checkpoint gate per partition.
 	for _, fileKey := range fileKeys {
-		safe, err := s.disklessFileExported(ctx, fileKey)
+		safe, err := s.disklessFileExported(ctx, fileKey, fileIdx)
 		if err != nil {
 			slog.Warn("diskless_retention_export_gate_failed", "topic", tc.Name, "partition", identity.Partition, "file", fileKey, "error", err)
 			return
@@ -152,16 +160,41 @@ func (s *Server) discoverDisklessRetentionJobs(ctx context.Context, tc meta.Topi
 	}
 }
 
+// planExpiredFilesFromIndex returns, for one partition, the file keys whose refs
+// in that partition are all expired and whose remaining refs anywhere (if any)
+// are also expired — equivalent to PlanExpiredFileDeletes, but computed from
+// the shared per-pass index instead of re-enumerating metadata per file.
+func planExpiredFilesFromIndex(idx *diskless.FileIndex, topic string, partition int, cutoff time.Time) []string {
+	pl := idx.PartitionFileLatest(topic, partition)
+	var out []string
+	for file, latestInPartition := range pl {
+		if latestInPartition.After(cutoff) {
+			continue // this partition still has a fresh ref to the file
+		}
+		if idx.FileLatest[file].After(cutoff) {
+			continue // another partition still references it freshly
+		}
+		out = append(out, file)
+	}
+	return out
+}
+
 // disklessFileExported reports whether every ref into fileKey is covered by the
 // Parquet checkpoint of its owning partition. A data file can be shared across
 // partitions (one flush packs several partitions into a single object), so all
 // of them must be exported before retention may delete it. Non-exporting
 // partitions have no dependent pipeline and are not gated. A missing checkpoint
 // (boundary 0, nothing exported) blocks deletion.
-func (s *Server) disklessFileExported(ctx context.Context, fileKey string) (bool, error) {
-	refs, err := s.disklessMeta.ListFileRefs(ctx, fileKey)
-	if err != nil {
-		return false, err
+func (s *Server) disklessFileExported(ctx context.Context, fileKey string, fileIdx *diskless.FileIndex) (bool, error) {
+	var refs []diskless.FileRef
+	if fileIdx != nil {
+		refs = fileIdx.ByFile[fileKey]
+	} else {
+		var err error
+		refs, err = s.disklessMeta.ListFileRefs(ctx, fileKey)
+		if err != nil {
+			return false, err
+		}
 	}
 	boundaries := make(map[string]int64)
 	for _, fr := range refs {
@@ -330,7 +363,7 @@ func (s *Server) runDisklessRetentionJob(ctx context.Context, job PartitionJob, 
 			// Re-check export coverage at run time: a job enqueued before the
 			// checkpoint gate, or one that raced the exporter, must not delete a
 			// shared file while any partition's refs into it are unexported.
-			if ok, err := s.disklessFileExported(ctx, payload.FileKey); err != nil {
+			if ok, err := s.disklessFileExported(ctx, payload.FileKey, nil); err != nil {
 				return err
 			} else if !ok {
 				return nil // retry on a later maintenance tick

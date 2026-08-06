@@ -233,7 +233,7 @@ func TestRunPartitionMaintenanceAutoDiscoversAndExecutesClassicSegmentMerge(t *t
 		t.Fatalf("buildClassicSegmentMergeArtifact() error = %v", err)
 	}
 
-	s.runPartitionMaintenance(ctx, []meta.TopicConfig{tc})
+	s.runPartitionMaintenance(ctx, []meta.TopicConfig{tc}, nil)
 
 	if _, err := s.s3Client.Get(ctx, expected.Ref.MetaObjectKey()); err != nil {
 		t.Fatalf("expected merged metadata to exist: %v", err)

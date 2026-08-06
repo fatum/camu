@@ -1678,18 +1678,20 @@ func (pm *PartitionManager) readRawBatchesWithUpperBound(ctx context.Context, to
 					continue
 				}
 
-				buf := make([]byte, entry.BatchSize)
-				n, err := activeSeg.ReadAt(buf, entry.Position)
+				// Read the batch directly into the page buffer instead of a
+				// scratch buf, avoiding a second copy per batch.
+				if len(out) > 0 && len(out)+int(entry.BatchSize) > maxBytes {
+					break
+				}
+				out = append(out, make([]byte, entry.BatchSize)...)
+				start := len(out) - int(entry.BatchSize)
+				n, err := activeSeg.ReadAt(out[start:], entry.Position)
 				if err != nil && n < int(entry.BatchSize) {
+					out = out[:start+n]
 					break
 				}
-				buf = buf[:n]
+				out = out[:start+n]
 
-				// Always include at least one batch even if it exceeds remaining.
-				if len(out) > 0 && len(out)+len(buf) > maxBytes {
-					break
-				}
-				out = append(out, buf...)
 				remaining = maxBytes - len(out)
 				if remaining <= 0 {
 					break

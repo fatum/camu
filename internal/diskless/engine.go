@@ -21,10 +21,15 @@ type Engine struct {
 	reader    *Reader
 	buf       *Buffer
 	cfg       EngineConfig
-	flushMu   sync.Mutex
+	flushSem  chan struct{}
 	lingerRst chan struct{} // signals linger timer to start
 	stop      chan struct{}
 	wg        sync.WaitGroup
+	// produceMu serializes Produce against Close. triggerFlush calls wg.Add
+	// from Produce, which must never race Close's wg.Wait: Close takes the
+	// write lock so no Produce (and therefore no wg.Add) can be in flight when
+	// it waits.
+	produceMu sync.RWMutex
 }
 
 // NewEngine creates an Engine that flushes to s3 via meta, identified by nodeID.
@@ -35,6 +40,7 @@ func NewEngine(s3 *storage.S3Client, meta MetaStore, nodeID string, cfg EngineCo
 		buf:       NewBuffer(cfg.MaxBatchBytes),
 		cfg:       cfg,
 		lingerRst: make(chan struct{}, 1),
+		flushSem:  make(chan struct{}, 4),
 		stop:      make(chan struct{}),
 	}
 	e.wg.Add(1)
@@ -45,23 +51,25 @@ func NewEngine(s3 *storage.S3Client, meta MetaStore, nodeID string, cfg EngineCo
 // Produce appends a batch to the buffer and blocks until flush completes.
 // Callee takes ownership of batch — caller must not mutate it after this call.
 func (e *Engine) Produce(ctx context.Context, topic string, partition int, batch []byte) (FlushResult, error) {
+	e.produceMu.RLock()
+	defer e.produceMu.RUnlock()
+
 	done := make(chan FlushResult, 1)
-	e.buf.Append(BufferEntry{
+	// Append both stores the entry and reports the size threshold in one lock,
+	// so Produce never takes the buffer lock twice per request.
+	if e.buf.Append(BufferEntry{
 		Topic:     topic,
 		Partition: partition,
 		Batch:     batch,
 		Done:      done,
-	})
+	}) {
+		e.triggerFlush()
+	}
 
 	// Signal linger timer (non-blocking).
 	select {
 	case e.lingerRst <- struct{}{}:
 	default:
-	}
-
-	// Flush immediately if buffer exceeds threshold.
-	if e.buf.ShouldFlush() {
-		e.triggerFlush()
 	}
 
 	// Wait for result or context cancellation.
@@ -80,6 +88,8 @@ func (e *Engine) Fetch(ctx context.Context, topic string, partition int, fromOff
 
 // Close stops the linger loop and performs a final flush.
 func (e *Engine) Close() {
+	e.produceMu.Lock()
+	defer e.produceMu.Unlock()
 	close(e.stop)
 	e.wg.Wait()
 }
@@ -120,18 +130,24 @@ func (e *Engine) lingerLoop() {
 }
 
 func (e *Engine) triggerFlush() {
-	e.flushMu.Lock()
-	defer e.flushMu.Unlock()
-
 	entries := e.buf.Drain()
 	if len(entries) == 0 {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := e.writer.Flush(ctx, entries); err != nil {
-		slog.Error("diskless_flush_error", "error", err)
-	}
+	// Never serialize the expensive upload/commit path engine-wide. Drained
+	// flushes retain bounded work (four files) and the Writer further bounds
+	// commit concurrency. Offset order remains exclusively in the metastore.
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		// Close waits for queued work; it does not discard already accepted data.
+		e.flushSem <- struct{}{}
+		defer func() { <-e.flushSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := e.writer.Flush(ctx, entries); err != nil {
+			slog.Error("diskless_flush_error", "error", err, "phase", "upload_or_commit")
+		}
+	}()
 }
