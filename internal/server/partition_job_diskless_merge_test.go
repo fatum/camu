@@ -9,11 +9,46 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )
+
+// stubLimitedMetaStore implements diskless.MetaStore plus the item-transaction
+// limit of the DynamoDB metastore, so the effective merge cap can be tested
+// without a live DynamoDB. No methods are exercised by those tests.
+type stubLimitedMetaStore struct{ limit int }
+
+func (s *stubLimitedMetaStore) ReplaceItemLimit() int { return s.limit }
+func (s *stubLimitedMetaStore) CommitUploadedBatches(context.Context, []diskless.UploadedBatch) ([]diskless.OffsetResult, error) {
+	return nil, nil
+}
+func (s *stubLimitedMetaStore) QuerySegments(context.Context, string, int, int64, int) ([]diskless.SegmentRef, error) {
+	return nil, nil
+}
+func (s *stubLimitedMetaStore) ReplaceSegmentRefs(context.Context, string, int, []diskless.RefKey, []diskless.SegmentRef) error {
+	return nil
+}
+func (s *stubLimitedMetaStore) GetPartitionHead(context.Context, string, int) (int64, error) { return 0, nil }
+func (s *stubLimitedMetaStore) GetCommittedHead(context.Context, string, int) (int64, error) { return 0, nil }
+func (s *stubLimitedMetaStore) GetPartitionStart(context.Context, string, int) (int64, error) { return 0, nil }
+func (s *stubLimitedMetaStore) PlanExpiredFileDeletes(context.Context, string, int, time.Time) ([]string, error) {
+	return nil, nil
+}
+func (s *stubLimitedMetaStore) DeleteFileRefs(context.Context, string) error { return nil }
+func (s *stubLimitedMetaStore) ListFileRefs(context.Context, string) ([]diskless.FileRef, error) {
+	return nil, nil
+}
+func (s *stubLimitedMetaStore) PlanUnreferencedFileDeletes(context.Context, []string) ([]string, error) {
+	return nil, nil
+}
+func (s *stubLimitedMetaStore) ArchiveCommitted(context.Context, string, int, int64, time.Time) (int, error) {
+	return 0, nil
+}
+func (s *stubLimitedMetaStore) DeleteTopic(context.Context, string) error { return nil }
+func (s *stubLimitedMetaStore) Close() error                             { return nil }
 
 // TestDisklessSegmentMerge verifies the full compaction flow: discovery of a
 // contiguous committed run, publication of a merged ref, and deletion of the
@@ -431,5 +466,98 @@ func TestDisklessSegmentMergeDropsJobWhenSourcesRetained(t *testing.T) {
 	}
 	if len(jobs) != 0 {
 		t.Fatalf("wedged merge job not dropped: %d job(s) remain", len(jobs))
+	}
+}
+
+// TestEffectiveDisklessMergeMaxSegments verifies the per-run file cap is
+// metastore-aware: the S3 metastore defaults to the unbounded safety cap so a
+// run reaches the byte target in one pass (never re-reading a merged chunk),
+// while the DynamoDB metastore keeps its transaction-tuned default and clamps
+// an explicit override to fit the 100-item limit.
+func TestEffectiveDisklessMergeMaxSegments(t *testing.T) {
+	s := newTestServer(t)
+	cfg := config.CompactionConfig{Enabled: true, TargetBytes: 64 << 20}
+
+	// S3 metastore: no transaction item limit, so the default is the unbounded
+	// safety cap and the byte target bounds the run.
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	if got := s.effectiveDisklessMergeMaxSegments(cfg); got != maxDisklessMergeSegmentsUnbounded {
+		t.Fatalf("s3 default cap = %d, want %d", got, maxDisklessMergeSegmentsUnbounded)
+	}
+	cfg.MaxSegmentsPerMerge = 2000
+	if got := s.effectiveDisklessMergeMaxSegments(cfg); got != 2000 {
+		t.Fatalf("s3 explicit cap = %d, want 2000", got)
+	}
+
+	// DynamoDB metastore: DynamoDB-tuned default, clamped to the transaction limit.
+	cfg.MaxSegmentsPerMerge = 0
+	s.disklessMeta = &stubLimitedMetaStore{limit: 100}
+	if got := s.effectiveDisklessMergeMaxSegments(cfg); got != 90 {
+		t.Fatalf("dynamo default cap = %d, want 90", got)
+	}
+	cfg.MaxSegmentsPerMerge = 5000
+	if got := s.effectiveDisklessMergeMaxSegments(cfg); got != 99 {
+		t.Fatalf("dynamo clamped cap = %d, want 99", got)
+	}
+}
+
+// TestDisklessSegmentMergeReachesByteTargetInOnePass verifies that on the S3
+// metastore a discovery run is bounded by the byte target rather than the
+// DynamoDB-tuned 90-file cap, so a merged chunk reaches target in a single
+// merge and compaction never re-reads it. With 100-byte refs and a 10,000-byte
+// target the run must cover 100 refs, not 90.
+func TestDisklessSegmentMergeReachesByteTargetInOnePass(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 4
+	s.cfg.Diskless.Compaction.TargetBytes = 10000
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	for i := 0; i < 300; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
+		data := bytes.Repeat([]byte{byte('a' + i%26)}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 merge job, got %d", len(jobs))
+	}
+	var payload DisklessMergePayload
+	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
+		t.Fatalf("decode merge payload: %v", err)
+	}
+	if len(payload.Sources) != 100 {
+		t.Fatalf("run covers %d sources, want 100 (byte target must bound the run, not the 90-file cap)", len(payload.Sources))
 	}
 }

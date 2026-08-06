@@ -87,6 +87,15 @@ type MetaStore interface {
 	Close() error
 }
 
+// ReplaceItemLimited is implemented by metastores whose ReplaceSegmentRefs
+// atomically rewrites refs inside a single bounded transaction. DynamoDB caps
+// TransactWriteItems at 100 operations; the S3 head-CAS and in-memory
+// metastores have no such bound, so a compaction run can replace a full
+// target-sized batch in one call.
+type ReplaceItemLimited interface {
+	ReplaceItemLimit() int
+}
+
 // parsePartitionKey splits a partition key of the form "topic#partition". The
 // partition is the segment after the last "#", so topic names containing "#"
 // are preserved.

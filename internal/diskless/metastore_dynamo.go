@@ -14,6 +14,18 @@ import (
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+// dynamoReplaceItemLimit is DynamoDB's hard cap on the number of items a single
+// TransactWriteItems call can touch. Every segment ref remove or add is one
+// item operation, so ReplaceSegmentRefs (and a compaction run) must stay under
+// it. There is no equivalent bound on the S3 or in-memory metastores.
+const dynamoReplaceItemLimit = 100
+
+// ReplaceItemLimit reports the per-transaction item cap, satisfying
+// diskless.ReplaceItemLimited.
+func (d *DynamoMetaStore) ReplaceItemLimit() int {
+	return dynamoReplaceItemLimit
+}
+
 type dynamoUploadState struct {
 	NextOffset int64                            `json:"next_offset"`
 	Producers  map[string][]dynamoProducerBatch `json:"producers,omitempty"`
@@ -213,8 +225,8 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 // watermark is not modified. A transaction is limited to 100 operations, so a
 // merge run must stay within that bound.
 func (d *DynamoMetaStore) ReplaceSegmentRefs(ctx context.Context, topic string, partition int, remove []RefKey, add []SegmentRef) error {
-	if len(remove)+len(add) > 100 {
-		return fmt.Errorf("replace segment refs: %d operations exceed the 100-item transaction limit", len(remove)+len(add))
+	if len(remove)+len(add) > dynamoReplaceItemLimit {
+		return fmt.Errorf("replace segment refs: %d operations exceed the %d-item transaction limit", len(remove)+len(add), dynamoReplaceItemLimit)
 	}
 	pk := partitionKey(topic, partition)
 	now := time.Now()
