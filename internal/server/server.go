@@ -107,8 +107,23 @@ type Server struct {
 	// assignments applied, partitions initialized).
 	ready atomic.Bool
 
-	// coordinationGCTick counts renewal ticks; GC runs every 10th tick.
+	// coordinationGCTick counts renewal ticks; a maintenance pass is
+	// triggered every 10th tick.
 	coordinationGCTick uint64
+
+	// maintenanceBusy prevents overlapping maintenance passes. A pass (file
+	// index build, partition jobs, leader GC, orphan sweeps) lists and stats
+	// the whole object store and can take minutes, so it runs on a background
+	// goroutine: it must never delay heartbeat or lease renewal in the
+	// coordination loop.
+	maintenanceBusy atomic.Bool
+	// maintenanceWg tracks in-flight maintenance passes for shutdown.
+	maintenanceWg sync.WaitGroup
+	// maintenanceCtx is cancelled at shutdown to abort an in-flight pass so it
+	// drains without racing the teardown of the diskless engine and partition
+	// state it uses.
+	maintenanceCtx    context.Context
+	maintenanceCancel context.CancelFunc
 
 	// topicDeletionCh is the bounded queue for async topic-deletion workers,
 	// so a long cleanup never blocks the leader's GC tick. topicDeletionInflight
@@ -288,6 +303,7 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	s.idempotencyManager = idempotencyMgr
 	s.myPartitions = make(map[string]map[int]localPartitionAssignment)
 	s.leaseStop = make(chan struct{})
+	s.maintenanceCtx, s.maintenanceCancel = context.WithCancel(context.Background())
 	s.leaseTTL = leaseTTL
 	s.leaseRenewalInterval = leaseRenewalInterval
 	s.replicationTimeout = replicationTimeout
@@ -735,6 +751,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// 1. Stop accepting new writes.
 	s.shuttingDown.Store(true)
 	s.stopAllParquetConsumers()
+
+	// 1b. Abort any in-flight background maintenance pass and wait for it to
+	// drain before closing the diskless engine and partition state it uses.
+	if s.maintenanceCancel != nil {
+		s.maintenanceCancel()
+	}
+	s.maintenanceWg.Wait()
 
 	// 2. Shut down HTTP servers (waits for in-flight requests to finish).
 	httpErr := s.httpServer.Shutdown(ctx)
@@ -1680,18 +1703,17 @@ func (s *Server) renewLeases() {
 	// Check ISR lag for leader partitions and update S3 if changed.
 	s.checkISRLag(ctx)
 
-	// Partition leaders run partition-scoped maintenance on a slow cadence.
-	if s.coordinationGCTick%10 == 0 {
-		s.runPartitionMaintenance(ctx, topics, s.buildDisklessFileIndex(ctx))
-	}
-
-	// Leader: periodically GC stale coordination files in S3.
+	// Partition maintenance (export pipeline, retention, segment merge) and the
+	// leader's coordination GC + diskless orphan sweeps are heavy: they list and
+	// stat the whole object store and can take minutes on a large cluster. Run
+	// them on a background goroutine so a slow pass can never delay the
+	// heartbeat or lease renewal in this loop. A pass is triggered every 10th
+	// tick but skipped while a previous pass is still running, so the cadence
+	// degrades gracefully instead of stacking passes.
 	s.coordinationGCTick++
-	if s.amLeader() && s.coordinationGCTick%10 == 0 {
-		fileIdx := s.buildDisklessFileIndex(ctx)
-		s.coordinationGC(ctx, topics)
-		s.sweepDisklessOrphans(ctx, fileIdx)
-		s.sweepDisklessArchiveOrphans(ctx, fileIdx)
+	if s.coordinationGCTick%10 == 0 && s.maintenanceBusy.CompareAndSwap(false, true) {
+		s.maintenanceWg.Add(1)
+		go s.runMaintenancePass()
 	}
 
 	// Evict stale idempotent producers every 10th tick.
@@ -1699,6 +1721,34 @@ func (s *Server) renewLeases() {
 		if evicted := s.partitionManager.EvictStaleProducers(30 * time.Minute); evicted > 0 {
 			slog.Info("idempotency_evicted_stale_producers", "count", evicted)
 		}
+	}
+}
+
+// runMaintenancePass executes one background maintenance pass off the
+// coordination loop: partition-scoped jobs (parquet export pipeline, retention,
+// segment merge) on every node, plus the leader-only coordination GC and
+// diskless orphan sweeps. Topics are listed and the diskless file index is
+// built once per pass and shared across the jobs and sweeps. The pass runs on
+// s.maintenanceCtx so shutdown cancels it at the next S3 operation instead of
+// letting it block teardown.
+func (s *Server) runMaintenancePass() {
+	defer s.maintenanceWg.Done()
+	defer s.maintenanceBusy.Store(false)
+	ctx := s.maintenanceCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	topics, err := s.topicStore.List(ctx)
+	if err != nil {
+		slog.Warn("maintenance: list topics", "error", err)
+		return
+	}
+	fileIdx := s.buildDisklessFileIndex(ctx)
+	s.runPartitionMaintenance(ctx, topics, fileIdx)
+	if s.amLeader() {
+		s.coordinationGC(ctx, topics)
+		s.sweepDisklessOrphans(ctx, fileIdx)
+		s.sweepDisklessArchiveOrphans(ctx, fileIdx)
 	}
 }
 
