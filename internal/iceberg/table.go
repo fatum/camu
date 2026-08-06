@@ -74,9 +74,10 @@ func (ts *TableStore) metadataFileKey(topic string, version int) string {
 }
 
 // dataFileKey returns the content-addressed data-file key under the table's
-// data directory. id must identify the file (see exportFileID).
-func (ts *TableStore) dataFileKey(topic, id string) string {
-	return ts.dataDir(topic) + id + ".parquet"
+// data directory, laid out by the dt/hour partition values. id must identify
+// the file (see exportFileID).
+func (ts *TableStore) dataFileKey(topic, id, dt string, hour int) string {
+	return fmt.Sprintf("%sdt=%s/hour=%02d/%s.parquet", ts.dataDir(topic), dt, hour, id)
 }
 
 // ExportDataFileKey returns the deterministic data-file key for one exported
@@ -85,8 +86,9 @@ func (ts *TableStore) dataFileKey(topic, id string) string {
 // segment being exported; together they make retries converge on one object.
 func (ts *TableStore) ExportDataFileKey(topic string, partition int, ingestTime time.Time, base, end int64, sourceIdentity string) string {
 	dt, hour := BucketDateHour(ingestTime)
+	hourInt, _ := strconv.Atoi(hour)
 	id := exportFileID(topic, partition, dt, hour, base, end, 1, sourceIdentity)
-	return ts.dataFileKey(topic, id)
+	return ts.dataFileKey(topic, id, dt, hourInt)
 }
 
 // Create initializes a new table with no snapshots. It fails with ErrConflict
@@ -222,6 +224,7 @@ func (ts *TableStore) CommitSnapshot(ctx context.Context, topic string, files []
 				AddedFilesCount:    len(files),
 				ExistingFilesCount: len(entries) - len(files),
 				AddedRowsCount:     addedRows,
+				Partitions:         partitionSummariesFor(entryFiles(entries)),
 			}}
 		} else {
 			manifestKey, manifestLen, err := ts.writeManifestFile(ctx, topic, snapshotID, added)
@@ -238,6 +241,7 @@ func (ts *TableStore) CommitSnapshot(ctx context.Context, topic string, files []
 				AddedSnapshotID:   snapshotID,
 				AddedFilesCount:   len(files),
 				AddedRowsCount:    addedRows,
+				Partitions:        partitionSummariesFor(files),
 			})
 		}
 		listKey, _, err := ts.writeManifestListFile(ctx, topic, snapshotID, list)

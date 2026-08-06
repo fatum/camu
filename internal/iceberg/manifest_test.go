@@ -15,6 +15,8 @@ func TestManifestWriteReadRoundTrip(t *testing.T) {
 				Content:       DataFileContentData,
 				FilePath:      "warehouse/events/data/abc.parquet",
 				FileFormat:    DataFileFormatParquet,
+				DT:            "2026-08-06",
+				Hour:          13,
 				RecordCount:   10,
 				FileSizeBytes: 2048,
 			},
@@ -27,6 +29,8 @@ func TestManifestWriteReadRoundTrip(t *testing.T) {
 				Content:       DataFileContentData,
 				FilePath:      "warehouse/events/data/def.parquet",
 				FileFormat:    DataFileFormatParquet,
+				DT:            "2026-08-06",
+				Hour:          14,
 				RecordCount:   3,
 				FileSizeBytes: 512,
 			},
@@ -51,7 +55,7 @@ func TestManifestWriteReadRoundTrip(t *testing.T) {
 		if e.Status != entries[i].Status || e.SnapshotID != entries[i].SnapshotID || e.SequenceNumber != entries[i].SequenceNumber {
 			t.Fatalf("entry %d = %+v, want %+v", i, e, entries[i])
 		}
-		if e.DataFile.FilePath != entries[i].DataFile.FilePath || e.DataFile.FileFormat != "PARQUET" || e.DataFile.RecordCount != entries[i].DataFile.RecordCount || e.DataFile.FileSizeBytes != entries[i].DataFile.FileSizeBytes || e.DataFile.Content != DataFileContentData {
+		if e.DataFile.FilePath != entries[i].DataFile.FilePath || e.DataFile.FileFormat != "PARQUET" || e.DataFile.DT != entries[i].DataFile.DT || e.DataFile.Hour != entries[i].DataFile.Hour || e.DataFile.RecordCount != entries[i].DataFile.RecordCount || e.DataFile.FileSizeBytes != entries[i].DataFile.FileSizeBytes || e.DataFile.Content != DataFileContentData {
 			t.Fatalf("entry %d data file = %+v, want %+v", i, e.DataFile, entries[i].DataFile)
 		}
 	}
@@ -69,6 +73,10 @@ func TestManifestListWriteReadRoundTrip(t *testing.T) {
 			AddedSnapshotID:   42,
 			AddedFilesCount:   2,
 			AddedRowsCount:    13,
+			Partitions: []PartitionFieldSummary{
+				{ContainsNull: false, LowerBound: []byte("2026-08-06"), UpperBound: []byte("2026-08-06")},
+				{ContainsNull: false, LowerBound: []byte{26}, UpperBound: []byte{28}},
+			},
 		},
 	}
 	var buf bytes.Buffer
@@ -88,7 +96,7 @@ func TestManifestListWriteReadRoundTrip(t *testing.T) {
 	}
 	m := got[0]
 	want := manifests[0]
-	if m.ManifestPath != want.ManifestPath || m.ManifestLength != want.ManifestLength || m.PartitionSpecID != 0 || m.Content != DataFileContentData || m.SequenceNumber != 1 || m.MinSequenceNumber != 1 || m.AddedSnapshotID != 42 || m.AddedFilesCount != 2 || m.AddedRowsCount != 13 {
+	if m.ManifestPath != want.ManifestPath || m.ManifestLength != want.ManifestLength || m.PartitionSpecID != 0 || m.Content != DataFileContentData || m.SequenceNumber != 1 || m.MinSequenceNumber != 1 || m.AddedSnapshotID != 42 || m.AddedFilesCount != 2 || m.AddedRowsCount != 13 || len(m.Partitions) != 2 || !bytes.Equal(m.Partitions[0].LowerBound, want.Partitions[0].LowerBound) || !bytes.Equal(m.Partitions[1].UpperBound, want.Partitions[1].UpperBound) {
 		t.Fatalf("manifest list row = %+v, want %+v", m, want)
 	}
 }

@@ -46,10 +46,12 @@ func (c Chunk) Cleanup() {
 }
 
 // EncodeChunk validates and encodes one committed source range into a
-// temporary Parquet file. It does not retain a second []log.Message containing
-// every valid record: the source reader's batch stays the only full in-memory
-// source range. The chunk file is removed by Cleanup.
-func EncodeChunk(dir string, messages []log.Message, schema *meta.TopicSchema) (Chunk, error) {
+// temporary Parquet file. dt and hour are the ingest-time partition values
+// written on every row (they drive the Iceberg partition spec). It does not
+// retain a second []log.Message containing every valid record: the source
+// reader's batch stays the only full in-memory source range. The chunk file is
+// removed by Cleanup.
+func EncodeChunk(dir string, messages []log.Message, schema *meta.TopicSchema, dt string, hour int32) (Chunk, error) {
 	if dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Chunk{}, fmt.Errorf("create parquet temp directory: %w", err)
@@ -72,7 +74,7 @@ func EncodeChunk(dir string, messages []log.Message, schema *meta.TopicSchema) (
 	encoder := newParquetRowEncoder(fileSchema, schema)
 	chunk := Chunk{}
 	for _, m := range messages {
-		row, err := encoder.row(m)
+		row, err := encoder.row(m, dt, hour)
 		if err != nil {
 			if schema != nil {
 				chunk.Failures = append(chunk.Failures, SchemaFailure{Message: m, Err: err})
@@ -110,6 +112,8 @@ func parquetSchema(topicSchema *meta.TopicSchema) *parquet.Schema {
 		"key":              parquet.Leaf(parquet.ByteArrayType),
 		"value":            parquet.Leaf(parquet.ByteArrayType),
 		"headers":          parquet.String(),
+		"dt":               parquet.String(),
+		"hour":             parquet.Int(32),
 	}
 	if topicSchema != nil {
 		for _, field := range topicSchema.Fields {
@@ -153,7 +157,7 @@ func newParquetRowEncoder(fileSchema *parquet.Schema, schema *meta.TopicSchema) 
 	return &parquetRowEncoder{schema: schema, builder: parquet.NewRowBuilder(fileSchema), columns: columns}
 }
 
-func (e *parquetRowEncoder) row(m log.Message) (parquet.Row, error) {
+func (e *parquetRowEncoder) row(m log.Message, dt string, hour int32) (parquet.Row, error) {
 	headersJSON := ""
 	if len(m.Headers) > 0 {
 		b, _ := json.Marshal(m.Headers)
@@ -165,6 +169,8 @@ func (e *parquetRowEncoder) row(m log.Message) (parquet.Row, error) {
 	e.builder.Add(e.columns["key"], parquet.ByteArrayValue(m.Key))
 	e.builder.Add(e.columns["value"], parquet.ByteArrayValue(m.Value))
 	e.builder.Add(e.columns["headers"], parquet.ValueOf(headersJSON))
+	e.builder.Add(e.columns["dt"], parquet.ValueOf(dt))
+	e.builder.Add(e.columns["hour"], parquet.Int32Value(hour))
 	if e.schema == nil {
 		e.buffer = e.builder.AppendRow(e.buffer[:0])
 		return e.buffer, nil

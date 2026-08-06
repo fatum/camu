@@ -34,11 +34,14 @@ const (
 	manifestEntryDeleted  = 2
 )
 
-// DataFile describes one Parquet data file referenced by a manifest.
+// DataFile describes one Parquet data file referenced by a manifest. DT and
+// Hour are the ingest-time partition values written on every row.
 type DataFile struct {
 	Content       int
 	FilePath      string
 	FileFormat    string
+	DT            string
+	Hour          int
 	RecordCount   int64
 	FileSizeBytes int64
 }
@@ -49,6 +52,14 @@ type ManifestEntry struct {
 	SnapshotID     int64
 	SequenceNumber int64
 	DataFile       DataFile
+}
+
+// PartitionFieldSummary is one manifest-list partition summary (per partition
+// spec field, in spec order): null/NaN presence plus binary min/max bounds.
+type PartitionFieldSummary struct {
+	ContainsNull bool
+	LowerBound   []byte
+	UpperBound   []byte
 }
 
 // ManifestFile is one row of a manifest list (a summary of one manifest).
@@ -64,6 +75,7 @@ type ManifestFile struct {
 	ExistingFilesCount int
 	AddedRowsCount     int64
 	ExistingRowsCount  int64
+	Partitions         []PartitionFieldSummary
 }
 
 // manifestEntryAvroSchema is the Iceberg v2 manifest entry schema, with the
@@ -84,7 +96,11 @@ const manifestEntryAvroSchema = `{
         {"name": "file_path", "type": "string", "field-id": 100},
         {"name": "file_format", "type": "string", "field-id": 101},
         {"name": "partition", "type": {
-          "type": "record", "name": "r102", "fields": []
+          "type": "record", "name": "r102",
+          "fields": [
+            {"name": "dt", "type": "string", "field-id": 1000},
+            {"name": "hour", "type": "int", "field-id": 1001}
+          ]
         }, "field-id": 102},
         {"name": "record_count", "type": "long", "field-id": 103},
         {"name": "file_size_in_bytes", "type": "long", "field-id": 104},
@@ -162,7 +178,7 @@ func encodeManifestEntries(entries []ManifestEntry) ([][]byte, error) {
 				"content":            e.DataFile.Content,
 				"file_path":          e.DataFile.FilePath,
 				"file_format":        e.DataFile.FileFormat,
-				"partition":          map[string]any{},
+				"partition":          map[string]any{"dt": e.DataFile.DT, "hour": e.DataFile.Hour},
 				"record_count":       e.DataFile.RecordCount,
 				"file_size_in_bytes": e.DataFile.FileSizeBytes,
 				"column_sizes":       nil,
@@ -204,6 +220,15 @@ func encodeManifestListRows(manifests []ManifestFile) ([][]byte, error) {
 	}
 	records := make([][]byte, 0, len(manifests))
 	for _, m := range manifests {
+		partitions := make([]any, 0, len(m.Partitions))
+		for _, p := range m.Partitions {
+			partitions = append(partitions, map[string]any{
+				"contains_null": p.ContainsNull,
+				"contains_nan":  nil,
+				"lower_bound":   p.LowerBound,
+				"upper_bound":   p.UpperBound,
+			})
+		}
 		row := map[string]any{
 			"manifest_path":        m.ManifestPath,
 			"manifest_length":      m.ManifestLength,
@@ -218,7 +243,7 @@ func encodeManifestListRows(manifests []ManifestFile) ([][]byte, error) {
 			"added_rows_count":     m.AddedRowsCount,
 			"existing_rows_count":  m.ExistingRowsCount,
 			"deleted_rows_count":   0,
-			"partitions":           []any{},
+			"partitions":           partitions,
 			"key_metadata":         nil,
 		}
 		encoded, err := avro.Marshal(schema, row)
@@ -270,6 +295,7 @@ func readManifestEntries(data []byte) ([]ManifestEntry, error) {
 			return nil, fmt.Errorf("manifest entry is not a record")
 		}
 		df, _ := m["data_file"].(map[string]any)
+		part, _ := df["partition"].(map[string]any)
 		entries = append(entries, ManifestEntry{
 			Status:         intVal(m["status"]),
 			SnapshotID:     longVal(m["snapshot_id"]),
@@ -278,6 +304,8 @@ func readManifestEntries(data []byte) ([]ManifestEntry, error) {
 				Content:       intVal(df["content"]),
 				FilePath:      strVal(df["file_path"]),
 				FileFormat:    strVal(df["file_format"]),
+				DT:            strVal(part["dt"]),
+				Hour:          intVal(part["hour"]),
 				RecordCount:   longVal(df["record_count"]),
 				FileSizeBytes: longVal(df["file_size_in_bytes"]),
 			},
@@ -302,16 +330,30 @@ func readManifestList(data []byte) ([]ManifestFile, error) {
 		if !ok {
 			return nil, fmt.Errorf("manifest list row is not a record")
 		}
+		var summaries []PartitionFieldSummary
+		if rawParts, ok := m["partitions"].([]any); ok {
+			for _, raw := range rawParts {
+				p, _ := raw.(map[string]any)
+				summaries = append(summaries, PartitionFieldSummary{
+					ContainsNull: boolVal(p["contains_null"]),
+					LowerBound:   bytesVal(p["lower_bound"]),
+					UpperBound:   bytesVal(p["upper_bound"]),
+				})
+			}
+		}
 		manifests = append(manifests, ManifestFile{
-			ManifestPath:      strVal(m["manifest_path"]),
-			ManifestLength:    longVal(m["manifest_length"]),
-			PartitionSpecID:   intVal(m["partition_spec_id"]),
-			Content:           intVal(m["content"]),
-			SequenceNumber:    longVal(m["sequence_number"]),
-			MinSequenceNumber: longVal(m["min_sequence_number"]),
-			AddedSnapshotID:   longVal(m["added_snapshot_id"]),
-			AddedFilesCount:   intVal(m["added_files_count"]),
-			AddedRowsCount:    longVal(m["added_rows_count"]),
+			ManifestPath:       strVal(m["manifest_path"]),
+			ManifestLength:     longVal(m["manifest_length"]),
+			PartitionSpecID:    intVal(m["partition_spec_id"]),
+			Content:            intVal(m["content"]),
+			SequenceNumber:     longVal(m["sequence_number"]),
+			MinSequenceNumber:  longVal(m["min_sequence_number"]),
+			AddedSnapshotID:    longVal(m["added_snapshot_id"]),
+			AddedFilesCount:    intVal(m["added_files_count"]),
+			ExistingFilesCount: intVal(m["existing_files_count"]),
+			AddedRowsCount:     longVal(m["added_rows_count"]),
+			ExistingRowsCount:  longVal(m["existing_rows_count"]),
+			Partitions:         summaries,
 		})
 	}
 	return manifests, nil
@@ -508,4 +550,62 @@ func strVal(v any) string {
 		return s
 	}
 	return ""
+}
+
+func boolVal(v any) bool {
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return false
+}
+
+func bytesVal(v any) []byte {
+	if b, ok := v.([]byte); ok {
+		return b
+	}
+	if s, ok := v.(string); ok {
+		return []byte(s)
+	}
+	return nil
+}
+
+// entryFiles extracts the data files from a set of manifest entries.
+func entryFiles(entries []ManifestEntry) []DataFile {
+	files := make([]DataFile, 0, len(entries))
+	for _, e := range entries {
+		files = append(files, e.DataFile)
+	}
+	return files
+}
+
+// partitionSummariesFor computes the manifest-list partition summaries for one
+// set of data files, per partition-spec field in order (dt, hour). Bounds are
+// binary-encoded per the Iceberg spec: strings as UTF-8, ints as Avro ints.
+func partitionSummariesFor(files []DataFile) []PartitionFieldSummary {
+	if len(files) == 0 {
+		return []PartitionFieldSummary{{}, {}}
+	}
+	minDT, maxDT := files[0].DT, files[0].DT
+	minHour, maxHour := files[0].Hour, files[0].Hour
+	for _, f := range files[1:] {
+		if f.DT < minDT {
+			minDT = f.DT
+		}
+		if f.DT > maxDT {
+			maxDT = f.DT
+		}
+		if f.Hour < minHour {
+			minHour = f.Hour
+		}
+		if f.Hour > maxHour {
+			maxHour = f.Hour
+		}
+	}
+	var hourMin, hourMax bytes.Buffer
+	putAvroLong(&hourMin, int64(minHour))
+	putAvroLong(&hourMax, int64(maxHour))
+	return []PartitionFieldSummary{
+		{ContainsNull: false, LowerBound: []byte(minDT), UpperBound: []byte(maxDT)},
+		{ContainsNull: false, LowerBound: hourMin.Bytes(), UpperBound: hourMax.Bytes()},
+	}
 }

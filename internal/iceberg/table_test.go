@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,23 +44,36 @@ func TestTableCreateLoadRoundTrip(t *testing.T) {
 		t.Fatalf("table-uuid changed across round trip: %s != %s", loaded.TableUUID, created.TableUUID)
 	}
 	icebergSchema := loaded.currentSchema()
-	if icebergSchema == nil || len(icebergSchema.Fields) != 7 {
-		t.Fatalf("schema fields = %d, want 7 (5 base + 2 typed)", len(icebergSchema.Fields))
+	if icebergSchema == nil || len(icebergSchema.Fields) != 9 {
+		t.Fatalf("schema fields = %d, want 9 (7 base + 2 typed)", len(icebergSchema.Fields))
 	}
 	if icebergSchema.Fields[0].Name != "record_offset" || icebergSchema.Fields[0].Type != "long" || !icebergSchema.Fields[0].Required {
 		t.Fatalf("base column 0 = %+v, want required record_offset long", icebergSchema.Fields[0])
 	}
-	if icebergSchema.Fields[5].Name != "id" || icebergSchema.Fields[5].Type != "long" || !icebergSchema.Fields[5].Required {
-		t.Fatalf("typed column id = %+v, want required long", icebergSchema.Fields[5])
+	if icebergSchema.Fields[5].Name != "dt" || icebergSchema.Fields[5].Type != "string" || !icebergSchema.Fields[5].Required {
+		t.Fatalf("partition column dt = %+v, want required string", icebergSchema.Fields[5])
 	}
-	if icebergSchema.Fields[6].Name != "note" || icebergSchema.Fields[6].Type != "string" || icebergSchema.Fields[6].Required {
-		t.Fatalf("typed column note = %+v, want nullable string", icebergSchema.Fields[6])
+	if icebergSchema.Fields[6].Name != "hour" || icebergSchema.Fields[6].Type != "int" || !icebergSchema.Fields[6].Required {
+		t.Fatalf("partition column hour = %+v, want required int", icebergSchema.Fields[6])
+	}
+	if icebergSchema.Fields[7].Name != "id" || icebergSchema.Fields[7].Type != "long" || !icebergSchema.Fields[7].Required {
+		t.Fatalf("typed column id = %+v, want required long", icebergSchema.Fields[7])
+	}
+	if icebergSchema.Fields[8].Name != "note" || icebergSchema.Fields[8].Type != "string" || icebergSchema.Fields[8].Required {
+		t.Fatalf("typed column note = %+v, want nullable string", icebergSchema.Fields[8])
 	}
 	if loaded.CurrentSnapshotID != nil {
 		t.Fatalf("new table has current-snapshot-id = %v, want nil", *loaded.CurrentSnapshotID)
 	}
-	if len(loaded.PartitionSpecs) != 1 || len(loaded.PartitionSpecs[0].Fields) != 0 {
-		t.Fatalf("partition specs = %+v, want one empty spec", loaded.PartitionSpecs)
+	spec := loaded.currentPartitionSpec()
+	if len(loaded.PartitionSpecs) != 1 || spec == nil || len(spec.Fields) != 2 {
+		t.Fatalf("partition specs = %+v, want one dt/hour spec", loaded.PartitionSpecs)
+	}
+	if spec.Fields[0].Name != "dt" || spec.Fields[0].Transform != "identity" || spec.Fields[0].SourceID != 6 || spec.Fields[0].FieldID != 1000 {
+		t.Fatalf("partition field 0 = %+v, want identity(dt) on column 6 field-id 1000", spec.Fields[0])
+	}
+	if spec.Fields[1].Name != "hour" || spec.Fields[1].Transform != "identity" || spec.Fields[1].SourceID != 7 || spec.Fields[1].FieldID != 1001 {
+		t.Fatalf("partition field 1 = %+v, want identity(hour) on column 7 field-id 1001", spec.Fields[1])
 	}
 }
 
@@ -199,7 +213,7 @@ func TestSchemaFromTopicTypes(t *testing.T) {
 		{Name: "b", Type: "bool", Path: "$.b"},
 		{Name: "t", Type: "timestamp", Path: "$.t"},
 	}})
-	want := []string{"long", "long", "binary", "binary", "string", "string", "long", "double", "boolean", "timestamp_ns"}
+	want := []string{"long", "long", "binary", "binary", "string", "string", "int", "string", "long", "double", "boolean", "timestamp_ns"}
 	if len(schema.Fields) != len(want) {
 		t.Fatalf("fields = %d, want %d", len(schema.Fields), len(want))
 	}
@@ -240,8 +254,8 @@ func TestTableCommitSnapshotWritesManifestAndList(t *testing.T) {
 		t.Fatalf("Create() error = %v", err)
 	}
 	files := []DataFile{
-		{Content: DataFileContentData, FilePath: "warehouse/events/data/a.parquet", FileFormat: DataFileFormatParquet, RecordCount: 4, FileSizeBytes: 1000},
-		{Content: DataFileContentData, FilePath: "warehouse/events/data/b.parquet", FileFormat: DataFileFormatParquet, RecordCount: 6, FileSizeBytes: 2000},
+		{Content: DataFileContentData, FilePath: "warehouse/events/data/a.parquet", FileFormat: DataFileFormatParquet, DT: "2026-08-06", Hour: 13, RecordCount: 4, FileSizeBytes: 1000},
+		{Content: DataFileContentData, FilePath: "warehouse/events/data/b.parquet", FileFormat: DataFileFormatParquet, DT: "2026-08-06", Hour: 14, RecordCount: 6, FileSizeBytes: 2000},
 	}
 	snap, err := ts.CommitSnapshot(ctx, "events", files)
 	if err != nil {
@@ -272,6 +286,15 @@ func TestTableCommitSnapshotWritesManifestAndList(t *testing.T) {
 	if len(manifests) != 1 || manifests[0].ManifestPath == "" || manifests[0].AddedFilesCount != 2 || manifests[0].AddedRowsCount != 10 {
 		t.Fatalf("manifest list = %+v, want 1 manifest with 2 files / 10 rows", manifests)
 	}
+	if len(manifests[0].Partitions) != 2 {
+		t.Fatalf("partition summaries = %d, want 2 (dt, hour)", len(manifests[0].Partitions))
+	}
+	if string(manifests[0].Partitions[0].LowerBound) != "2026-08-06" || string(manifests[0].Partitions[0].UpperBound) != "2026-08-06" {
+		t.Fatalf("dt summary bounds = %q..%q, want 2026-08-06..2026-08-06", manifests[0].Partitions[0].LowerBound, manifests[0].Partitions[0].UpperBound)
+	}
+	if !bytes.Equal(manifests[0].Partitions[1].LowerBound, []byte{26}) || !bytes.Equal(manifests[0].Partitions[1].UpperBound, []byte{28}) {
+		t.Fatalf("hour summary bounds = %v..%v, want zigzag(13)..zigzag(14)", manifests[0].Partitions[1].LowerBound, manifests[0].Partitions[1].UpperBound)
+	}
 	manifestData, err := ts.objects.Get(ctx, manifests[0].ManifestPath)
 	if err != nil {
 		t.Fatalf("get manifest: %v", err)
@@ -284,8 +307,8 @@ func TestTableCommitSnapshotWritesManifestAndList(t *testing.T) {
 		t.Fatalf("manifest entries = %d, want 2", len(entries))
 	}
 	for i, e := range entries {
-		if e.Status != manifestEntryAdded || e.SnapshotID != snap.SnapshotID || e.DataFile.FilePath != files[i].FilePath {
-			t.Fatalf("entry %d = %+v, want ADDED snapshot %d file %s", i, e, snap.SnapshotID, files[i].FilePath)
+		if e.Status != manifestEntryAdded || e.SnapshotID != snap.SnapshotID || e.DataFile.FilePath != files[i].FilePath || e.DataFile.DT != "2026-08-06" {
+			t.Fatalf("entry %d = %+v, want ADDED snapshot %d file %s dt=2026-08-06", i, e, snap.SnapshotID, files[i].FilePath)
 		}
 	}
 }

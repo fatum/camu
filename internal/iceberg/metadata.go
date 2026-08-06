@@ -122,25 +122,27 @@ type TableMetadata struct {
 // tableFormatVersion is the Iceberg format-version Camu writes.
 const tableFormatVersion = 2
 
-// unpartitionedPartitionID is the Iceberg sentinel for an unpartitioned
-// table's last-partition-id.
-const unpartitionedPartitionID = 999
-
-// Base export column ids. Typed topic columns follow starting at
-// baseExportColumnIDCount+1.
+// Base export column ids. dt/hour are the ingest-time partition columns; typed
+// topic columns follow starting at baseExportColumnIDCount+1.
 const (
 	exportColumnRecordOffset    = "record_offset"
 	exportColumnRecordTimestamp = "record_timestamp"
 	exportColumnKey             = "key"
 	exportColumnValue           = "value"
 	exportColumnHeaders         = "headers"
-	baseExportColumnIDCount     = 5
+	exportColumnDT              = "dt"
+	exportColumnHour            = "hour"
+	baseExportColumnIDCount     = 7
+	// partition field ids for the dt/hour identity partition spec.
+	partitionFieldIDDT   = 1000
+	partitionFieldIDHour = 1001
 )
 
 // SchemaFromTopic derives the Iceberg schema for a camu topic from its typed
-// schema. The five base export columns are always present; typed topic columns
-// are appended (nullable per the topic schema). Column order matches the
-// Parquet file written by EncodeChunk.
+// schema. The seven base export columns are always present (including the
+// dt/hour partition columns); typed topic columns are appended (nullable per
+// the topic schema). Column order matches the Parquet file written by
+// EncodeChunk.
 func SchemaFromTopic(topicSchema *meta.TopicSchema) *Schema {
 	fields := []SchemaField{
 		{ID: 1, Name: exportColumnRecordOffset, Required: true, Type: "long"},
@@ -148,6 +150,8 @@ func SchemaFromTopic(topicSchema *meta.TopicSchema) *Schema {
 		{ID: 3, Name: exportColumnKey, Required: true, Type: "binary"},
 		{ID: 4, Name: exportColumnValue, Required: true, Type: "binary"},
 		{ID: 5, Name: exportColumnHeaders, Required: true, Type: "string"},
+		{ID: 6, Name: exportColumnDT, Required: true, Type: "string"},
+		{ID: 7, Name: exportColumnHour, Required: true, Type: "int"},
 	}
 	nextID := baseExportColumnIDCount + 1
 	if topicSchema != nil {
@@ -180,7 +184,8 @@ func icebergFieldType(t string) string {
 }
 
 // NewTableMetadata creates the initial (version 0) metadata for a table with
-// no snapshots. tableLocation is the object-store root of the table.
+// no snapshots. tableLocation is the object-store root of the table. Tables
+// are partitioned by identity(dt), identity(hour) on the ingest-time columns.
 func NewTableMetadata(tableLocation string, topicSchema *meta.TopicSchema) *TableMetadata {
 	schema := SchemaFromTopic(topicSchema)
 	lastColumnID := schema.Fields[len(schema.Fields)-1].ID
@@ -197,9 +202,12 @@ func NewTableMetadata(tableLocation string, topicSchema *meta.TopicSchema) *Tabl
 		DefaultSpecID:      0,
 		PartitionSpecs: []*PartitionSpec{{
 			SpecID: 0,
-			Fields: []PartitionField{},
+			Fields: []PartitionField{
+				{Name: exportColumnDT, Transform: "identity", SourceID: 6, FieldID: partitionFieldIDDT},
+				{Name: exportColumnHour, Transform: "identity", SourceID: 7, FieldID: partitionFieldIDHour},
+			},
 		}},
-		LastPartitionID:    unpartitionedPartitionID,
+		LastPartitionID:    partitionFieldIDHour,
 		DefaultSortOrderID: 0,
 		SortOrders:         []SortOrder{{OrderID: 0, Fields: []SortField{}}},
 		Properties:         map[string]string{},

@@ -136,7 +136,17 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 		if len(messages) == 0 || next <= nextOffset {
 			break
 		}
-		chunk, err := s.encodeParquetChunk(messages, tc.Schema)
+		// The ingest (segment-flush) time is per-chunk and stable across retries;
+		// it becomes the dt/hour partition values written on every row.
+		ingestTime := parquetExportIngestTime(index, messages[0].Offset, messages[0].Timestamp)
+		dt, hourStr := iceberg.BucketDateHour(ingestTime)
+		hour, err := strconv.ParseInt(hourStr, 10, 32)
+		if err != nil {
+			result = "encode_error"
+			slog.Warn("iceberg_pipeline_hour_parse_failed", "topic", tc.Name, "partition", identity.Partition, "hour", hourStr, "error", err)
+			return
+		}
+		chunk, err := s.encodeParquetChunk(messages, tc.Schema, dt, int32(hour))
 		if err != nil {
 			result = "encode_error"
 			slog.Warn("iceberg_pipeline_encode_failed", "topic", tc.Name, "partition", identity.Partition, "checkpoint_offset", nextOffset, "records", len(messages), "error", err)
@@ -150,7 +160,6 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 				return
 			}
 		}
-		ingestTime := parquetExportIngestTime(index, chunk.Start, chunk.StartTS)
 		objectKey := table.ExportDataFileKey(tc.Name, identity.Partition, ingestTime, int64(chunk.Start), int64(chunk.End), "iceberg")
 		if err := putImmutableParquetFile(passCtx, s.s3Client, objectKey, chunk.File, chunk.Size); err != nil {
 			chunk.Cleanup()
@@ -162,6 +171,8 @@ func (s *Server) runIcebergExportPass(ctx context.Context, tc meta.TopicConfig, 
 			Content:       iceberg.DataFileContentData,
 			FilePath:      objectKey,
 			FileFormat:    iceberg.DataFileFormatParquet,
+			DT:            dt,
+			Hour:          int(hour),
 			RecordCount:   int64(chunk.Records),
 			FileSizeBytes: chunk.Size,
 		})
