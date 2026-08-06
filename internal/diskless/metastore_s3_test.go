@@ -322,6 +322,46 @@ func TestS3MetaStore_CommitUploadedBatchIsReadableAndDeduplicated(t *testing.T) 
 	}
 }
 
+// TestS3MetaStore_CommitMultipleBatchesAtomically verifies a single invocation
+// carrying several same-partition batches publishes them in one head CAS with
+// contiguous offsets.
+func TestS3MetaStore_CommitMultipleBatchesAtomically(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	results, err := m.CommitUploadedBatches(ctx, []UploadedBatch{
+		{BatchID: "a:0:10", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: time.Now()},
+		{BatchID: "b:10:10", FileKey: "b", Topic: "t", Partition: 0, Count: 2, ByteLength: 10, ProducerID: 7, Sequence: 1, CreatedAt: time.Now()},
+		{BatchID: "c:20:10", FileKey: "c", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, CreatedAt: time.Now()},
+	})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if len(results) != 3 || results[0].BaseOffset != 0 || results[1].BaseOffset != 1 || results[2].BaseOffset != 3 {
+		t.Fatalf("unexpected results: %+v", results)
+	}
+	if head, err := m.GetCommittedHead(ctx, "t", 0); err != nil || head != 4 {
+		t.Fatalf("committed head = %d, %v; want 4", head, err)
+	}
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
+	if err != nil || len(refs) != 3 {
+		t.Fatalf("refs = %+v, %v; want 3", refs, err)
+	}
+}
+
+// TestS3MetaStore_CommitRejectsCrossPartitionBatch verifies the one-partition
+// atomicity boundary of a commit invocation.
+func TestS3MetaStore_CommitRejectsCrossPartitionBatch(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	_, err := m.CommitUploadedBatches(ctx, []UploadedBatch{
+		{BatchID: "a:0:10", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 10},
+		{BatchID: "b:0:10", FileKey: "b", Topic: "t", Partition: 1, Count: 1, ByteLength: 10},
+	})
+	if err == nil {
+		t.Fatal("expected cross-partition batch to be rejected")
+	}
+}
+
 // TestS3MetaStore_CommitNonIdempotentRetryAppends verifies non-idempotent
 // batches are not deduplicated, matching Kafka semantics: a retried upload is a
 // fresh append.

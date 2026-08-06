@@ -69,6 +69,9 @@ type memObject struct {
 // s3Backend is the interface for storage backends.
 type s3Backend interface {
 	put(ctx context.Context, key string, data []byte, opts PutOpts) error
+	// putStream uploads exactly size bytes read from r without materializing a
+	// contiguous in-memory copy on backends that support streaming bodies.
+	putStream(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error
 	get(ctx context.Context, key string) ([]byte, error)
 	getRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	getRangeInto(ctx context.Context, key string, offset, length int64, dst []byte) error
@@ -166,6 +169,22 @@ func (c *S3Client) Put(ctx context.Context, key string, data []byte, opts PutOpt
 	started := time.Now()
 	err := c.backend.put(ctx, key, data, opts)
 	c.observe("put", started, int64(len(data)), err)
+	return err
+}
+
+// PutReader streams exactly size bytes from r to key without first copying them
+// into a contiguous buffer, so large immutable uploads never hold two copies of
+// the payload. r must yield at least size bytes.
+func (c *S3Client) PutReader(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error {
+	if err := c.checkFault("put"); err != nil {
+		return err
+	}
+	if size < 0 {
+		return fmt.Errorf("put reader %q: negative size", key)
+	}
+	started := time.Now()
+	err := c.backend.putStream(ctx, key, r, size, opts)
+	c.observe("put", started, size, err)
 	return err
 }
 
@@ -347,6 +366,17 @@ func (m *memBackend) put(_ context.Context, key string, data []byte, _ PutOpts) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.objects[key] = memObject{data: cp, etag: uuid.NewString(), createdAt: time.Now()}
+	return nil
+}
+
+func (m *memBackend) putStream(_ context.Context, key string, r io.Reader, size int64, _ PutOpts) error {
+	data := make([]byte, size)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return fmt.Errorf("read streamed put: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects[key] = memObject{data: data, etag: uuid.NewString(), createdAt: time.Now()}
 	return nil
 }
 
@@ -581,6 +611,23 @@ func (b *awsS3Backend) put(ctx context.Context, key string, data []byte, opts Pu
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(key),
 		Body:   bytes.NewReader(data),
+	}
+	if opts.ContentType != "" {
+		input.ContentType = aws.String(opts.ContentType)
+	}
+	_, err := b.client.PutObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("s3 Put %q: %w", key, err)
+	}
+	return nil
+}
+
+func (b *awsS3Backend) putStream(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error {
+	input := &s3.PutObjectInput{
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(key),
+		Body:          r,
+		ContentLength: aws.Int64(size),
 	}
 	if opts.ContentType != "" {
 		input.ContentType = aws.String(opts.ContentType)

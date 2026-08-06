@@ -144,27 +144,34 @@ func s3ArchiveKey(topic string, partition int, end int64) string {
 }
 
 // CommitUploadedBatches publishes already-uploaded batches through a single
-// CAS-protected partition head. An upload which never reaches this method
-// cannot consume an offset or affect the readable head.
+// CAS-protected partition head: one read-modify-write publishes every batch in
+// the invocation together, so a partial commit can never leak a gap. An upload
+// which never reaches this method cannot consume an offset or affect the
+// readable head. All batches must belong to the same partition.
 func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
-	if len(batches) > 1 {
-		return nil, fmt.Errorf("commit uploaded batches accepts one batch per invocation")
+	if err := samePartitionBatches(batches); err != nil {
+		return nil, err
 	}
+	if len(batches) == 0 {
+		return nil, nil
+	}
+	topic, partition := batches[0].Topic, batches[0].Partition
 	results := make([]OffsetResult, len(batches))
-	for i, batch := range batches {
-		if batch.BatchID == "" || batch.Count <= 0 {
-			return nil, fmt.Errorf("uploaded batch %s has invalid count %d", batch.FileKey, batch.Count)
+	for {
+		key := s3ManifestKey(topic, partition)
+		data, etag, err := m.s3.GetWithETag(ctx, key)
+		manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}}
+		if err == nil {
+			if err := json.Unmarshal(data, &manifest); err != nil {
+				return nil, fmt.Errorf("parse upload manifest %s/%d: %w", topic, partition, err)
+			}
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			return nil, err
 		}
-		for {
-			key := s3ManifestKey(batch.Topic, batch.Partition)
-			data, etag, err := m.s3.GetWithETag(ctx, key)
-			manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}}
-			if err == nil {
-				if err := json.Unmarshal(data, &manifest); err != nil {
-					return nil, fmt.Errorf("parse upload manifest %s/%d: %w", batch.Topic, batch.Partition, err)
-				}
-			} else if !errors.Is(err, storage.ErrNotFound) {
-				return nil, err
+		changed := false
+		for i, batch := range batches {
+			if batch.BatchID == "" || batch.Count <= 0 {
+				return nil, fmt.Errorf("uploaded batch %s has invalid count %d", batch.FileKey, batch.Count)
 			}
 			pid := strconv.FormatInt(batch.ProducerID, 10)
 			duplicate := false
@@ -181,17 +188,19 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 					duplicate = true
 					break
 				}
-				if len(h) > 0 {
-					last := h[len(h)-1]
-					if _, err := checkProducerSequence(batch.ProducerID, batch.Sequence, batch.Count, last.FirstSequence, last.Count); err != nil {
+				if !duplicate {
+					if len(h) > 0 {
+						last := h[len(h)-1]
+						if _, err := checkProducerSequence(batch.ProducerID, batch.Sequence, batch.Count, last.FirstSequence, last.Count); err != nil {
+							return nil, err
+						}
+					} else if err := checkInitialProducerSequence(batch.ProducerID, batch.Sequence); err != nil {
 						return nil, err
 					}
-				} else if err := checkInitialProducerSequence(batch.ProducerID, batch.Sequence); err != nil {
-					return nil, err
 				}
 			}
 			if duplicate {
-				break
+				continue
 			}
 			base := manifest.NextOffset
 			end := base + int64(batch.Count)
@@ -205,22 +214,25 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 				}
 				manifest.Producers[pid] = h
 			}
-			manifest.Version++
-			encoded, err := json.Marshal(manifest)
-			if err != nil {
-				return nil, err
-			}
-			if _, err = m.s3.ConditionalPut(ctx, key, encoded, etag); err != nil {
-				if errors.Is(err, storage.ErrConflict) {
-					continue
-				}
-				return nil, fmt.Errorf("commit uploaded batch %s: %w", batch.FileKey, err)
-			}
 			results[i] = OffsetResult{BaseOffset: base}
-			break
+			changed = true
 		}
+		if !changed {
+			return results, nil // every batch was a duplicate
+		}
+		manifest.Version++
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = m.s3.ConditionalPut(ctx, key, encoded, etag); err != nil {
+			if errors.Is(err, storage.ErrConflict) {
+				continue
+			}
+			return nil, fmt.Errorf("commit uploaded batches %s/%d: %w", topic, partition, err)
+		}
+		return results, nil
 	}
-	return results, nil
 }
 
 // ArchiveCommitted rolls the oldest compaction-final refs out of the head

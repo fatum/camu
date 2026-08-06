@@ -55,22 +55,21 @@ func (e *Engine) Produce(ctx context.Context, topic string, partition int, batch
 	defer e.produceMu.RUnlock()
 
 	done := make(chan FlushResult, 1)
-	e.buf.Append(BufferEntry{
+	// Append both stores the entry and reports the size threshold in one lock,
+	// so Produce never takes the buffer lock twice per request.
+	if e.buf.Append(BufferEntry{
 		Topic:     topic,
 		Partition: partition,
 		Batch:     batch,
 		Done:      done,
-	})
+	}) {
+		e.triggerFlush()
+	}
 
 	// Signal linger timer (non-blocking).
 	select {
 	case e.lingerRst <- struct{}{}:
 	default:
-	}
-
-	// Flush immediately if buffer exceeds threshold.
-	if e.buf.ShouldFlush() {
-		e.triggerFlush()
 	}
 
 	// Wait for result or context cancellation.

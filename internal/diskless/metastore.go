@@ -12,16 +12,18 @@ import (
 type MetaStore interface {
 	// CommitUploadedBatches atomically, per partition, validates producer
 	// sequences, assigns offsets, publishes uploaded refs, and advances the
-	// readable head. Idempotency follows the Kafka contract: an exact retry of
-	// an idempotent batch (same producer, first sequence, count) is deduplicated
-	// against the producer's commit history and returns its original offset
-	// without another ref. Dedup matches any recorded sequence within the
-	// bounded history (the last `uploadedProducerHistory` batches per producer),
-	// so a retry of a non-latest but still-recorded batch is also deduplicated.
-	// An exact replay that has rotated out of that window is rejected as
-	// out-of-order rather than re-allocated, so a stale retry can never
-	// silently duplicate records at a fresh offset. Non-idempotent batches are
-	// not deduplicated.
+	// readable head. All batches in one invocation must belong to the same
+	// topic-partition, and the commit is all-or-nothing for the invocation:
+	// either every batch becomes visible or none does. Idempotency follows the
+	// Kafka contract: an exact retry of an idempotent batch (same producer,
+	// first sequence, count) is deduplicated against the producer's commit
+	// history and returns its original offset without another ref. Dedup
+	// matches any recorded sequence within the bounded history (the last
+	// `uploadedProducerHistory` batches per producer), so a retry of a
+	// non-latest but still-recorded batch is also deduplicated. An exact replay
+	// that has rotated out of that window is rejected as out-of-order rather
+	// than re-allocated, so a stale retry can never silently duplicate records
+	// at a fresh offset. Non-idempotent batches are not deduplicated.
 	CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error)
 	// QuerySegments returns segment references covering [fromOffset, ...) for a
 	// given topic-partition, up to maxBytes of data.
@@ -98,4 +100,16 @@ func parsePartitionKey(key string) (string, int, error) {
 		return "", 0, fmt.Errorf("malformed partition key %q: %w", key, err)
 	}
 	return key[:idx], partition, nil
+}
+
+// samePartitionBatches enforces the atomicity boundary of a commit invocation:
+// every batch must belong to the same topic-partition so the write is
+// all-or-nothing per partition and never spans a cross-partition prefix.
+func samePartitionBatches(batches []UploadedBatch) error {
+	for i := 1; i < len(batches); i++ {
+		if batches[i].Topic != batches[0].Topic || batches[i].Partition != batches[0].Partition {
+			return fmt.Errorf("commit uploaded batches spans multiple partitions")
+		}
+	}
+	return nil
 }

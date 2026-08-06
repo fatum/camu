@@ -91,11 +91,30 @@ func TestMemoryMetaStore_CommitRequiresInitialProducerSequenceZero(t *testing.T)
 	require.Zero(t, head)
 }
 
-func TestMemoryMetaStore_CommitRejectsMultiBatchWithoutMutation(t *testing.T) {
+func TestMemoryMetaStore_CommitMultipleBatchesAtomically(t *testing.T) {
+	ms := NewMemoryMetaStore()
+	ctx := context.Background()
+	results, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{
+		{BatchID: "a:0:1", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 0},
+		{BatchID: "b:1:1", FileKey: "b", Topic: "t", Partition: 0, Count: 2, ByteLength: 1, ProducerID: 7, Sequence: 1},
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, int64(0), results[0].BaseOffset)
+	require.Equal(t, int64(1), results[1].BaseOffset)
+	head, err := ms.GetCommittedHead(ctx, "t", 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), head)
+	refs, err := ms.QuerySegments(ctx, "t", 0, 0, 1024)
+	require.NoError(t, err)
+	require.Len(t, refs, 2)
+}
+
+func TestMemoryMetaStore_CommitRejectsCrossPartitionBatch(t *testing.T) {
 	ms := NewMemoryMetaStore()
 	_, err := ms.CommitUploadedBatches(context.Background(), []UploadedBatch{
 		{BatchID: "a:0:1", FileKey: "a", Topic: "t", Partition: 0, Count: 1, ByteLength: 1},
-		{BatchID: "b:0:1", FileKey: "b", Topic: "t", Partition: 0, Count: 1, ByteLength: 1},
+		{BatchID: "b:0:1", FileKey: "b", Topic: "t", Partition: 1, Count: 1, ByteLength: 1},
 	})
 	require.Error(t, err)
 	head, err := ms.GetCommittedHead(context.Background(), "t", 0)

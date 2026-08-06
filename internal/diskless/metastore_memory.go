@@ -45,17 +45,15 @@ func NewMemoryMetaStore() *MemoryMetaStore {
 	}
 }
 
-// CommitUploadedBatches makes an uploaded object visible without ever
-// reserving an offset before the ref is durable. It intentionally accepts
-// several partitions, but each partition is committed independently.
+// CommitUploadedBatches makes uploaded objects visible without ever reserving
+// an offset before a ref is durable. All batches in one invocation must belong
+// to the same partition; they are committed together under a single lock, so
+// the commit is an all-or-nothing validation boundary per partition.
 func (m *MemoryMetaStore) CommitUploadedBatches(_ context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// A commit invocation is intentionally restricted to one partition. Writer
-	// commits each uploaded batch separately, so this preserves an all-or-nothing
-	// validation boundary and avoids a cross-partition partial prefix.
-	if len(batches) > 1 {
-		return nil, fmt.Errorf("commit uploaded batches accepts one batch per invocation")
+	if err := samePartitionBatches(batches); err != nil {
+		return nil, err
 	}
 	results := make([]OffsetResult, len(batches))
 	for i, b := range batches {

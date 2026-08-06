@@ -77,33 +77,39 @@ func NewDynamoMetaStore(ctx context.Context, cfg DynamoMetaStoreConfig) (*Dynamo
 	}, nil
 }
 
-// CommitUploadedBatches uses a two-item transaction per batch: the partition
-// ordering state and its readable ref change together. The conditional state
-// write makes concurrent writers reload and revalidate their producer sequence.
+// CommitUploadedBatches atomically commits one partition's uploaded batches
+// through a single transaction: the partition ordering state and every readable
+// ref change together, so the commit is all-or-nothing per invocation. All
+// batches must belong to the same partition. The conditional state write makes
+// concurrent writers reload and revalidate their producer sequences.
 func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
-	if len(batches) > 1 {
-		return nil, fmt.Errorf("commit uploaded batches accepts one batch per invocation")
+	if err := samePartitionBatches(batches); err != nil {
+		return nil, err
 	}
+	if len(batches) == 0 {
+		return nil, nil
+	}
+	pk := partitionKey(batches[0].Topic, batches[0].Partition)
 	results := make([]OffsetResult, len(batches))
-	for i, b := range batches {
-		if b.BatchID == "" || b.Count <= 0 {
-			return nil, fmt.Errorf("uploaded batch %s has invalid count %d", b.FileKey, b.Count)
+	for attempt := 0; ; attempt++ {
+		out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.offsetsTable, Key: map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}}, ProjectionExpression: aws.String("upload_state")})
+		if err != nil {
+			return nil, fmt.Errorf("read upload state %s: %w", pk, err)
 		}
-		pk := partitionKey(b.Topic, b.Partition)
-		for attempt := 0; ; attempt++ {
-			out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.offsetsTable, Key: map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}}, ProjectionExpression: aws.String("upload_state")})
-			if err != nil {
-				return nil, fmt.Errorf("read upload state %s: %w", pk, err)
-			}
-			state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}}
-			var old string
-			if out.Item != nil {
-				if a, ok := out.Item["upload_state"].(*ddbtypes.AttributeValueMemberS); ok {
-					old = a.Value
-					if err := json.Unmarshal([]byte(old), &state); err != nil {
-						return nil, fmt.Errorf("parse upload state %s: %w", pk, err)
-					}
+		state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}}
+		var old string
+		if out.Item != nil {
+			if a, ok := out.Item["upload_state"].(*ddbtypes.AttributeValueMemberS); ok {
+				old = a.Value
+				if err := json.Unmarshal([]byte(old), &state); err != nil {
+					return nil, fmt.Errorf("parse upload state %s: %w", pk, err)
 				}
+			}
+		}
+		writes := make([]ddbtypes.TransactWriteItem, 0, len(batches)+1)
+		for i, b := range batches {
+			if b.BatchID == "" || b.Count <= 0 {
+				return nil, fmt.Errorf("uploaded batch %s has invalid count %d", b.FileKey, b.Count)
 			}
 			pid := strconv.FormatInt(b.ProducerID, 10)
 			duplicate := false
@@ -119,17 +125,19 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 						break
 					}
 				}
-				if len(h) > 0 {
-					last := h[len(h)-1]
-					if _, err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.FirstSequence, last.Count); err != nil {
+				if !duplicate {
+					if len(h) > 0 {
+						last := h[len(h)-1]
+						if _, err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.FirstSequence, last.Count); err != nil {
+							return nil, err
+						}
+					} else if err := checkInitialProducerSequence(b.ProducerID, b.Sequence); err != nil {
 						return nil, err
 					}
-				} else if err := checkInitialProducerSequence(b.ProducerID, b.Sequence); err != nil {
-					return nil, err
 				}
 			}
 			if duplicate {
-				break
+				continue
 			}
 			base := state.NextOffset
 			end := base + int64(b.Count)
@@ -142,36 +150,61 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 				}
 				state.Producers[pid] = h
 			}
-			encoded, err := json.Marshal(state)
-			if err != nil {
-				return nil, err
-			}
-			condition := "attribute_not_exists(upload_state)"
-			values := map[string]ddbtypes.AttributeValue{":new": &ddbtypes.AttributeValueMemberS{Value: string(encoded)}, ":next": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(end, 10)}}
-			if old != "" {
-				condition = "upload_state = :old"
-				values[":old"] = &ddbtypes.AttributeValueMemberS{Value: old}
-			}
-			_, err = d.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: []ddbtypes.TransactWriteItem{
-				{Update: &ddbtypes.Update{TableName: &d.offsetsTable, Key: map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}}, UpdateExpression: aws.String("SET upload_state = :new, next_offset = :next, committed_offset = :next"), ConditionExpression: aws.String(condition), ExpressionAttributeValues: values}},
-				{Put: &ddbtypes.Put{TableName: &d.segmentsTable, ConditionExpression: aws.String("attribute_not_exists(pk)"), Item: map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}, "sk": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(base, 10)}, "file_key": &ddbtypes.AttributeValueMemberS{Value: b.FileKey}, "byte_offset": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(b.ByteOffset, 10)}, "byte_length": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(b.ByteLength, 10)}, "end_offset": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(end, 10)}, "created_at": &ddbtypes.AttributeValueMemberS{Value: b.CreatedAt.Format(time.RFC3339)}}}},
-			}})
-			if err == nil {
-				results[i] = OffsetResult{BaseOffset: base}
-				break
-			}
-			if attempt >= 7 {
-				return nil, fmt.Errorf("commit uploaded batch %s: %w", b.FileKey, err)
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(allocateRetryBackoff(attempt)):
-			}
-			continue
+			results[i] = OffsetResult{BaseOffset: base}
+			writes = append(writes, ddbtypes.TransactWriteItem{
+				Put: &ddbtypes.Put{
+					TableName:         &d.segmentsTable,
+					ConditionExpression: aws.String("attribute_not_exists(pk)"),
+					Item: map[string]ddbtypes.AttributeValue{
+						"pk":          &ddbtypes.AttributeValueMemberS{Value: pk},
+						"sk":          &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(base, 10)},
+						"file_key":    &ddbtypes.AttributeValueMemberS{Value: b.FileKey},
+						"byte_offset": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(b.ByteOffset, 10)},
+						"byte_length": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(b.ByteLength, 10)},
+						"end_offset":  &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(end, 10)},
+						"created_at":  &ddbtypes.AttributeValueMemberS{Value: b.CreatedAt.Format(time.RFC3339)},
+					},
+				},
+			})
+		}
+		if len(writes) == 0 {
+			return results, nil // every batch was a duplicate
+		}
+		encoded, err := json.Marshal(state)
+		if err != nil {
+			return nil, err
+		}
+		condition := "attribute_not_exists(upload_state)"
+		values := map[string]ddbtypes.AttributeValue{
+			":new":  &ddbtypes.AttributeValueMemberS{Value: string(encoded)},
+			":next": &ddbtypes.AttributeValueMemberN{Value: strconv.FormatInt(state.NextOffset, 10)},
+		}
+		if old != "" {
+			condition = "upload_state = :old"
+			values[":old"] = &ddbtypes.AttributeValueMemberS{Value: old}
+		}
+		writes = append(writes, ddbtypes.TransactWriteItem{
+			Update: &ddbtypes.Update{
+				TableName: &d.offsetsTable,
+				Key:       map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}},
+				UpdateExpression:       aws.String("SET upload_state = :new, next_offset = :next, committed_offset = :next"),
+				ConditionExpression:    aws.String(condition),
+				ExpressionAttributeValues: values,
+			},
+		})
+		_, err = d.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: writes})
+		if err == nil {
+			return results, nil
+		}
+		if attempt >= 7 {
+			return nil, fmt.Errorf("commit uploaded batches %s: %w", pk, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(allocateRetryBackoff(attempt)):
 		}
 	}
-	return results, nil
 }
 
 // ReplaceSegmentRefs atomically removes the refs identified by remove and

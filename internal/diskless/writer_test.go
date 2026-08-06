@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -238,6 +239,79 @@ func TestWriter_Flush_RetriesTransientPutFailure(t *testing.T) {
 	if _, err := s3.Get(ctx, refs[0].FileKey); err != nil {
 		t.Fatalf("retried put did not persist the file: %v", err)
 	}
+}
+
+// TestWriter_FlushBatchesSamePartitionIntoOneCommit verifies that a flush
+// carrying several same-partition batches commits them together in one
+// CommitUploadedBatches call (chunked to maxBatchesPerCommit), delivering
+// contiguous offsets in submission order.
+func TestWriter_FlushBatchesSamePartitionIntoOneCommit(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := &countingMeta{MetaStore: NewMemoryMetaStore()}
+	w := NewWriter(s3, meta, "node1")
+	ctx := context.Background()
+
+	const n = 30 // > maxBatchesPerCommit, so chunking is exercised
+	entries := make([]BufferEntry, 0, n)
+	dones := make([]chan FlushResult, n)
+	for i := 0; i < n; i++ {
+		d := make(chan FlushResult, 1)
+		dones[i] = d
+		entries = append(entries, BufferEntry{
+			Topic:     "t",
+			Partition: 0,
+			Batch:     makeTestBatch(t, []log.Message{{Key: []byte("k"), Value: []byte(fmt.Sprintf("v%d", i))}}),
+			Done:      d,
+		})
+	}
+	if err := w.Flush(ctx, entries); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	for i, d := range dones {
+		r := <-d
+		if r.Err != nil {
+			t.Fatalf("entry %d error: %v", i, r.Err)
+		}
+		if r.BaseOffset != int64(i) {
+			t.Fatalf("entry %d base offset = %d, want %d", i, r.BaseOffset, i)
+		}
+	}
+	if head, _ := meta.GetPartitionHead(ctx, "t", 0); head != int64(n) {
+		t.Fatalf("head = %d, want %d", head, n)
+	}
+	if refs, _ := meta.QuerySegments(ctx, "t", 0, 0, 1<<20); len(refs) != n {
+		t.Fatalf("refs = %d, want %d", len(refs), n)
+	}
+
+	meta.mu.Lock()
+	calls, maxB := meta.calls, meta.maxBatches
+	meta.mu.Unlock()
+	if calls == 0 {
+		t.Fatal("no commit calls made")
+	}
+	if maxB < 2 {
+		t.Fatalf("expected same-partition batches batched into one call, max batches per call = %d", maxB)
+	}
+	if maxB > maxBatchesPerCommit {
+		t.Fatalf("commit call exceeded chunk size: %d > %d", maxB, maxBatchesPerCommit)
+	}
+}
+
+type countingMeta struct {
+	MetaStore
+	mu         sync.Mutex
+	calls      int
+	maxBatches int
+}
+
+func (c *countingMeta) CommitUploadedBatches(ctx context.Context, batches []UploadedBatch) ([]OffsetResult, error) {
+	c.mu.Lock()
+	c.calls++
+	if len(batches) > c.maxBatches {
+		c.maxBatches = len(batches)
+	}
+	c.mu.Unlock()
+	return c.MetaStore.CommitUploadedBatches(ctx, batches)
 }
 
 // segment-registration failure after a successful PUT is retried rather than
