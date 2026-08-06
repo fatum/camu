@@ -21,10 +21,15 @@ type decodePlan struct {
 	avro     avro.Schema                    // avro
 	avroJSON string                         // avro schema JSON (for EncodeAvroValue)
 	proto    protoreflect.MessageDescriptor // protobuf
+	// nameToIndex maps an avro/protobuf field name to its projection index.
+	nameToIndex map[string]int
 }
 
 func newDecodePlan(schema *meta.TopicSchema) (*decodePlan, error) {
-	plan := &decodePlan{encoding: schema.Encoding, fields: schema.Fields}
+	plan := &decodePlan{encoding: schema.Encoding, fields: schema.Fields, nameToIndex: make(map[string]int, len(schema.Fields))}
+	for i, f := range schema.Fields {
+		plan.nameToIndex[avroFieldName(f.Path)] = i
+	}
 	switch schema.Encoding {
 	case "json":
 		plan.tree = newJSONFieldTree(schema.Fields)

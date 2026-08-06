@@ -94,40 +94,13 @@ func DecodeProtobufTypedFields(ctx context.Context, topic string, topicSchema *m
 }
 
 func (p *decodePlan) decodeProtobufInto(ctx context.Context, topic string, resolver SchemaResolver, input []byte, values []DecodedField) error {
-	writer := p
-	if schemaID, payload, wrapped := AvroUnwrap(input); wrapped {
-		if resolver != nil {
-			resolved, err := resolver.SchemaForID(ctx, topic, schemaID)
-			if err != nil {
-				return fmt.Errorf("resolve schema id %d: %w", schemaID, err)
-			}
-			writer, err = decodePlanFor(resolved)
-			if err != nil {
-				return err
-			}
-		}
+	// The wire scan matches fields by number, which the projection assigns
+	// positionally (1..N) and evolution preserves by appending, so the writer
+	// schema need not be resolved. Strip the envelope, if any, and decode.
+	if _, payload, wrapped := AvroUnwrap(input); wrapped {
 		input = payload
 	}
-	md := writer.proto
-	msg := dynamicpb.NewMessage(md)
-	if err := proto.Unmarshal(input, msg); err != nil {
-		return fmt.Errorf("decode protobuf value: %w", err)
-	}
-	for i, f := range p.fields {
-		fd := md.Fields().ByNumber(protoreflect.FieldNumber(i + 1))
-		if fd == nil || !msg.Has(fd) {
-			if !f.Nullable {
-				return fmt.Errorf("required field %q is missing", f.Name)
-			}
-			continue
-		}
-		v, err := protobufFieldValue(f, fd.Kind(), msg.Get(fd))
-		if err != nil {
-			return err
-		}
-		values[i] = DecodedField{Present: true, Value: v}
-	}
-	return nil
+	return p.decodeProtobufWire(input, values)
 }
 
 // EncodeProtobufValue encodes a record value against a topic's derived
