@@ -4,118 +4,99 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/fatum/camu.svg)](https://pkg.go.dev/github.com/fatum/camu)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
 
-**Camu is an S3-native event log with HTTP and Kafka APIs.** It keeps the
-mutable tail on the partition owner, replicates it to an ISR quorum, and
-persists immutable segments in S3-compatible storage.
+> **Camu is the S3-native event log that turns your stream into a queryable Iceberg lake.**
+>
+> Kafka-compatible produce/consume, an ISR quorum for acknowledged durability, and a
+> self-managed Apache Iceberg projection — all on plain object storage. No broker disk
+> fleet, no ZooKeeper, no CGO, no ETL pipeline.
 
 ```text
-producer ──HTTP / Kafka──> partition leader ──fetch──> ISR followers
-                                  │
-                                  └── background sealed segments ──> S3 / MinIO
+  Kafka / HTTP producers ──▶ partition leader ──▶ ISR quorum (acknowledged durability)
+                                    │
+                                    └──▶ sealed segments ──▶ S3 / MinIO ──▶ Apache Iceberg tables
+                                                                                │
+                                                                                ▼
+                                                            DuckDB · Trino · Spark query directly
 ```
 
 ## Why Camu?
 
-Use Camu when applications need an ordered, replayable event log but object
-storage should be the durable shared data plane.
+Applications need an ordered, replayable event log. Camu is the alternative that makes
+object storage the shared durable data plane — so the log **is** the archive, and the
+archive **is** the analytics store.
 
-- Keep the familiar partition, consumer-offset, idempotent-produce, and ISR
-  quorum model for operational data.
-- Store immutable history in S3-compatible storage rather than a separate
-  broker-disk fleet and a second archival pipeline.
-- Query committed history with Parquet and DuckDB SQL without copying it into a
-  separate analytics system.
+- **One storage tier, not three.** No broker-disk fleet, no separate archival pipeline,
+  no separate data warehouse. Immutable history lives once in S3-compatible storage, and
+  everything reads from it.
+- **Kafka-compatible, zero-copy.** Native `RecordBatch` bytes replicate unchanged and are
+  served over the Kafka wire protocol, so existing clients, CLIs, and tooling just work —
+  alongside a first-class HTTP + SSE API.
+- **Acknowledged durability you can trust.** Writes to replicated topics are confirmed
+  only after the configured ISR quorum holds them, and the whole model is exercised under
+  faults by a five-node Jepsen harness.
+- **Analytics with no ETL.** Turn a topic into a self-managed Apache Iceberg table with a
+  single flag, then query it with DuckDB, Trino, or Spark directly — no copy jobs, no
+  warehouse.
+- **Typed topics with a schema registry.** Define JSON, Avro, or Protobuf schemas, evolve
+  them backward-compatibly, and route decode failures to a dead-letter topic.
+- **Runs anywhere.** A single Go binary. `classic` mode for local fast tails, `diskless`
+  mode that needs no local disks at all; both speak the same APIs.
 
-Camu is a focused alternative for systems that value S3-native durability and
-simple replayable streams; it is not a drop-in replacement for the full Kafka
-ecosystem.
+Camu is a focused system, not a drop-in for every Kafka feature. It is the right choice
+when S3-native durability, simple replayable streams, and a queryable projection matter
+more than the full Kafka ecosystem. See the
+[API support matrix](docs/api-support-matrix.md) for exactly what is supported and what is
+intentionally out of scope.
 
-## Core model
+## Features
 
-- A topic has partitions, a replication factor, and `min_insync_replicas`.
-- The partition leader appends native Kafka `RecordBatch` bytes to its local
-  active segment. Followers replicate those bytes without re-encoding.
-- For replicated topics, a produce succeeds only after the high watermark
-  passes the written offset: the configured ISR quorum has acknowledged it.
-  This applies to both the HTTP API and the Kafka wire protocol (`acks=0`
-  requests are fire-and-forget and return immediately).
-- Segment sealing and S3 persistence happen in the background. A pending
-  sealed segment remains available to follower replication until it is
-  published.
-- Object storage holds immutable segments and the coordination state; there is
-  no separate metadata quorum.
+### An event log with real durability semantics
+
+- Topics with partitions, replication factor, and `min_insync_replicas`.
+- The partition leader appends native Kafka `RecordBatch` bytes; followers replicate them
+  byte-for-byte, no re-encoding.
+- A produce is acknowledged only after the high watermark passes the written offset — the
+  ISR quorum has it. `acks=0` stays fire-and-forget, matching Kafka.
+- Idempotent produce with producer IDs and per-partition sequences, so safe retries never
+  duplicate records.
+- Object storage holds immutable segments **and** the coordination state — no separate
+  metadata quorum.
 
 | Produce configuration | Successful response means |
 | --- | --- |
-| `rf=1`, `minISR=1` | The owner appended the record to its local active segment, and re-verified its ownership against the assignment store (amortized by `coordination.fence_interval`, default `2s`). |
+| `rf=1`, `minISR=1` | The owner appended the record to its local active segment, and re-verified ownership against the assignment store. |
 | `rf>1` | The leader and the configured ISR quorum have the record. |
 
-Object-store persistence is asynchronous in both cases. Do not treat an
-`rf=1` acknowledgement as protection against permanent loss of the only owner
-before its active segment is persisted.
+### Iceberg analytics built in
 
-## What Camu provides
+Set `export_enabled: true` on any topic and Camu projects its committed history as a
+self-managed Apache Iceberg table (v2 metadata, Avro manifests, `dt`/`hour` partitioning).
+Point DuckDB, Trino, or Spark at the warehouse path and query it like any Iceberg table —
+no in-process SQL engine, no export job to operate, and export never delays produce.
 
-- HTTP, SSE, and a supported subset of the Kafka wire protocol.
-- Idempotent produce with producer IDs and per-partition sequences.
-- `classic` topics (local active tail plus sealed S3 segments) and `diskless`
-  topics (object-store-centric storage path).
-- Optional leader-owned Parquet export and read-only DuckDB SQL. Query
-  visibility is manifest-driven.
-- Resumable topic deletion, retention, and maintenance jobs.
-
-It is intentionally not a complete Kafka implementation. See the
-[API support matrix](docs/api-support-matrix.md) for exact support and explicit
-limitations.
-
-## SQL analytics
-
-Set `export_enabled: true` on a topic (classic or diskless) to project its
-committed records to Parquet. Export runs on the partition leader and does not
-delay produce. `POST /v1/sql` exposes those manifest-published files through
-read-only DuckDB SQL:
-
-```bash
-curl -X POST http://localhost:8080/v1/sql \
-  -H 'Content-Type: application/json' \
-  -d '{"sql":"select count(*) as n from \"events\"","topics":["events"]}'
+```sql
+INSTALL iceberg; LOAD iceberg;
+SELECT count(*), dt FROM iceberg_scan('s3://bucket/warehouse/events') GROUP BY dt;
 ```
 
-SQL can run on a separate `server.mode=query` node with read-only object-store
-credentials. See [Parquet and SQL](docs/parquet-sql.md) for the consistency and
-retention rules.
+See [Iceberg](docs/iceberg.md) for the pipeline, layout, and retention rules.
 
-### SQL sizing and performance
+### Typed topics, evolved safely
 
-DuckDB is a vectorized analytical engine: Parquet projection and filter pushdown
-mean that a selective query can read far less than the whole topic. There is no
-single records-per-second promise; scan rate depends on selected columns,
-predicate selectivity, Parquet layout, CPU, local temporary-disk throughput,
-and object-store latency.
+Give a topic a schema — JSON, Avro, or Protobuf — and Camu validates produces, writes typed
+Parquet columns, and carries the schema through an embedded registry with Confluent-style
+ids so values decode against their own writer schema across versions. Add fields over time
+with backward-compatibility checks; failed decodes go to a configured dead-letter topic.
 
-The queryable dataset is not limited to RAM. DuckDB can spill larger-than-memory
-workloads to its temporary directory, and reports production database files
-larger than 15 TB. Camu still applies request-level bounds, by default:
+### Two storage modes, one API
 
-| Limit | Default | Meaning |
-| --- | ---: | --- |
-| Parquet cache | 5 GiB | Local object cache, not a dataset-size cap. |
-| Concurrent queries | 4 | Independent DuckDB connections. |
-| Query timeout | 30s | Wall-clock budget per request. |
-| Files per query | 4,096 | Maximum manifest-referenced files scanned. |
+- **`classic`** — a local active tail on the partition owner plus immutable sealed segments
+  in object storage.
+- **`diskless`** — the object-store-centric path: no local disks, atomic offset allocation
+  backed by an S3 head object or DynamoDB, background compaction that bounds the hot
+  window regardless of history.
 
-Size a query node for its working set, not its total history: provide fast local
-disk for `sql.duckdb_temp_directory`, set `sql.duckdb_memory_limit` below the
-memory available to Camu, and increase `sql.max_scan_files` only with measured
-queries. DuckDB recommends roughly 1–4 GiB of memory per execution thread for
-good performance, and its Parquet guidance favors files around 100 MB–10 GB
-with row groups large enough to use available cores. Camu does not yet compact
-Parquet automatically, so benchmark your actual exported file layout before
-raising these limits.
-
-See DuckDB’s [workload tuning](https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads),
-[out-of-memory guidance](https://duckdb.org/docs/current/guides/performance/oom),
-and [Parquet guidance](https://duckdb.org/docs/current/guides/performance/my_workload_is_slow).
+Both modes expose identical HTTP, SSE, and Kafka APIs.
 
 ## Quick start
 
@@ -131,8 +112,8 @@ docker exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
 docker exec minio mc mb local/camu-data
 ```
 
-Build Camu, copy the example configuration, and set `storage.endpoint`,
-`storage.bucket`, and credentials for MinIO:
+Build Camu, copy the example configuration, and set `storage.endpoint`, `storage.bucket`,
+and credentials for MinIO:
 
 ```bash
 go build -o camu ./cmd/camu
@@ -154,32 +135,42 @@ curl -X POST http://localhost:8080/v1/topics/events/messages \
 curl 'http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limit=100'
 ```
 
-For a replicated topic, set `replication_factor` and `min_insync_replicas` at
-creation time. See the [API guide](docs/api.md) for request shapes, idempotent
-produce, consumer offsets, SQL, and Kafka behavior.
+Create a typed, Iceberg-exported topic:
+
+```bash
+curl -X POST http://localhost:8080/v1/topics \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name":"orders","partitions":4,"export_enabled":true,
+    "schema":{"encoding":"json","fields":[{"name":"id","type":"int64","path":"$.id"},{"name":"sku","type":"string","path":"$.sku"}]}
+  }'
+```
+
+For a replicated topic, set `replication_factor` and `min_insync_replicas` at creation time.
+See the [API guide](docs/api.md) for request shapes, idempotent produce, typed schemas,
+Iceberg export, and Kafka behavior.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): write/read paths, storage, and maintenance.
-- [Coordination](docs/architecture/coordination.md): leases, assignments, ISR, and failover.
+- [Architecture](docs/architecture.md) — write/read paths, storage, and maintenance.
+- [Coordination](docs/architecture/coordination.md) — leases, assignments, ISR, and failover.
 - [API guide](docs/api.md) and [API support matrix](docs/api-support-matrix.md).
-- [Parquet and SQL](docs/parquet-sql.md): export and query model.
-- [Reliability](docs/reliability.md): guarantees, limits, and Jepsen evidence.
-- [Jepsen harness](jepsen/camu/README.md): run commands and artifacts.
+- [Iceberg](docs/iceberg.md) — the export and query model.
+- [Reliability](docs/reliability.md) — guarantees, limits, and Jepsen evidence.
+- [Jepsen harness](jepsen/camu/README.md) — run commands and artifacts.
 
 ## Verification
 
-Core distributed behavior is covered by integration tests and a five-node
-Jepsen harness backed by MinIO. The harness checks acknowledged-write
-durability, leader safety, ordering, high-watermark monotonicity, and replica
-convergence under faults. The Jepsen matrix covers both the HTTP and the Kafka
-wire-protocol API, including leader-kill, leader-pause-then-ack, partition,
-pause, clock-skew, and object-store isolation faults; its exact scope and latest
-reproducible runs are in [docs/reliability.md](docs/reliability.md).
+Core distributed behavior is covered by integration tests and a five-node Jepsen harness
+backed by MinIO. The harness checks acknowledged-write durability, leader safety, ordering,
+high-watermark monotonicity, and replica convergence under faults — covering leader kills,
+pauses, partitions, clock skew, and object-store isolation across both the HTTP and Kafka
+APIs. The exact scope and latest reproducible runs are in
+[docs/reliability.md](docs/reliability.md).
 
 The `dynamodb` diskless metastore is exercised against a real DynamoDB in CI
-(`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT`
-pointing at DynamoDB Local).
+(`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` pointing at
+DynamoDB Local).
 
 ## License
 

@@ -256,9 +256,9 @@ func TestDisklessRetentionExportCheckpointGate(t *testing.T) {
 		t.Helper()
 		generation++
 		store := pipeline.NewCheckpointStore(s.s3Client, pipeline.NoFence{})
-		if err := store.Publish(ctx, parquetPipelineName, pipeline.Checkpoint{
+		if err := store.Publish(ctx, icebergPipelineName, pipeline.Checkpoint{
 			SourceTopic: tc.Name, Partition: 0, NextOffset: nextOffset, SourceEpoch: 1,
-			Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, Generation: generation,
+			Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion, Generation: generation,
 		}); err != nil {
 			t.Fatalf("publish checkpoint %d: %v", nextOffset, err)
 		}
@@ -340,9 +340,9 @@ func TestDisklessRetentionSharedFileWaitsForEveryPartition(t *testing.T) {
 	publishCheckpoint := func(partition int) {
 		t.Helper()
 		store := pipeline.NewCheckpointStore(s.s3Client, pipeline.NoFence{})
-		if err := store.Publish(ctx, parquetPipelineName, pipeline.Checkpoint{
+		if err := store.Publish(ctx, icebergPipelineName, pipeline.Checkpoint{
 			SourceTopic: tc.Name, Partition: partition, NextOffset: 2, SourceEpoch: 1,
-			Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, Generation: 1,
+			Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion, Generation: 1,
 		}); err != nil {
 			t.Fatalf("publish checkpoint for partition %d: %v", partition, err)
 		}
@@ -652,7 +652,7 @@ func TestClassicRetentionWaitsForPipelineCheckpoint(t *testing.T) {
 	}
 
 	store := pipeline.NewCheckpointStore(s.s3Client, pipeline.NoFence{})
-	if err := store.Publish(ctx, parquetPipelineName, pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, NextOffset: 10, Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion, Generation: 1}); err != nil {
+	if err := store.Publish(ctx, icebergPipelineName, pipeline.Checkpoint{SourceTopic: tc.Name, Partition: 0, NextOffset: 10, Sink: icebergPipelineName, SinkVersion: icebergPipelineVersion, Generation: 1}); err != nil {
 		t.Fatalf("publish parquet pipeline checkpoint: %v", err)
 	}
 	s.discoverClassicRetentionJobs(ctx, tc, identity)

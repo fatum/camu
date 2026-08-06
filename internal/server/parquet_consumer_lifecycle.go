@@ -76,24 +76,25 @@ func (s *Server) ensureParquetConsumer(tc meta.TopicConfig, identity PartitionId
 		s.parquetConsumersMu.Unlock()
 
 		go s.runParquetConsumer(ctx, done, tc, identity)
-		slog.Info("parquet_export_consumer_started", "topic", tc.Name, "partition", identity.Partition, "epoch", identity.LeaderEpoch)
+		slog.Info("iceberg_export_consumer_started", "topic", tc.Name, "partition", identity.Partition, "epoch", identity.LeaderEpoch)
 		return
 	}
 }
 
 func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc meta.TopicConfig, identity PartitionIdentity) {
 	defer close(done)
+	sinkName, sinkVersion := icebergPipelineName, icebergPipelineVersion
 	var cp pipeline.Checkpoint
 	for {
 		var err error
-		cp, err = s.loadParquetCheckpoint(ctx, tc.Name, identity.Partition)
+		cp, err = s.loadParquetCheckpoint(ctx, tc.Name, identity.Partition, sinkName, sinkVersion)
 		if err == nil {
 			break
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		slog.Warn("parquet_pipeline_checkpoint_load_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		slog.Warn("iceberg_pipeline_checkpoint_load_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
 		select {
 		case <-ctx.Done():
 			return
@@ -101,8 +102,18 @@ func (s *Server) runParquetConsumer(ctx context.Context, done chan struct{}, tc 
 		}
 	}
 	for {
+		// Re-read the topic config each pass so a schema update (or an export
+		// toggle) takes effect within one poll interval, rather than waiting for
+		// ensureParquetConsumer's DeepEqual restart during the next maintenance
+		// pass. A deleted topic keeps the last known config; the pass is a no-op
+		// for it and the next maintenance pass stops the consumer.
+		if fresh, err := s.topicStore.Get(ctx, tc.Name); err == nil {
+			tc = fresh
+		} else if ctx.Err() == nil {
+			slog.Warn("iceberg_export_consumer_config_reload_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+		}
 		before := cp.NextOffset
-		s.runParquetExportPass(ctx, tc, identity, &cp)
+		s.runIcebergExportPass(ctx, tc, identity, &cp)
 		// Back off when the pass exported nothing: the partition is caught up,
 		// so an idle pass only re-reads the committed head / index. Once new
 		// data appears the next pass advances the checkpoint and the loop
@@ -126,13 +137,13 @@ func parquetConsumerPollIntervalFor(before, after uint64) time.Duration {
 	return parquetConsumerPollInterval
 }
 
-func (s *Server) loadParquetCheckpoint(ctx context.Context, topic string, partition int) (pipeline.Checkpoint, error) {
+func (s *Server) loadParquetCheckpoint(ctx context.Context, topic string, partition int, sinkName, sinkVersion string) (pipeline.Checkpoint, error) {
 	store := pipeline.NewCheckpointStore(s.s3Client, serverPipelineFence{server: s})
-	cp, err := store.Load(ctx, parquetPipelineName, topic, partition)
+	cp, err := store.Load(ctx, sinkName, topic, partition)
 	if errors.Is(err, storage.ErrNotFound) {
-		return pipeline.Checkpoint{SourceTopic: topic, Partition: partition, Sink: parquetPipelineName, SinkVersion: parquetPipelineVersion}, nil
+		return pipeline.Checkpoint{SourceTopic: topic, Partition: partition, Sink: sinkName, SinkVersion: sinkVersion}, nil
 	}
-	if err == nil && (cp.Sink != parquetPipelineName || cp.SinkVersion != parquetPipelineVersion) {
+	if err == nil && (cp.Sink != sinkName || cp.SinkVersion != sinkVersion) {
 		return pipeline.Checkpoint{}, errors.New("parquet pipeline checkpoint has incompatible sink version")
 	}
 	return cp, err
@@ -167,7 +178,7 @@ func (s *Server) stopParquetConsumer(topic string, partition int) {
 		delete(s.parquetConsumers, key)
 	}
 	s.parquetConsumersMu.Unlock()
-	slog.Info("parquet_export_consumer_stopped", "topic", topic, "partition", partition)
+	slog.Info("iceberg_export_consumer_stopped", "topic", topic, "partition", partition)
 }
 
 func (s *Server) stopAllParquetConsumers() {

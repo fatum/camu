@@ -192,3 +192,104 @@ func TestTopicStore_CreateDuplicate(t *testing.T) {
 		t.Fatal("Create duplicate: expected error, got nil")
 	}
 }
+
+func schemaCfg(name string, version int) TopicConfig {
+	return TopicConfig{
+		Name:              name,
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now().UTC(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+		Schema:            &TopicSchema{Encoding: "json", Version: version, Fields: []SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}},
+	}
+}
+
+// TestTopicStore_UpdateRejectsSchemaChange and UpdateSchema bypasses it: the
+// schema-evolution path must not run into the immutability guard (the HTTP
+// schema endpoint previously always failed with 500).
+func TestTopicStore_UpdateSchemaBypassesImmutabilityGuard(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	v0 := schemaCfg("orders", 0)
+	if err := store.Create(ctx, v0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Generic Update with a changed schema is rejected.
+	v1 := schemaCfg("orders", 1)
+	if err := store.Update(ctx, v1); err == nil {
+		t.Fatal("Update with changed schema: expected error, got nil")
+	}
+
+	// UpdateSchema writes the new version.
+	if err := store.UpdateSchema(ctx, v1); err != nil {
+		t.Fatalf("UpdateSchema: %v", err)
+	}
+	got, err := store.Get(ctx, "orders")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Schema == nil || got.Schema.Version != 1 {
+		t.Fatalf("schema version after UpdateSchema = %+v, want version 1", got.Schema)
+	}
+}
+
+// TestTopicStore_GetReturnsIndependentSchema ensures a caller mutating the
+// schema of a returned TopicConfig cannot corrupt the cached copy or the
+// schema another reader sees.
+func TestTopicStore_GetReturnsIndependentSchema(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	v0 := schemaCfg("orders", 0)
+	if err := store.Create(ctx, v0); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	first, err := store.Get(ctx, "orders")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	second, err := store.Get(ctx, "orders")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	first.Schema.Version = 99
+	first.Schema.Fields[0].Name = "mutated"
+	if second.Schema.Version != 0 || second.Schema.Fields[0].Name != "id" {
+		t.Fatalf("mutating one Get's schema leaked into another: %+v", second.Schema)
+	}
+	if third, _ := store.Get(ctx, "orders"); third.Schema.Version != 0 || third.Schema.Fields[0].Name != "id" {
+		t.Fatalf("mutating one Get's schema leaked into a later Get: %+v", third.Schema)
+	}
+}
+
+// TestTopicStore_CreateIsConditionalAcrossInstances verifies the create-if-not-
+// exists write holds even when the second store has a cold cache (no TOCTOU
+// window between the existence check and the write).
+func TestTopicStore_CreateIsConditionalAcrossInstances(t *testing.T) {
+	ctx := context.Background()
+	s3Client, err := storage.NewS3Client(storage.S3Config{
+		Bucket:   "test-bucket",
+		Region:   "us-east-1",
+		Endpoint: "memory://",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewTopicStore(s3Client)
+	other := NewTopicStore(s3Client) // same backend, cold cache
+	if err := store.Create(ctx, schemaCfg("orders", 0)); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := other.Create(ctx, schemaCfg("orders", 1)); err == nil {
+		t.Fatal("Create from cold cache: expected error, got nil")
+	}
+	got, err := store.Get(ctx, "orders")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Schema != nil && got.Schema.Version != 0 {
+		t.Fatalf("Create overwrote the topic: schema version = %d, want 0", got.Schema.Version)
+	}
+}

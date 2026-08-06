@@ -153,54 +153,11 @@
             (commit-offsets-gen partitions)
             (get-offsets-gen)]))
 
-(defn sql-count-gen
-  "Returns a generator emitting :sql-query ops that ask for the current row
-   count in the topic. The checker ignores these (it only consumes the final
-   drain query) but they exercise the SQL path during the fault window."
-  []
-  (fn [_ _]
-    {:type  :invoke
-     :f     :sql-query
-     :value {:sql   "select count(*)::BIGINT as n from jepsen_topic"
-             :final false}}))
 
-(defn retention-state-gen
-  "Continuously samples source-segment and export-checkpoint state during the
-   short-retention lifecycle workload."
-  []
-  (fn [_ _]
-    {:type :invoke :f :retention-state :value {}}))
 
-(defn sql-drain-query-gen
-  "Returns a generator that issues ONE final drain-style SQL query. The
-   checker consumes :ok :sql-query ops with :final true."
-  [topic typed?]
-  (fn [_ _]
-    {:type  :invoke
-     :f     :sql-query
-     :value {:sql   (if typed?
-                      (str "select key, id, paid from \"" topic "\"")
-                      (str "select key from \"" topic "\""))
-             :final true}}))
 
-(declare retention-lifecycle?)
 
-(defn typed-value
-  [n]
-  (str "{\"id\":" n ",\"paid\":true}"))
 
-(defn sql-workload-gen
-  "Produce-heavy workload that mixes in periodic :sql-query probes during
-   the fault window. The actual end-of-run SQL drain is appended as a
-   distinct phase in camu-test so it runs AFTER the nemesis stops and the
-   exporter has had time to catch up."
-  [retention-lifecycle? typed? _partitions counter _offsets]
-  (let [producer (if typed?
-                   (produce-gen counter typed-value)
-                   (produce-gen counter))]
-    (gen/mix (cond-> [producer producer producer producer producer producer producer producer
-                      (sql-count-gen)]
-               retention-lifecycle? (into (repeat 3 (retention-state-gen)))))))
 
 (defn num-partitions
   [opts]
@@ -234,7 +191,6 @@
       :large-requests (large-requests-workload-gen partitions counter offsets)
       :replica-flushed-reads (replica-flushed-reads-workload-gen partitions counter offsets)
       :concurrent-writes (concurrent-writes-workload-gen partitions counter offsets)
-      :sql (sql-workload-gen (retention-lifecycle? opts) (:typed opts) partitions counter offsets)
       (mixed-workload-gen partitions counter offsets))))
 
 (defn drain-gen
@@ -275,23 +231,8 @@
       (contains? #{:mixed :large-requests :concurrent-writes :idempotent}
                  (or (:workload opts) :mixed))))
 
-(defn sql-workload?
-  [opts]
-  (= :sql (:workload opts)))
 
-(defn retention-lifecycle?
-  "True only for the explicit short-retention SQL lifecycle scenario."
-  [opts]
-  (true? (:retention-lifecycle opts)))
 
-(defn sql-checkers
-  "The SQL checker set. Retention assertions belong only to the explicit
-   short-retention lifecycle run, never to ordinary SQL failover coverage."
-  [opts]
-  (cond-> (cond-> {:sql-visibility (camu-checker/sql-visibility-checker)}
-            (:typed opts) (assoc :typed-sql (camu-checker/typed-sql-checker)))
-    (retention-lifecycle? opts)
-    (assoc :retention-export (camu-checker/retention-export-checker))))
 
 (defn validate-opts!
   [opts]
@@ -306,11 +247,6 @@
                     {:type :unsupported-read-mode
                      :api :kafka
                      :read-mode (:read-mode opts)})))
-  (when (and (sql-workload? opts) (kafka-api? opts))
-    (throw (ex-info "SQL workload requires --api http"
-                    {:type :unsupported-workload
-                     :api :kafka
-                     :workload :sql})))
   opts)
 
 (defn checker-suite
@@ -358,11 +294,6 @@
                :total-order          (camu-checker/total-order-checker)
                :consumer-offsets     (camu-checker/consumer-offset-checker)})
 
-       (sql-workload? opts)
-       ;; SQL workloads verify their final Parquet view. Only the dedicated
-       ;; short-retention lifecycle run makes source-deletion assertions.
-       (merge meta-checkers (sql-checkers opts))
-
        (replicated? opts)
        (cond-> (merge replicated-base
                       {:committed-durability (camu-checker/committed-durability-checker)
@@ -405,7 +336,6 @@
             :topic           topic
             :num-partitions  partitions
             :read-mode       (or (:read-mode opts) :leader)
-            :enable-sql?     (sql-workload? opts)
             :os              os/noop
             :db              (db/db)
             :client          (if (kafka-api? opts)
@@ -433,34 +363,13 @@
                         (gen/nemesis (gen/once {:type :info :f fault :value :stop}))))
                (gen/log "Recovering — waiting 15s for cluster stabilization...")
                (gen/sleep 15)
-               ]
-              (when-not (sql-workload? opts)
-                [(gen/log "Draining all partitions for verification...")
-                 (gen/clients (drain-gen partitions))])
+               ;; Phase 3: drain ALL partitions for verification
+               (gen/log "Draining all partitions for verification...")
+               (gen/clients (drain-gen partitions))]
               ;; Phase 4: drain ALL partitions from replicas to verify convergence
-              (when (and (not (sql-workload? opts))
-                         (replicated? opts)
-                         (http-api? opts))
+              (when (and (replicated? opts) (http-api? opts))
                 [(gen/log "Draining all partitions from replicas...")
-                 (gen/clients (drain-gen partitions :replica-drain))])
-              ;; Phase 5 (sql workload only): sleep to let the async
-              ;; parquet exporter catch up on any just-flushed segments,
-              ;; then issue a single final drain SQL query that the
-              ;; sql-visibility checker consumes. Pinned to process 0 so
-              ;; exactly one op fires regardless of client count.
-              (when (sql-workload? opts)
-                (concat
-                 [(gen/log "Waiting 15s for async parquet exporter to catch up...")
-                  (gen/sleep 15)
-                  (gen/log "Issuing final SQL drain query...")
-                  (gen/on-threads
-                   #{0}
-                   (gen/once (sql-drain-query-gen topic (:typed opts))))]
-                 (when (retention-lifecycle? opts)
-                   [(gen/log "Verifying checkpoint-covered source retention...")
-                    (gen/on-threads
-                     #{0}
-                     (gen/once {:type :invoke :f :retention-state :value {}}))])))))})))
+                 (gen/clients (drain-gen partitions :replica-drain))])))})))
 
 (def cli-opts
   "Additional CLI options for camu tests."
@@ -497,20 +406,14 @@
     :default "1m"]
    [nil "--topic-retention DURATION" "TEST-ONLY topic retention for lifecycle scenarios"
     :default "24h"]
-   [nil "--retention-lifecycle BOOL" "Enable source-retention assertions for the SQL lifecycle scenario"
-    :default false
-    :parse-fn #(Boolean/parseBoolean %)]
-   [nil "--typed BOOL" "Use an immutable JSON typed schema for SQL workload"
-    :default false
-    :parse-fn #(Boolean/parseBoolean %)]
    [nil "--read-mode MODE" "Read routing mode: leader, replica, or any"
     :default :leader
     :parse-fn keyword
     :validate [#{:leader :replica :any} "must be one of: leader, replica, any"]]
-   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, idempotent, offsets, concurrent-writes, or sql"
+   [nil "--workload NAME" "Workload: mixed, large-requests, replica-flushed-reads, idempotent, offsets, or concurrent-writes"
     :default :mixed
     :parse-fn keyword
-    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent :offsets :concurrent-writes :sql} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent, offsets, concurrent-writes, sql"]]])
+    :validate [#{:mixed :large-requests :replica-flushed-reads :idempotent :offsets :concurrent-writes} "must be one of: mixed, large-requests, replica-flushed-reads, idempotent, offsets, concurrent-writes"]]])
 
 (defn -main
   "Entry point for the Jepsen CLI."

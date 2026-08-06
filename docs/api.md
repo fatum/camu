@@ -71,40 +71,11 @@ Diskless coordination:
   duplicate records, matching Kafka. Unreferenced uploads (a commit that
   permanently failed after upload, or a tombstoned retry) are swept by the
   leader after a grace period.
-- Diskless topics support typed schemas, `export_enabled`, and Parquet/SQL
-  exactly like classic topics: the partition leader exports the committed
-  diskless log (bounded by the diskless committed watermark) through the same
-  Parquet pipeline. Background small-segment compaction (`diskless.compaction`)
-  merges committed refs below the watermark without moving it.
-
-## Query Mode
-
-Camu also supports a separate runtime role:
-
-- `server.mode=stream`
-- `server.mode=query`
-
-`stream` is the normal log-serving node.
-
-`query` is a read-only SQL node:
-
-- no topic creation or produce/consume surface
-- no Kafka listener
-- no registry/assignment participation
-- exposes `POST /v1/sql`, `GET /v1/ready`, and `GET /v1/cluster/status`
-
-When `server.auth_token` is configured, SQL requests require
-`Authorization: Bearer <token>`; missing or invalid credentials return 401.
-TLS is terminated by the deployment proxy and is not provided by Camu.
-
-Query nodes require `sql.enabled: true`. They do not bind `internal_address`
-or `kafka_port`; those settings can be omitted from a query-role configuration.
-Use separate object-store credentials restricted to read-only access for
-`parquet/`, `_meta/parquet_manifests/`, and `_meta/topics/`. The status endpoint
-reports only that query node's local status; it is not cluster discovery.
-
-Start from [`camu.query.yaml.example`](../camu.query.yaml.example) when
-deploying the role.
+- Diskless topics support typed schemas, `export_enabled`, and Iceberg export exactly like
+  classic topics: the partition leader exports the committed diskless log (bounded by the
+  diskless committed watermark) through the same export pipeline. Background
+  small-segment compaction (`diskless.compaction`) merges committed refs below the
+  watermark without moving it.
 
 ## HTTP API
 
@@ -232,107 +203,12 @@ Allocate a producer ID:
 curl -X POST http://localhost:8080/v1/producers/init
 ```
 
-### SQL Query
+### Export (Iceberg)
 
-Enable SQL first:
-
-- `sql.enabled: true`
-
-Optional operational bounds:
-
-- `sql.cache_directory`
-- `sql.duckdb_temp_directory`
-- `sql.cache_max_size`
-- `sql.duckdb_memory_limit`
-- `sql.max_concurrency`
-- `sql.query_timeout`
-- `sql.max_scan_files`
-
-Run a query:
-
-```bash
-curl -X POST http://localhost:8080/v1/sql \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "sql":"select key, value from \"orders\" order by record_offset",
-    "topics":["orders"],
-    "limit":1000
-  }'
-```
-
-Envelope fields:
-
-- `sql`: required SQL text (single `SELECT` or `WITH` statement; no `;` inside)
-- `topics`: required list of topic names that may be referenced
-- `params`: optional bound parameters, positional. Numbers come through JSON as floats — cast to the target type inside the SQL (e.g. `WHERE record_offset = CAST(? AS BIGINT)`) rather than relying on implicit DuckDB coercion
-- `time_range`: optional manifest bucket filter (`from`, `to` RFC 3339; end is inclusive at the bucket boundary, so `to=2026-04-11T23:00:00Z` includes the `hour=23` bucket through midnight)
-- `limit`: optional server-side row cap. Default `1000`, max `10000`; values above max are rejected
-
-Response shape:
-
-```json
-{
-  "columns": [
-    {"name": "key",   "type": "BLOB"},
-    {"name": "value", "type": "BLOB"}
-  ],
-  "rows": [
-    ["base64-of-key-bytes", "base64-of-value-bytes"]
-  ]
-}
-```
-
-- `columns[].type` is the DuckDB column type name.
-- `rows` is a list of lists; column order matches `columns`.
-- `BLOB` columns (including `key`/`value` on the default export schema) are base64-encoded JSON strings; decode client-side. JSON cannot represent raw bytes, so this is unavoidable on the wire.
-- `NULL` is sent as JSON `null`.
-
-Error codes:
-
-- `400 Bad Request` — catch-all for validation and execution errors. Covers: missing required field, mutating statement, multi-statement SQL, invalid topic name, invalid `time_range`, `limit` above max, no published manifests for a requested topic in the time window (`no parquet data available for topic ...`), scan budget exceeded (`sql scan budget exceeded`), query timeout (`sql.query_timeout` expired), concurrency admission cancellation (`sql.max_concurrency` saturated and client disconnects while queued), and any DuckDB-level execution error. Inspect the response body's error string to disambiguate.
-- `404 Not Found` — a requested topic does not exist in the topic store at all.
-
-Note: timeout and concurrency saturation are not surfaced as distinct HTTP codes today; they collapse into 400 with a descriptive message. Future work may split these out.
-
-Current behavior:
-
-- read-only `SELECT` / `WITH` only; `copy`, `attach`, `install`, `load`, `create`, `alter`, `drop`, `insert`, `update`, `delete`, `export`, `call`, `pragma` are rejected (the validator strips quoted identifiers and string literals before scanning, so an identifier like `"events-export"` does not trip the filter)
-- queries read only Parquet files referenced by published manifests — **eventually consistent with the log**, lagging produce by the export cadence. Freshly-produced records are not visible until the partition leader's next export pass seals a segment and publishes a new manifest
-- SQL is topic-scoped; topic names must be declared in the request
-- if no Parquet files are published for the requested topic/time window, the query is rejected
-- BLOB columns are base64-encoded JSON strings (see above)
-- defaults: `sql.query_timeout=30s`, `sql.max_scan_files=4096`, `sql.max_concurrency=4`, `sql.cache_max_size=5GiB`
-
-Example with time window:
-
-```bash
-curl -X POST http://localhost:8080/v1/sql \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "sql":"select count(*)::BIGINT as n from \"orders\"",
-    "topics":["orders"],
-    "time_range":{
-      "from":"2026-04-11T00:00:00Z",
-      "to":"2026-04-11T23:59:59Z"
-    }
-  }'
-```
-
-Parquet export notes:
-
-- export is asynchronous and partition-leader-driven
-- currently applies to `classic` topics
-- opt-in per classic topic with `export_enabled: true`
-- while enabled, classic retention waits until the durable Parquet pipeline checkpoint
-  covers a sealed segment before deleting its native data; a missing, lagging,
-  or unreadable checkpoint blocks cleanup rather than losing queryable data
-- requires `unclean_leader_election=false` for every export-enabled classic topic.
-  Disable unclean leader election before enabling export; startup fails for
-  incompatible persisted topics.
-- export object layout uses ingest-time buckets:
-  - `parquet/dt=YYYY-MM-DD/topic={topic}/hour=HH/{file-id}.parquet`
-- query visibility is manifest-driven through:
-  - `_meta/parquet_manifests/...`
+Export-enabled topics are projected as self-managed Apache Iceberg tables
+under `maintenance.parquet_export.warehouse`; see
+[docs/iceberg.md](iceberg.md) for the pipeline, layout, and how to query the
+tables with external engines. Camu no longer serves in-process SQL.
 
 ## Idempotent Produce
 
@@ -387,21 +263,47 @@ Operational rules:
 
 ## Typed topic schemas
 
-Topics may be created with an immutable JSON schema:
+Topics may be created with a typed schema in one of three encodings: `json`, `avro`, or
+`protobuf`.
 
 ```json
 {"name":"orders","partitions":1,"schema":{"encoding":"json","fields":[{"name":"id","type":"int64","path":"$.id"}],"dead_letter_topic":"orders_dlq"}}
 ```
 
-Supported field types are `string`, `int64`, `float64`, `bool`, and
-`timestamp`; paths are simple `$.field`/`$.nested.field` selectors. HTTP
-produces are validated before append. Kafka values remain opaque until export.
-The per-partition Parquet consumer writes physical typed Parquet columns alongside offset, timestamp,
-key, value, and headers. Decode failures are published to the configured raw
-`dead_letter_topic` before the pipeline checkpoint advances; without one they
-are explicitly skipped and logged. Schema fields and DLQ configuration cannot
-be changed after topic creation. Kafka exposes the schema through the
-`camu.schema` topic config.
+Supported field types are `string`, `int64`, `float64`, `bool`, and `timestamp`; JSON paths
+are simple `$.field`/`$.nested.field` selectors. HTTP produces are validated before append.
+Kafka values remain opaque until export. The export pipeline writes physical typed Parquet
+columns alongside offset, timestamp, key, value, and headers. Decode failures are published
+to the configured raw `dead_letter_topic` before the pipeline checkpoint advances; without
+one they are explicitly skipped and logged.
+
+### Schema versions and evolution
+
+Each topic's schema is registered in the embedded schema registry (`_meta/schemas/`), which
+assigns stable ids and enforces backward compatibility. Register a new version:
+
+```text
+POST /v1/topics/{topic}/schema
+{"schema":{"encoding":"json","fields":[{"name":"id","type":"int64","path":"$.id"},{"name":"note","type":"string","path":"$.note","nullable":true}]}}
+```
+
+Evolution rules:
+
+- fields may only be **added** — never removed or retyped
+- a required field may only relax to nullable
+- the encoding cannot change
+
+The topic's current schema updates and the Iceberg table schema advances to the new version
+immediately, preserving stable column ids.
+
+### Encodings
+
+- `json` — values are JSON text; HTTP produce takes them inline.
+- `avro` / `protobuf` — values on the wire carry the Confluent-style schema-id envelope
+  (`0x00` + 4-byte big-endian id), so the exporter decodes against each value's own writer
+  schema. HTTP produce/consume uses base64; Kafka carries raw bytes.
+
+Kafka exposes the schema through the `camu.schema` topic config.
 
 Camu supports a Kafka protocol subset rather than full Kafka parity.
 

@@ -82,9 +82,10 @@ func New(t testing.TB, opts ...Option) *Env {
 				Directory: cacheDir,
 				MaxSize:   104857600, // 100 MB for tests
 			},
-			SQL: config.SQLConfig{
-				CacheDirectory: filepath.Join(cacheDir, "sql-cache"),
-				TempDirectory:  filepath.Join(cacheDir, "sql-tmp"),
+			Maintenance: config.MaintenanceConfig{
+				ParquetExport: config.ParquetExportConfig{
+					TempDirectory: filepath.Join(cacheDir, "export-tmp"),
+				},
 			},
 			Coordination: config.CoordinationConfig{
 				LeaseTTL:          "6s",
@@ -209,7 +210,7 @@ func (e *Env) RestartInstance(idx int) {
 			Directory: ic.cacheDir,
 			MaxSize:   ic.cfg.Cache.MaxSize,
 		},
-		SQL:          ic.cfg.SQL,
+		Maintenance:  ic.cfg.Maintenance,
 		Coordination: ic.cfg.Coordination,
 	}
 

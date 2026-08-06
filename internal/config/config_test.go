@@ -32,8 +32,6 @@ cache:
 sql:
   cache_directory: "/tmp/sql-cache"
   cache_max_size: 268435456
-  duckdb_temp_directory: "/tmp/sql-tmp"
-  duckdb_memory_limit: "512MB"
   max_concurrency: 8
 coordination:
   lease_ttl: "20s"
@@ -99,27 +97,6 @@ coordination:
 	if cfg.Cache.MaxSize != 5368709120 {
 		t.Errorf("Cache.MaxSize = %d, want %d", cfg.Cache.MaxSize, 5368709120)
 	}
-	if cfg.SQL.CacheDirectory != "/tmp/sql-cache" {
-		t.Errorf("SQL.CacheDirectory = %q, want %q", cfg.SQL.CacheDirectory, "/tmp/sql-cache")
-	}
-	if cfg.SQL.CacheDirectoryValue() != "/tmp/sql-cache" {
-		t.Errorf("SQL.CacheDirectoryValue() = %q, want %q", cfg.SQL.CacheDirectoryValue(), "/tmp/sql-cache")
-	}
-	if cfg.SQL.CacheMaxSize != 268435456 {
-		t.Errorf("SQL.CacheMaxSize = %d, want %d", cfg.SQL.CacheMaxSize, 268435456)
-	}
-	if cfg.SQL.TempDirectory != "/tmp/sql-tmp" {
-		t.Errorf("SQL.TempDirectory = %q, want %q", cfg.SQL.TempDirectory, "/tmp/sql-tmp")
-	}
-	if cfg.SQL.TempDirectoryValue() != "/tmp/sql-tmp" {
-		t.Errorf("SQL.TempDirectoryValue() = %q, want %q", cfg.SQL.TempDirectoryValue(), "/tmp/sql-tmp")
-	}
-	if cfg.SQL.MemoryLimit != "512MB" {
-		t.Errorf("SQL.MemoryLimit = %q, want %q", cfg.SQL.MemoryLimit, "512MB")
-	}
-	if cfg.SQL.MaxConcurrency != 8 {
-		t.Errorf("SQL.MaxConcurrency = %d, want %d", cfg.SQL.MaxConcurrency, 8)
-	}
 	if cfg.Coordination.LeaseTTL != "20s" {
 		t.Errorf("Coordination.LeaseTTL = %q, want %q", cfg.Coordination.LeaseTTL, "20s")
 	}
@@ -160,12 +137,6 @@ storage:
 	if cfg.Server.Address != ":8080" {
 		t.Errorf("Server.Address = %q, want %q", cfg.Server.Address, ":8080")
 	}
-	if cfg.Server.Mode != config.ServerModeStream {
-		t.Errorf("Server.Mode = %q, want %q", cfg.Server.Mode, config.ServerModeStream)
-	}
-	if !cfg.Server.IsStreamMode() {
-		t.Error("Server.IsStreamMode() = false, want true")
-	}
 	if cfg.Segments.RecordBatchTargetSize != 16*1024 {
 		t.Errorf("Segments.RecordBatchTargetSize = %d, want %d", cfg.Segments.RecordBatchTargetSize, 16*1024)
 	}
@@ -174,24 +145,6 @@ storage:
 	}
 	if cfg.Segments.MaxSize != 8388608 {
 		t.Errorf("Segments.MaxSize = %d, want %d", cfg.Segments.MaxSize, 8388608)
-	}
-	if cfg.SQL.CacheDirectory != "/var/lib/camu/sql-cache" {
-		t.Errorf("SQL.CacheDirectory = %q, want %q", cfg.SQL.CacheDirectory, "/var/lib/camu/sql-cache")
-	}
-	if cfg.SQL.CacheDirectoryValue() != "/var/lib/camu/sql-cache" {
-		t.Errorf("SQL.CacheDirectoryValue() = %q, want %q", cfg.SQL.CacheDirectoryValue(), "/var/lib/camu/sql-cache")
-	}
-	if cfg.SQL.CacheMaxSize != 5*1024*1024*1024 {
-		t.Errorf("SQL.CacheMaxSize = %d, want %d", cfg.SQL.CacheMaxSize, 5*1024*1024*1024)
-	}
-	if cfg.SQL.TempDirectory != "/var/lib/camu/sql-tmp" {
-		t.Errorf("SQL.TempDirectory = %q, want %q", cfg.SQL.TempDirectory, "/var/lib/camu/sql-tmp")
-	}
-	if cfg.SQL.TempDirectoryValue() != "/var/lib/camu/sql-tmp" {
-		t.Errorf("SQL.TempDirectoryValue() = %q, want %q", cfg.SQL.TempDirectoryValue(), "/var/lib/camu/sql-tmp")
-	}
-	if cfg.SQL.MaxConcurrency != 4 {
-		t.Errorf("SQL.MaxConcurrency = %d, want %d", cfg.SQL.MaxConcurrency, 4)
 	}
 	if cfg.Coordination.MaintenanceMaxConcurrency != 4 {
 		t.Errorf("Coordination.MaintenanceMaxConcurrency = %d, want %d", cfg.Coordination.MaintenanceMaxConcurrency, 4)
@@ -202,83 +155,6 @@ storage:
 	}
 	if instanceTTL != 90*time.Second {
 		t.Errorf("InstanceTTLDuration() = %v, want %v", instanceTTL, 90*time.Second)
-	}
-}
-
-func TestLoadQueryMode(t *testing.T) {
-	content := `
-server:
-  mode: "query"
-storage:
-  bucket: "bucket"
-`
-	f, err := os.CreateTemp("", "camu-config-*.yaml")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	defer os.Remove(f.Name())
-	if _, err := f.WriteString(content); err != nil {
-		t.Fatalf("failed to write temp file: %v", err)
-	}
-	f.Close()
-
-	cfg, err := config.Load(f.Name())
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.Server.Mode != config.ServerModeQuery {
-		t.Fatalf("Server.Mode = %q, want %q", cfg.Server.Mode, config.ServerModeQuery)
-	}
-	if !cfg.Server.IsQueryMode() {
-		t.Fatal("Server.IsQueryMode() = false, want true")
-	}
-}
-
-func TestLoadQueryModeWithSQLDisabled(t *testing.T) {
-	content := `
-server:
-  mode: "query"
-storage:
-  bucket: "bucket"
-sql:
-  enabled: false
-`
-	f, err := os.CreateTemp("", "camu-config-*.yaml")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	defer os.Remove(f.Name())
-	if _, err := f.WriteString(content); err != nil {
-		t.Fatalf("failed to write temp file: %v", err)
-	}
-	f.Close()
-
-	_, err = config.Load(f.Name())
-	if err == nil {
-		t.Fatal("Load() error = nil, want query mode SQL validation error")
-	}
-}
-
-func TestLoadInvalidServerMode(t *testing.T) {
-	content := `
-server:
-  mode: "weird"
-storage:
-  bucket: "bucket"
-`
-	f, err := os.CreateTemp("", "camu-config-*.yaml")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	defer os.Remove(f.Name())
-	if _, err := f.WriteString(content); err != nil {
-		t.Fatalf("failed to write temp file: %v", err)
-	}
-	f.Close()
-
-	_, err = config.Load(f.Name())
-	if err == nil {
-		t.Fatal("Load() error = nil, want invalid server.mode error")
 	}
 }
 
@@ -371,5 +247,14 @@ func TestCompactionIntervalDefault(t *testing.T) {
 	}
 	if got != 150*time.Millisecond {
 		t.Fatalf("IntervalDuration(150ms) = %v, want 150ms", got)
+	}
+}
+
+func TestParquetExportWarehouseDefaults(t *testing.T) {
+	if got := (config.ParquetExportConfig{}).WarehouseValue(); got != "warehouse/" {
+		t.Fatalf("default WarehouseValue = %q, want warehouse/", got)
+	}
+	if got := (config.ParquetExportConfig{Warehouse: "lake/"}).WarehouseValue(); got != "lake/" {
+		t.Fatalf("WarehouseValue(lake/) = %q, want lake/", got)
 	}
 }

@@ -1,97 +1,41 @@
 package server
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/base64"
 	"fmt"
-	"strings"
-	"time"
 
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/meta"
 )
 
-func validateTypedValue(schema *meta.TopicSchema, value string) error {
-	if schema == nil {
+// validateTypedValue validates a produce value against its topic schema.
+// JSON values are the request string verbatim; avro values are base64-encoded
+// and, when wrapped in the schema-id envelope, decoded against the registered
+// writer schema.
+func (s *Server) validateTypedValue(ctx context.Context, topicCfg meta.TopicConfig, value string) error {
+	if topicCfg.Schema == nil {
 		return nil
 	}
-	_, err := decodeTypedFields(schema, []byte(value))
+	raw, err := typedValueBytes(topicCfg.Schema, value)
+	if err != nil {
+		return err
+	}
+	_, err = iceberg.DecodeTypedFields(ctx, topicCfg.Name, topicCfg.Schema, s.schemaRegistry, raw)
 	return err
 }
 
-func jsonPathValue(root map[string]any, path string) (any, bool) {
-	parts := strings.Split(strings.TrimPrefix(path, "$."), ".")
-	var cur any = root
-	for _, p := range parts {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return nil, false
+// typedValueBytes returns the raw bytes a topic value should be stored as.
+// JSON schema values are the request string verbatim; avro and protobuf schema
+// values are base64-encoded in the HTTP body and decoded to raw bytes before
+// storage (the Kafka path already carries raw bytes).
+func typedValueBytes(schema *meta.TopicSchema, value string) ([]byte, error) {
+	if schema != nil && (schema.Encoding == "avro" || schema.Encoding == "protobuf") {
+		raw, err := base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s value must be base64-encoded: %w", schema.Encoding, err)
 		}
-		cur, ok = m[p]
-		if !ok {
-			return nil, false
-		}
+		return raw, nil
 	}
-	return cur, true
-}
-
-func validTimestamp(v any) bool {
-	_, err := parseTimestamp(v)
-	return err == nil
-}
-
-func typedValueAtPath(value string, path string) (any, bool, error) {
-	var root map[string]any
-	if err := json.Unmarshal([]byte(value), &root); err != nil {
-		return nil, false, err
-	}
-	v, ok := jsonPathValue(root, path)
-	return v, ok, nil
-}
-
-func asInt64(v any) (int64, error) {
-	n, ok := v.(float64)
-	if !ok || n != float64(int64(n)) {
-		return 0, fmt.Errorf("not int64")
-	}
-	return int64(n), nil
-}
-func asFloat64(v any) (float64, error) {
-	n, ok := v.(float64)
-	if !ok {
-		return 0, fmt.Errorf("not number")
-	}
-	return n, nil
-}
-func asString(v any) (string, error) {
-	s, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("not string")
-	}
-	return s, nil
-}
-func asBool(v any) (bool, error) {
-	b, ok := v.(bool)
-	if !ok {
-		return false, fmt.Errorf("not bool")
-	}
-	return b, nil
-}
-func parseTimestamp(v any) (time.Time, error) {
-	s, err := asString(v)
-	if err != nil {
-		return time.Time{}, err
-	}
-	timestamp, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		return time.Time{}, err
-	}
-	// time.Time.UnixNano is only defined within this interval. Reject values
-	// outside it while validating, before they can reach either Parquet export
-	// or the schema DLQ path.
-	min := time.Unix(-9223372037, 145224192).UTC()
-	max := time.Unix(9223372036, 854775807).UTC()
-	timestamp = timestamp.UTC()
-	if timestamp.Before(min) || timestamp.After(max) {
-		return time.Time{}, fmt.Errorf("timestamp outside Unix nanosecond range")
-	}
-	return timestamp, nil
+	return []byte(value), nil
 }

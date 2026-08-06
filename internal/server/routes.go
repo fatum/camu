@@ -20,18 +20,10 @@ func (s *Server) publicAPIHandler() http.Handler {
 	if s.cfg.Server.HeapProfileEnabled && s.cfg.Server.AuthToken != "" {
 		mux.Handle("GET /v1/debug/heap", s.requireBearerAuth(http.HandlerFunc(s.handleHeapProfile), "camu-debug"))
 	}
-	if s.cfg.SQL.EnabledValue(s.isQueryMode()) {
-		mux.Handle("POST /v1/sql", s.requireBearerAuth(http.HandlerFunc(s.handleSQLQuery), "camu-sql"))
-	}
-	if s.isQueryMode() {
-		mux.HandleFunc("GET /v1/ready", s.handleReady)
-		mux.HandleFunc("GET /v1/cluster/status", s.handleClusterStatus)
-		mux.HandleFunc("GET /v1/cluster/ready", s.handleClusterReady)
-		return mux
-	}
 	mux.HandleFunc("POST /v1/topics", s.handleCreateTopic)
 	mux.HandleFunc("GET /v1/topics", s.handleListTopics)
 	mux.HandleFunc("GET /v1/topics/{topic}", s.handleGetTopic)
+	mux.HandleFunc("POST /v1/topics/{topic}/schema", s.handleUpdateTopicSchema)
 	mux.HandleFunc("DELETE /v1/topics/{topic}", s.handleDeleteTopic)
 	mux.HandleFunc("GET /v1/ready", s.handleReady)
 	mux.HandleFunc("GET /v1/cluster/status", s.handleClusterStatus)
@@ -90,9 +82,6 @@ func (s *Server) internalRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/ready", s.handleReady)
 	mux.HandleFunc("GET /v1/internal/readiness", s.handleInternalReadiness)
-	if s.isQueryMode() {
-		return s.withMiddleware(mux)
-	}
 	// Produce endpoints are registered here so proxied requests from
 	// non-leader nodes can be handled by the leader's internal server.
 	mux.HandleFunc("POST /v1/topics/{topic}/messages", s.handleProduceHighLevel)

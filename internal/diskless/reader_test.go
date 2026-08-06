@@ -187,6 +187,127 @@ func TestReader_FetchCompactedRefPatchesAllBatches(t *testing.T) {
 	}
 }
 
+// TestReader_FetchTrimsOversizedMergedRefToWholeBatches verifies that a fetch
+// with a byte budget smaller than a compacted merged ref returns only whole
+// record batches within the budget — never a partial batch or an oversized
+// response — while always including the first batch so the client makes
+// progress. This is the regression test for the leaky ref-level cap: a 64MB
+// merged object served to a Kafka consumer that requested 16MB used to be
+// treated as a budget violation and silently paused the partition.
+func TestReader_FetchTrimsOversizedMergedRefToWholeBatches(t *testing.T) {
+	s3 := testS3Client(t)
+	meta := NewMemoryMetaStore()
+	w := NewWriter(s3, meta, "node1")
+	ctx := context.Background()
+
+	batch := makeTestBatch(t, []log.Message{{Key: []byte("k"), Value: []byte("v")}})
+	for i := 0; i < 5; i++ {
+		done := make(chan FlushResult, 1)
+		if err := w.Flush(ctx, []BufferEntry{{Topic: "t1", Partition: 0, Batch: batch, Done: done}}); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+		if result := <-done; result.Err != nil {
+			t.Fatalf("flush %d result: %v", i, result.Err)
+		}
+	}
+	refs, err := meta.QuerySegments(ctx, "t1", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	merged := make([]byte, 0)
+	for _, ref := range refs {
+		buf := make([]byte, ref.ByteLength)
+		if err := s3.GetRangeInto(ctx, ref.FileKey, ref.ByteOffset, ref.ByteLength, buf); err != nil {
+			t.Fatalf("get range: %v", err)
+		}
+		merged = append(merged, buf...)
+	}
+	if err := s3.Put(ctx, "_diskless_merge/t1/0/merged.data", merged, storage.PutOpts{}); err != nil {
+		t.Fatalf("put merged: %v", err)
+	}
+	remove := make([]RefKey, 0, len(refs))
+	for _, ref := range refs {
+		remove = append(remove, RefKey{BaseOffset: ref.BaseOffset, EndOffset: ref.EndOffset})
+	}
+	if err := meta.ReplaceSegmentRefs(ctx, "t1", 0, remove, []SegmentRef{{
+		FileKey: "_diskless_merge/t1/0/merged.data", ByteOffset: 0,
+		ByteLength: int64(len(merged)), BaseOffset: 0, EndOffset: 5,
+	}}); err != nil {
+		t.Fatalf("replace refs: %v", err)
+	}
+
+	// Walk the merged object to get the per-batch sizes and the cumulative
+	// boundary of whole batches for a given budget.
+	batchSizes := batchSizesOf(t, merged)
+	mergedSize := int64(len(merged))
+
+	reader := NewReader(s3, meta)
+
+	// Budget covers a fraction of the merged object: the response must be
+	// whole batches within the budget.
+	budget := int(mergedSize / 2)
+	data, hw, err := reader.Fetch(ctx, "t1", 0, 0, budget)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if hw != 5 {
+		t.Fatalf("hw = %d, want 5", hw)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected at least the first batch")
+	}
+	if len(data) > budget {
+		t.Fatalf("response %d bytes exceeds budget %d", len(data), budget)
+	}
+	gotSizes := batchSizesOf(t, data)
+	if len(gotSizes) == 0 || len(gotSizes) == len(batchSizes) {
+		t.Fatalf("response covers %d of %d batches, want a strict trim", len(gotSizes), len(batchSizes))
+	}
+	// The batches returned must be the leading whole batches of the merged
+	// object with their logical offsets patched.
+	var wantOffset int64
+	for _, size := range gotSizes {
+		hdr, err := log.ReadRecordBatchHeader(data[0:size])
+		if err != nil {
+			t.Fatalf("header: %v", err)
+		}
+		if hdr.FirstOffset != wantOffset {
+			t.Fatalf("batch offset = %d, want %d", hdr.FirstOffset, wantOffset)
+		}
+		wantOffset += int64(hdr.NumRecords)
+		data = data[size:]
+	}
+
+	// A budget smaller than a single batch still returns the whole first batch
+	// so the fetch always makes progress.
+	tiny := int(batchSizes[0] - 1)
+	if tiny < 1 {
+		tiny = 1
+	}
+	data, _, err = NewReader(s3, meta).Fetch(ctx, "t1", 0, 0, tiny)
+	if err != nil {
+		t.Fatalf("fetch tiny: %v", err)
+	}
+	if len(data) != batchSizes[0] {
+		t.Fatalf("tiny fetch returned %d bytes, want the whole first batch (%d)", len(data), batchSizes[0])
+	}
+}
+
+// batchSizesOf returns the wire size of every self-framing RecordBatch in data.
+func batchSizesOf(t *testing.T, data []byte) []int {
+	t.Helper()
+	var sizes []int
+	for pos := 0; pos < len(data); {
+		hdr, err := log.ReadRecordBatchHeader(data[pos:])
+		if err != nil {
+			t.Fatalf("read header at %d: %v", pos, err)
+		}
+		sizes = append(sizes, int(hdr.RecordBatchSize()))
+		pos += int(hdr.RecordBatchSize())
+	}
+	return sizes
+}
+
 // TestReader_HighWatermarkIsCommittedNotAllocated verifies that the readable
 // high watermark reflects only durably materialized segments, never offsets
 // that were allocated but not yet registered (in-flight flushes or gaps).

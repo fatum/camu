@@ -136,11 +136,6 @@ func (s *Server) handleInternalReadiness(w http.ResponseWriter, _ *http.Request)
 
 func (s *Server) clusterStatus(parent context.Context) clusterStatusResponse {
 	resp := clusterStatusResponse{Instances: []instanceInfo{}}
-	if s.isQueryMode() {
-		resp.Status = "unavailable"
-		resp.Reasons = []string{"cluster readiness is not supported in query mode"}
-		return resp
-	}
 	if s.registry == nil || s.assignmentStore == nil || s.topicStore == nil {
 		resp.Status = "unavailable"
 		resp.Reasons = []string{"cluster coordination is unavailable"}

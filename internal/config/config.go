@@ -14,7 +14,6 @@ type Config struct {
 	Storage      StorageConfig      `yaml:"storage"`
 	Segments     SegmentsConfig     `yaml:"segments"`
 	Cache        CacheConfig        `yaml:"cache"`
-	SQL          SQLConfig          `yaml:"sql"`
 	Coordination CoordinationConfig `yaml:"coordination"`
 	Diskless     DisklessConfig     `yaml:"diskless"`
 	Maintenance  MaintenanceConfig  `yaml:"maintenance"`
@@ -25,11 +24,31 @@ type MaintenanceConfig struct {
 	ParquetExport ParquetExportConfig `yaml:"parquet_export"`
 }
 
-// ParquetExportConfig controls the per-partition Parquet export consumer.
+// ParquetExportConfig controls the per-partition export consumer, which
+// writes committed records as self-managed Apache Iceberg tables.
 type ParquetExportConfig struct {
 	MaxRecords  int    `yaml:"max_records"`
 	MaxDuration string `yaml:"max_duration"`
+	// TempDirectory is where the export pipeline encodes Parquet data files
+	// before uploading them.
+	TempDirectory string `yaml:"temp_directory"`
+	// Warehouse is the object-store prefix Iceberg tables live under.
+	Warehouse string `yaml:"warehouse"`
+	// TargetBytes bounds how much data one Iceberg snapshot commits; the
+	// export pass keeps appending data files until the target or MaxInterval
+	// is reached, so snapshots and manifest lists stay small at high load.
+	TargetBytes int64 `yaml:"target_bytes"`
+	// MaxInterval bounds how long an Iceberg export pass may run before it
+	// commits whatever it buffered.
+	MaxInterval string `yaml:"max_interval"`
 }
+
+const (
+	defaultExportWarehouse   = "warehouse/"
+	defaultExportTargetBytes = 64 << 20
+	defaultExportMaxInterval = 30 * time.Second
+	defaultExportTempDir     = "/var/lib/camu/export-tmp"
+)
 
 func (p ParquetExportConfig) MaxRecordsValue() int {
 	if p.MaxRecords <= 0 {
@@ -45,15 +64,41 @@ func (p ParquetExportConfig) MaxDurationValue() time.Duration {
 	return d
 }
 
-type SQLConfig struct {
-	Enabled        *bool  `yaml:"enabled"`
-	CacheDirectory string `yaml:"cache_directory"`
-	CacheMaxSize   int64  `yaml:"cache_max_size"`
-	TempDirectory  string `yaml:"duckdb_temp_directory"`
-	MemoryLimit    string `yaml:"duckdb_memory_limit"`
-	MaxConcurrency int    `yaml:"max_concurrency"`
-	QueryTimeout   string `yaml:"query_timeout"`
-	MaxScanFiles   int    `yaml:"max_scan_files"`
+// WarehouseValue returns the Iceberg warehouse prefix, defaulting to
+// warehouse/.
+func (p ParquetExportConfig) WarehouseValue() string {
+	if p.Warehouse == "" {
+		return defaultExportWarehouse
+	}
+	return p.Warehouse
+}
+
+// TempDirectoryValue returns the export temp directory, defaulting to
+// /var/lib/camu/export-tmp.
+func (p ParquetExportConfig) TempDirectoryValue() string {
+	if p.TempDirectory == "" {
+		return defaultExportTempDir
+	}
+	return p.TempDirectory
+}
+
+// TargetBytesValue returns the Iceberg snapshot byte target, defaulting to
+// 64 MiB.
+func (p ParquetExportConfig) TargetBytesValue() int64 {
+	if p.TargetBytes <= 0 {
+		return defaultExportTargetBytes
+	}
+	return p.TargetBytes
+}
+
+// MaxIntervalValue returns the Iceberg snapshot commit interval, defaulting to
+// 30s.
+func (p ParquetExportConfig) MaxIntervalValue() time.Duration {
+	d, err := time.ParseDuration(p.MaxInterval)
+	if err != nil || d <= 0 {
+		return defaultExportMaxInterval
+	}
+	return d
 }
 
 // DisklessConfig holds settings for diskless topic mode.
@@ -188,27 +233,6 @@ type ServerConfig struct {
 	ClusterToken          string `yaml:"cluster_token"`           // Internal API shared secret (optional)
 	KafkaPort             int    `yaml:"kafka_port"`              // Kafka protocol port (0 = disabled)
 	KafkaAdvertiseAddress string `yaml:"kafka_advertise_address"` // Public Kafka host:port override (optional)
-	Mode                  string `yaml:"mode"`                    // "stream" (default) or "query"
-}
-
-const (
-	ServerModeStream = "stream"
-	ServerModeQuery  = "query"
-)
-
-func (s ServerConfig) ModeValue() string {
-	if s.Mode == "" {
-		return ServerModeStream
-	}
-	return s.Mode
-}
-
-func (s ServerConfig) IsQueryMode() bool {
-	return s.ModeValue() == ServerModeQuery
-}
-
-func (s ServerConfig) IsStreamMode() bool {
-	return s.ModeValue() == ServerModeStream
 }
 
 // StorageConfig holds S3-compatible object storage settings.
@@ -237,12 +261,6 @@ type SegmentsConfig struct {
 const (
 	defaultSegmentRecordBatchTargetSize = 16 * 1024
 	defaultSegmentIndexIntervalBytes    = 4096
-	defaultSQLCacheMaxSize              = 5 * 1024 * 1024 * 1024
-	defaultSQLMaxConcurrency            = 4
-	defaultSQLCacheDirectory            = "/var/lib/camu/sql-cache"
-	defaultSQLTempDirectory             = "/var/lib/camu/sql-tmp"
-	defaultSQLQueryTimeout              = 30 * time.Second
-	defaultSQLMaxScanFiles              = 4096
 )
 
 // MaxAgeDuration parses MaxAge as a time.Duration.
@@ -350,55 +368,6 @@ func (c CoordinationConfig) FenceIntervalDuration() (time.Duration, error) {
 	return parseDurationOrDefault(c.FenceInterval, defaultFenceInterval)
 }
 
-func (s SQLConfig) CacheMaxSizeValue() int64 {
-	if s.CacheMaxSize <= 0 {
-		return defaultSQLCacheMaxSize
-	}
-	return s.CacheMaxSize
-}
-
-func (s SQLConfig) CacheDirectoryValue() string {
-	if s.CacheDirectory == "" {
-		return defaultSQLCacheDirectory
-	}
-	return s.CacheDirectory
-}
-
-func (s SQLConfig) TempDirectoryValue() string {
-	if s.TempDirectory == "" {
-		return defaultSQLTempDirectory
-	}
-	return s.TempDirectory
-}
-
-func (s SQLConfig) MaxConcurrencyValue() int {
-	if s.MaxConcurrency <= 0 {
-		return defaultSQLMaxConcurrency
-	}
-	return s.MaxConcurrency
-}
-
-// EnabledValue reports whether the /v1/sql endpoint is enabled. Defaults to
-// true in query mode and false in stream mode unless explicitly overridden,
-// so that analytical SQL does not land on hot streaming nodes by default.
-func (s SQLConfig) EnabledValue(queryMode bool) bool {
-	if s.Enabled != nil {
-		return *s.Enabled
-	}
-	return queryMode
-}
-
-func (s SQLConfig) QueryTimeoutDuration() (time.Duration, error) {
-	return parseDurationOrDefault(s.QueryTimeout, defaultSQLQueryTimeout)
-}
-
-func (s SQLConfig) MaxScanFilesValue() int {
-	if s.MaxScanFiles <= 0 {
-		return defaultSQLMaxScanFiles
-	}
-	return s.MaxScanFiles
-}
-
 // Load reads a YAML config file at path, applies defaults, and validates required fields.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -426,7 +395,6 @@ func defaults() *Config {
 			Address:            ":8080",
 			InternalAddress:    ":8081",
 			ReplicationAddress: ":8082",
-			Mode:               ServerModeStream,
 		},
 		Segments: SegmentsConfig{
 			MaxSize:               8388608,
@@ -438,12 +406,6 @@ func defaults() *Config {
 		Cache: CacheConfig{
 			Directory: "/var/lib/camu/cache",
 			MaxSize:   10737418240,
-		},
-		SQL: SQLConfig{
-			CacheDirectory: "/var/lib/camu/sql-cache",
-			CacheMaxSize:   defaultSQLCacheMaxSize,
-			TempDirectory:  "/var/lib/camu/sql-tmp",
-			MaxConcurrency: defaultSQLMaxConcurrency,
 		},
 		Coordination: CoordinationConfig{
 			LeaseTTL:                  defaultLeaseTTL.String(),
@@ -460,14 +422,6 @@ func defaults() *Config {
 func validate(cfg *Config) error {
 	if cfg.Storage.Bucket == "" {
 		return fmt.Errorf("storage.bucket is required")
-	}
-	switch cfg.Server.ModeValue() {
-	case ServerModeStream, ServerModeQuery:
-	default:
-		return fmt.Errorf("server.mode must be %q or %q", ServerModeStream, ServerModeQuery)
-	}
-	if cfg.Server.IsQueryMode() && !cfg.SQL.EnabledValue(true) {
-		return fmt.Errorf("sql.enabled must be true in query mode")
 	}
 	return nil
 }

@@ -1,17 +1,13 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"net/http"
-	"strings"
 	"time"
 )
 
 // webAnalyticsEvent is the message value used when WEB_ANALYTICS is enabled. It
 // embeds the integrity fields consumed by typedValue plus fifteen typed
-// web-analytics columns exported to Parquet and queryable through /v1/sql. All
+// web-analytics columns exported to Parquet as Iceberg table columns. All
 // fields are derived deterministically from Sequence so produce and consume
 // agree on the payload digest without extra hashing.
 type webAnalyticsEvent struct {
@@ -153,54 +149,13 @@ var webAnalyticsDimensions = []webAnalyticsDimension{
 	{Column: "user_agent", pool: webAnalyticsUserAgents},
 }
 
-// verifyWebAnalyticsSQL aggregates each dimension column through /v1/sql and
+// dimension columns are exported as Iceberg table columns;
 // checks the exported Parquet data is internally consistent. It is tolerant of
 // gap-filled retained topics (event_ids may be missing from interrupted runs)
 // but rejects duplicates and any value outside the deterministic pools:
 //   - every dimension value comes from its fixed pool;
 //   - the GROUP BY counts sum to the committed record count;
 //   - event_ids are unique.
-func verifyWebAnalyticsSQL(ctx context.Context, c client, cfg config, count int64) error {
-	quoted := `"` + strings.ReplaceAll(cfg.Topic, `"`, `""`) + `"`
-	var resp struct {
-		Rows [][]any `json:"rows"`
-	}
-	query := fmt.Sprintf("SELECT count(*)::BIGINT, count(distinct event_id)::BIGINT FROM %s", quoted)
-	if err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": query, "topics": []string{cfg.Topic}}, &resp); err != nil {
-		return err
-	}
-	if len(resp.Rows) == 0 || len(resp.Rows[0]) < 2 {
-		return errors.New("web analytics SQL returned no integrity rows")
-	}
-	if got := sqlRowInt64(resp.Rows[0][0]); got != count {
-		return fmt.Errorf("web analytics SQL count = %d, want %d", got, count)
-	}
-	if distinct := sqlRowInt64(resp.Rows[0][1]); distinct != count {
-		return fmt.Errorf("web analytics event_id duplicates: %d distinct of %d", distinct, count)
-	}
-
-	for _, dim := range webAnalyticsDimensions {
-		query := fmt.Sprintf("SELECT %s, count(*)::BIGINT FROM %s GROUP BY %s", dim.Column, quoted, dim.Column)
-		if err := c.request(ctx, http.MethodPost, "/v1/sql", map[string]any{"sql": query, "topics": []string{cfg.Topic}}, &resp); err != nil {
-			return err
-		}
-		var total int64
-		for _, row := range resp.Rows {
-			if len(row) < 2 {
-				return fmt.Errorf("web analytics dimension %s returned a malformed row", dim.Column)
-			}
-			value := fmt.Sprintf("%v", row[0])
-			if !webAnalyticsDimensionValue(dim, value) {
-				return fmt.Errorf("web analytics dimension %s returned unexpected value %q", dim.Column, value)
-			}
-			total += sqlRowInt64(row[1])
-		}
-		if total != count {
-			return fmt.Errorf("web analytics dimension %s total = %d, want %d", dim.Column, total, count)
-		}
-	}
-	return nil
-}
 
 func webAnalyticsDimensionValue(dim webAnalyticsDimension, value string) bool {
 	for _, v := range dim.pool {
@@ -209,16 +164,4 @@ func webAnalyticsDimensionValue(dim webAnalyticsDimension, value string) bool {
 		}
 	}
 	return false
-}
-
-func sqlRowInt64(v any) int64 {
-	switch n := v.(type) {
-	case float64:
-		return int64(n)
-	case int64:
-		return n
-	case nil:
-		return 0
-	}
-	return 0
 }
