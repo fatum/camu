@@ -45,14 +45,13 @@ diskless:
   metastore: "memory"
 maintenance:
   parquet_export:
-    # Requires unclean_leader_election: false on every topic.
+    # Requires unclean_leader_election: false on every topic. Writes the
+    # export as self-managed Apache Iceberg tables (readable by external
+    # engines) under `warehouse`.
     enabled: false
     max_records: 16384
     max_duration: "30s"
     temp_directory: "/var/lib/camu/export-tmp"
-    # Write the export as self-managed Apache Iceberg tables (readable by
-    # external engines) instead of the legacy per-bucket Parquet manifests.
-    iceberg: false
     warehouse: "warehouse/"
     target_bytes: 67108864
     max_interval: "30s"
