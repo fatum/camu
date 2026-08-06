@@ -39,8 +39,9 @@ archive **is** the analytics store.
   warehouse.
 - **Typed topics with a schema registry.** Define JSON, Avro, or Protobuf schemas, evolve
   them backward-compatibly, and route decode failures to a dead-letter topic.
-- **Runs anywhere.** A single Go binary. `classic` mode for local fast tails, `diskless`
-  mode that needs no local disks at all; both speak the same APIs.
+- **Runs anywhere.** A single Go binary — [download a release](https://github.com/fatum/camu/releases)
+  for macOS or Linux, or build from source. `classic` mode for local fast tails,
+  `diskless` mode that needs no local disks at all; both speak the same APIs.
 
 Camu is a focused system, not a drop-in for every Kafka feature. It is the right choice
 when S3-native durability, simple replayable streams, and a queryable projection matter
@@ -96,9 +97,22 @@ with backward-compatibility checks; failed decodes go to a configured dead-lette
   backed by an S3 head object or DynamoDB, background compaction that bounds the hot
   window regardless of history.
 
-Both modes expose identical HTTP, SSE, and Kafka APIs.
+Both modes expose identical HTTP, SSE, and Kafka APIs. See
+[Storage Modes](docs/storage-modes.md) for throughput characteristics,
+configuration, and guidance on choosing between them.
 
 ## Quick start
+
+### With Docker Compose
+
+```bash
+docker compose up
+```
+
+This starts MinIO, creates the bucket, and runs Camu — all configured.
+Camu is available at `http://localhost:8080`.
+
+### Manual
 
 Start MinIO and create a bucket:
 
@@ -112,12 +126,15 @@ docker exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
 docker exec minio mc mb local/camu-data
 ```
 
-Build Camu, copy the example configuration, and set `storage.endpoint`, `storage.bucket`,
-and credentials for MinIO:
+Build Camu and configure the endpoint and credentials for MinIO.
+Or download a [prebuilt binary](https://github.com/fatum/camu/releases) for your platform.
 
 ```bash
 go build -o camu ./cmd/camu
 cp camu.yaml.example camu.yaml
+# Edit camu.yaml: set storage.endpoint to http://localhost:9000,
+# storage.credentials.access_key to minioadmin,
+# and storage.credentials.secret_key to minioadmin.
 ./camu serve --config camu.yaml
 ```
 
@@ -154,6 +171,7 @@ Iceberg export, and Kafka behavior.
 
 - [Architecture](docs/architecture.md) — write/read paths, storage, and maintenance.
 - [Coordination](docs/architecture/coordination.md) — leases, assignments, ISR, and failover.
+- [Storage Modes](docs/storage-modes.md) — classic vs diskless: pros, cons, throughput, and configuration.
 - [API guide](docs/api.md) and [API support matrix](docs/api-support-matrix.md).
 - [Iceberg](docs/iceberg.md) — the export and query model.
 - [Reliability](docs/reliability.md) — guarantees, limits, and Jepsen evidence.

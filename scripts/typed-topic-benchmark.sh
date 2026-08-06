@@ -77,8 +77,8 @@ storage:
     access_key: minioadmin
     secret_key: minioadmin
 segments:
-  max_size: 8388608
-  max_age: 5s
+  max_size: 67108864
+  max_age: 1m
 cache:
   directory: /var/lib/camu/cache-$node
   max_size: 1073741824

@@ -74,8 +74,8 @@ func New(t testing.TB, opts ...Option) *Env {
 				Endpoint: "memory://",
 			},
 			Segments: config.SegmentsConfig{
-				MaxSize:     8388608,
-				MaxAge:      "5s",
+				MaxSize:     67108864,
+				MaxAge:      "1m",
 				Compression: "none",
 			},
 			Cache: config.CacheConfig{

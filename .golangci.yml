@@ -100,9 +100,6 @@ issues:
     - path: internal/producer
       linters:
         - errcheck
-    - text: "cognitive complexity"
-      linters:
-        - gocognit
     - text: "ifElseChain"
       linters:
         - gocritic

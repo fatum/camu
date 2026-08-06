@@ -1,5 +1,5 @@
 // Command typed-topic-benchmark exercises the typed HTTP topic, consume, and
-// Parquet/SQL paths without retaining the generated dataset.
+// Parquet/Iceberg paths without retaining the generated dataset.
 package main
 
 import (
@@ -912,8 +912,8 @@ func verifyConsumeStates(expected, actual []hashState) bool {
 }
 
 // detectTopicStorageMode reports the storage mode of an existing topic so a
-// consume or sql run against a diskless topic skips the classic cluster
-// readiness wait even when STORAGE_MODE is not set. A missing topic returns "".
+// consume run against a diskless topic skips the classic cluster readiness
+// wait even when STORAGE_MODE is not set. A missing topic returns "".
 func (c client) detectTopicStorageMode(ctx context.Context, cfg config) (string, error) {
 	var topic benchmarkTopic
 	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
@@ -929,7 +929,7 @@ func (c client) detectTopicStorageMode(ctx context.Context, cfg config) (string,
 func runSingleOperation(ctx context.Context, c client, cfg config, res *result) {
 	if cfg.StorageMode == "" {
 		// An existing diskless topic is served without cluster-wide readiness;
-		// detect it so consume/sql runs do not wait on /v1/cluster/ready, which
+		// detect it so consume runs do not wait on /v1/cluster/ready, which
 		// never reports ready for diskless partitions.
 		mode, err := c.detectTopicStorageMode(ctx, cfg)
 		if err != nil {
@@ -1095,7 +1095,7 @@ func main() {
 		benchmarkLog("cluster readiness failed: %v", err)
 		return
 	}
-	benchmarkLog("cluster is ready; starting producer and SQL visibility sampling")
+	benchmarkLog("cluster is ready; starting producer and visibility sampling")
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 	if cfg.StorageMode != "diskless" {

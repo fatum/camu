@@ -29,10 +29,6 @@ segments:
 cache:
   directory: "/tmp/cache"
   max_size: 5368709120
-sql:
-  cache_directory: "/tmp/sql-cache"
-  cache_max_size: 268435456
-  max_concurrency: 8
 coordination:
   lease_ttl: "20s"
   heartbeat_interval: "5s"
@@ -143,8 +139,8 @@ storage:
 	if cfg.Segments.IndexIntervalBytes != 4096 {
 		t.Errorf("Segments.IndexIntervalBytes = %d, want %d", cfg.Segments.IndexIntervalBytes, 4096)
 	}
-	if cfg.Segments.MaxSize != 8388608 {
-		t.Errorf("Segments.MaxSize = %d, want %d", cfg.Segments.MaxSize, 8388608)
+	if cfg.Segments.MaxSize != 67108864 {
+		t.Errorf("Segments.MaxSize = %d, want %d", cfg.Segments.MaxSize, 67108864)
 	}
 	if cfg.Coordination.MaintenanceMaxConcurrency != 4 {
 		t.Errorf("Coordination.MaintenanceMaxConcurrency = %d, want %d", cfg.Coordination.MaintenanceMaxConcurrency, 4)
