@@ -1,0 +1,233 @@
+package iceberg
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/maksim/camu/internal/meta"
+)
+
+func newTestTableStore() *TableStore {
+	return NewTableStore(newFakeObjectStore(), nil, "warehouse/")
+}
+
+func TestTableCreateLoadRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	schema := &meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{
+		{Name: "id", Type: "int64", Path: "$.id"},
+		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
+	}}
+	created, err := ts.Create(ctx, "events", schema)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if created.version != 0 {
+		t.Fatalf("created version = %d, want 0", created.version)
+	}
+	if created.FormatVersion != tableFormatVersion {
+		t.Fatalf("format-version = %d, want %d", created.FormatVersion, tableFormatVersion)
+	}
+
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.version != 0 {
+		t.Fatalf("loaded version = %d, want 0", loaded.version)
+	}
+	if loaded.TableUUID != created.TableUUID {
+		t.Fatalf("table-uuid changed across round trip: %s != %s", loaded.TableUUID, created.TableUUID)
+	}
+	icebergSchema := loaded.currentSchema()
+	if icebergSchema == nil || len(icebergSchema.Fields) != 7 {
+		t.Fatalf("schema fields = %d, want 7 (5 base + 2 typed)", len(icebergSchema.Fields))
+	}
+	if icebergSchema.Fields[0].Name != "record_offset" || icebergSchema.Fields[0].Type != "long" || !icebergSchema.Fields[0].Required {
+		t.Fatalf("base column 0 = %+v, want required record_offset long", icebergSchema.Fields[0])
+	}
+	if icebergSchema.Fields[5].Name != "id" || icebergSchema.Fields[5].Type != "long" || !icebergSchema.Fields[5].Required {
+		t.Fatalf("typed column id = %+v, want required long", icebergSchema.Fields[5])
+	}
+	if icebergSchema.Fields[6].Name != "note" || icebergSchema.Fields[6].Type != "string" || icebergSchema.Fields[6].Required {
+		t.Fatalf("typed column note = %+v, want nullable string", icebergSchema.Fields[6])
+	}
+	if loaded.CurrentSnapshotID != nil {
+		t.Fatalf("new table has current-snapshot-id = %v, want nil", *loaded.CurrentSnapshotID)
+	}
+	if len(loaded.PartitionSpecs) != 1 || len(loaded.PartitionSpecs[0].Fields) != 0 {
+		t.Fatalf("partition specs = %+v, want one empty spec", loaded.PartitionSpecs)
+	}
+}
+
+func TestTableLoadMissingReturnsNotFound(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	_, err := ts.Load(ctx, "missing")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load(missing) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestTableCreateConflictsWhenExists(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	_, err := ts.Create(ctx, "events", nil)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("second Create() error = %v, want ErrConflict", err)
+	}
+}
+
+func TestTableAppendSnapshotAndReload(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	manifestList := ts.manifestListKey("events", 42, 1, 1)
+	snap, err := ts.AppendSnapshot(ctx, "events", manifestList, SnapshotSummary{"added-data-files": "2"})
+	if err != nil {
+		t.Fatalf("AppendSnapshot() error = %v", err)
+	}
+	if snap.ManifestList != manifestList {
+		t.Fatalf("snapshot manifest list = %q, want %q", snap.ManifestList, manifestList)
+	}
+
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.version != 1 {
+		t.Fatalf("version after commit = %d, want 1", loaded.version)
+	}
+	if loaded.CurrentSnapshotID == nil || *loaded.CurrentSnapshotID != snap.SnapshotID {
+		t.Fatalf("current-snapshot-id = %v, want %d", loaded.CurrentSnapshotID, snap.SnapshotID)
+	}
+	if len(loaded.Snapshots) != 1 || loaded.Snapshots[0].SnapshotID != snap.SnapshotID {
+		t.Fatalf("snapshots = %+v, want [%d]", loaded.Snapshots, snap.SnapshotID)
+	}
+	if ref, ok := loaded.Refs["main"]; !ok || ref.SnapshotID != snap.SnapshotID {
+		t.Fatalf("main ref = %+v, want snapshot %d", loaded.Refs["main"], snap.SnapshotID)
+	}
+}
+
+func TestTableAppendSnapshotIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	manifestList := ts.manifestListKey("events", 42, 1, 1)
+	first, err := ts.AppendSnapshot(ctx, "events", manifestList, nil)
+	if err != nil {
+		t.Fatalf("first AppendSnapshot() error = %v", err)
+	}
+	second, err := ts.AppendSnapshot(ctx, "events", manifestList, nil)
+	if err != nil {
+		t.Fatalf("retry AppendSnapshot() error = %v", err)
+	}
+	if second.SnapshotID != first.SnapshotID {
+		t.Fatalf("retry snapshot id = %d, want %d", second.SnapshotID, first.SnapshotID)
+	}
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(loaded.Snapshots) != 1 {
+		t.Fatalf("snapshots after idempotent retry = %d, want 1", len(loaded.Snapshots))
+	}
+}
+
+func TestTableAppendSnapshotRetriesCASConflict(t *testing.T) {
+	ctx := context.Background()
+	objects := newFakeObjectStore()
+	ts := NewTableStore(objects, nil, "warehouse/")
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	// The first version-hint CAS after the metadata write fails once; the
+	// commit must reload the winner's metadata and retry at the next version.
+	objects.injectConditionalPutConflict("warehouse/events/metadata/version-hint.text", 1)
+	manifestList := ts.manifestListKey("events", 42, 1, 1)
+	snap, err := ts.AppendSnapshot(ctx, "events", manifestList, nil)
+	if err != nil {
+		t.Fatalf("AppendSnapshot() after conflict error = %v", err)
+	}
+	if snap.SnapshotID != snapshotIDFor(manifestList) {
+		t.Fatalf("snapshot id = %d, want %d", snap.SnapshotID, snapshotIDFor(manifestList))
+	}
+	loaded, err := ts.Load(ctx, "events")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.version != 1 {
+		t.Fatalf("version after retried commit = %d, want 1", loaded.version)
+	}
+	if len(loaded.Snapshots) != 1 {
+		t.Fatalf("snapshots after retried commit = %d, want 1", len(loaded.Snapshots))
+	}
+}
+
+func TestTableDeleteRemovesEverything(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := ts.AppendSnapshot(ctx, "events", ts.manifestListKey("events", 42, 1, 1), nil); err != nil {
+		t.Fatalf("AppendSnapshot() error = %v", err)
+	}
+	if err := ts.DeleteTable(ctx, "events"); err != nil {
+		t.Fatalf("DeleteTable() error = %v", err)
+	}
+	if _, err := ts.Load(ctx, "events"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Load after delete error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSchemaFromTopicTypes(t *testing.T) {
+	schema := SchemaFromTopic(&meta.TopicSchema{Encoding: "json", Fields: []meta.SchemaField{
+		{Name: "s", Type: "string", Path: "$.s"},
+		{Name: "i", Type: "int64", Path: "$.i"},
+		{Name: "f", Type: "float64", Path: "$.f"},
+		{Name: "b", Type: "bool", Path: "$.b"},
+		{Name: "t", Type: "timestamp", Path: "$.t"},
+	}})
+	want := []string{"long", "long", "binary", "binary", "string", "string", "long", "double", "boolean", "timestamp_ns"}
+	if len(schema.Fields) != len(want) {
+		t.Fatalf("fields = %d, want %d", len(schema.Fields), len(want))
+	}
+	for i, f := range schema.Fields {
+		if f.Type != want[i] {
+			t.Fatalf("field %d (%s) type = %q, want %q", i, f.Name, f.Type, want[i])
+		}
+		if f.ID != i+1 {
+			t.Fatalf("field %s id = %d, want %d", f.Name, f.ID, i+1)
+		}
+	}
+}
+
+func TestTableRejectsInvalidMetadataFile(t *testing.T) {
+	ctx := context.Background()
+	objects := newFakeObjectStore()
+	ts := NewTableStore(objects, nil, "warehouse/")
+	if _, err := ts.Create(ctx, "events", nil); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	// Corrupt the current metadata file.
+	for key := range objects.objects {
+		if strings.HasSuffix(key, ".metadata.json") {
+			objects.mu.Lock()
+			objects.objects[key] = fakeObject{data: []byte("{not json"), etag: "x"}
+			objects.mu.Unlock()
+		}
+	}
+	if _, err := ts.Load(ctx, "events"); err == nil || !strings.Contains(err.Error(), "parse iceberg table metadata") {
+		t.Fatalf("Load(corrupt) error = %v, want parse error", err)
+	}
+}
