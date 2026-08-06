@@ -459,3 +459,47 @@ func TestValidateTableDetectsMissingDataFile(t *testing.T) {
 		t.Fatal("ValidateTable() error = nil, want missing data file detection")
 	}
 }
+
+func TestTableEnsureSchemaEvolvesWithStableIds(t *testing.T) {
+	ctx := context.Background()
+	ts := newTestTableStore()
+	v0 := &meta.TopicSchema{Version: 0, Encoding: "json", Fields: []meta.SchemaField{{Name: "id", Type: "int64", Path: "$.id"}}}
+	if _, err := ts.Create(ctx, "events", v0); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	// Evolve to version 1: add a nullable field. The shared field keeps its id.
+	v1 := &meta.TopicSchema{Version: 1, Encoding: "json", Fields: []meta.SchemaField{
+		{Name: "note", Type: "string", Path: "$.note", Nullable: true},
+		{Name: "id", Type: "int64", Path: "$.id"},
+	}}
+	loaded, err := ts.EnsureSchema(ctx, "events", v1, 1)
+	if err != nil {
+		t.Fatalf("EnsureSchema(1) error = %v", err)
+	}
+	if loaded.CurrentSchemaID != 1 {
+		t.Fatalf("current schema id = %d, want 1", loaded.CurrentSchemaID)
+	}
+	if len(loaded.Schemas) != 2 {
+		t.Fatalf("schemas = %d, want 2", len(loaded.Schemas))
+	}
+	idID, noteID := 0, 0
+	for _, f := range loaded.currentSchema().Fields {
+		switch f.Name {
+		case "id":
+			idID = f.ID
+		case "note":
+			noteID = f.ID
+		}
+	}
+	if idID != 8 || noteID != 9 {
+		t.Fatalf("evolved ids: id=%d note=%d, want id=8 note=9 (stable across reordering)", idID, noteID)
+	}
+	// No-op when the table already matches the version.
+	again, err := ts.EnsureSchema(ctx, "events", v1, 1)
+	if err != nil {
+		t.Fatalf("EnsureSchema(1) re-run error = %v", err)
+	}
+	if len(again.Schemas) != 2 {
+		t.Fatalf("schemas after no-op re-run = %d, want 2", len(again.Schemas))
+	}
+}

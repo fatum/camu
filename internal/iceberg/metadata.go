@@ -142,8 +142,21 @@ const (
 // schema. The seven base export columns are always present (including the
 // dt/hour partition columns); typed topic columns are appended (nullable per
 // the topic schema). Column order matches the Parquet file written by
-// EncodeChunk.
+// EncodeChunk. The schema id is the topic schema's version, so a schema
+// evolution registers a new Iceberg schema id.
 func SchemaFromTopic(topicSchema *meta.TopicSchema) *Schema {
+	schemaID := 0
+	if topicSchema != nil {
+		schemaID = topicSchema.Version
+	}
+	return buildTableSchema(nil, topicSchema, schemaID)
+}
+
+// buildTableSchema builds an Iceberg schema for a topic schema version,
+// preserving column ids for fields that appeared in an earlier schema so that
+// schema evolution never renumbers a column a reader already knows. prior is
+// the table's previous schema (nil for the initial version).
+func buildTableSchema(prior *Schema, topicSchema *meta.TopicSchema, schemaID int) *Schema {
 	fields := []SchemaField{
 		{ID: 1, Name: exportColumnRecordOffset, Required: true, Type: "long"},
 		{ID: 2, Name: exportColumnRecordTimestamp, Required: true, Type: "long"},
@@ -153,19 +166,39 @@ func SchemaFromTopic(topicSchema *meta.TopicSchema) *Schema {
 		{ID: 6, Name: exportColumnDT, Required: true, Type: "string"},
 		{ID: 7, Name: exportColumnHour, Required: true, Type: "int"},
 	}
+	nameToID := make(map[string]int, len(fields))
+	for _, f := range fields {
+		nameToID[f.Name] = f.ID
+	}
 	nextID := baseExportColumnIDCount + 1
+	if prior != nil {
+		for _, f := range prior.Fields {
+			if _, ok := nameToID[f.Name]; ok {
+				continue // base column
+			}
+			nameToID[f.Name] = f.ID
+			if f.ID >= nextID {
+				nextID = f.ID + 1
+			}
+		}
+	}
 	if topicSchema != nil {
 		for _, field := range topicSchema.Fields {
+			id, ok := nameToID[field.Name]
+			if !ok {
+				id = nextID
+				nextID++
+				nameToID[field.Name] = id
+			}
 			fields = append(fields, SchemaField{
-				ID:       nextID,
+				ID:       id,
 				Name:     field.Name,
 				Required: !field.Nullable,
 				Type:     icebergFieldType(field.Type),
 			})
-			nextID++
 		}
 	}
-	return &Schema{Type: "struct", SchemaID: 0, Fields: fields}
+	return &Schema{Type: "struct", SchemaID: schemaID, Fields: fields}
 }
 
 func icebergFieldType(t string) string {

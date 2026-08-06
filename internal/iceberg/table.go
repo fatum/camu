@@ -258,8 +258,42 @@ func (ts *TableStore) CommitSnapshot(ctx context.Context, topic string, files []
 			TimestampMS:    time.Now().UnixMilli(),
 			ManifestList:   listKey,
 			Summary:        summary,
+			SchemaID:       &current.CurrentSchemaID,
 		}, nil
 	})
+}
+
+// EnsureSchema advances the table to the given topic schema version when it is
+// newer than the table's current schema, appending the new Iceberg schema with
+// stable column ids for fields already present. It returns the current table
+// metadata (unchanged when no evolution is needed).
+func (ts *TableStore) EnsureSchema(ctx context.Context, topic string, topicSchema *meta.TopicSchema, schemaID int) (*TableMetadata, error) {
+	for attempt := 0; ; attempt++ {
+		current, err := ts.Load(ctx, topic)
+		if err != nil {
+			return nil, err
+		}
+		if current.CurrentSchemaID >= schemaID {
+			return current, nil
+		}
+		next := current.clone()
+		next.Schemas = append(next.Schemas, buildTableSchema(next.currentSchema(), topicSchema, schemaID))
+		next.CurrentSchemaID = schemaID
+		newest := next.Schemas[len(next.Schemas)-1]
+		if last := newest.Fields[len(newest.Fields)-1].ID; last > next.LastColumnID {
+			next.LastColumnID = last
+		}
+		committed, err := ts.commitCAS(ctx, topic, current, next)
+		if err == nil {
+			return committed, nil
+		}
+		if !errors.Is(err, ErrConflict) {
+			return nil, err
+		}
+		if attempt >= maxTableCommitAttempts {
+			return nil, fmt.Errorf("evolve iceberg schema %q: CAS conflict after %d attempts", topic, attempt+1)
+		}
+	}
 }
 
 // AppendSnapshot commits a new snapshot whose manifest list is stored at

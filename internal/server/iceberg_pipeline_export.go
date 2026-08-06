@@ -28,16 +28,23 @@ func (s *Server) icebergTableStoreFor() *iceberg.TableStore {
 	return iceberg.NewTableStore(parquetObjectAdapter{client: s.s3Client}, serverFencer{s: s}, s.cfg.Maintenance.ParquetExport.WarehouseValue())
 }
 
-// ensureIcebergTable creates the topic's Iceberg table if it does not exist.
+// ensureIcebergTable creates the topic's Iceberg table if it does not exist,
+// then advances the table schema to the topic's current schema version.
 func (s *Server) ensureIcebergTable(ctx context.Context, tc meta.TopicConfig) error {
 	store := s.icebergTableStoreFor()
-	if _, err := store.Load(ctx, tc.Name); err == nil {
-		return nil
-	} else if !errors.Is(err, iceberg.ErrNotFound) {
+	if _, err := store.Load(ctx, tc.Name); errors.Is(err, iceberg.ErrNotFound) {
+		// A concurrent leader may create it first; a conflict is fine.
+		if _, err := store.Create(ctx, tc.Name, tc.Schema); err != nil && !errors.Is(err, iceberg.ErrConflict) {
+			return err
+		}
+	} else if err != nil {
 		return err
 	}
-	// A concurrent leader may create it first; a conflict is fine.
-	if _, err := store.Create(ctx, tc.Name, tc.Schema); err != nil && !errors.Is(err, iceberg.ErrConflict) {
+	version := 0
+	if tc.Schema != nil {
+		version = tc.Schema.Version
+	}
+	if _, err := store.EnsureSchema(ctx, tc.Name, tc.Schema, version); err != nil {
 		return err
 	}
 	return nil
