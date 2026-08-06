@@ -545,13 +545,22 @@ func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition
 
 	var refs []SegmentRef
 	var totalBytes int64
+	// appendRef appends r and reports whether collection should continue. A ref
+	// is always included when it is the first (offset coverage: skipping it
+	// would create a gap the reader cannot bridge); subsequent refs are skipped
+	// when they would push the total over maxBytes. The byte budget is ref-level
+	// only — a single oversized ref (a compacted merge object) is still returned
+	// and the reader trims the response to whole batches.
 	appendRef := func(r s3CatalogRef) bool {
 		if r.EndOffset <= fromOffset {
 			return true
 		}
+		if len(refs) > 0 && totalBytes+int64(r.ByteLength) > int64(maxBytes) {
+			return false
+		}
 		refs = append(refs, SegmentRef(r))
-		totalBytes += r.ByteLength
-		return totalBytes < int64(maxBytes)
+		totalBytes += int64(r.ByteLength)
+		return true
 	}
 
 	if manifest.Archive != nil && fromOffset < manifest.Archive.End {

@@ -165,7 +165,7 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 			results[i] = OffsetResult{BaseOffset: base}
 			writes = append(writes, ddbtypes.TransactWriteItem{
 				Put: &ddbtypes.Put{
-					TableName:         &d.segmentsTable,
+					TableName:           &d.segmentsTable,
 					ConditionExpression: aws.String("attribute_not_exists(pk)"),
 					Item: map[string]ddbtypes.AttributeValue{
 						"pk":          &ddbtypes.AttributeValueMemberS{Value: pk},
@@ -197,10 +197,10 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 		}
 		writes = append(writes, ddbtypes.TransactWriteItem{
 			Update: &ddbtypes.Update{
-				TableName: &d.offsetsTable,
-				Key:       map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}},
-				UpdateExpression:       aws.String("SET upload_state = :new, next_offset = :next, committed_offset = :next"),
-				ConditionExpression:    aws.String(condition),
+				TableName:                 &d.offsetsTable,
+				Key:                       map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}},
+				UpdateExpression:          aws.String("SET upload_state = :new, next_offset = :next, committed_offset = :next"),
+				ConditionExpression:       aws.String(condition),
 				ExpressionAttributeValues: values,
 			},
 		})
@@ -345,11 +345,15 @@ func (d *DynamoMetaStore) QuerySegments(ctx context.Context, topic string, parti
 			if err != nil {
 				return nil, err
 			}
-			refs = append(refs, ref)
-			totalBytes += ref.ByteLength
-			if totalBytes >= int64(maxBytes) {
+			// Match the other metastores' semantics: the first ref is always
+			// included (offset coverage); a later ref that would push the total
+			// over maxBytes ends the collection. A single oversized ref is still
+			// returned and the reader trims the response to whole batches.
+			if len(refs) > 0 && totalBytes+int64(ref.ByteLength) > int64(maxBytes) {
 				return refs, nil
 			}
+			refs = append(refs, ref)
+			totalBytes += ref.ByteLength
 		}
 	}
 	return refs, nil

@@ -79,7 +79,41 @@ func (r *Reader) Fetch(ctx context.Context, topic string, partition int, fromOff
 		pos += ref.ByteLength
 	}
 
+	// A single ref can far exceed the byte budget: a compacted merge object is
+	// built up to the full compaction target (64MB), so QuerySegments's
+	// ref-level cap cannot bound the response on its own. Trim to whole
+	// self-framing record batches within maxBytes so a client that requested a
+	// smaller budget (e.g. Kafka FetchMaxPartitionBytes=16MB) is never served
+	// an oversized record batch that clients treat as a budget violation.
+	result = trimResultBatches(result, maxBytes)
 	return result, committedHead, nil
+}
+
+// trimResultBatches bounds RecordBatch bytes to whole batches within maxBytes.
+// It always keeps the first batch even when that batch alone exceeds the
+// budget, so a fetch always makes progress (Kafka semantics). A malformed
+// trailing range is left as-is rather than truncated mid-batch. maxBytes <= 0
+// means unbounded.
+func trimResultBatches(data []byte, maxBytes int) []byte {
+	if maxBytes <= 0 || len(data) <= maxBytes {
+		return data
+	}
+	end := 0
+	batchCount := 0
+	for pos := 0; pos < len(data); {
+		hdr, err := log.ReadRecordBatchHeader(data[pos:])
+		if err != nil {
+			break
+		}
+		size := int(hdr.RecordBatchSize())
+		if batchCount > 0 && end+size > maxBytes {
+			break
+		}
+		end += size
+		pos += size
+		batchCount++
+	}
+	return data[:end]
 }
 
 // patchRefOffsets overwrites the stored base offset of every self-framing

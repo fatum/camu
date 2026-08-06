@@ -94,6 +94,41 @@ func TestS3MetaStore_ArchiveCommittedBoundsHeadAndReadsAcrossCheckpoints(t *test
 	}
 }
 
+// TestS3MetaStore_QuerySegmentsBoundsToMaxBytes verifies the ref-level byte
+// budget: the first ref is always included even when it alone exceeds maxBytes
+// (offset coverage — the reader trims the response to whole batches), and
+// later refs are skipped once the total would exceed the budget.
+func TestS3MetaStore_QuerySegmentsBoundsToMaxBytes(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	// One oversized merged ref (64MB, the compaction target) followed by small
+	// refs, as a compacted partition's manifest looks after the S3 compaction
+	// change.
+	commitS3Batch(t, m, "merged", 100, 64<<20, now)
+	commitS3Batch(t, m, "small1", 1, 100, now)
+	commitS3Batch(t, m, "small2", 1, 100, now)
+
+	// A 16MB budget still includes the oversized first ref (the reader trims),
+	// but stops there instead of piling on more refs past the budget.
+	refs, err := m.QuerySegments(ctx, "t", 0, 0, 16<<20)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(refs) != 1 || refs[0].FileKey != "merged" {
+		t.Fatalf("refs = %+v, want only the oversized merged ref", refs)
+	}
+
+	// A budget that fits the first two refs stops before the third.
+	refs, err = m.QuerySegments(ctx, "t", 0, 0, 64<<20+100)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(refs) != 2 || refs[1].FileKey != "small1" {
+		t.Fatalf("refs = %+v, want merged + small1", refs)
+	}
+}
+
 // TestS3MetaStore_ArchiveCommittedSkipsSmallAndRetentionPending verifies the
 // roll leaves compaction-pending small refs and retention-pending refs in the
 // head window.
