@@ -51,7 +51,6 @@ const (
 	// s3ArchivePrefix holds immutable per-partition checkpoints that archived
 	// compaction-sized refs out of the head window.
 	s3ArchivePrefix = s3MetaPrefix + "archive/"
-	s3SegmentPrefix = s3MetaPrefix + "seg/"
 	s3HeadFile      = ".json"
 )
 
@@ -663,10 +662,6 @@ func s3CatalogPrefixForTopic(topic string) string {
 	return s3CatalogPrefix + topic + "/"
 }
 
-func s3SegPrefixForTopic(topic string) string {
-	return s3SegmentPrefix + topic + "/"
-}
-
 // hasRef reports whether the catalog already holds a ref with the given range.
 func (c *s3Catalog) hasRef(baseOffset, endOffset int64) bool {
 	for _, r := range c.Refs {
@@ -991,9 +986,6 @@ func (m *S3MetaStore) DeleteTopic(ctx context.Context, topic string) error {
 		s3CatalogPrefixForTopic(topic),
 		s3ManifestPrefix + topic + "/",
 		s3ArchivePrefix + topic + "/",
-		"_diskless_meta/head/" + topic + "/",      // legacy, if any remain
-		"_diskless_meta/committed/" + topic + "/", // legacy, if any remain
-		s3SegPrefixForTopic(topic),                // legacy per-batch refs, if any remain
 	} {
 		keys, err := m.s3.List(ctx, prefix)
 		if err != nil {

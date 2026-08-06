@@ -70,13 +70,6 @@ func (gc *GarbageCollector) FindOrphans(ctx context.Context, topic string, parti
 		}
 	}
 
-	// Legacy index.json files.
-	for _, key := range keys {
-		if strings.HasSuffix(key, "/index.json") {
-			orphans = append(orphans, key)
-		}
-	}
-
 	return orphans, nil
 }
 

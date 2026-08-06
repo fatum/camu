@@ -71,10 +71,9 @@ segments:
 cache:
   directory: "${CAMU_CACHE_DIR}"
   max_size: 10737418240
-sql:
-  enabled: false
-  cache_directory: "${CAMU_CACHE_DIR}/sql-cache"
-  duckdb_temp_directory: "${CAMU_CACHE_DIR}/sql-tmp"
+maintenance:
+  parquet_export:
+    temp_directory: "${CAMU_CACHE_DIR}/export-tmp"
 coordination:
   lease_ttl: "30s"
   rebalance_delay: "5s"

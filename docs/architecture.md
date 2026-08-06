@@ -211,5 +211,4 @@ Camu uses S3 conditional writes instead of a separate consensus cluster.
 - Epoch history fences stale leaders and supports divergence checks
 
 See [architecture/coordination.md](architecture/coordination.md) for the coordination-specific view.
-See [architecture/query-role.md](architecture/query-role.md) for the staged
-stream/query/export role split and its trust boundaries.
+See [iceberg.md](iceberg.md) for the export projection model.

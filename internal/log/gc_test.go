@@ -18,9 +18,8 @@ func TestGC_FindsOrphanedSegmentAssets(t *testing.T) {
 	}
 	// 2 sidecar orphans (100-1.offset.idx, 100-1.meta.json)
 	// + 2 reverse orphans (200-1.segment, 200-1.offset.idx)
-	// + 1 legacy index.json
-	if len(orphans) != 5 {
-		t.Fatalf("expected 5 orphans, got %d: %v", len(orphans), orphans)
+	if len(orphans) != 4 {
+		t.Fatalf("expected 4 orphans, got %d: %v", len(orphans), orphans)
 	}
 }
 
@@ -57,36 +56,6 @@ func TestGC_FindsReverseOrphans(t *testing.T) {
 	}
 	if !has["topic1/0/50-1.offset.idx"] {
 		t.Error("expected 50-1.offset.idx to be flagged as orphan")
-	}
-}
-
-func TestGC_FindsLegacyIndexJSON(t *testing.T) {
-	s3Client, _ := storage.NewS3Client(storage.S3Config{
-		Bucket: "test", Region: "us-east-1", Endpoint: "memory://",
-	})
-	ctx := context.Background()
-
-	// Complete segment — not an orphan.
-	s3Client.Put(ctx, "topic1/0/0-1.segment", []byte("seg0"), storage.PutOpts{})
-	s3Client.Put(ctx, "topic1/0/0-1.offset.idx", []byte("idx0"), storage.PutOpts{})
-	s3Client.Put(ctx, "topic1/0/0-1.meta.json", []byte("meta0"), storage.PutOpts{})
-
-	// Legacy index.json — orphan.
-	s3Client.Put(ctx, "topic1/0/index.json", []byte("[]"), storage.PutOpts{})
-
-	// state.json must NOT be flagged.
-	s3Client.Put(ctx, "topic1/0/state.json", []byte("{}"), storage.PutOpts{})
-
-	gc := NewGarbageCollector(s3Client)
-	orphans, err := gc.FindOrphans(ctx, "topic1", 0)
-	if err != nil {
-		t.Fatalf("FindOrphans() error: %v", err)
-	}
-	if len(orphans) != 1 {
-		t.Fatalf("expected 1 orphan (index.json), got %d: %v", len(orphans), orphans)
-	}
-	if orphans[0] != "topic1/0/index.json" {
-		t.Errorf("expected topic1/0/index.json, got %s", orphans[0])
 	}
 }
 
@@ -129,9 +98,6 @@ func newTestGC(t *testing.T) *GarbageCollector {
 	// Reverse orphan: bare .segment without .meta.json (crash after segment upload).
 	s3Client.Put(ctx, "topic1/0/200-1.segment", []byte("seg200"), storage.PutOpts{})
 	s3Client.Put(ctx, "topic1/0/200-1.offset.idx", []byte("idx200"), storage.PutOpts{})
-
-	// Legacy index.json that should be cleaned up.
-	s3Client.Put(ctx, "topic1/0/index.json", []byte("[]"), storage.PutOpts{})
 
 	// Non-sidecar files that must be ignored.
 	s3Client.Put(ctx, "topic1/0/state.json", []byte("{}"), storage.PutOpts{})

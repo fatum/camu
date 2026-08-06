@@ -34,12 +34,12 @@ compose() {
 	"${compose_cmd[@]}" "$@"
 }
 
-echo "Building camu for Linux (inside container — go-duckdb requires CGO)..."
+echo "Building camu for Linux (static; no CGO)..."
 cd "$(dirname "$0")/../.."
-# Build inside a matching-arch golang image so the CGO bindings for
-# go-duckdb compile without a host cross-toolchain. The named volumes
-# cache the module and build cache across runs so only the first
-# invocation pays the dep-download cost.
+# Build inside a matching-arch golang image so the binary links for the target
+# platform without a host cross-toolchain. The named volumes cache the module
+# and build cache across runs so only the first invocation pays the
+# dep-download cost.
 docker run --rm \
   -v "$PWD:/src" \
   -v camu-jepsen-gocache:/root/.cache/go-build \

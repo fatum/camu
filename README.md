@@ -68,54 +68,15 @@ It is intentionally not a complete Kafka implementation. See the
 [API support matrix](docs/api-support-matrix.md) for exact support and explicit
 limitations.
 
-## SQL analytics
+## Iceberg analytics
 
-Set `export_enabled: true` on a topic (classic or diskless) to project its
-committed records to Parquet. Export runs on the partition leader and does not
-delay produce. `POST /v1/sql` exposes those manifest-published files through
-read-only DuckDB SQL:
-
-```bash
-curl -X POST http://localhost:8080/v1/sql \
-  -H 'Content-Type: application/json' \
-  -d '{"sql":"select count(*) as n from \"events\"","topics":["events"]}'
-```
-
-SQL can run on a separate `server.mode=query` node with read-only object-store
-credentials. See [Parquet and SQL](docs/parquet-sql.md) for the consistency and
-retention rules.
-
-### SQL sizing and performance
-
-DuckDB is a vectorized analytical engine: Parquet projection and filter pushdown
-mean that a selective query can read far less than the whole topic. There is no
-single records-per-second promise; scan rate depends on selected columns,
-predicate selectivity, Parquet layout, CPU, local temporary-disk throughput,
-and object-store latency.
-
-The queryable dataset is not limited to RAM. DuckDB can spill larger-than-memory
-workloads to its temporary directory, and reports production database files
-larger than 15 TB. Camu still applies request-level bounds, by default:
-
-| Limit | Default | Meaning |
-| --- | ---: | --- |
-| Parquet cache | 5 GiB | Local object cache, not a dataset-size cap. |
-| Concurrent queries | 4 | Independent DuckDB connections. |
-| Query timeout | 30s | Wall-clock budget per request. |
-| Files per query | 4,096 | Maximum manifest-referenced files scanned. |
-
-Size a query node for its working set, not its total history: provide fast local
-disk for `sql.duckdb_temp_directory`, set `sql.duckdb_memory_limit` below the
-memory available to Camu, and increase `sql.max_scan_files` only with measured
-queries. DuckDB recommends roughly 1–4 GiB of memory per execution thread for
-good performance, and its Parquet guidance favors files around 100 MB–10 GB
-with row groups large enough to use available cores. Camu does not yet compact
-Parquet automatically, so benchmark your actual exported file layout before
-raising these limits.
-
-See DuckDB’s [workload tuning](https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads),
-[out-of-memory guidance](https://duckdb.org/docs/current/guides/performance/oom),
-and [Parquet guidance](https://duckdb.org/docs/current/guides/performance/my_workload_is_slow).
+Set `export_enabled: true` on a topic (classic or diskless) and
+`maintenance.parquet_export.iceberg: true` to project its committed records as
+a self-managed Apache Iceberg table under `maintenance.parquet_export.warehouse`.
+Export runs on the partition leader and does not delay produce. Point any
+Iceberg engine (DuckDB `iceberg_scan`, Trino, Spark) at the warehouse path to
+query the projection; see [Iceberg](docs/iceberg.md) for the pipeline, layout,
+and retention rules.
 
 ## Quick start
 
@@ -163,7 +124,7 @@ produce, consumer offsets, SQL, and Kafka behavior.
 - [Architecture](docs/architecture.md): write/read paths, storage, and maintenance.
 - [Coordination](docs/architecture/coordination.md): leases, assignments, ISR, and failover.
 - [API guide](docs/api.md) and [API support matrix](docs/api-support-matrix.md).
-- [Parquet and SQL](docs/parquet-sql.md): export and query model.
+- [Iceberg](docs/iceberg.md): export and query model.
 - [Reliability](docs/reliability.md): guarantees, limits, and Jepsen evidence.
 - [Jepsen harness](jepsen/camu/README.md): run commands and artifacts.
 
