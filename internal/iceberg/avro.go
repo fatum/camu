@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/hamba/avro/v2"
+
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/storage"
 )

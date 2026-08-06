@@ -108,7 +108,7 @@ func TestServerDLQAppenderWaitDurableFencesEpochZeroReassignment(t *testing.T) {
 func TestServerDLQAppenderRemoteLeaderUsesNormalProduceAndDeduplicatesRetry(t *testing.T) {
 	ctx := context.Background()
 	source := newTestServer(t)
-	destination := cloneTestServerForInstance(t, source, "n2")
+	destination := cloneTestServerForInstance(t, source)
 	dlq := meta.TopicConfig{Name: "events-dlq", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1}
 	if err := source.topicStore.Create(ctx, dlq); err != nil {
 		t.Fatal(err)
@@ -165,7 +165,7 @@ func TestServerDLQAppenderRemoteLeaderUsesNormalProduceAndDeduplicatesRetry(t *t
 func TestHandleSchemaDecodeFailuresDeliversToRemoteDLQAndRetriesIdempotently(t *testing.T) {
 	ctx := context.Background()
 	source := newTestServer(t)
-	destination := cloneTestServerForInstance(t, source, "n2")
+	destination := cloneTestServerForInstance(t, source)
 	events := meta.TopicConfig{
 		Name:              "events",
 		Partitions:        1,

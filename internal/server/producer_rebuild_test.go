@@ -1,8 +1,9 @@
 package server
 
 import (
-	"github.com/maksim/camu/internal/log"
 	"testing"
+
+	"github.com/maksim/camu/internal/log"
 )
 
 func TestRebuildProducerSeqsRestoresLastOffset(t *testing.T) {

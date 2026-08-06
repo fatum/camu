@@ -6,8 +6,9 @@ import (
 	"sync"
 
 	"github.com/hamba/avro/v2"
-	"github.com/maksim/camu/internal/meta"
 	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/maksim/camu/internal/meta"
 )
 
 // decodePlan is the compiled, reusable state for decoding a topic schema's
@@ -66,14 +67,22 @@ func decodePlanFor(schema *meta.TopicSchema) (*decodePlan, error) {
 		return newDecodePlan(&meta.TopicSchema{Encoding: "json"})
 	}
 	if v, ok := decodePlanCache.Load(schema); ok {
-		return v.(*decodePlan), nil
+		plan, ok := v.(*decodePlan)
+		if !ok {
+			return nil, fmt.Errorf("decode plan cache: unexpected type %T", v)
+		}
+		return plan, nil
 	}
 	plan, err := newDecodePlan(schema)
 	if err != nil {
 		return nil, err
 	}
 	actual, _ := decodePlanCache.LoadOrStore(schema, plan)
-	return actual.(*decodePlan), nil
+	actualPlan, ok := actual.(*decodePlan)
+	if !ok {
+		return nil, fmt.Errorf("decode plan cache: unexpected type %T", actual)
+	}
+	return actualPlan, nil
 }
 
 func (p *decodePlan) decode(ctx context.Context, topic string, resolver SchemaResolver, input []byte) ([]DecodedField, error) {
@@ -97,14 +106,6 @@ func (p *decodePlan) decodeInto(ctx context.Context, topic string, resolver Sche
 	default:
 		return p.decodeJSONInto(input, values)
 	}
-}
-
-func (p *decodePlan) decodeJSON(input []byte) ([]DecodedField, error) {
-	values := make([]DecodedField, len(p.fields))
-	if err := p.decodeJSONInto(input, values); err != nil {
-		return nil, err
-	}
-	return values, nil
 }
 
 func (p *decodePlan) decodeJSONInto(input []byte, values []DecodedField) error {

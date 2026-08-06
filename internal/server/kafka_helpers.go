@@ -6,10 +6,11 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/twmb/franz-go/pkg/kmsg"
+
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/producer"
-	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func requestedMetadataTopics(req *kmsg.MetadataRequest) map[string]bool {

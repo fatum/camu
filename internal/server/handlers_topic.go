@@ -74,7 +74,7 @@ func (s *Server) createTopic(ctx context.Context, req createTopicRequest) (meta.
 	if err := s.validateParquetExportTopicConfig(req.ExportEnabled, req.UncleanLeaderElection); err != nil {
 		return meta.TopicConfig{}, err
 	}
-	if _, err := s.getTopicDeletion(ctx, req.Name); err == nil {
+	if err := s.getTopicDeletion(ctx, req.Name); err == nil {
 		return meta.TopicConfig{}, fmt.Errorf("topic %q deletion in progress", req.Name)
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return meta.TopicConfig{}, err
@@ -409,7 +409,7 @@ func (s *Server) deleteTopic(ctx context.Context, name string) error {
 			}
 		}
 	}
-	if _, err := s.getTopicDeletion(ctx, name); err == nil {
+	if err := s.getTopicDeletion(ctx, name); err == nil {
 		if err := s.topicStore.Delete(ctx, name); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return err
 		}

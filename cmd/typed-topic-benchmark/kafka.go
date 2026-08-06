@@ -67,9 +67,9 @@ func produceKafka(ctx context.Context, cfg config, count int64, expected []hashS
 				for first := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
 					records := make([]*kgo.Record, 0, cfg.BatchMessages)
 					for sequence := first; sequence < cfg.SequenceStart+count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
-					value := typedValue{RunID: cfg.RunID, ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
-					key := cfg.RunID + ":" + strconv.FormatInt(sequence, 10)
-					valueBytes := mustJSON(benchmarkEvent(cfg, value))
+						value := typedValue{RunID: cfg.RunID, ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
+						key := cfg.RunID + ":" + strconv.FormatInt(sequence, 10)
+						valueBytes := mustJSON(benchmarkEvent(cfg, value))
 						records = append(records, &kgo.Record{Topic: cfg.Topic, Partition: int32(partition), Key: []byte(key), Value: valueBytes})
 						expected[partition].add(value)
 						atomic.AddInt64(&serialized, int64(len(key)+len(valueBytes)))
@@ -217,7 +217,7 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 // validateKafkaRecord verifies the persisted Kafka offset. Payload sequence
 // validation is performed separately per benchmark run so concurrent producer
 // runs may interleave in a partition.
-func validateKafkaRecord(cfg config, partition int, expectedOffset, offset int64, value typedValue) error {
+func validateKafkaRecord(_ config, partition int, expectedOffset, offset int64, _ typedValue) error {
 	if offset != expectedOffset {
 		return fmt.Errorf("consume Kafka: partition %d offset gap or reordering: got %d, want %d", partition, offset, expectedOffset)
 	}

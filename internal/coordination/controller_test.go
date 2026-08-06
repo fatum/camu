@@ -4,10 +4,10 @@ import (
 	"testing"
 )
 
-func newTestMeta(leader string, epoch uint64, replicas, isr []string, hw uint64) *PartitionMeta {
+func newTestMeta(leader string, replicas, isr []string, hw uint64) *PartitionMeta {
 	return &PartitionMeta{
 		Leader:       leader,
-		Epoch:        epoch,
+		Epoch:        1,
 		Replicas:     replicas,
 		ISR:          isr,
 		HW:           hw,
@@ -17,7 +17,7 @@ func newTestMeta(leader string, epoch uint64, replicas, isr []string, hw uint64)
 
 func TestControllerState_AddPartition(t *testing.T) {
 	cs := NewControllerState()
-	meta := newTestMeta("node1", 1, []string{"node1", "node2"}, []string{"node1", "node2"}, 0)
+	meta := newTestMeta("node1", []string{"node1", "node2"}, []string{"node1", "node2"}, 0)
 
 	cs.SetPartition("my-topic", 0, meta)
 
@@ -41,7 +41,7 @@ func TestControllerState_GetPartition_NotFound(t *testing.T) {
 		t.Errorf("expected nil for unknown partition, got %+v", got)
 	}
 
-	cs.SetPartition("my-topic", 0, newTestMeta("node1", 1, nil, nil, 0))
+	cs.SetPartition("my-topic", 0, newTestMeta("node1", nil, nil, 0))
 	got = cs.GetPartition("my-topic", 99)
 	if got != nil {
 		t.Errorf("expected nil for unknown partition id, got %+v", got)
@@ -50,7 +50,7 @@ func TestControllerState_GetPartition_NotFound(t *testing.T) {
 
 func TestControllerState_ElectLeader(t *testing.T) {
 	cs := NewControllerState()
-	meta := newTestMeta("node1", 1,
+	meta := newTestMeta("node1",
 		[]string{"node1", "node2", "node3"},
 		[]string{"node1", "node2", "node3"},
 		42,
@@ -97,7 +97,7 @@ func TestControllerState_ElectLeader(t *testing.T) {
 func TestControllerState_ElectLeader_NoEligible(t *testing.T) {
 	cs := NewControllerState()
 	// Only the failed leader is in the ISR.
-	meta := newTestMeta("node1", 1,
+	meta := newTestMeta("node1",
 		[]string{"node1"},
 		[]string{"node1"},
 		0,
@@ -121,7 +121,7 @@ func TestControllerState_ElectLeader_NotFound(t *testing.T) {
 
 func TestControllerState_UpdateISR(t *testing.T) {
 	cs := NewControllerState()
-	cs.SetPartition("topic", 0, newTestMeta("node1", 1,
+	cs.SetPartition("topic", 0, newTestMeta("node1",
 		[]string{"node1", "node2", "node3"},
 		[]string{"node1", "node2", "node3"},
 		0,
@@ -144,7 +144,7 @@ func TestControllerState_UpdateISR(t *testing.T) {
 
 func TestControllerState_UpdateHW(t *testing.T) {
 	cs := NewControllerState()
-	cs.SetPartition("topic", 0, newTestMeta("node1", 1, nil, nil, 10))
+	cs.SetPartition("topic", 0, newTestMeta("node1", nil, nil, 10))
 
 	// Higher HW should be accepted.
 	vBefore := cs.Version()
@@ -177,9 +177,9 @@ func TestControllerState_UpdateHW(t *testing.T) {
 
 func TestControllerState_AllPartitions(t *testing.T) {
 	cs := NewControllerState()
-	cs.SetPartition("topic-a", 0, newTestMeta("node1", 1, nil, nil, 0))
-	cs.SetPartition("topic-a", 1, newTestMeta("node2", 1, nil, nil, 0))
-	cs.SetPartition("topic-b", 0, newTestMeta("node3", 1, nil, nil, 0))
+	cs.SetPartition("topic-a", 0, newTestMeta("node1", nil, nil, 0))
+	cs.SetPartition("topic-a", 1, newTestMeta("node2", nil, nil, 0))
+	cs.SetPartition("topic-b", 0, newTestMeta("node3", nil, nil, 0))
 
 	snap := cs.AllPartitions()
 
@@ -206,8 +206,8 @@ func TestControllerState_AllPartitions(t *testing.T) {
 
 func TestControllerState_TopicPartitions(t *testing.T) {
 	cs := NewControllerState()
-	cs.SetPartition("topic-a", 0, newTestMeta("node1", 1, nil, nil, 0))
-	cs.SetPartition("topic-a", 1, newTestMeta("node2", 1, nil, nil, 0))
+	cs.SetPartition("topic-a", 0, newTestMeta("node1", nil, nil, 0))
+	cs.SetPartition("topic-a", 1, newTestMeta("node2", nil, nil, 0))
 
 	snap := cs.TopicPartitions("topic-a")
 	if len(snap) != 2 {
@@ -234,7 +234,7 @@ func TestControllerState_Version(t *testing.T) {
 		t.Errorf("initial version: got %d, want 0", cs.Version())
 	}
 
-	cs.SetPartition("topic", 0, newTestMeta("node1", 1, []string{"node1"}, []string{"node1"}, 0))
+	cs.SetPartition("topic", 0, newTestMeta("node1", []string{"node1"}, []string{"node1"}, 0))
 	if cs.Version() != 1 {
 		t.Errorf("after SetPartition: got %d, want 1", cs.Version())
 	}

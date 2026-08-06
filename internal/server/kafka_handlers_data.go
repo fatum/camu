@@ -4,11 +4,12 @@ import (
 	"context"
 	"time"
 
-	"github.com/maksim/camu/internal/log"
 	"github.com/twmb/franz-go/pkg/kmsg"
+
+	"github.com/maksim/camu/internal/log"
 )
 
-func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceRequest) (kmsg.Response, error) {
+func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceRequest) kmsg.Response {
 	resp := kmsg.NewPtrProduceResponse()
 	setKafkaResponseVersion(resp, req.GetVersion())
 
@@ -106,7 +107,7 @@ func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceReque
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 
-	return resp, nil
+	return resp
 }
 
 // maxKafkaFetchPartitionBytes bounds the raw RecordBatch bytes returned for a
@@ -114,7 +115,7 @@ func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceReque
 // a larger page is safe while remaining bounded per partition.
 const maxKafkaFetchPartitionBytes = 16 << 20
 
-func (ks *KafkaServer) handleFetch(ctx context.Context, req *kmsg.FetchRequest) (kmsg.Response, error) {
+func (ks *KafkaServer) handleFetch(ctx context.Context, req *kmsg.FetchRequest) kmsg.Response {
 	resp := kmsg.NewPtrFetchResponse()
 	setKafkaResponseVersion(resp, req.GetVersion())
 
@@ -134,7 +135,7 @@ func (ks *KafkaServer) handleFetch(ctx context.Context, req *kmsg.FetchRequest) 
 					maxBytes = maxKafkaFetchPartitionBytes
 				}
 				started := time.Now()
-				raw, hw, err := ks.cfg.FetchRawBatchesFunc(ctx, topic.Topic, int(partition.Partition), int64(partition.FetchOffset), maxBytes)
+				raw, hw, err := ks.cfg.FetchRawBatchesFunc(ctx, topic.Topic, int(partition.Partition), partition.FetchOffset, maxBytes)
 				ks.observeKafkaFetch(len(raw), time.Since(started), err)
 				if err != nil {
 					errorCode = mapKafkaError(err)
@@ -165,7 +166,7 @@ func (ks *KafkaServer) handleFetch(ctx context.Context, req *kmsg.FetchRequest) 
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 
-	return resp, nil
+	return resp
 }
 
 func (ks *KafkaServer) observeKafkaFetch(bytes int, duration time.Duration, err error) {

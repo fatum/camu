@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kmsg"
+
 	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/internal/coordination"
 	"github.com/maksim/camu/internal/diskless"
@@ -23,7 +25,6 @@ import (
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/replication"
 	"github.com/maksim/camu/internal/storage"
-	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func newTestServer(t testing.TB) *Server {
@@ -559,6 +560,7 @@ func TestHandleReplicaFetch_DemotionDuringLongPollReturnsNotFound(t *testing.T) 
 	locked := make(chan struct{})
 	go func() {
 		ps.mu.Lock()
+		_ = 0
 		ps.mu.Unlock()
 		close(locked)
 	}()
@@ -1078,7 +1080,7 @@ func TestHandleKafkaDeleteTopicsEnqueuesDisklessCleanup(t *testing.T) {
 	if _, err := s.topicStore.Get(ctx, "diskless-topic"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("topicStore.Get(after) error = %v, want ErrNotFound", err)
 	}
-	if _, err := s.getTopicDeletion(ctx, "diskless-topic"); err != nil {
+	if err := s.getTopicDeletion(ctx, "diskless-topic"); err != nil {
 		t.Fatalf("getTopicDeletion() error = %v, want marker to remain", err)
 	}
 	head, err = s.disklessMeta.GetPartitionHead(ctx, "diskless-topic", 0)
@@ -1361,10 +1363,7 @@ func TestKafkaControllerBrokerUsesLeaderLease(t *testing.T) {
 	}
 	s.leaderLease.Store(&lease)
 
-	brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
-	if err != nil {
-		t.Fatalf("kafkaControllerBroker() error = %v", err)
-	}
+	brokerID, host, port := s.kafkaControllerBroker(context.Background())
 	wantHost, wantPort := splitKafkaBrokerAddr("127.0.0.1:19092")
 	if brokerID != kafkaBrokerID("n1") || host != wantHost || port != wantPort {
 		t.Fatalf("kafkaControllerBroker() = (%d,%s,%d), want (%d,%s,%d)", brokerID, host, port, kafkaBrokerID("n1"), wantHost, wantPort)
@@ -1392,10 +1391,7 @@ func TestKafkaControllerBrokerPrefersCurrentController(t *testing.T) {
 		t.Fatal("expected n2 to acquire controller lease")
 	}
 
-	brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
-	if err != nil {
-		t.Fatalf("kafkaControllerBroker() error = %v", err)
-	}
+	brokerID, host, port := s.kafkaControllerBroker(context.Background())
 	wantHost, wantPort := splitKafkaBrokerAddr("127.0.0.2:29092")
 	if brokerID != kafkaBrokerID("n2") || host != wantHost || port != wantPort {
 		t.Fatalf("kafkaControllerBroker() = (%d,%s,%d), want (%d,%s,%d)", brokerID, host, port, kafkaBrokerID("n2"), wantHost, wantPort)
@@ -2769,7 +2765,7 @@ func TestHandleDeleteTopicEnqueuesAsyncCleanup(t *testing.T) {
 	if _, err := s.topicStore.Get(ctx, "doomed"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for deleted topic, got %v", err)
 	}
-	if _, err := s.getTopicDeletion(ctx, "doomed"); err != nil {
+	if err := s.getTopicDeletion(ctx, "doomed"); err != nil {
 		t.Fatalf("expected deletion marker for doomed topic, got %v", err)
 	}
 

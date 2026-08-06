@@ -128,7 +128,7 @@ func decodeKafkaBatchRecords(codec int16, data []byte) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gzip record batch: %w", err)
 		}
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 		decoded, err := io.ReadAll(reader)
 		if err != nil {
 			return nil, fmt.Errorf("gzip record batch: %w", err)

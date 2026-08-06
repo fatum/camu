@@ -11,10 +11,6 @@ func (s *Server) runPartitionMaintenance(ctx context.Context, topics []meta.Topi
 	s.partitionLeader().runMaintenance(ctx, topics, fileIdx)
 }
 
-func (s *Server) runPartitionJobsForTopic(ctx context.Context, tc meta.TopicConfig, fileIdx *diskless.FileIndex) {
-	s.partitionLeader().runJobsForTopic(ctx, tc, fileIdx)
-}
-
 func (s *Server) runClaimedPartitionJob(ctx context.Context, job PartitionJob) error {
 	return s.partitionLeader().runJob(ctx, job)
 }

@@ -6,7 +6,7 @@ import "sync"
 type BufferEntry struct {
 	Topic     string
 	Partition int
-	Batch     []byte          // raw RecordBatch bytes
+	Batch     []byte           // raw RecordBatch bytes
 	Done      chan FlushResult // signaled when flush completes
 }
 

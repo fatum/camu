@@ -193,9 +193,9 @@ func TestTopicStore_CreateDuplicate(t *testing.T) {
 	}
 }
 
-func schemaCfg(name string, version int) TopicConfig {
+func schemaCfg(version int) TopicConfig {
 	return TopicConfig{
-		Name:              name,
+		Name:              "orders",
 		Partitions:        1,
 		Retention:         time.Hour,
 		CreatedAt:         time.Now().UTC(),
@@ -211,13 +211,13 @@ func schemaCfg(name string, version int) TopicConfig {
 func TestTopicStore_UpdateSchemaBypassesImmutabilityGuard(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	v0 := schemaCfg("orders", 0)
+	v0 := schemaCfg(0)
 	if err := store.Create(ctx, v0); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	// Generic Update with a changed schema is rejected.
-	v1 := schemaCfg("orders", 1)
+	v1 := schemaCfg(1)
 	if err := store.Update(ctx, v1); err == nil {
 		t.Fatal("Update with changed schema: expected error, got nil")
 	}
@@ -241,7 +241,7 @@ func TestTopicStore_UpdateSchemaBypassesImmutabilityGuard(t *testing.T) {
 func TestTopicStore_GetReturnsIndependentSchema(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	v0 := schemaCfg("orders", 0)
+	v0 := schemaCfg(0)
 	if err := store.Create(ctx, v0); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -279,10 +279,10 @@ func TestTopicStore_CreateIsConditionalAcrossInstances(t *testing.T) {
 	}
 	store := NewTopicStore(s3Client)
 	other := NewTopicStore(s3Client) // same backend, cold cache
-	if err := store.Create(ctx, schemaCfg("orders", 0)); err != nil {
+	if err := store.Create(ctx, schemaCfg(0)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := other.Create(ctx, schemaCfg("orders", 1)); err == nil {
+	if err := other.Create(ctx, schemaCfg(1)); err == nil {
 		t.Fatal("Create from cold cache: expected error, got nil")
 	}
 	got, err := store.Get(ctx, "orders")

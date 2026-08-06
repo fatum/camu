@@ -338,7 +338,7 @@ func streamReplicaBatches(r io.Reader, totalLen int32, requestedOffset uint64, a
 		if err != nil {
 			return fmt.Errorf("fetcher: parse batch header: %w", err)
 		}
-		batchSize := int32(header.RecordBatchSize())
+		batchSize := header.RecordBatchSize()
 		if batchSize < log.RecordBatchHeaderSize || batchSize > maxReplicaBatchBytes {
 			return fmt.Errorf("fetcher: invalid replica batch size %d", batchSize)
 		}

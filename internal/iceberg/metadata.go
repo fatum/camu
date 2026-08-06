@@ -2,10 +2,10 @@ package iceberg
 
 import (
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/maksim/camu/internal/meta"
 )
 
@@ -315,13 +315,6 @@ func (m *TableMetadata) snapshotByID(id int64) *Snapshot {
 		}
 	}
 	return nil
-}
-
-// sortedSnapshots returns the table's snapshots ordered by sequence number.
-func (m *TableMetadata) sortedSnapshots() []*Snapshot {
-	out := append([]*Snapshot(nil), m.Snapshots...)
-	sort.Slice(out, func(i, j int) bool { return out[i].SequenceNumber < out[j].SequenceNumber })
-	return out
 }
 
 // nextSequenceNumber returns the sequence number the next snapshot would

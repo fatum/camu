@@ -16,7 +16,7 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
-func testServerWithRf1Partition(t *testing.T, localEpoch uint64) *Server {
+func testServerWithRf1Partition(t *testing.T) *Server {
 	t.Helper()
 	s := newTestServer(t)
 
@@ -37,12 +37,12 @@ func testServerWithRf1Partition(t *testing.T, localEpoch uint64) *Server {
 	s.initPartitionAsLeader(context.Background(), "topic", 0, coordination.PartitionAssignment{
 		Replicas:    []string{"n1"},
 		Leader:      "n1",
-		LeaderEpoch: localEpoch,
+		LeaderEpoch: 1,
 	})
 
 	s.assignmentsMu.Lock()
 	s.myPartitions["topic"] = map[int]localPartitionAssignment{
-		0: {Owned: true, LeaderEpoch: localEpoch},
+		0: {Owned: true, LeaderEpoch: 1},
 	}
 	s.assignmentsMu.Unlock()
 	return s
@@ -71,7 +71,7 @@ func writeAssignment(t *testing.T, s *Server, leader string, epoch uint64) {
 }
 
 func TestVerifyPartitionFence_ValidOwnership(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	writeAssignment(t, s, "n1", 1)
 
 	if !s.verifyPartitionFence(context.Background(), "topic", 0, 1) {
@@ -80,7 +80,7 @@ func TestVerifyPartitionFence_ValidOwnership(t *testing.T) {
 }
 
 func TestVerifyPartitionFence_RevokesOnLostLeadership(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	writeAssignment(t, s, "n2", 2)
 
 	if s.verifyPartitionFence(context.Background(), "topic", 0, 1) {
@@ -92,7 +92,7 @@ func TestVerifyPartitionFence_RevokesOnLostLeadership(t *testing.T) {
 }
 
 func TestVerifyPartitionFence_RevokesOnEpochMismatch(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	writeAssignment(t, s, "n1", 3)
 
 	if s.verifyPartitionFence(context.Background(), "topic", 0, 1) {
@@ -104,7 +104,7 @@ func TestVerifyPartitionFence_RevokesOnEpochMismatch(t *testing.T) {
 }
 
 func TestVerifyPartitionFence_NotFoundFallsBackToLocal(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	s.readAssignments = func(ctx context.Context, topic string) (coordination.TopicAssignments, error) {
 		return coordination.TopicAssignments{}, storage.ErrNotFound
 	}
@@ -115,7 +115,7 @@ func TestVerifyPartitionFence_NotFoundFallsBackToLocal(t *testing.T) {
 }
 
 func TestVerifyPartitionFence_ReadErrorFailsClosed(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	s.readAssignments = func(ctx context.Context, topic string) (coordination.TopicAssignments, error) {
 		return coordination.TopicAssignments{}, errors.New("temporary s3 read failure")
 	}
@@ -126,7 +126,7 @@ func TestVerifyPartitionFence_ReadErrorFailsClosed(t *testing.T) {
 }
 
 func TestVerifyPartitionFence_Amortized(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	writeAssignment(t, s, "n1", 1)
 	s.fenceInterval = time.Hour
 
@@ -146,7 +146,7 @@ func TestVerifyPartitionFence_Amortized(t *testing.T) {
 }
 
 func TestOnISRWriteError_StaleEpochRevokes(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 
 	s.onISRWriteError("topic", 0, replication.ErrISRStaleEpoch)
 	if s.isOwnedPartition("topic", 0) {
@@ -155,7 +155,7 @@ func TestOnISRWriteError_StaleEpochRevokes(t *testing.T) {
 }
 
 func TestOnISRWriteError_TransientKeepsOwnership(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 
 	s.onISRWriteError("topic", 0, errors.New("temporary s3 failure"))
 	if !s.isOwnedPartition("topic", 0) {
@@ -164,7 +164,7 @@ func TestOnISRWriteError_TransientKeepsOwnership(t *testing.T) {
 }
 
 func TestProduceRf1RejectsWhenFenced(t *testing.T) {
-	s := testServerWithRf1Partition(t, 1)
+	s := testServerWithRf1Partition(t)
 	// Leadership has moved to another instance.
 	writeAssignment(t, s, "n2", 2)
 

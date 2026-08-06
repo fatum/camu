@@ -93,9 +93,8 @@ type Server struct {
 
 	// fenceMu guards fenceVerified, the per-partition last-verified timestamps
 	// for rf=1 ack-time ownership checks.
-	fenceMu        sync.Mutex
-	fenceVerified  map[string]time.Time
-	fenceCheckFunc func(ctx context.Context, topic string, partitionID int, epoch uint64) bool
+	fenceMu       sync.Mutex
+	fenceVerified map[string]time.Time
 
 	// shuttingDown is set to 1 during shutdown; produce handlers check this
 	// and reject new writes with 503 before batcher/local state are torn down.
@@ -668,24 +667,20 @@ func (s *Server) handleKafkaFetch(topic string, partition int, startOffset uint6
 	if maxBytes <= 0 {
 		remaining = 1 << 20
 	}
-	for len(msgs) > 0 {
-		batchSize := len(msgs)
-		batch := encodeKafkaRecordBatch(msgs[:batchSize])
-		if len(batch) == 0 {
-			break
+	if len(msgs) > 0 {
+		batch := encodeKafkaRecordBatch(msgs)
+		if len(batch) != 0 {
+			if len(out) == 0 && len(batch) > remaining {
+				return KafkaFetchResult{
+					RecordBatches:    batch,
+					HighWatermark:    kafkaFetchHighWatermark(highWatermark, hwOK, nextOffset),
+					LastStableOffset: kafkaFetchHighWatermark(highWatermark, hwOK, nextOffset),
+				}, nil
+			}
+			if len(out) == 0 || len(out)+len(batch) <= remaining {
+				out = append(out, batch...)
+			}
 		}
-		if len(out) > 0 && len(out)+len(batch) > remaining {
-			break
-		}
-		if len(out) == 0 && len(batch) > remaining {
-			return KafkaFetchResult{
-				RecordBatches:    batch,
-				HighWatermark:    kafkaFetchHighWatermark(highWatermark, hwOK, nextOffset),
-				LastStableOffset: kafkaFetchHighWatermark(highWatermark, hwOK, nextOffset),
-			}, nil
-		}
-		out = append(out, batch...)
-		break
 	}
 	hw := kafkaFetchHighWatermark(highWatermark, hwOK, nextOffset)
 	return KafkaFetchResult{
@@ -845,10 +840,6 @@ func kafkaBrokerID(instanceID string) int32 {
 		return 1
 	}
 	return int32(id)
-}
-
-func routablePeerAddress(instanceID, rawAddr string) string {
-	return routableAddress(instanceID, rawAddr, "8081")
 }
 
 func routableReplicationAddress(instanceID, rawAddr string) string {
@@ -1806,7 +1797,7 @@ func (s *Server) onISRWriteError(topic string, pid int, err error) {
 // and returns true so the caller aborts the promotion instead of continuing to
 // re-add its own ownership-cache entry. Transient errors are logged and return
 // false so the caller can proceed with best-effort recovery.
-func (s *Server) abortPromotionOnStaleISR(ctx context.Context, topic string, pid int, err error, ps *partitionState) bool {
+func (s *Server) abortPromotionOnStaleISR(_ context.Context, topic string, pid int, err error, ps *partitionState) bool {
 	if err == nil {
 		return false
 	}
@@ -1945,14 +1936,6 @@ func (s *Server) leaderInternalAddr(topic string, pid int) string {
 // and the response is streamed back to the original client.
 func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, leaderAddr string) {
 	s.partitionFollower().proxyToLeader(w, r, leaderAddr)
-}
-
-// attemptPartitionLeadership is called when a follower detects the leader is
-// down. It tries to become the new leader via a CAS write to the assignment
-// store and, on success, transitions the local partition state from follower
-// to leader.
-func (s *Server) attemptPartitionLeadership(topic string, pid int) error {
-	return s.partitionFollower().attemptPartitionLeadership(topic, pid)
 }
 
 // checkISRLag iterates over all leader partitions and removes followers from

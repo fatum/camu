@@ -28,7 +28,6 @@ import (
 func buildTestRecordBatch(
 	firstOffset int64,
 	partitionLeaderEpoch int32,
-	attributes int16,
 	lastOffsetDelta int32,
 	firstTimestamp int64,
 	maxTimestamp int64,
@@ -49,7 +48,7 @@ func buildTestRecordBatch(
 	binary.BigEndian.PutUint32(buf[12:16], uint32(partitionLeaderEpoch))
 	buf[16] = 2 // magic
 	// [17:21] CRC — filled in below
-	binary.BigEndian.PutUint16(buf[21:23], uint16(attributes))
+	binary.BigEndian.PutUint16(buf[21:23], 0)
 	binary.BigEndian.PutUint32(buf[23:27], uint32(lastOffsetDelta))
 	binary.BigEndian.PutUint64(buf[27:35], uint64(firstTimestamp))
 	binary.BigEndian.PutUint64(buf[35:43], uint64(maxTimestamp))
@@ -70,7 +69,6 @@ func TestReadRecordBatchHeader_HappyPath(t *testing.T) {
 	batch := buildTestRecordBatch(
 		42,   // firstOffset
 		7,    // partitionLeaderEpoch
-		0,    // attributes
 		5,    // lastOffsetDelta
 		1000, // firstTimestamp
 		2000, // maxTimestamp
@@ -145,7 +143,7 @@ func TestReadRecordBatchHeader_ShortBuffer(t *testing.T) {
 
 func TestReadRecordBatchHeader_ExactSize(t *testing.T) {
 	// A header-only batch (no records payload) should work fine.
-	batch := buildTestRecordBatch(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, nil)
+	batch := buildTestRecordBatch(0, 0, 0, 0, 0, 0, 0, 0, 0, nil)
 	if len(batch) != RecordBatchHeaderSize {
 		t.Fatalf("expected %d bytes, got %d", RecordBatchHeaderSize, len(batch))
 	}
@@ -156,7 +154,7 @@ func TestReadRecordBatchHeader_ExactSize(t *testing.T) {
 }
 
 func TestRecordBatchHeader_HelperMethods(t *testing.T) {
-	batch := buildTestRecordBatch(10, 0, 0, 4, 0, 0, 0, 0, 0, 5, nil)
+	batch := buildTestRecordBatch(10, 0, 4, 0, 0, 0, 0, 0, 5, nil)
 	hdr, err := ReadRecordBatchHeader(batch)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -176,7 +174,7 @@ func TestRecordBatchHeader_HelperMethods(t *testing.T) {
 }
 
 func TestPatchRecordBatchFirstOffset_PreservesCRC(t *testing.T) {
-	batch := buildTestRecordBatch(100, 1, 0, 0, 0, 0, 0, 0, 0, 1, nil)
+	batch := buildTestRecordBatch(100, 1, 0, 0, 0, 0, 0, 0, 1, nil)
 
 	// Verify CRC is valid before patching.
 	if err := ValidateRecordBatchCRC(batch); err != nil {
@@ -203,7 +201,7 @@ func TestPatchRecordBatchFirstOffset_PreservesCRC(t *testing.T) {
 }
 
 func TestPatchRecordBatchLeaderEpoch_PreservesCRC(t *testing.T) {
-	batch := buildTestRecordBatch(0, 1, 0, 0, 0, 0, 0, 0, 0, 1, nil)
+	batch := buildTestRecordBatch(0, 1, 0, 0, 0, 0, 0, 0, 1, nil)
 
 	if err := ValidateRecordBatchCRC(batch); err != nil {
 		t.Fatalf("CRC invalid before patch: %v", err)
@@ -227,7 +225,7 @@ func TestPatchRecordBatchLeaderEpoch_PreservesCRC(t *testing.T) {
 }
 
 func TestValidateRecordBatchCRC_DetectsCorruption(t *testing.T) {
-	batch := buildTestRecordBatch(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, []byte("payload"))
+	batch := buildTestRecordBatch(0, 0, 0, 0, 0, 0, 0, 0, 1, []byte("payload"))
 
 	if err := ValidateRecordBatchCRC(batch); err != nil {
 		t.Fatalf("CRC should be valid initially: %v", err)
@@ -250,7 +248,7 @@ func TestValidateRecordBatchCRC_ShortBuffer(t *testing.T) {
 func TestPatchFirstOffset_RoundTrip(t *testing.T) {
 	offsets := []int64{0, 1, -1, 1<<62 - 1, -1 << 62}
 	for _, off := range offsets {
-		batch := buildTestRecordBatch(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, nil)
+		batch := buildTestRecordBatch(0, 0, 0, 0, 0, 0, 0, 0, 1, nil)
 		if err := PatchRecordBatchFirstOffset(batch, off); err != nil {
 			t.Fatalf("offset %d: patch error: %v", off, err)
 		}

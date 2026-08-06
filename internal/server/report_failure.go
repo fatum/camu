@@ -49,7 +49,7 @@ func (s *Server) reportFailureToController(topic string, pid int) error {
 	if err != nil {
 		return fmt.Errorf("POST report-failure: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("report-failure returned %d", resp.StatusCode)
 	}

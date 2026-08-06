@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 
@@ -95,22 +94,6 @@ func putImmutableParquetFile(ctx context.Context, client *storage.S3Client, obje
 		}
 	}
 	return nil
-}
-
-func writeParquetChunk(messages []log.Message, schema *meta.TopicSchema) ([]byte, error) {
-	chunk, err := iceberg.EncodeChunk(context.Background(), "", messages, schema, "1970-01-01", 0, "", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer chunk.Cleanup()
-	if _, err := chunk.File.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("rewind parquet chunk: %w", err)
-	}
-	data, err := io.ReadAll(chunk.File)
-	if err != nil {
-		return nil, fmt.Errorf("read parquet chunk: %w", err)
-	}
-	return data, nil
 }
 
 // encodeParquetChunk encodes one committed source range under the configured

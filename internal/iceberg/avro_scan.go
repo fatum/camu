@@ -6,8 +6,9 @@ import (
 	"math"
 
 	"github.com/hamba/avro/v2"
-	"github.com/maksim/camu/internal/meta"
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/maksim/camu/internal/meta"
 )
 
 // A hand-rolled Avro binary record decoder. The libraries' generic decode
@@ -124,7 +125,10 @@ func skipAvroValue(r *avroReader, schema avro.Schema) error {
 	case avro.Null:
 		return nil
 	case avro.Record:
-		rs := schema.(*avro.RecordSchema)
+		rs, ok := schema.(*avro.RecordSchema)
+		if !ok {
+			return fmt.Errorf("avro skip: expected RecordSchema, got %T", schema)
+		}
 		for _, f := range rs.Fields() {
 			if err := skipAvroValue(r, f.Type()); err != nil {
 				return err
@@ -136,13 +140,20 @@ func skipAvroValue(r *avroReader, schema avro.Schema) error {
 		if err != nil {
 			return err
 		}
-		us := schema.(*avro.UnionSchema)
+		us, ok := schema.(*avro.UnionSchema)
+		if !ok {
+			return fmt.Errorf("avro skip: expected UnionSchema, got %T", schema)
+		}
 		if idx < 0 || int(idx) >= len(us.Types()) {
 			return fmt.Errorf("invalid avro union index %d", idx)
 		}
 		return skipAvroValue(r, us.Types()[idx])
 	case avro.Array:
-		items := schema.(*avro.ArraySchema).Items()
+		as, ok := schema.(*avro.ArraySchema)
+		if !ok {
+			return fmt.Errorf("avro skip: expected ArraySchema, got %T", schema)
+		}
+		items := as.Items()
 		for {
 			count, err := r.readLong()
 			if err != nil {
@@ -164,7 +175,11 @@ func skipAvroValue(r *avroReader, schema avro.Schema) error {
 			}
 		}
 	case avro.Map:
-		values := schema.(*avro.MapSchema).Values()
+		ms, ok := schema.(*avro.MapSchema)
+		if !ok {
+			return fmt.Errorf("avro skip: expected MapSchema, got %T", schema)
+		}
+		values := ms.Values()
 		for {
 			count, err := r.readLong()
 			if err != nil {
@@ -189,10 +204,15 @@ func skipAvroValue(r *avroReader, schema avro.Schema) error {
 			}
 		}
 	case avro.Fixed:
-		if err := r.need(schema.(*avro.FixedSchema).Size()); err != nil {
+		fs, ok := schema.(*avro.FixedSchema)
+		if !ok {
+			return fmt.Errorf("avro skip: expected FixedSchema, got %T", schema)
+		}
+		sz := fs.Size()
+		if err := r.need(sz); err != nil {
 			return err
 		}
-		r.pos += schema.(*avro.FixedSchema).Size()
+		r.pos += sz
 		return nil
 	default:
 		return fmt.Errorf("unsupported avro type %q", schema.Type())
@@ -205,7 +225,10 @@ func skipAvroValue(r *avroReader, schema avro.Schema) error {
 // Timestamps are epoch millis on the wire and converted to Unix nanoseconds.
 func readAvroProjected(r *avroReader, f meta.SchemaField, wireType avro.Schema) (parquet.Value, bool, error) {
 	if wireType.Type() == avro.Union {
-		us := wireType.(*avro.UnionSchema)
+		us, ok := wireType.(*avro.UnionSchema)
+		if !ok {
+			return parquet.Value{}, false, fmt.Errorf("avro read: expected UnionSchema, got %T", wireType)
+		}
 		idx, err := r.readLong() // union index is a zigzag long
 		if err != nil {
 			return parquet.Value{}, false, err

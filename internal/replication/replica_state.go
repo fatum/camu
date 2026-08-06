@@ -157,13 +157,19 @@ func (rs *ReplicaState) AddToISR(id string) {
 // by closing the current channel and replacing it with a fresh one.
 func (rs *ReplicaState) NotifyNewData() {
 	old := rs.newDataCh.Swap(make(chan struct{}))
-	close(old.(chan struct{}))
+	ch, ok := old.(chan struct{})
+	if ok {
+		close(ch)
+	}
 }
 
 // WaitForData blocks until new data is signalled or the timeout elapses.
 // Returns true if data was signalled, false on timeout.
 func (rs *ReplicaState) WaitForData(timeout time.Duration) bool {
-	ch := rs.newDataCh.Load().(chan struct{})
+	ch, ok := rs.newDataCh.Load().(chan struct{})
+	if !ok {
+		return false
+	}
 	select {
 	case <-ch:
 		return true

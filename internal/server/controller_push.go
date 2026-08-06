@@ -49,7 +49,7 @@ func (p *AssignmentPusher) Push(ctx context.Context, nodeAddr string, req pushAs
 	if err != nil {
 		return fmt.Errorf("push to %s: %w", nodeAddr, err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("push to %s: status %d", nodeAddr, resp.StatusCode)
 	}

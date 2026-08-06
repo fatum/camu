@@ -16,9 +16,9 @@ func (s *Server) metricAdd(name, help string, labels map[string]string, value fl
 	}
 }
 
-func (s *Server) metricSet(name, help string, labels map[string]string, value float64) {
+func (s *Server) metricSet(name, help string, value float64) {
 	if s.metrics != nil {
-		s.metrics.Set(name, help, labels, value)
+		s.metrics.Set(name, help, nil, value)
 	}
 }
 

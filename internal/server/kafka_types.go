@@ -8,9 +8,10 @@ import (
 	"net"
 	"sync"
 
+	"github.com/twmb/franz-go/pkg/kmsg"
+
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/metrics"
-	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 const maxKafkaRequestSize = 16 << 20

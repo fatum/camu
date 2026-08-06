@@ -18,25 +18,21 @@ var (
 )
 
 // checkProducerSequence validates a new allocation for an idempotent producer
-// against its last recorded batch. exactRetry is true when the allocation is an
-// exact retry of the last batch (the caller deduplicates and must verify the
-// count). Otherwise the allocation must be exactly the next contiguous batch
-// (prev.first + prev.count); anything lower, inside, or beyond is rejected.
-func checkProducerSequence(producerID int64, allocSequence int64, allocCount int, prevFirstSequence int64, prevCount int) (exactRetry bool, err error) {
+// against its last recorded batch. Returns nil if the allocation is an exact
+// retry or the next contiguous batch; otherwise returns an error.
+func checkProducerSequence(producerID int64, allocSequence int64, _ int, prevFirstSequence int64, prevCount int) error {
 	next := prevFirstSequence + int64(prevCount)
 	switch {
 	case allocSequence == prevFirstSequence:
-		return true, nil
+		return nil
 	case allocSequence < prevFirstSequence:
-		return false, fmt.Errorf("%w: producer %d sent sequence %d below recorded %d", ErrOutOfOrderSequence, producerID, allocSequence, prevFirstSequence)
+		return fmt.Errorf("%w: producer %d sent sequence %d below recorded %d", ErrOutOfOrderSequence, producerID, allocSequence, prevFirstSequence)
 	case allocSequence > next:
-		return false, fmt.Errorf("%w: producer %d sent sequence %d, expected %d", ErrSequenceGap, producerID, allocSequence, next)
+		return fmt.Errorf("%w: producer %d sent sequence %d, expected %d", ErrSequenceGap, producerID, allocSequence, next)
 	case allocSequence < next:
-		// prevFirst < allocSequence < next: inside the recorded batch.
-		return false, fmt.Errorf("%w: producer %d sent sequence %d inside batch [%d,%d)", ErrOutOfOrderSequence, producerID, allocSequence, prevFirstSequence, next)
+		return fmt.Errorf("%w: producer %d sent sequence %d inside batch [%d,%d)", ErrOutOfOrderSequence, producerID, allocSequence, prevFirstSequence, next)
 	default:
-		// allocSequence == next: the exact next contiguous batch.
-		return false, nil
+		return nil
 	}
 }
 

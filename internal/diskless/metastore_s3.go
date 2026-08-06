@@ -190,7 +190,7 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 				if !duplicate {
 					if len(h) > 0 {
 						last := h[len(h)-1]
-						if _, err := checkProducerSequence(batch.ProducerID, batch.Sequence, batch.Count, last.FirstSequence, last.Count); err != nil {
+						if err := checkProducerSequence(batch.ProducerID, batch.Sequence, batch.Count, last.FirstSequence, last.Count); err != nil {
 							return nil, err
 						}
 					} else if err := checkInitialProducerSequence(batch.ProducerID, batch.Sequence); err != nil {
@@ -555,11 +555,11 @@ func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition
 		if r.EndOffset <= fromOffset {
 			return true
 		}
-		if len(refs) > 0 && totalBytes+int64(r.ByteLength) > int64(maxBytes) {
+		if len(refs) > 0 && totalBytes+r.ByteLength > int64(maxBytes) {
 			return false
 		}
 		refs = append(refs, SegmentRef(r))
-		totalBytes += int64(r.ByteLength)
+		totalBytes += r.ByteLength
 		return true
 	}
 

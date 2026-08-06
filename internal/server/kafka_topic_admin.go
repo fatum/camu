@@ -520,7 +520,7 @@ func applyKafkaTopicConfigs(tc meta.TopicConfig, values map[string]*string, rese
 			if *value != "classic" && *value != "diskless" {
 				return tc, fmt.Errorf("invalid camu.storage.mode")
 			}
-			if *value != next.StorageMode && !(*value == "classic" && next.StorageMode == "") {
+			if *value != next.StorageMode && (*value != "classic" || next.StorageMode != "") {
 				return tc, fmt.Errorf("camu.storage.mode is immutable")
 			}
 		case "camu.export.enabled":

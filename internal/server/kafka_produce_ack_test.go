@@ -12,7 +12,7 @@ import (
 	"github.com/maksim/camu/internal/log"
 )
 
-func kafkaProduceAckServer(appendErr error, waitErr error) (*KafkaServer, *struct {
+func kafkaProduceAckServer(waitErr error) (*KafkaServer, *struct {
 	topic     string
 	partition int
 	offset    uint64
@@ -36,7 +36,7 @@ func kafkaProduceAckServer(appendErr error, waitErr error) (*KafkaServer, *struc
 		},
 		BrokerID: 1,
 		AppendRawBatchFunc: func(ctx context.Context, topic string, partition int, b []byte) (int64, error) {
-			return 100, appendErr
+			return 100, nil
 		},
 		WaitForReplicatedFunc: func(ctx context.Context, topic string, partition int, offset uint64) error {
 			waited.topic = topic
@@ -63,7 +63,7 @@ func TestKafkaProduceAcksAllWaitsForReplication(t *testing.T) {
 		{Key: []byte("k1"), Value: []byte("v1")},
 		{Key: []byte("k2"), Value: []byte("v2")},
 	})
-	ks, waited := kafkaProduceAckServer(nil, nil)
+	ks, waited := kafkaProduceAckServer(nil)
 
 	resp, err := ks.HandleRequest(context.Background(), produceRequest(-1, batch))
 	require.NoError(t, err)
@@ -80,7 +80,7 @@ func TestKafkaProduceAcksAllWaitsForReplication(t *testing.T) {
 
 func TestKafkaProduceAcksOneWaitsForReplication(t *testing.T) {
 	batch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
-	ks, waited := kafkaProduceAckServer(nil, nil)
+	ks, waited := kafkaProduceAckServer(nil)
 
 	resp, err := ks.HandleRequest(context.Background(), produceRequest(1, batch))
 	require.NoError(t, err)
@@ -93,7 +93,7 @@ func TestKafkaProduceAcksOneWaitsForReplication(t *testing.T) {
 
 func TestKafkaProduceAcksZeroSkipsReplicationWait(t *testing.T) {
 	batch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
-	ks, waited := kafkaProduceAckServer(nil, nil)
+	ks, waited := kafkaProduceAckServer(nil)
 
 	resp, err := ks.HandleRequest(context.Background(), produceRequest(0, batch))
 	require.NoError(t, err)
@@ -106,12 +106,12 @@ func TestKafkaProduceAcksZeroSkipsReplicationWait(t *testing.T) {
 
 func TestKafkaProduceReplicationWaitErrorSetsServerError(t *testing.T) {
 	batch := log.EncodeRecordBatch(0, []log.Message{{Key: []byte("k1"), Value: []byte("v1")}})
-	ks, waited := kafkaProduceAckServer(nil, errors.New("replication timeout"))
+	ks, waited := kafkaProduceAckServer(errors.New("replication timeout"))
 
 	resp, err := ks.HandleRequest(context.Background(), produceRequest(-1, batch))
 	require.NoError(t, err)
 
 	partResp := resp.(*kmsg.ProduceResponse).Topics[0].Partitions[0]
-	assert.Equal(t, int16(kafkaErrorUnknownServer), partResp.ErrorCode)
+	assert.Equal(t, kafkaErrorUnknownServer, partResp.ErrorCode)
 	assert.Equal(t, 1, waited.calls)
 }

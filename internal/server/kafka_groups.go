@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maksim/camu/internal/storage"
 	"github.com/twmb/franz-go/pkg/kmsg"
+
+	"github.com/maksim/camu/internal/storage"
 )
 
 const (

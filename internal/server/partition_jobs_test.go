@@ -3,10 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"github.com/maksim/camu/internal/jobs"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/maksim/camu/internal/jobs"
 )
 
 // TestPartitionJobQueueRoundTrip proves a job can be put, listed, and

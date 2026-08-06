@@ -5,11 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maksim/camu/internal/meta"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/maksim/camu/internal/meta"
 )
 
 func testProtobufSchema() *meta.TopicSchema {

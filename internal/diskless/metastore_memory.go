@@ -79,7 +79,7 @@ func (m *MemoryMetaStore) CommitUploadedBatches(_ context.Context, batches []Upl
 			}
 			if len(history) > 0 {
 				last := history[len(history)-1]
-				if _, err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.firstSequence, last.count); err != nil {
+				if err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.firstSequence, last.count); err != nil {
 					return nil, err
 				}
 			} else if err := checkInitialProducerSequence(b.ProducerID, b.Sequence); err != nil {

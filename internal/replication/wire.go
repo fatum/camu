@@ -90,7 +90,6 @@ func EncodeRequest(req *ReplicaFetchRequest) []byte {
 	off += 8
 
 	binary.BigEndian.PutUint32(buf[off:], uint32(req.MaxBytes))
-	off += 4
 
 	return buf
 }
@@ -174,7 +173,6 @@ func parseRequest(body []byte) (*ReplicaFetchRequest, error) {
 		return nil, fmt.Errorf("replication: truncated maxBytes")
 	}
 	req.MaxBytes = int32(binary.BigEndian.Uint32(body[off:]))
-	off += 4
 
 	return req, nil
 }
@@ -205,7 +203,6 @@ func EncodeResponseHeader(resp *ReplicaFetchResponse) []byte {
 		dataLen = int32(len(resp.BatchData))
 	}
 	binary.BigEndian.PutUint32(buf[off:], uint32(dataLen))
-	off += 4
 	return buf
 }
 

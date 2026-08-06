@@ -319,9 +319,12 @@ func (c client) requestHeaders(ctx context.Context, method, path string, body an
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err != nil {
+			return nil, fmt.Errorf("%s %s: read body: %w", method, path, err)
+		}
 		return nil, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
 	}
 	if out != nil {
@@ -576,8 +579,7 @@ func (c client) waitForReplication(ctx context.Context, cfg config) error {
 	return errors.New("timed out waiting for replicated topic assignments")
 }
 
-func payload(n int64) string          { return strings.Repeat("x", int(n)) }
-func digestFor(v typedValue) [32]byte { b, _ := json.Marshal(v); return sha256.Sum256(b) }
+func payload(n int64) string { return strings.Repeat("x", int(n)) }
 func targetCount(target, messageBytes int64) (int64, error) {
 	if target <= 0 || messageBytes <= 0 || target > math.MaxInt64-(messageBytes-1) {
 		return 0, errors.New("TARGET_BYTES/MESSAGE_BYTES overflow")
@@ -892,7 +894,10 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 		}
 		records += r
 		bytesN += b
-		db, _ := hex.DecodeString(d)
+		db, err := hex.DecodeString(d)
+		if err != nil {
+			return phaseResult{}, err
+		}
 		h.Write(db)
 	}
 	d := time.Since(start)

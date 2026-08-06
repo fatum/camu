@@ -16,17 +16,17 @@ import (
 	"github.com/maksim/camu/internal/storage"
 )
 
-func cloneTestServerForInstance(t *testing.T, src *Server, instanceID string) *Server {
+func cloneTestServerForInstance(t *testing.T, src *Server) *Server {
 	t.Helper()
 
 	cfg := *src.cfg
-	cfg.Server.InstanceID = instanceID
+	cfg.Server.InstanceID = "n2"
 
 	s, err := NewWithS3Client(&cfg, src.s3Client)
 	if err != nil {
 		t.Fatalf("NewWithS3Client() error = %v", err)
 	}
-	s.registry = coordination.NewRegistry(src.s3Client, instanceID, "127.0.0.1:8080", "127.0.0.1:8081", "", "", time.Minute)
+	s.registry = coordination.NewRegistry(src.s3Client, "n2", "127.0.0.1:8080", "127.0.0.1:8081", "", "", time.Minute)
 	return s
 }
 
@@ -527,7 +527,7 @@ func TestClassicRetentionOwnerJobResumesAfterReassignment(t *testing.T) {
 		t.Fatalf("expected metadata to remain after stale-owner attempt: %v", err)
 	}
 
-	s2 := cloneTestServerForInstance(t, s1, "n2")
+	s2 := cloneTestServerForInstance(t, s1)
 	s2.runPartitionMaintenance(ctx, []meta.TopicConfig{tc}, nil)
 
 	if _, err := s2.s3Client.Get(ctx, metaKey); !errors.Is(err, storage.ErrNotFound) {
@@ -617,7 +617,7 @@ func TestDisklessRetentionOwnerJobResumesAfterReassignment(t *testing.T) {
 		t.Fatalf("expected refs to remain after stale-owner attempt, got %d", len(refs))
 	}
 
-	s2 := cloneTestServerForInstance(t, s1, "n2")
+	s2 := cloneTestServerForInstance(t, s1)
 	s2.disklessMeta = s1.disklessMeta
 	s2.runPartitionMaintenance(ctx, []meta.TopicConfig{tc}, nil)
 

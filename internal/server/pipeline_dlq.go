@@ -119,7 +119,7 @@ func (a *serverDLQAppender) appendRemote(ctx context.Context, topic string, part
 	if err != nil {
 		return 0, false, fmt.Errorf("produce dead-letter messages: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return 0, false, fmt.Errorf("produce dead-letter messages: %s", resp.Status)
 	}

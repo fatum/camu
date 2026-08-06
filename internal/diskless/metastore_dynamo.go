@@ -140,7 +140,7 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 				if !duplicate {
 					if len(h) > 0 {
 						last := h[len(h)-1]
-						if _, err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.FirstSequence, last.Count); err != nil {
+						if err := checkProducerSequence(b.ProducerID, b.Sequence, b.Count, last.FirstSequence, last.Count); err != nil {
 							return nil, err
 						}
 					} else if err := checkInitialProducerSequence(b.ProducerID, b.Sequence); err != nil {
@@ -341,15 +341,12 @@ func (d *DynamoMetaStore) QuerySegments(ctx context.Context, topic string, parti
 			return nil, fmt.Errorf("query segments for %s: %w", pk, err)
 		}
 		for _, item := range page.Items {
-			ref, err := itemToSegmentRef(item)
-			if err != nil {
-				return nil, err
-			}
+			ref := itemToSegmentRef(item)
 			// Match the other metastores' semantics: the first ref is always
 			// included (offset coverage); a later ref that would push the total
 			// over maxBytes ends the collection. A single oversized ref is still
 			// returned and the reader trims the response to whole batches.
-			if len(refs) > 0 && totalBytes+int64(ref.ByteLength) > int64(maxBytes) {
+			if len(refs) > 0 && totalBytes+ref.ByteLength > int64(maxBytes) {
 				return refs, nil
 			}
 			refs = append(refs, ref)
@@ -359,7 +356,7 @@ func (d *DynamoMetaStore) QuerySegments(ctx context.Context, topic string, parti
 	return refs, nil
 }
 
-func itemToSegmentRef(item map[string]ddbtypes.AttributeValue) (SegmentRef, error) {
+func itemToSegmentRef(item map[string]ddbtypes.AttributeValue) SegmentRef {
 	var ref SegmentRef
 	if v, ok := item["file_key"].(*ddbtypes.AttributeValueMemberS); ok {
 		ref.FileKey = v.Value
@@ -381,7 +378,7 @@ func itemToSegmentRef(item map[string]ddbtypes.AttributeValue) (SegmentRef, erro
 			ref.CreatedAt = t
 		}
 	}
-	return ref, nil
+	return ref
 }
 
 // GetPartitionHead returns the next offset for a partition, or 0 if none allocated.
@@ -618,10 +615,7 @@ func (d *DynamoMetaStore) ListFileRefs(ctx context.Context, fileKey string) ([]F
 			return nil, fmt.Errorf("list file refs for %s: %w", fileKey, err)
 		}
 		for _, item := range page.Items {
-			ref, err := itemToSegmentRef(item)
-			if err != nil {
-				return nil, err
-			}
+			ref := itemToSegmentRef(item)
 			pk, ok := item["pk"].(*ddbtypes.AttributeValueMemberS)
 			if !ok {
 				continue
