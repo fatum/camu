@@ -225,9 +225,9 @@ func (s *Server) deleteTopicPipelineCheckpoints(ctx context.Context, topic strin
 	return nil
 }
 
-// deleteDisklessDataFiles deletes all _diskless/ backing data files referenced
-// by the topic's segment catalogs, before the metadata is dropped so the
-// file→topic mapping is still intact.
+// deleteDisklessDataFiles deletes _diskless/ backing data files that are
+// referenced by the topic's segment catalogs and have no references from any
+// other topic (a single flush file may contain batches from multiple topics).
 func (s *Server) deleteDisklessDataFiles(ctx context.Context, tc meta.TopicConfig) error {
 	seen := make(map[string]bool)
 	for partition := 0; partition < tc.Partitions; partition++ {
@@ -241,7 +241,18 @@ func (s *Server) deleteDisklessDataFiles(ctx context.Context, tc meta.TopicConfi
 			}
 		}
 	}
-	for fileKey := range seen {
+	if len(seen) == 0 {
+		return nil
+	}
+	fileKeys := make([]string, 0, len(seen))
+	for k := range seen {
+		fileKeys = append(fileKeys, k)
+	}
+	deletable, err := s.disklessMeta.PlanUnreferencedFileDeletes(ctx, fileKeys)
+	if err != nil {
+		return fmt.Errorf("plan unreferenced deletes: %w", err)
+	}
+	for _, fileKey := range deletable {
 		if err := s.s3Client.Delete(ctx, fileKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return fmt.Errorf("delete diskless data %s: %w", fileKey, err)
 		}

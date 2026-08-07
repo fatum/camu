@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -69,6 +71,12 @@ func runAnalyze() int {
 	}
 	var windows []snapshot
 	for _, key := range keys {
+		// verify-* files use a different schema (verificationReport, no
+		// start/end/node_id); parsing them as snapshots yields zero-time
+		// windows that corrupt duration and node lists.
+		if strings.HasPrefix(path.Base(key), "verify-") {
+			continue
+		}
 		data, err := s3GetRetry(key)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "read %s: %v\n", key, err)
@@ -77,6 +85,9 @@ func runAnalyze() int {
 		var snap snapshot
 		if err := json.Unmarshal(data, &snap); err != nil {
 			fmt.Fprintf(os.Stderr, "parse %s: %v\n", key, err)
+			continue
+		}
+		if snap.Start.IsZero() || snap.End.IsZero() || snap.NodeID == "" {
 			continue
 		}
 		windows = append(windows, snap)
