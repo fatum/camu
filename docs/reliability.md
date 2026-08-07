@@ -44,7 +44,9 @@ Integration coverage exercises end-to-end paths with real servers:
 
 Jepsen is the strongest evidence for distributed behavior. The repository-local
 harness runs five Camu nodes against MinIO and writes every run's
-`results.edn`, history, and node logs under `jepsen/camu/store/`.
+`results.edn`, history, and node logs under `jepsen/camu/store/`. The fault,
+read-mode, and recovery matrices run automatically every day in CI
+(`.github/workflows/jepsen-matrix.yml`) in addition to the per-PR smoke run.
 
 The fault matrix covers kill, leader kill, leader pause-then-ack, network
 partition, pause, membership changes, rejoin, object-store partition, clock
