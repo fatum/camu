@@ -82,7 +82,6 @@ func produceLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 		}
 
 		records := make([]*kgo.Record, 0, batchSize)
-		seqs := make([]int64, 0, batchSize)
 		for len(records) < batchSize {
 			for pi, partition := range myPartitions {
 				if len(records) >= batchSize {
@@ -102,17 +101,19 @@ func produceLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 					Key:       []byte(key),
 					Value:     mustJSON(value),
 				})
-				seqs = append(seqs, seq)
 			}
 		}
 
 		started := time.Now()
 		results := kafkaClient.ProduceSync(ctx, records...)
 		latency := time.Since(started)
-		for i, r := range results {
+		// ProduceSync results are not guaranteed to align index-wise with the
+		// input records, so derive the seq from the record value rather than a
+		// parallel slice.
+		for _, r := range results {
 			if r.Err != nil {
 				stats.recordError(topic, int(r.Record.Partition), "produce")
-				slog.Warn("produce_error", "topic", topic, "partition", r.Record.Partition, "seq", seqs[i], "error", r.Err)
+				slog.Warn("produce_error", "topic", topic, "partition", r.Record.Partition, "error", r.Err)
 			} else {
 				stats.recordProduce(topic, int(r.Record.Partition), int64(len(r.Record.Value)), latency)
 			}

@@ -63,6 +63,9 @@ func consumeLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 			if err := validators[record.Partition].validate(cfg, int(record.Partition), value); err != nil {
 				stats.recordError(topic, int(record.Partition), "validate")
 				slog.Warn("validate_error", "topic", topic, "partition", record.Partition, "offset", record.Offset, "error", err)
+				// Validation re-baselines inside the validator, so a single lost
+				// record reports one gap instead of poisoning every later record
+				// of the partition.
 				return
 			}
 			stats.recordConsume(topic, int(record.Partition), int64(len(record.Value)))
@@ -90,6 +93,10 @@ func (v *partitionValidator) validate(cfg serviceConfig, partition int, rec type
 		// (the consumer may begin mid-stream) and require contiguity after it.
 		expected = rec.Seq
 	} else if rec.Seq != expected {
+		// A gap (e.g. a produce that never landed) must not poison the rest of
+		// the partition: count it once and re-baseline to the record actually
+		// present so later records validate normally again.
+		v.nextSeq[partition] = rec.Seq + int64(cfg.Partitions)
 		return fmt.Errorf("seq gap: partition %d got %d, want %d", partition, rec.Seq, expected)
 	}
 	v.nextSeq[partition] = expected + int64(cfg.Partitions)
