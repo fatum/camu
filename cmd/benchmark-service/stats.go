@@ -37,7 +37,7 @@ type phaseCounters struct {
 type partitionCounters struct {
 	records      int64
 	bytes        int64
-	hwm          int64
+	consumed     int64
 	offsetGaps   int64
 	decodeErrors int64
 }
@@ -68,7 +68,7 @@ type phaseSnapshot struct {
 type partitionSnapshot struct {
 	Records      int64 `json:"records"`
 	Bytes        int64 `json:"bytes"`
-	HWM          int64 `json:"hwm"`
+	Consumed     int64 `json:"consumed,omitempty"`
 	OffsetGaps   int64 `json:"offset_gaps"`
 	DecodeErrors int64 `json:"decode_errors"`
 }
@@ -135,7 +135,7 @@ func (s *statsAccumulator) recordConsume(topic string, partition int, bytes int6
 		p = &partitionCounters{}
 		tc.partitions[partition] = p
 	}
-	p.hwm++
+	p.consumed++
 	s.totalCons.Add(1)
 }
 
@@ -200,7 +200,7 @@ func (s *statsAccumulator) snapshot(start, end time.Time) snapshot {
 			ts.Partitions[p] = partitionSnapshot{
 				Records:      pc.records,
 				Bytes:        pc.bytes,
-				HWM:          pc.hwm,
+				Consumed:     pc.consumed,
 				OffsetGaps:   pc.offsetGaps,
 				DecodeErrors: pc.decodeErrors,
 			}

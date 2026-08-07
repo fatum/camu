@@ -35,6 +35,7 @@ type topicAnalysis struct {
 
 type partition struct {
 	Records      int64 `json:"records"`
+	Consumed     int64 `json:"consumed"`
 	Errors       int64 `json:"errors"`
 	OffsetGaps   int64 `json:"offset_gaps"`
 	DecodeErrors int64 `json:"decode_errors"`
@@ -150,6 +151,7 @@ func buildReport(windows []snapshot) analysisReport {
 					ta.PartitionSummary[pid] = p
 				}
 				p.Records += ps.Records
+				p.Consumed += ps.Consumed
 				p.Errors += ps.OffsetGaps + ps.DecodeErrors
 				p.OffsetGaps += ps.OffsetGaps
 				p.DecodeErrors += ps.DecodeErrors

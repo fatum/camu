@@ -24,7 +24,6 @@ func consumeLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 	}
 	defer kafkaClient.Close()
 
-	expected := make(map[int32]int64)
 	validators := make(map[int32]*partitionValidator)
 	for p := 0; p < cfg.Partitions; p++ {
 		pid := int32(p)
@@ -53,43 +52,46 @@ func consumeLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 				slog.Warn("decode_error", "topic", topic, "partition", record.Partition, "offset", record.Offset, "error", err)
 				return
 			}
-			v := validators[record.Partition]
-			if v == nil {
-				v = newPartitionValidator()
-				validators[record.Partition] = v
+			if value.RunID != cfg.RunID {
+				// Records from other runs (other clients, prior processes)
+				// share the partition's offset space and are not contiguous in
+				// this run's sequence; count them as consumed but do not
+				// validate them against this run's sequence.
+				stats.recordConsume(topic, int(record.Partition), int64(len(record.Value)))
+				return
 			}
-			if err := v.validate(cfg, int(record.Partition), record.Offset, value); err != nil {
+			if err := validators[record.Partition].validate(cfg, int(record.Partition), value); err != nil {
 				stats.recordError(topic, int(record.Partition), "validate")
 				slog.Warn("validate_error", "topic", topic, "partition", record.Partition, "offset", record.Offset, "error", err)
 				return
 			}
 			stats.recordConsume(topic, int(record.Partition), int64(len(record.Value)))
-			expected[record.Partition] = record.Offset + 1
 		})
 	}
 }
 
+// partitionValidator checks that a single producer run's records arrive on a
+// partition in monotonic sequence order: partition p carries seqs p, p+P,
+// p+2P, ... This is robust to multiple producers sharing the partition (their
+// Kafka offsets interleave, so offset-contiguity validation was a false
+// positive) while still catching dropped or reordered records of this run.
 type partitionValidator struct {
-	nextSeq map[string]int64
+	nextSeq map[int]int64
 }
 
 func newPartitionValidator() *partitionValidator {
-	return &partitionValidator{nextSeq: make(map[string]int64)}
+	return &partitionValidator{nextSeq: make(map[int]int64)}
 }
 
-func (v *partitionValidator) validate(cfg serviceConfig, partition int, offset int64, rec typedRecord) error {
-	if rec.RunID == "" {
-		return nil
-	}
-	expectedOffset, ok := v.nextSeq[rec.RunID]
+func (v *partitionValidator) validate(cfg serviceConfig, partition int, rec typedRecord) error {
+	expected, ok := v.nextSeq[partition]
 	if !ok {
-		// First record seen for this run — accept any starting offset
-		// (the topic may have data from previous runs).
-		expectedOffset = offset
+		// First record of this run on the partition: accept any starting seq
+		// (the consumer may begin mid-stream) and require contiguity after it.
+		expected = rec.Seq
+	} else if rec.Seq != expected {
+		return fmt.Errorf("seq gap: partition %d got %d, want %d", partition, rec.Seq, expected)
 	}
-	if offset != expectedOffset {
-		return fmt.Errorf("offset gap: got %d, want %d", offset, expectedOffset)
-	}
-	v.nextSeq[rec.RunID] = offset + 1
+	v.nextSeq[partition] = expected + int64(cfg.Partitions)
 	return nil
 }

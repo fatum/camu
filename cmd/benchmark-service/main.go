@@ -19,19 +19,20 @@ import (
 )
 
 type serviceConfig struct {
-	RunID         string
-	Topics        []string
-	StorageModes  []string
-	RateLimit     int
-	Partitions    int
-	MessageBytes  int64
-	StatsInterval time.Duration
-	S3Bucket      string
-	S3Prefix      string
-	S3Endpoint    string
-	S3Region      string
-	KafkaBrokers  []string
-	NodeID        string
+	RunID               string
+	Topics              []string
+	StorageModes        []string
+	RateLimit           int
+	ProducerConcurrency int
+	Partitions          int
+	MessageBytes        int64
+	StatsInterval       time.Duration
+	S3Bucket            string
+	S3Prefix            string
+	S3Endpoint          string
+	S3Region            string
+	KafkaBrokers        []string
+	NodeID              string
 }
 
 func env(key, def string) string {
@@ -57,6 +58,10 @@ func loadServiceConfig() (serviceConfig, error) {
 	statsInterval, err := time.ParseDuration(env("STATS_INTERVAL", "5m"))
 	if err != nil || statsInterval <= 0 {
 		return serviceConfig{}, fmt.Errorf("STATS_INTERVAL must be a positive duration")
+	}
+	producerConcurrency, err := strconv.Atoi(env("PRODUCER_CONCURRENCY", "4"))
+	if err != nil || producerConcurrency < 1 {
+		return serviceConfig{}, fmt.Errorf("PRODUCER_CONCURRENCY must be a positive integer")
 	}
 
 	topicRaw := env("TOPICS", "")
@@ -94,19 +99,20 @@ func loadServiceConfig() (serviceConfig, error) {
 	}
 
 	return serviceConfig{
-		RunID:         runID,
-		Topics:        topics,
-		StorageModes:  modes,
-		RateLimit:     rateLimit,
-		Partitions:    partitions,
-		MessageBytes:  messageBytes,
-		StatsInterval: statsInterval,
-		S3Bucket:      env("S3_BUCKET", ""),
-		S3Prefix:      env("S3_PREFIX", "benchmark-stats"),
-		S3Endpoint:    env("S3_ENDPOINT", ""),
-		S3Region:      env("S3_REGION", "us-east-1"),
-		KafkaBrokers:  brokers,
-		NodeID:        env("NODE_ID", "benchmark-node"),
+		RunID:               runID,
+		Topics:              topics,
+		StorageModes:        modes,
+		RateLimit:           rateLimit,
+		ProducerConcurrency: producerConcurrency,
+		Partitions:          partitions,
+		MessageBytes:        messageBytes,
+		StatsInterval:       statsInterval,
+		S3Bucket:            env("S3_BUCKET", ""),
+		S3Prefix:            env("S3_PREFIX", "benchmark-stats"),
+		S3Endpoint:          env("S3_ENDPOINT", ""),
+		S3Region:            env("S3_REGION", "us-east-1"),
+		KafkaBrokers:        brokers,
+		NodeID:              env("NODE_ID", "benchmark-node"),
 	}, nil
 }
 func main() {
@@ -127,6 +133,7 @@ func main() {
 		"run_id", cfg.RunID,
 		"topics", cfg.Topics,
 		"rate", cfg.RateLimit,
+		"producer_concurrency", cfg.ProducerConcurrency,
 		"partitions", cfg.Partitions,
 		"message_bytes", cfg.MessageBytes,
 		"stats_interval", cfg.StatsInterval.String(),
@@ -166,11 +173,15 @@ func runTopic(ctx context.Context, cfg serviceConfig, topic, mode string, stats 
 	slog.Info("topic_loop_starting", "topic", topic, "mode", mode)
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		produceLoop(ctx, cfg, topic, stats)
-	}()
+	limiter := newRateLimiter(cfg.RateLimit)
+	for i := 0; i < cfg.ProducerConcurrency; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			produceLoop(ctx, cfg, topic, stats, limiter, i, cfg.ProducerConcurrency)
+		}(i)
+	}
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		consumeLoop(ctx, cfg, topic, stats)
