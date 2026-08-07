@@ -5,6 +5,14 @@ import (
 	"fmt"
 )
 
+// ErrProduceRetryable marks a diskless produce failure where the batch was
+// NOT recorded in the metastore (upload/commit aborted by a transient
+// object-store error or deadline). Kafka clients must retry such a batch with
+// the same producer sequence, so the produce path maps it to a retriable
+// Kafka error. Surfacing it as a non-retriable error would make an idempotent
+// client advance past the unrecorded batch and create a permanent gap.
+var ErrProduceRetryable = errors.New("diskless produce retryable failure")
+
 // Idempotent-produce sequence errors. They mirror the classic path's
 // ErrSequenceGap / out-of-order rejection so HTTP produce maps them to 422.
 var (

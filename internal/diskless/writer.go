@@ -202,9 +202,10 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 		}
 		select {
 		case <-ctx.Done():
-			w.sendError(entries, fmt.Errorf("diskless upload phase file_key=%s: %w (last upload error: %v)", fileKey, ctx.Err(), uploadErr))
+			err := fmt.Errorf("%w: diskless upload phase file_key=%s: %v (last upload error: %v)", ErrProduceRetryable, fileKey, ctx.Err(), uploadErr)
+			w.sendError(entries, err)
 			finishAllTurns()
-			return ctx.Err()
+			return err
 		case <-time.After(backoff):
 		}
 		if backoff < maxFlushRetryBackoff {
@@ -232,7 +233,7 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 				select {
 				case <-turn.previous:
 				case <-ctx.Done():
-					w.failChunk(entries, c.indexes, ctx.Err())
+					w.failChunk(entries, c.indexes, fmt.Errorf("%w: waiting to commit: %v", ErrProduceRetryable, ctx.Err()))
 					finishTurn(turn)
 					return
 				}
@@ -240,7 +241,7 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				w.failChunk(entries, c.indexes, ctx.Err())
+				w.failChunk(entries, c.indexes, fmt.Errorf("%w: waiting for commit slot: %v", ErrProduceRetryable, ctx.Err()))
 				finishTurn(turn)
 				return
 			}

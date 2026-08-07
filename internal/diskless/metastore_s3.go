@@ -156,6 +156,14 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 	}
 	topic, partition := batches[0].Topic, batches[0].Partition
 	results := make([]OffsetResult, len(batches))
+	// All camu nodes own every diskless partition, so the same producer's
+	// consecutive batches can be committed concurrently by different nodes.
+	// A commit that validated against a manifest read taken before a peer's
+	// commit landed would spuriously report a sequence gap. Re-reading before
+	// declaring a gap resolves that race; a genuine gap fails the re-check too.
+	seqRechecks := 0
+	const maxSeqRechecks = 2
+manifestLoop:
 	for {
 		key := s3ManifestKey(topic, partition)
 		data, etag, err := m.s3.GetWithETag(ctx, key)
@@ -165,7 +173,11 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 				return nil, fmt.Errorf("parse upload manifest %s/%d: %w", topic, partition, err)
 			}
 		} else if !errors.Is(err, storage.ErrNotFound) {
-			return nil, err
+			// A failed read leaves the batch unrecorded: mark it retryable so
+			// Kafka clients re-send the same batch instead of advancing past a
+			// gap. ErrNotFound means the partition manifest does not exist yet,
+			// which is a normal first-commit state, not a failure.
+			return nil, fmt.Errorf("%w: get upload manifest %s/%d: %v", ErrProduceRetryable, topic, partition, err)
 		}
 		changed := false
 		for i, batch := range batches {
@@ -191,9 +203,17 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 					if len(h) > 0 {
 						last := h[len(h)-1]
 						if err := checkProducerSequence(batch.ProducerID, batch.Sequence, batch.Count, last.FirstSequence, last.Count); err != nil {
+							if seqRechecks < maxSeqRechecks {
+								seqRechecks++
+								continue manifestLoop
+							}
 							return nil, err
 						}
 					} else if err := checkInitialProducerSequence(batch.ProducerID, batch.Sequence); err != nil {
+						if seqRechecks < maxSeqRechecks {
+							seqRechecks++
+							continue manifestLoop
+						}
 						return nil, err
 					}
 				}
@@ -228,7 +248,11 @@ func (m *S3MetaStore) CommitUploadedBatches(ctx context.Context, batches []Uploa
 			if errors.Is(err, storage.ErrConflict) {
 				continue
 			}
-			return nil, fmt.Errorf("commit uploaded batches %s/%d: %w", topic, partition, err)
+			// The CAS write failed, so nothing in this invocation was recorded:
+			// mark it retryable so the client re-sends the same batch. A retry
+			// either commits the batch fresh or deduplicates it as an exact
+			// retry; it can never burn the producer sequence.
+			return nil, fmt.Errorf("%w: commit uploaded batches %s/%d: %v", ErrProduceRetryable, topic, partition, err)
 		}
 		return results, nil
 	}
