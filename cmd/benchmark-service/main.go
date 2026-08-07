@@ -146,6 +146,10 @@ func main() {
 		go runTopic(ctx, cfg, topic, mode, stats)
 	}
 
+	// Verification loop checks diskless merge, Parquet export, and Iceberg
+	// metadata every 10 minutes (or 2x stats interval, whichever is longer).
+	go startVerificationLoop(ctx, cfg, stats)
+
 	<-ctx.Done()
 	slog.Info("benchmark_service_shutting_down")
 	time.Sleep(2 * time.Second)

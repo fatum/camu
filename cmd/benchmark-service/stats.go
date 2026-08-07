@@ -10,13 +10,14 @@ import (
 )
 
 type statsAccumulator struct {
-	mu         sync.Mutex
-	produceSeq int64
-	topics     map[string]*topicCounters
-	cfg        serviceConfig
-	totalProd  atomic.Int64
-	totalCons  atomic.Int64
-	totalErr   atomic.Int64
+	mu            sync.Mutex
+	produceSeq    int64
+	produceTimes  map[int64]time.Time // seq -> wall clock when produced
+	topics        map[string]*topicCounters
+	cfg           serviceConfig
+	totalProd     atomic.Int64
+	totalCons     atomic.Int64
+	totalErr      atomic.Int64
 }
 
 type topicCounters struct {
@@ -74,8 +75,9 @@ type partitionSnapshot struct {
 
 func newStats(cfg serviceConfig) *statsAccumulator {
 	s := &statsAccumulator{
-		cfg:    cfg,
-		topics: make(map[string]*topicCounters),
+		cfg:          cfg,
+		topics:       make(map[string]*topicCounters),
+		produceTimes: make(map[int64]time.Time),
 	}
 	for _, t := range cfg.Topics {
 		s.topics[t] = &topicCounters{partitions: make(map[int]*partitionCounters)}
@@ -103,6 +105,19 @@ func (s *statsAccumulator) recordProduce(topic string, partition int, bytes int6
 	p.records++
 	p.bytes += bytes
 	s.totalProd.Add(1)
+
+	// Sample every 100th produce for delay tracking
+	seq := s.totalProd.Load()
+	if seq%100 == 0 {
+		if len(s.produceTimes) > 10000 {
+			// Evict oldest entries to bound memory
+			for k := range s.produceTimes {
+				delete(s.produceTimes, k)
+				break
+			}
+		}
+		s.produceTimes[seq] = time.Now()
+	}
 }
 
 func (s *statsAccumulator) recordConsume(topic string, partition int, bytes int64) {
@@ -231,4 +246,24 @@ func (s *statsAccumulator) summary() map[string]any {
 		"total_consumed": s.totalCons.Load(),
 		"total_errors":   s.totalErr.Load(),
 	}
+}
+
+// produceTime returns the wall clock time when approximately seq records had
+// been produced, or the zero time if unknown.
+func (s *statsAccumulator) produceTime(seq int64) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.produceTimes[seq]; ok {
+		return t
+	}
+	// Linear scan for nearest sampled time
+	var bestSeq int64
+	var bestTime time.Time
+	for k, v := range s.produceTimes {
+		if k <= seq && k > bestSeq {
+			bestSeq = k
+			bestTime = v
+		}
+	}
+	return bestTime
 }
