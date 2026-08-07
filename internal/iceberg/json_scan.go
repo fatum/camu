@@ -7,8 +7,9 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"github.com/maksim/camu/internal/meta"
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/maksim/camu/internal/meta"
 )
 
 // jsonFieldTree maps a topic schema's field paths to leaf nodes holding the

@@ -39,12 +39,6 @@ func (p partitionLeaderService) runMaintenance(ctx context.Context, topics []met
 	})
 }
 
-func (p partitionLeaderService) runJobsForTopic(ctx context.Context, tc meta.TopicConfig, fileIdx *diskless.FileIndex) {
-	for partition := 0; partition < tc.Partitions; partition++ {
-		p.runPartitionJobDiscovery(ctx, tc, partition, fileIdx)
-	}
-}
-
 func (p partitionLeaderService) runPartitionJobDiscovery(ctx context.Context, tc meta.TopicConfig, partition int, fileIdx *diskless.FileIndex) {
 	identity, err := p.server.ResolvePartitionIdentity(ctx, tc.Name, partition)
 	if err != nil {

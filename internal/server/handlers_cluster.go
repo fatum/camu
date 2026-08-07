@@ -184,7 +184,7 @@ func (s *Server) clusterStatus(parent context.Context) clusterStatusResponse {
 			continue
 		}
 		decodeErr := json.NewDecoder(httpResp.Body).Decode(&lr)
-		httpResp.Body.Close()
+		_ = httpResp.Body.Close()
 		if httpResp.StatusCode != http.StatusOK || decodeErr != nil {
 			resp.Reasons = append(resp.Reasons, fmt.Sprintf("instance %s readiness unavailable", info.InstanceID))
 			continue

@@ -34,8 +34,8 @@ func TestBuildClassicSegmentMergeArtifactConcatenatesSegmentsAndSidecars(t *test
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 
-	ref1, seg1, idx1, meta1 := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 0, 1, 1, 2)
-	ref2, seg2, idx2, meta2 := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 2, 3, 1, 2)
+	ref1, seg1 := seedSealedSegmentForMerge(t, s, ctx, 0, 1, 1, 2)
+	ref2, seg2 := seedSealedSegmentForMerge(t, s, ctx, 2, 3, 1, 2)
 
 	artifact, err := s.buildClassicSegmentMergeArtifact(ctx, []log.SegmentRef{ref1, ref2})
 	if err != nil {
@@ -74,18 +74,14 @@ func TestBuildClassicSegmentMergeArtifactConcatenatesSegmentsAndSidecars(t *test
 		t.Fatalf("merged metadata segment key = %q, want %q", metaDoc.SegmentKey, artifact.Ref.Key)
 	}
 
-	_ = idx1
-	_ = idx2
-	_ = meta1
-	_ = meta2
 }
 
 func TestBuildClassicSegmentMergeArtifactRejectsEpochMismatch(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 
-	ref1, _, _, _ := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 0, 1, 1, 1)
-	ref2, _, _, _ := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 2, 3, 2, 1)
+	ref1, _ := seedSealedSegmentForMerge(t, s, ctx, 0, 1, 1, 1)
+	ref2, _ := seedSealedSegmentForMerge(t, s, ctx, 2, 3, 2, 1)
 
 	if _, err := s.buildClassicSegmentMergeArtifact(ctx, []log.SegmentRef{ref1, ref2}); err == nil {
 		t.Fatal("expected epoch mismatch error")
@@ -125,8 +121,8 @@ func TestRunSegmentMergeJobPublishesMergedSegmentAndRemovesSources(t *testing.T)
 	}
 	s.assignmentsMu.Unlock()
 
-	ref1, _, _, _ := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 0, 1, 1, 2)
-	ref2, _, _, _ := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 2, 3, 1, 2)
+	ref1, _ := seedSealedSegmentForMerge(t, s, ctx, 0, 1, 1, 2)
+	ref2, _ := seedSealedSegmentForMerge(t, s, ctx, 2, 3, 1, 2)
 	ps := s.partitionManager.GetPartitionState("orders", 0)
 	ps.mu.Lock()
 	ps.index.Add(ref1)
@@ -220,8 +216,8 @@ func TestRunPartitionMaintenanceAutoDiscoversAndExecutesClassicSegmentMerge(t *t
 	}
 	s.assignmentsMu.Unlock()
 
-	ref1, _, _, _ := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 0, 1, 1, 2)
-	ref2, _, _, _ := seedSealedSegmentForMerge(t, s, ctx, "orders", 0, 2, 3, 1, 2)
+	ref1, _ := seedSealedSegmentForMerge(t, s, ctx, 0, 1, 1, 2)
+	ref2, _ := seedSealedSegmentForMerge(t, s, ctx, 2, 3, 1, 2)
 	ps := s.partitionManager.GetPartitionState("orders", 0)
 	ps.mu.Lock()
 	ps.index.Add(ref1)
@@ -255,7 +251,7 @@ func TestRunPartitionMaintenanceAutoDiscoversAndExecutesClassicSegmentMerge(t *t
 	}
 }
 
-func seedSealedSegmentForMerge(t *testing.T, s *Server, ctx context.Context, topic string, partition int, baseOffset, endOffset, epoch uint64, batchRecords int) (log.SegmentRef, []byte, []byte, []byte) {
+func seedSealedSegmentForMerge(t *testing.T, s *Server, ctx context.Context, baseOffset, endOffset, epoch uint64, batchRecords int) (log.SegmentRef, []byte) {
 	t.Helper()
 
 	messages := make([]log.Message, 0, batchRecords)
@@ -267,7 +263,7 @@ func seedSealedSegmentForMerge(t *testing.T, s *Server, ctx context.Context, top
 		})
 	}
 	segData := log.EncodeRecordBatch(int64(baseOffset), messages)
-	segKey := log.FormatSegmentKey(topic, partition, baseOffset, endOffset, epoch)
+	segKey := log.FormatSegmentKey("orders", 0, baseOffset, endOffset, epoch)
 	idxKey := log.SegmentOffsetIndexKey(segKey)
 	metaKey := log.SegmentMetadataKey(segKey)
 	entry := log.IndexEntry{
@@ -312,5 +308,5 @@ func seedSealedSegmentForMerge(t *testing.T, s *Server, ctx context.Context, top
 			t.Fatalf("s3Client.Put(%s) error = %v", item.key, err)
 		}
 	}
-	return ref, segData, sidecar.Bytes(), metaData
+	return ref, segData
 }

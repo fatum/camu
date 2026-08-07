@@ -141,7 +141,7 @@ func TestPartitionManagerAppendBatch_ConcurrentWritesPreserveOffsetOrder(t *test
 
 func TestRecoverLocalLogEnd_PrefersNativeData(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 
@@ -632,7 +632,7 @@ func TestDuplicateBaseOffset_ConcurrentAppendNoDataRace(t *testing.T) {
 			default:
 			}
 			ps.mu.Lock()
-			ps.recordAppendedBatch(99, seq, 2, int64(seq), uint64(seq)+1)
+			ps.recordAppendedBatch(99, seq, 2, int64(seq), seq+1)
 			ps.mu.Unlock()
 			seq += 2
 			runtime.Gosched()
@@ -1019,7 +1019,7 @@ func TestReadRawBatches_ActiveSegment(t *testing.T) {
 
 func TestReadReplicaBatchRange_ReadsPastHighWatermark(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 
@@ -1077,7 +1077,7 @@ func TestReadReplicaBatchRange_ReadsPastHighWatermark(t *testing.T) {
 
 func TestReadReplicaBatchRangeDoesNotServeSealedPrefix(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 
@@ -1128,7 +1128,7 @@ func TestReadReplicaBatchRangeDoesNotServeSealedPrefix(t *testing.T) {
 func TestReadRawBatchesDoesNotJumpFromSealedPrefixToActiveTail(t *testing.T) {
 	ctx := context.Background()
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(ctx, newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(ctx, newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1179,7 +1179,7 @@ func TestReadRawBatchesDoesNotJumpFromSealedPrefixToActiveTail(t *testing.T) {
 func TestReadRawBatchesDoesNotJumpSealedGapToNewestSegment(t *testing.T) {
 	ctx := context.Background()
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(ctx, newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(ctx, newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1248,7 +1248,7 @@ func TestReadRawBatchesDoesNotJumpSealedGapToNewestSegment(t *testing.T) {
 
 func TestSyncFollowerSealedPrefixAdvancesLocalOffsetFromIndex(t *testing.T) {
 	pm := newTestPartitionManager(t)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 	ps := pm.GetPartitionState("topic", 0)
@@ -1493,9 +1493,9 @@ func TestReadRawBatches_MaxBytesLimit(t *testing.T) {
 	}
 }
 
-func newTestTopicConfig(name string) meta.TopicConfig {
+func newTestTopicConfig() meta.TopicConfig {
 	return meta.TopicConfig{
-		Name:              name,
+		Name:              "topic",
 		Partitions:        1,
 		Retention:         time.Hour,
 		CreatedAt:         time.Now(),
@@ -1506,7 +1506,7 @@ func newTestTopicConfig(name string) meta.TopicConfig {
 
 func TestAppendReplicatedRawBatches(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 
@@ -1566,7 +1566,7 @@ func TestAppendReplicatedRawBatches(t *testing.T) {
 
 func TestAppendReplicatedRawBatches_NoActiveSegment(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 
@@ -1589,7 +1589,7 @@ func TestAppendReplicatedRawBatches_PartitionNotFound(t *testing.T) {
 
 func TestUpdateFollowerProgressDoesNotAdvertiseUnreplicatedOffsets(t *testing.T) {
 	pm := newTestPartitionManager(t)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatalf("InitTopic() error = %v", err)
 	}
 	ps := pm.GetPartitionState("topic", 0)
@@ -1608,7 +1608,7 @@ func TestUpdateFollowerProgressDoesNotAdvertiseUnreplicatedOffsets(t *testing.T)
 
 func TestUpdateFollowerProgressCompactsOnlyDurableFollowerPrefix(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatal(err)
 	}
 	ps := pm.GetPartitionState("topic", 0)
@@ -1645,7 +1645,7 @@ func TestUpdateFollowerProgressCompactsOnlyDurableFollowerPrefix(t *testing.T) {
 
 func TestUpdateFollowerProgressKeepsPrefixUntilIndexIsRefreshed(t *testing.T) {
 	pm := newTestPartitionManagerWithSegmentMaxSize(t, 1<<20)
-	if err := pm.InitTopic(context.Background(), newTestTopicConfig("topic"), map[int]uint64{}); err != nil {
+	if err := pm.InitTopic(context.Background(), newTestTopicConfig(), map[int]uint64{}); err != nil {
 		t.Fatal(err)
 	}
 	ps := pm.GetPartitionState("topic", 0)

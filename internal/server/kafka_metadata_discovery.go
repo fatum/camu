@@ -141,10 +141,7 @@ func (s *Server) handleKafkaFindCoordinator(_ context.Context, req *kmsg.FindCoo
 			keys = []string{req.CoordinatorKey}
 		}
 		for _, key := range keys {
-			brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
-			if err != nil {
-				return nil, err
-			}
+			brokerID, host, port := s.kafkaControllerBroker(context.Background())
 			resp.Coordinators = append(resp.Coordinators, kmsg.FindCoordinatorResponseCoordinator{
 				Key:    key,
 				NodeID: brokerID,
@@ -155,28 +152,25 @@ func (s *Server) handleKafkaFindCoordinator(_ context.Context, req *kmsg.FindCoo
 		return resp, nil
 	}
 
-	brokerID, host, port, err := s.kafkaControllerBroker(context.Background())
-	if err != nil {
-		return nil, err
-	}
+	brokerID, host, port := s.kafkaControllerBroker(context.Background())
 	resp.NodeID = brokerID
 	resp.Host = host
 	resp.Port = port
 	return resp, nil
 }
 
-func (s *Server) kafkaControllerBroker(ctx context.Context) (int32, string, int32, error) {
+func (s *Server) kafkaControllerBroker(ctx context.Context) (int32, string, int32) {
 	lease, err := s.leaderElection.GetLeader(ctx)
 	if err == nil && lease.InstanceID != "" && time.Now().Before(lease.ExpiresAt) {
 		info, infoErr := s.registry.GetInstanceInfo(ctx, lease.InstanceID)
 		if infoErr == nil && info.KafkaAddress != "" {
 			host, port := splitKafkaBrokerAddr(info.KafkaAddress)
-			return kafkaBrokerID(info.InstanceID), host, port, nil
+			return kafkaBrokerID(info.InstanceID), host, port
 		}
 	}
 
 	host, port := splitKafkaBrokerAddr(kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort, s.cfg.Server.KafkaAdvertiseAddress))
-	return kafkaBrokerID(s.instanceID), host, port, nil
+	return kafkaBrokerID(s.instanceID), host, port
 }
 
 func (s *Server) handleKafkaListOffsets(ctx context.Context, topic string, partition int, timestamp int64) (KafkaOffsetResponse, error) {

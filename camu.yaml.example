@@ -13,8 +13,8 @@ storage:
     access_key: ""
     secret_key: ""
 segments:
-  max_size: 8388608
-  max_age: "5s"
+  max_size: 67108864
+  max_age: "1m"
   compression: "none"
   record_batch_target_size: 16384
   index_interval_bytes: 4096

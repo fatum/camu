@@ -233,7 +233,7 @@ func (ks *KafkaServer) handleLeaveGroup(req *kmsg.LeaveGroupRequest) (kmsg.Respo
 	return kmsg.NewPtrLeaveGroupResponse(), nil
 }
 
-func (ks *KafkaServer) handleListOffsets(req *kmsg.ListOffsetsRequest) (kmsg.Response, error) {
+func (ks *KafkaServer) handleListOffsets(req *kmsg.ListOffsetsRequest) kmsg.Response {
 	resp := kmsg.NewPtrListOffsetsResponse()
 	setKafkaResponseVersion(resp, req.GetVersion())
 
@@ -269,7 +269,7 @@ func (ks *KafkaServer) handleListOffsets(req *kmsg.ListOffsetsRequest) (kmsg.Res
 		resp.Topics = append(resp.Topics, topicResp)
 	}
 
-	return resp, nil
+	return resp
 }
 
 func (ks *KafkaServer) handleOffsetCommit(req *kmsg.OffsetCommitRequest) (kmsg.Response, error) {

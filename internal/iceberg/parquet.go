@@ -7,9 +7,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/parquet-go/parquet-go"
+
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
-	"github.com/parquet-go/parquet-go"
 )
 
 // SchemaFailure is one source record that could not be converted to typed

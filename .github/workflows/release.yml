@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'jepsen/**'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          for target in \
+            darwin/amd64 \
+            darwin/arm64 \
+            linux/amd64 \
+            linux/arm64
+          do
+            GOOS=${target%/*} GOARCH=${target#*/}
+            echo "→ $GOOS/$GOARCH"
+            CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' \
+              -o "dist/camu-${GOOS}-${GOARCH}" ./cmd/camu
+          done
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > checksums.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: v${{ github.run_number }}
+          files: dist/*
+          generate_release_notes: true

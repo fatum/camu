@@ -3,15 +3,34 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/maksim/camu/internal/iceberg"
 	"github.com/maksim/camu/internal/log"
 	"github.com/maksim/camu/internal/meta"
 )
+
+func writeParquetChunk(messages []log.Message, schema *meta.TopicSchema) ([]byte, error) {
+	chunk, err := iceberg.EncodeChunk(context.Background(), "", messages, schema, "1970-01-01", 0, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer chunk.Cleanup()
+	if _, err := chunk.File.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind parquet chunk: %w", err)
+	}
+	data, err := io.ReadAll(chunk.File)
+	if err != nil {
+		return nil, fmt.Errorf("read parquet chunk: %w", err)
+	}
+	return data, nil
+}
 
 func BenchmarkWriteParquetChunk(b *testing.B) {
 	messages, schema := parquetBenchmarkMessages()

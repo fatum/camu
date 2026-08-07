@@ -62,11 +62,8 @@ func (s *Server) handleKafkaOffsetDelete(ctx context.Context, req *kmsg.OffsetDe
 	return resp, nil
 }
 
-func (s *Server) isLocalKafkaCoordinator(ctx context.Context, groupKey string) bool {
-	brokerID, _, _, err := s.kafkaControllerBroker(ctx)
-	if err != nil {
-		return false
-	}
+func (s *Server) isLocalKafkaCoordinator(ctx context.Context, _ string) bool {
+	brokerID, _, _ := s.kafkaControllerBroker(ctx)
 	return brokerID == kafkaBrokerID(s.instanceID)
 }
 

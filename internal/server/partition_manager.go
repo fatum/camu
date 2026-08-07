@@ -119,20 +119,6 @@ func newestActiveSegmentBaseOffset(dir string, fallback int64) int64 {
 	return newest
 }
 
-func (pm *PartitionManager) activeSegmentLogEnd(topic string, partitionID int) (uint64, bool) {
-	ps := pm.GetPartitionState(topic, partitionID)
-	if ps == nil {
-		return 0, false
-	}
-	ps.mu.RLock()
-	seg := ps.activeSegment
-	ps.mu.RUnlock()
-	if seg == nil {
-		return 0, false
-	}
-	return uint64(seg.NextOffset()), true
-}
-
 func (pm *PartitionManager) localPartitionDir(topic string, partitionID int) string {
 	return filepath.Join(pm.localDir, topic, fmt.Sprintf("%d", partitionID))
 }
@@ -143,19 +129,6 @@ func (pm *PartitionManager) activeSegmentDir(topic string, partitionID int) stri
 
 func (pm *PartitionManager) EpochHistoryPath(topic string, partitionID int) string {
 	return filepath.Join(pm.localPartitionDir(topic, partitionID), "epochs.json")
-}
-
-func (pm *PartitionManager) hasNativeRecoveryData(topic string, partitionID int) bool {
-	ps := pm.GetPartitionState(topic, partitionID)
-	if ps == nil {
-		return false
-	}
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	if ps.index != nil && ps.index.NextOffset() > 0 {
-		return true
-	}
-	return ps.activeSegment != nil && len(ps.activeSegment.OffsetIndex()) > 0
 }
 
 func (pm *PartitionManager) recoverLocalLogEnd(topic string, partitionID int) uint64 {
@@ -1861,33 +1834,6 @@ func (pm *PartitionManager) readSealedSegmentSidecar(ctx context.Context, ref lo
 		return data, nil
 	}
 	return nil, fmt.Errorf("no storage backend available for sidecar %s", key)
-}
-
-// readSealedSegmentOffsetIndex reads a sealed segment's offset index from disk cache or S3.
-func (pm *PartitionManager) readSealedSegmentOffsetIndex(ctx context.Context, ref log.SegmentRef) ([]byte, error) {
-	key := ref.OffsetIndexObjectKey()
-
-	// Try disk cache first.
-	if pm.diskCache != nil {
-		data, err := pm.diskCache.Get(key)
-		if err == nil && len(data) > 0 {
-			return data, nil
-		}
-	}
-
-	// Fall back to S3.
-	if pm.s3Client != nil {
-		data, err := pm.s3Client.Get(ctx, key)
-		if err != nil {
-			return nil, fmt.Errorf("s3 get %s: %w", key, err)
-		}
-		if pm.diskCache != nil {
-			_ = pm.diskCache.Put(key, data)
-		}
-		return data, nil
-	}
-
-	return nil, fmt.Errorf("no storage backend available for offset index %s", key)
 }
 
 // SetLeaseChecker sets a callback to verify partition ownership before flushing.

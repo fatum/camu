@@ -98,7 +98,7 @@ func (s *TopicSchema) Validate() error {
 			return fmt.Errorf("unsupported schema field type %q", f.Type)
 		}
 		if len(f.Path) < 3 || f.Path[:2] != "$." || strings.Contains(f.Path, "[") || strings.Contains(f.Path, "'") || strings.HasSuffix(f.Path, ".") {
-			return fmt.Errorf("schema field %q path must start with $.", f.Name)
+			return fmt.Errorf("schema field %q: path must start with \"$.\"", f.Name)
 		}
 	}
 	return nil
@@ -253,7 +253,10 @@ func (ts *TopicStore) UpdateSchema(ctx context.Context, cfg TopicConfig) error {
 func (ts *TopicStore) Get(ctx context.Context, name string) (TopicConfig, error) {
 	// Check cache first.
 	if v, ok := ts.cache.Load(name); ok {
-		cfg := v.(TopicConfig)
+		cfg, ok := v.(TopicConfig)
+		if !ok {
+			return TopicConfig{}, fmt.Errorf("cache: unexpected type %T", v)
+		}
 		cfg.Schema = CloneSchema(cfg.Schema)
 		return cfg, nil
 	}
@@ -306,7 +309,11 @@ func (ts *TopicStore) List(ctx context.Context) ([]TopicConfig, error) {
 		live[topics[i].Name] = struct{}{}
 	}
 	ts.cache.Range(func(key, _ any) bool {
-		if _, ok := live[key.(string)]; !ok {
+		k, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if _, ok := live[k]; !ok {
 			ts.cache.Delete(key)
 		}
 		return true
@@ -321,7 +328,11 @@ func (ts *TopicStore) List(ctx context.Context) ([]TopicConfig, error) {
 func (ts *TopicStore) ListCached() []TopicConfig {
 	var topics []TopicConfig
 	ts.cache.Range(func(_, v any) bool {
-		topics = append(topics, withClonedSchema(v.(TopicConfig)))
+		tc, ok := v.(TopicConfig)
+		if !ok {
+			return true
+		}
+		topics = append(topics, withClonedSchema(tc))
 		return true
 	})
 	return topics

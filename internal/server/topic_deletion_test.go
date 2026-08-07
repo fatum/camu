@@ -148,7 +148,7 @@ func TestDeleteTopicEnqueuesAsyncDisklessCleanupAndPreservesMetaUntilS3Deleted(t
 	if _, err := s.topicStore.Get(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("topicStore.Get(after enqueue) error = %v, want ErrNotFound", err)
 	}
-	if _, err := s.getTopicDeletion(ctx, tc.Name); err != nil {
+	if err := s.getTopicDeletion(ctx, tc.Name); err != nil {
 		t.Fatalf("getTopicDeletion() error = %v, want marker to remain", err)
 	}
 	if _, err := s.s3Client.Get(ctx, tc.Name+"/0/segment.data"); err != nil {
@@ -195,7 +195,7 @@ func TestDeleteTopicEnqueuesAsyncDisklessCleanupAndPreservesMetaUntilS3Deleted(t
 	if len(refs) != 0 {
 		t.Fatalf("QuerySegments(after GC) = %d refs, want 0", len(refs))
 	}
-	if _, err := s.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
+	if err := s.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected topic deletion marker to be removed, got %v", err)
 	}
 }
@@ -250,7 +250,7 @@ func TestTopicDeletionGCResumesFromMarkerAfterRestart(t *testing.T) {
 	if head != 0 {
 		t.Fatalf("GetPartitionHead(after resumed GC) = %d, want 0", head)
 	}
-	if _, err := s2.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
+	if err := s2.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected deletion marker to be cleared after resumed GC, got %v", err)
 	}
 }
@@ -287,7 +287,7 @@ func TestTopicDeletionGCRemovesRegistryEntryAfterCrashWindow(t *testing.T) {
 	if _, err := s.topicStore.Get(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("topicStore.Get(after GC) error = %v, want ErrNotFound", err)
 	}
-	if _, err := s.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
+	if err := s.getTopicDeletion(ctx, tc.Name); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expected deletion marker to be cleared, got %v", err)
 	}
 }
@@ -325,7 +325,7 @@ func TestTopicDeletionAsyncWorkersProcessPendingMarkers(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := s.getTopicDeletion(ctx, tc.Name); errors.Is(err, storage.ErrNotFound) {
+		if err := s.getTopicDeletion(ctx, tc.Name); errors.Is(err, storage.ErrNotFound) {
 			break
 		}
 		if time.Now().After(deadline) {

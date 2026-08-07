@@ -287,8 +287,8 @@ func TestKafkaGroupCoordinatorSyncGroupRejectsFollowerAssignments(t *testing.T) 
 	secondResp, err := gc.joinGroup(context.Background(), joinReq)
 	require.NoError(t, err)
 
-	leaderAssignment := newTestKafkaMemberAssignment("test-topic", 0)
-	followerAssignment := newTestKafkaMemberAssignment("test-topic", 1)
+	leaderAssignment := newTestKafkaMemberAssignment(0)
+	followerAssignment := newTestKafkaMemberAssignment(1)
 
 	syncReq := kmsg.NewPtrSyncGroupRequest()
 	syncReq.Group = "group-sync-follower"
@@ -326,7 +326,7 @@ func TestKafkaGroupCoordinatorSyncGroupRejectsIncompleteAssignments(t *testing.T
 	syncReq.Generation = secondResp.Generation
 	syncReq.MemberID = leaderResp.MemberID
 	syncReq.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{
-		{MemberID: leaderResp.MemberID, MemberAssignment: newTestKafkaMemberAssignment("test-topic", 0)},
+		{MemberID: leaderResp.MemberID, MemberAssignment: newTestKafkaMemberAssignment(0)},
 	}
 
 	syncResp, err := gc.syncGroup(context.Background(), syncReq)
@@ -353,7 +353,7 @@ func TestKafkaGroupCoordinatorLeaveGroupRebalancesOnMemberRemoval(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, int32(2), secondResp.Generation)
 
-	assignment := newTestKafkaMemberAssignment("test-topic", 0)
+	assignment := newTestKafkaMemberAssignment(0)
 	syncReq := kmsg.NewPtrSyncGroupRequest()
 	syncReq.Group = "group-leave-rebalance"
 	syncReq.Generation = secondResp.Generation
@@ -424,11 +424,11 @@ func newTestKafkaJoinGroupRequest(group string) *kmsg.JoinGroupRequest {
 	return joinReq
 }
 
-func newTestKafkaMemberAssignment(topic string, partition int32) []byte {
+func newTestKafkaMemberAssignment(partition int32) []byte {
 	assignment := kmsg.NewConsumerMemberAssignment()
 	assignment.Version = 0
 	assignment.Topics = []kmsg.ConsumerMemberAssignmentTopic{{
-		Topic:      topic,
+		Topic:      "test-topic",
 		Partitions: []int32{partition},
 	}}
 	return assignment.AppendTo(nil)

@@ -176,19 +176,6 @@ func containsReplica(replicas []string, leader string) bool {
 	return false
 }
 
-func rotateLeaderFirst(replicas []string, leader string) []string {
-	for i, replica := range replicas {
-		if replica != leader {
-			continue
-		}
-		rotated := make([]string, 0, len(replicas))
-		rotated = append(rotated, replicas[i:]...)
-		rotated = append(rotated, replicas[:i]...)
-		return rotated
-	}
-	return replicas
-}
-
 func firstActiveReplica(replicas []string, active []string) (string, bool) {
 	for _, replica := range replicas {
 		if containsReplica(active, replica) {

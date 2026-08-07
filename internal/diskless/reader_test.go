@@ -280,7 +280,7 @@ func TestReader_FetchTrimsOversizedMergedRefToWholeBatches(t *testing.T) {
 
 	// A budget smaller than a single batch still returns the whole first batch
 	// so the fetch always makes progress.
-	tiny := int(batchSizes[0] - 1)
+	tiny := batchSizes[0] - 1
 	if tiny < 1 {
 		tiny = 1
 	}

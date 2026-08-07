@@ -124,11 +124,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	s.metricSet("camu_runtime_heap_alloc_bytes", "Go heap bytes allocated by Camu", nil, float64(mem.HeapAlloc))
-	s.metricSet("camu_runtime_heap_inuse_bytes", "Go heap bytes in use by Camu", nil, float64(mem.HeapInuse))
-	s.metricSet("camu_runtime_memory_sys_bytes", "Go runtime memory obtained from the operating system", nil, float64(mem.Sys))
-	s.metricSet("camu_runtime_goroutines", "Current number of Camu goroutines", nil, float64(runtime.NumGoroutine()))
-	s.metricSet("camu_runtime_gc_cycles", "Completed Go garbage-collection cycles", nil, float64(mem.NumGC))
+	s.metricSet("camu_runtime_heap_alloc_bytes", "Go heap bytes allocated by Camu", float64(mem.HeapAlloc))
+	s.metricSet("camu_runtime_heap_inuse_bytes", "Go heap bytes in use by Camu", float64(mem.HeapInuse))
+	s.metricSet("camu_runtime_memory_sys_bytes", "Go runtime memory obtained from the operating system", float64(mem.Sys))
+	s.metricSet("camu_runtime_goroutines", "Current number of Camu goroutines", float64(runtime.NumGoroutine()))
+	s.metricSet("camu_runtime_gc_cycles", "Completed Go garbage-collection cycles", float64(mem.NumGC))
 	_, _ = w.Write([]byte(s.metrics.Handler()))
 }
 

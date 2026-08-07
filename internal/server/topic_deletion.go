@@ -23,19 +23,19 @@ func topicDeletionKey(topic string) string {
 	return topicDeletionPrefix + topic + ".json"
 }
 
-func (s *Server) getTopicDeletion(ctx context.Context, topic string) (topicDeletionRecord, error) {
+func (s *Server) getTopicDeletion(ctx context.Context, topic string) error {
 	data, err := s.s3Client.Get(ctx, topicDeletionKey(topic))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return topicDeletionRecord{}, storage.ErrNotFound
+			return storage.ErrNotFound
 		}
-		return topicDeletionRecord{}, err
+		return err
 	}
 	var rec topicDeletionRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
-		return topicDeletionRecord{}, fmt.Errorf("unmarshal topic deletion %q: %w", topic, err)
+		return fmt.Errorf("unmarshal topic deletion %q: %w", topic, err)
 	}
-	return rec, nil
+	return nil
 }
 
 func (s *Server) putTopicDeletion(ctx context.Context, rec topicDeletionRecord) error {
@@ -75,8 +75,7 @@ func (s *Server) listTopicDeletions(ctx context.Context) ([]topicDeletionRecord,
 }
 
 func (s *Server) topicDeletionPending(ctx context.Context, topic string) bool {
-	_, err := s.getTopicDeletion(ctx, topic)
-	return err == nil
+	return s.getTopicDeletion(ctx, topic) == nil
 }
 
 func (s *Server) enqueueTopicDeletion(ctx context.Context, tc meta.TopicConfig) error {

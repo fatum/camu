@@ -54,47 +54,37 @@ func produceKafka(ctx context.Context, cfg config, count int64, expected []hashS
 	var serialized int64
 	var wg sync.WaitGroup
 	errs := make(chan error, cfg.Partitions)
-	jobs := make(chan int)
-	workers := cfg.ProducerConcurrency
-	if workers > cfg.Partitions {
-		workers = cfg.Partitions
-	}
-	for worker := 0; worker < workers; worker++ {
+	for partition := 0; partition < cfg.Partitions; partition++ {
+		partition := partition
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for partition := range jobs {
-				for first := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
-					records := make([]*kgo.Record, 0, cfg.BatchMessages)
-					for sequence := first; sequence < cfg.SequenceStart+count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
+			for first := firstSequenceForPartition(cfg.SequenceStart, partition, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
+				records := make([]*kgo.Record, 0, cfg.BatchMessages)
+				for sequence := first; sequence < cfg.SequenceStart+count && len(records) < cfg.BatchMessages; sequence += int64(cfg.Partitions) {
 					value := typedValue{RunID: cfg.RunID, ID: sequence, Payload: payload(cfg.MessageBytes), PayloadBytes: cfg.MessageBytes, Sequence: sequence}
 					key := cfg.RunID + ":" + strconv.FormatInt(sequence, 10)
 					valueBytes := mustJSON(benchmarkEvent(cfg, value))
-						records = append(records, &kgo.Record{Topic: cfg.Topic, Partition: int32(partition), Key: []byte(key), Value: valueBytes})
-						expected[partition].add(value)
-						atomic.AddInt64(&serialized, int64(len(key)+len(valueBytes)))
-					}
-					if err := retryProduce(ctx, fmt.Sprintf("produce Kafka partition %d sequence %d", partition, first), func() error {
-						for _, result := range client.ProduceSync(ctx, records...) {
-							if result.Err != nil {
-								return result.Err
-							}
-						}
-						return nil
-					}); err != nil {
-						errs <- err
-						return
-					}
-					atomic.AddInt64(&total, int64(len(records)))
-					progress(int64(len(records)))
+					records = append(records, &kgo.Record{Topic: cfg.Topic, Partition: int32(partition), Key: []byte(key), Value: valueBytes})
+					expected[partition].add(value)
+					atomic.AddInt64(&serialized, int64(len(key)+len(valueBytes)))
 				}
+				if err := retryProduce(ctx, fmt.Sprintf("produce Kafka partition %d sequence %d", partition, first), func() error {
+					for _, result := range client.ProduceSync(ctx, records...) {
+						if result.Err != nil {
+							return result.Err
+						}
+					}
+					return nil
+				}); err != nil {
+					errs <- err
+					return
+				}
+				atomic.AddInt64(&total, int64(len(records)))
+				progress(int64(len(records)))
 			}
 		}()
 	}
-	for partition := 0; partition < cfg.Partitions; partition++ {
-		jobs <- partition
-	}
-	close(jobs)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -217,7 +207,7 @@ func consumeKafka(ctx context.Context, cfg config, expected []hashState, actual 
 // validateKafkaRecord verifies the persisted Kafka offset. Payload sequence
 // validation is performed separately per benchmark run so concurrent producer
 // runs may interleave in a partition.
-func validateKafkaRecord(cfg config, partition int, expectedOffset, offset int64, value typedValue) error {
+func validateKafkaRecord(_ config, partition int, expectedOffset, offset int64, _ typedValue) error {
 	if offset != expectedOffset {
 		return fmt.Errorf("consume Kafka: partition %d offset gap or reordering: got %d, want %d", partition, offset, expectedOffset)
 	}

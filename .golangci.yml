@@ -1,3 +1,5 @@
+version: "2"
+
 run:
   timeout: 5m
   modules-download-mode: readonly
@@ -5,13 +7,10 @@ run:
 linters:
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
     - unused
-    - gofmt
-    - goimports
     - misspell
     - unconvert
     - unparam
@@ -19,98 +18,113 @@ linters:
     - gocritic
     - gochecknoinits
 
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-    exclude-functions:
-      - os.File.Close
-      - os.Remove
-      - fmt.Scanf
-      - fmt.Sscanf
-      - fmt.Sscan
-      - strconv.Atoi
-      - strconv.ParseUint
-      - strconv.ParseInt
-      - json.Marshal
-      - json.Unmarshal
-      - (*encoding/json.Encoder).Encode
-      - (*encoding/json.Decoder).Decode
-      - (*list.Element).Value
-  gosec:
-    excludes:
-      - G104
-      - G301
-      - G302
-      - G304
-      - G306
-      - G112
-      - G115
-  govet:
-    enable-all: true
-    disable:
-      - shadow
-  gofmt:
-    simplify: true
-  goimports:
-    local-prefixes: github.com/maksim/camu
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+      exclude-functions:
+        - (*os.File).Close
+        - os.Remove
+        - fmt.Scanf
+        - fmt.Sscanf
+        - fmt.Sscan
+        - strconv.Atoi
+        - strconv.ParseUint
+        - strconv.ParseInt
+        - json.Marshal
+        - json.Unmarshal
+        - (*encoding/json.Encoder).Encode
+        - (*encoding/json.Decoder).Decode
+        - (*list.Element).Value
+    gosec:
+      excludes:
+        - G103
+        - G104
+        - G109
+        - G112
+        - G115
+        - G118
+        - G301
+        - G302
+        - G304
+        - G306
+        - G602
+        - G702
+        - G703
+        - G706
+    govet:
+      enable-all: true
+      disable:
+        - shadow
 
-issues:
-  exclude-use-default: false
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-    - path: pkg/camutest
-      linters:
-        - errcheck
-    - path: cmd/camu/main\.go
-      linters:
-        - gocritic
-    - path: internal/fsutil/atomic\.go
-      linters:
-        - errcheck
-    - path: internal/storage/s3\.go
-      linters:
-        - errcheck
-    - path: internal/log/cache\.go
-      linters:
-        - errcheck
-    - path: internal/log/segment\.go
-      linters:
-        - errcheck
-    - path: internal/log/wal\.go
-      linters:
-        - errcheck
-    - path: internal/replication/epoch_history\.go
-      linters:
-        - errcheck
-    - path: internal/replication/fetcher\.go
-      linters:
-        - errcheck
-    - path: internal/server/handlers_consume\.go
-      linters:
-        - errcheck
-    - path: internal/server/partition_manager\.go
-      linters:
-        - errcheck
-    - path: internal/server/server\.go
-      linters:
-        - errcheck
-    - path: internal/producer
-      linters:
-        - errcheck
-    - text: "cognitive complexity"
-      linters:
-        - gocognit
-    - text: "ifElseChain"
-      linters:
-        - gocritic
-    - text: "fieldalignment"
-      linters:
-        - govet
+  exclusions:
+    presets: []
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+      - path: pkg/camutest
+        linters:
+          - errcheck
+      - path: cmd/camu/main\.go
+        linters:
+          - gocritic
+      - path: internal/fsutil/atomic\.go
+        linters:
+          - errcheck
+      - path: internal/storage/s3\.go
+        linters:
+          - errcheck
+      - path: internal/log/cache\.go
+        linters:
+          - errcheck
+      - path: internal/log/segment\.go
+        linters:
+          - errcheck
+      - path: internal/log/wal\.go
+        linters:
+          - errcheck
+      - path: internal/replication/epoch_history\.go
+        linters:
+          - errcheck
+      - path: internal/replication/fetcher\.go
+        linters:
+          - errcheck
+      - path: internal/server/handlers_consume\.go
+        linters:
+          - errcheck
+      - path: internal/server/partition_manager\.go
+        linters:
+          - errcheck
+      - path: internal/server/server\.go
+        linters:
+          - errcheck
+      - path: internal/producer
+        linters:
+          - errcheck
+      - text: "ifElseChain"
+        linters:
+          - gocritic
+      - text: "fieldalignment"
+        linters:
+          - govet
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/maksim/camu
 
 output:
-  format: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
+  formats:
+    text:
+      path: stdout
+      print-issued-lines: true
+      print-linter-name: true

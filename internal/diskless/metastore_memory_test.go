@@ -3,8 +3,9 @@ package diskless
 import (
 	"context"
 	"fmt"
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestMemoryMetaStore_CommitUploadedBatches_IsAtomicAndIdempotent(t *testing.T) {

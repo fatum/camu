@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/maksim/camu/internal/meta"
 	"github.com/parquet-go/parquet-go"
+
+	"github.com/maksim/camu/internal/meta"
 )
 
 // A hand-rolled protobuf wire decoder. The dynamicpb + proto.Unmarshal path

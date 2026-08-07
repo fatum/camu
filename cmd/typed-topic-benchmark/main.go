@@ -1,5 +1,5 @@
 // Command typed-topic-benchmark exercises the typed HTTP topic, consume, and
-// Parquet/SQL paths without retaining the generated dataset.
+// Parquet/Iceberg paths without retaining the generated dataset.
 package main
 
 import (
@@ -319,9 +319,12 @@ func (c client) requestHeaders(ctx context.Context, method, path string, body an
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err != nil {
+			return nil, fmt.Errorf("%s %s: read body: %w", method, path, err)
+		}
 		return nil, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
 	}
 	if out != nil {
@@ -576,8 +579,7 @@ func (c client) waitForReplication(ctx context.Context, cfg config) error {
 	return errors.New("timed out waiting for replicated topic assignments")
 }
 
-func payload(n int64) string          { return strings.Repeat("x", int(n)) }
-func digestFor(v typedValue) [32]byte { b, _ := json.Marshal(v); return sha256.Sum256(b) }
+func payload(n int64) string { return strings.Repeat("x", int(n)) }
 func targetCount(target, messageBytes int64) (int64, error) {
 	if target <= 0 || messageBytes <= 0 || target > math.MaxInt64-(messageBytes-1) {
 		return 0, errors.New("TARGET_BYTES/MESSAGE_BYTES overflow")
@@ -624,45 +626,35 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 	payloadText := payload(cfg.MessageBytes)
 	var wg sync.WaitGroup
 	errs := make(chan error, cfg.Partitions)
-	jobs := make(chan int)
-	workers := cfg.ProducerConcurrency
-	if workers > cfg.Partitions {
-		workers = cfg.Partitions
-	}
-	for w := 0; w < workers; w++ {
+	for w := 0; w < cfg.Partitions; w++ {
+		p := w
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for p := range jobs {
-				sequence := uint64(0)
-				for first := firstSequenceForPartition(cfg.SequenceStart, p, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
-					batch := make([]map[string]any, 0, cfg.BatchMessages)
-					for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
-						v := typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
-						batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(benchmarkEvent(cfg, v)))})
-						expected[p].add(v)
-					}
-					atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
-					path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(cfg.Topic), p)
-					partitionClient := c.nodeClient(cfg)
-					request := idempotentProduceRequest{ProducerID: producerID, Sequence: sequence, Messages: batch}
-					if err := retryProduce(ctx, fmt.Sprintf("produce HTTP partition %d sequence %d", p, sequence), func() error {
-						return partitionClient.request(ctx, http.MethodPost, path, request, nil)
-					}); err != nil {
-						errs <- err
-						return
-					}
-					sequence += uint64(len(batch))
-					atomic.AddInt64(&total, int64(len(batch)))
-					progress(int64(len(batch)))
+			sequence := uint64(0)
+			for first := firstSequenceForPartition(cfg.SequenceStart, p, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
+				batch := make([]map[string]any, 0, cfg.BatchMessages)
+				for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
+					v := typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
+					batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(benchmarkEvent(cfg, v)))})
+					expected[p].add(v)
 				}
+				atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
+				path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(cfg.Topic), p)
+				partitionClient := c.nodeClient(cfg)
+				request := idempotentProduceRequest{ProducerID: producerID, Sequence: sequence, Messages: batch}
+				if err := retryProduce(ctx, fmt.Sprintf("produce HTTP partition %d sequence %d", p, sequence), func() error {
+					return partitionClient.request(ctx, http.MethodPost, path, request, nil)
+				}); err != nil {
+					errs <- err
+					return
+				}
+				sequence += uint64(len(batch))
+				atomic.AddInt64(&total, int64(len(batch)))
+				progress(int64(len(batch)))
 			}
 		}()
 	}
-	for p := 0; p < cfg.Partitions; p++ {
-		jobs <- p
-	}
-	close(jobs)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -892,7 +884,10 @@ func (c client) consume(ctx context.Context, cfg config, expected []hashState, a
 		}
 		records += r
 		bytesN += b
-		db, _ := hex.DecodeString(d)
+		db, err := hex.DecodeString(d)
+		if err != nil {
+			return phaseResult{}, err
+		}
 		h.Write(db)
 	}
 	d := time.Since(start)
@@ -912,8 +907,8 @@ func verifyConsumeStates(expected, actual []hashState) bool {
 }
 
 // detectTopicStorageMode reports the storage mode of an existing topic so a
-// consume or sql run against a diskless topic skips the classic cluster
-// readiness wait even when STORAGE_MODE is not set. A missing topic returns "".
+// consume run against a diskless topic skips the classic cluster readiness
+// wait even when STORAGE_MODE is not set. A missing topic returns "".
 func (c client) detectTopicStorageMode(ctx context.Context, cfg config) (string, error) {
 	var topic benchmarkTopic
 	err := c.request(ctx, http.MethodGet, "/v1/topics/"+url.PathEscape(cfg.Topic), nil, &topic)
@@ -929,7 +924,7 @@ func (c client) detectTopicStorageMode(ctx context.Context, cfg config) (string,
 func runSingleOperation(ctx context.Context, c client, cfg config, res *result) {
 	if cfg.StorageMode == "" {
 		// An existing diskless topic is served without cluster-wide readiness;
-		// detect it so consume/sql runs do not wait on /v1/cluster/ready, which
+		// detect it so consume runs do not wait on /v1/cluster/ready, which
 		// never reports ready for diskless partitions.
 		mode, err := c.detectTopicStorageMode(ctx, cfg)
 		if err != nil {
@@ -1095,7 +1090,7 @@ func main() {
 		benchmarkLog("cluster readiness failed: %v", err)
 		return
 	}
-	benchmarkLog("cluster is ready; starting producer and SQL visibility sampling")
+	benchmarkLog("cluster is ready; starting producer and visibility sampling")
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 	if cfg.StorageMode != "diskless" {

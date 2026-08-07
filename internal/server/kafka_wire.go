@@ -59,7 +59,7 @@ func (ks *KafkaServer) HandleRequest(ctx context.Context, req kmsg.Request) (res
 	case *kmsg.OffsetFetchRequest:
 		return ks.handleOffsetFetch(req)
 	case *kmsg.ListOffsetsRequest:
-		return ks.handleListOffsets(req)
+		return ks.handleListOffsets(req), nil
 	case *kmsg.MetadataRequest:
 		return ks.handleMetadata(req)
 	case *kmsg.CreateTopicsRequest:
@@ -83,9 +83,9 @@ func (ks *KafkaServer) HandleRequest(ctx context.Context, req kmsg.Request) (res
 	case *kmsg.DeleteACLsRequest:
 		return ks.handleDeleteACLs(req)
 	case *kmsg.ProduceRequest:
-		return ks.handleProduce(ctx, req)
+		return ks.handleProduce(ctx, req), nil
 	case *kmsg.FetchRequest:
-		return ks.handleFetch(ctx, req)
+		return ks.handleFetch(ctx, req), nil
 	default:
 		return nil, fmt.Errorf("unsupported API key: %d", req.Key())
 	}
@@ -95,7 +95,7 @@ func (ks *KafkaServer) HandleConn(conn net.Conn, _ net.Listener) {
 	ks.trackConn(conn)
 	defer func() {
 		ks.untrackConn(conn)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	var reqBuf []byte
@@ -188,7 +188,7 @@ func (ks *KafkaServer) Close() error {
 	// immediately instead of hanging on stale TCP sockets.
 	ks.connsMu.Lock()
 	for conn := range ks.conns {
-		conn.Close()
+		_ = conn.Close()
 	}
 	ks.conns = nil
 	ks.connsMu.Unlock()
@@ -245,7 +245,7 @@ func decodeKafkaRequestBody(apiKey, apiVersion int16, body []byte, withHeader bo
 		return nil, err
 	}
 
-	if withHeader && !(apiKey == 7 && apiVersion == 0) {
+	if withHeader && (apiKey != 7 || apiVersion != 0) {
 		reader := kbin.Reader{Src: body}
 		_ = reader.NullableString()
 		if req.IsFlexible() {

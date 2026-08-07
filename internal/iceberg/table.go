@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/maksim/camu/internal/meta"
 )
 
@@ -252,7 +253,8 @@ func (ts *TableStore) CommitSnapshot(ctx context.Context, topic string, files []
 			if err != nil {
 				return "", nil, nil, err
 			}
-			list = append(parentManifests, ManifestFile{
+			list = append(list, parentManifests...)
+			list = append(list, ManifestFile{
 				ManifestPath:      manifestKey,
 				ManifestLength:    manifestLen,
 				PartitionSpecID:   current.DefaultSpecID,
@@ -635,7 +637,7 @@ func snapshotIDForFiles(files []DataFile) int64 {
 	sorted := append([]DataFile(nil), files...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FilePath < sorted[j].FilePath })
 	for _, f := range sorted {
-		fmt.Fprintf(h, "%s|%d|%d|", f.FilePath, f.RecordCount, f.FileSizeBytes)
+		_, _ = fmt.Fprintf(h, "%s|%d|%d|", f.FilePath, f.RecordCount, f.FileSizeBytes)
 	}
 	return int64(binary.BigEndian.Uint64(h.Sum(nil)[:8]) & (1<<63 - 1))
 }

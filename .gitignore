@@ -1,6 +1,9 @@
 # Built binaries
 /camu
 /cmd/camu/camu
+/typed-topic-benchmark
+/typed-topic-benchmark.errors.log
+/typed-topic-benchmark.log
 
 # Test cache
 *.test

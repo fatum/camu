@@ -419,13 +419,8 @@ func (s *ActiveSegment) Recover() error {
 	hdrBuf := make([]byte, RecordBatchHeaderSize)
 
 	// 3. Scan from position 0.
-	for {
-		// a. If not enough bytes remain for a header, stop.
-		if position+RecordBatchHeaderSize > fileSize {
-			break
-		}
-
-		// b. Read the 61-byte header.
+	for position+RecordBatchHeaderSize <= fileSize {
+		// a. Read the 61-byte header.
 		if _, err := s.file.ReadAt(hdrBuf, position); err != nil {
 			break
 		}
@@ -435,15 +430,15 @@ func (s *ActiveSegment) Recover() error {
 			break
 		}
 
-		// c. Compute full batch size.
+		// b. Compute full batch size.
 		batchSize := int64(hdr.RecordBatchSize())
 
-		// d. Sanity checks.
+		// c. Sanity checks.
 		if batchSize < RecordBatchHeaderSize || position+batchSize > fileSize {
 			break
 		}
 
-		// e. Read the full batch and validate CRC.
+		// d. Read the full batch and validate CRC.
 		batchBuf := make([]byte, batchSize)
 		if _, err := s.file.ReadAt(batchBuf, position); err != nil {
 			break
@@ -452,7 +447,7 @@ func (s *ActiveSegment) Recover() error {
 			break
 		}
 
-		// f. Update in-memory indices (same logic as Append).
+		// e. Update in-memory indices (same logic as Append).
 		s.offsetIdx = append(s.offsetIdx, IndexEntry{
 			BaseOffset:     hdr.FirstOffset,
 			LastOffset:     hdr.LastOffset(),

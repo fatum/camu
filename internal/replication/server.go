@@ -87,7 +87,7 @@ func (rs *ReplicationServer) Close() error {
 
 	rs.connsMu.Lock()
 	for conn := range rs.conns {
-		conn.Close()
+		_ = conn.Close()
 	}
 	rs.conns = nil
 	rs.connsMu.Unlock()
@@ -102,7 +102,7 @@ func (rs *ReplicationServer) handleConn(conn net.Conn) {
 	rs.trackConn(conn)
 	defer func() {
 		rs.untrackConn(conn)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -293,7 +293,7 @@ func decompressRecords(codec int, compressed []byte) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gzip: %w", err)
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		return io.ReadAll(io.LimitReader(r, decompressLimit))
 
 	case codecSnappy:
