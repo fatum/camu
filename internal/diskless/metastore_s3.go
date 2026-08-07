@@ -363,7 +363,14 @@ func (m *S3MetaStore) loadCheckpoints(ctx context.Context, head *s3UploadManifes
 	for key != "" {
 		data, err := m.s3.Get(ctx, key)
 		if errors.Is(err, storage.ErrNotFound) {
-			break
+			// A checkpoint referenced by the archive chain is missing. Retention
+			// truncation relinks the chain and updates the head's archive
+			// pointer, so a missing checkpoint is corruption or an interrupted
+			// cleanup, not a legitimate end of the chain. Treating it as the end
+			// silently drops every older checkpoint from the reference view,
+			// which makes the orphan sweeps delete their data files. Fail
+			// closed instead.
+			return nil, fmt.Errorf("checkpoint %s referenced by archive chain is missing", key)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("read checkpoint %s: %w", key, err)
@@ -443,7 +450,7 @@ func (m *S3MetaStore) BuildFileIndex(ctx context.Context) (*FileIndex, error) {
 				return err
 			}
 			if chk == nil {
-				continue
+				return fmt.Errorf("checkpoint %s referenced by archive chain is missing", key)
 			}
 			for _, r := range chk.Refs {
 				note(r)
@@ -475,7 +482,7 @@ func (m *S3MetaStore) loadCheckpointKeys(ctx context.Context, head *s3UploadMani
 			return nil, err
 		}
 		if chk == nil {
-			break
+			return nil, fmt.Errorf("checkpoint %s referenced by archive chain is missing", key)
 		}
 		key = chk.PrevKey
 	}

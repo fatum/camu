@@ -1691,10 +1691,17 @@ func (s *Server) runMaintenancePass() {
 		slog.Warn("maintenance: list topics", "error", err)
 		return
 	}
-	fileIdx := s.buildDisklessFileIndex(ctx)
+	fileIdx, idxErr := s.buildDisklessFileIndex(ctx)
 	s.runPartitionMaintenance(ctx, topics, fileIdx)
 	if s.amLeader() {
 		s.coordinationGC(ctx, topics)
+		if idxErr != nil {
+			// Fail closed: an incomplete reference index would make the orphan
+			// sweeps treat checkpoint-referenced data files as unreferenced and
+			// delete them, permanently losing committed records.
+			slog.Warn("diskless_orphan_sweep_skipped_index_failed", "error", idxErr)
+			return
+		}
 		s.sweepDisklessOrphans(ctx, fileIdx)
 		s.sweepDisklessArchiveOrphans(ctx, fileIdx)
 	}

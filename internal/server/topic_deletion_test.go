@@ -46,7 +46,8 @@ func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
 		}
 	}
 
-	s.sweepDisklessOrphans(ctx, s.buildDisklessFileIndex(ctx))
+	idx, _ := s.buildDisklessFileIndex(ctx)
+	s.sweepDisklessOrphans(ctx, idx)
 
 	if _, err := s.s3Client.Get(ctx, referenced); err != nil {
 		t.Fatalf("referenced object %s must survive the sweep, got %v", referenced, err)
@@ -94,7 +95,8 @@ func TestSweepDisklessArchiveOrphansUsesIndex(t *testing.T) {
 		t.Fatalf("put stray checkpoint: %v", err)
 	}
 
-	s.sweepDisklessArchiveOrphans(ctx, s.buildDisklessFileIndex(ctx))
+	idx, _ := s.buildDisklessFileIndex(ctx)
+	s.sweepDisklessArchiveOrphans(ctx, idx)
 
 	// The referenced checkpoint survives; the stray is deleted.
 	orphans, err := s.s3Client.List(ctx, "_diskless_meta/archive/t/0/")
@@ -390,7 +392,7 @@ func TestPlanExpiredFilesFromIndexMatchesFallback(t *testing.T) {
 	commit("B", 0, old)
 	commit("C", 0, now)
 
-	idx := s.buildDisklessFileIndex(ctx)
+	idx, _ := s.buildDisklessFileIndex(ctx)
 	if idx == nil {
 		t.Fatal("expected a file index for the S3 metastore")
 	}

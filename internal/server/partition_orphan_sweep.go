@@ -35,22 +35,25 @@ type disklessFileIndexer interface {
 	BuildFileIndex(ctx context.Context) (*diskless.FileIndex, error)
 }
 
-// buildDisklessFileIndex builds the shared per-pass metadata snapshot, or nil
-// when the metastore cannot (memory/DynamoDB backends, or a build error).
-func (s *Server) buildDisklessFileIndex(ctx context.Context) *diskless.FileIndex {
+// buildDisklessFileIndex builds the shared per-pass metadata snapshot, or
+// (nil, nil) when the metastore cannot (memory/DynamoDB backends). A non-nil
+// error means the snapshot is incomplete and every consumer of it must fail
+// closed: retention and the orphan sweeps would otherwise treat
+// checkpoint-referenced data as unreferenced and delete committed records.
+func (s *Server) buildDisklessFileIndex(ctx context.Context) (*diskless.FileIndex, error) {
 	if s.disklessMeta == nil {
-		return nil
+		return nil, nil
 	}
 	indexer, ok := s.disklessMeta.(disklessFileIndexer)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	idx, err := indexer.BuildFileIndex(ctx)
 	if err != nil {
 		slog.Warn("diskless_file_index_build_failed", "error", err)
-		return nil
+		return nil, err
 	}
-	return idx
+	return idx, nil
 }
 
 // sweepDisklessArchiveOrphans deletes archived checkpoint objects under
