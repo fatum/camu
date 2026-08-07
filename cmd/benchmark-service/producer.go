@@ -35,6 +35,15 @@ func newKafkaProducer(cfg serviceConfig) (*kgo.Client, error) {
 		kgo.RecordDeliveryTimeout(5 * time.Minute),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+		// A long-running benchmark must survive transient broker failures
+		// (e.g. S3 throttling during a flush) without wedging: an idempotent
+		// producer whose sequence space gains a hole is rejected forever with
+		// sequence-gap errors until the client re-initializes. Disabling
+		// idempotency makes every failure an ordinary retry; the consumer's
+		// per-run seq validation still detects real data loss, and duplicates
+		// from uncertain retries surface as re-baselined validation errors
+		// rather than a permanent producer poison-pill.
+		kgo.DisableIdempotentWrite(),
 	)
 }
 
