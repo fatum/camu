@@ -1694,13 +1694,17 @@ func (s *Server) runMaintenancePass() {
 	fileIdx, idxErr := s.buildDisklessFileIndex(ctx)
 	s.runPartitionMaintenance(ctx, topics, fileIdx)
 	// Topics pending deletion are no longer in the topic registry, so the
-	// per-partition maintenance no longer reconciles their consumers. Stop this
-	// node's export consumers for every pending deletion; each node stops only
-	// its own consumers. A stale consumer would otherwise churn forever
-	// reloading a missing topic.
+	// per-partition maintenance no longer reconciles them. Each node must stop
+	// its own export consumers AND drop its local partition runtime state
+	// (segments, epoch sidecars, in-memory partition state) for every pending
+	// deletion. Otherwise a recreated topic's partitions recover the stale
+	// local segments and epoch history of the deleted topic, breaking leader
+	// initialization ("invalid epoch history") so the ISR never forms and
+	// acks=all produce hangs.
 	if pending, err := s.listTopicDeletions(ctx); err == nil {
 		for _, rec := range pending {
 			s.stopTopicParquetConsumers(rec.Topic)
+			s.dropTopicRuntime(rec.Topic.Name)
 		}
 	} else {
 		slog.Warn("maintenance: list topic deletions", "error", err)
