@@ -34,5 +34,6 @@ runcmd:
   - >-
     docker run -d --name benchmark-service --restart unless-stopped --network host
     --label=io.camu.component=benchmark
+    --entrypoint /usr/local/bin/benchmark-service
     --env-file /etc/camu/benchmark-env
-    ${benchmark_image} /usr/local/bin/benchmark-service
+    ${benchmark_image}

@@ -188,11 +188,52 @@ func (s *Server) processTopicDeletion(ctx context.Context, rec topicDeletionReco
 			return fmt.Errorf("delete diskless metadata: %w", err)
 		}
 	}
+	if err := s.deleteTopicPartitionJobs(ctx, rec.Topic.Name); err != nil {
+		return fmt.Errorf("delete partition jobs: %w", err)
+	}
+	if err := s.deleteTopicPipelineCheckpoints(ctx, rec.Topic.Name); err != nil {
+		return fmt.Errorf("delete pipeline checkpoints: %w", err)
+	}
+	if err := s.deleteTopicPrefix(ctx, "_diskless_merge/"+rec.Topic.Name+"/"); err != nil {
+		return fmt.Errorf("delete diskless merge data: %w", err)
+	}
 	s.dropTopicRuntime(rec.Topic.Name)
 	if err := s.s3Client.Delete(ctx, topicDeletionKey(rec.Topic.Name)); err != nil {
 		return fmt.Errorf("delete topic deletion marker: %w", err)
 	}
 	slog.Info("topic_delete_completed", "topic", rec.Topic.Name)
+	return nil
+}
+
+// deleteTopicPartitionJobs removes all partition jobs for topic from S3.
+func (s *Server) deleteTopicPartitionJobs(ctx context.Context, topic string) error {
+	prefix := partitionJobPrefix + topic + "/"
+	return s.deleteTopicPrefix(ctx, prefix)
+}
+
+// deleteTopicPipelineCheckpoints removes all pipeline checkpoints for topic.
+func (s *Server) deleteTopicPipelineCheckpoints(ctx context.Context, topic string) error {
+	for _, pipeline := range []string{"iceberg-export"} {
+		prefix := fmt.Sprintf("_meta/pipelines/%s/%s/", pipeline, topic)
+		if err := s.deleteTopicPrefix(ctx, prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteTopicPrefix deletes all S3 objects under prefix. Missing objects are
+// ignored so re-creation after a partial cleanup is safe.
+func (s *Server) deleteTopicPrefix(ctx context.Context, prefix string) error {
+	keys, err := s.s3Client.List(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", prefix, err)
+	}
+	for _, key := range keys {
+		if err := s.s3Client.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("delete %s: %w", key, err)
+		}
+	}
 	return nil
 }
 

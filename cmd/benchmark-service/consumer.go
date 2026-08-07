@@ -83,7 +83,9 @@ func (v *partitionValidator) validate(cfg serviceConfig, partition int, offset i
 	}
 	expectedOffset, ok := v.nextSeq[rec.RunID]
 	if !ok {
-		expectedOffset = 0
+		// First record seen for this run — accept any starting offset
+		// (the topic may have data from previous runs).
+		expectedOffset = offset
 	}
 	if offset != expectedOffset {
 		return fmt.Errorf("offset gap: got %d, want %d", offset, expectedOffset)

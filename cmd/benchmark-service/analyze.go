@@ -47,24 +47,24 @@ type anomaly struct {
 }
 
 func runAnalyze() int {
-	cfg, err := loadServiceConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+	runID := env("BENCHMARK_RUN_ID", "")
+	if runID == "" {
+		fmt.Fprintf(os.Stderr, "BENCHMARK_RUN_ID is required\n")
 		return 2
 	}
+	prefix := env("S3_PREFIX", "benchmark-stats") + "/" + runID + "/"
 	initS3()
 	if s3c == nil {
 		fmt.Fprintln(os.Stderr, "S3 not configured — set S3_BUCKET, S3_ENDPOINT, and credentials")
 		return 1
 	}
-	prefix := fmt.Sprintf("%s/%s/", cfg.S3Prefix, cfg.RunID)
 	keys, err := s3ListRetry(prefix)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list stats: %v\n", err)
 		return 1
 	}
 	if len(keys) == 0 {
-		fmt.Fprintf(os.Stderr, "no stats found for run %q at %s\n", cfg.RunID, prefix)
+		fmt.Fprintf(os.Stderr, "no stats found for run %q at %s\n", runID, prefix)
 		return 1
 	}
 	var windows []snapshot
