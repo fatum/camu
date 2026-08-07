@@ -118,7 +118,15 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		}
 		run = append(run, ref)
 		total += ref.ByteLength
-		if len(run) >= maxSegments || total >= target {
+		if len(run) >= maxSegments {
+			break
+		}
+		// The byte target is approximate; never let it starve the run below
+		// min_segments. A frontier ref just under the target otherwise fills
+		// the byte budget and leaves room for only a couple of small refs, so
+		// the run is rejected below the minimum and the partition stalls
+		// until enough new data happens to accumulate.
+		if total >= target && len(run) >= cfg.MinSegmentsValue() {
 			break
 		}
 	}
