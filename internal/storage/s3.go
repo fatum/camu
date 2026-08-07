@@ -638,10 +638,25 @@ func (b *awsS3Backend) put(ctx context.Context, key string, data []byte, opts Pu
 }
 
 func (b *awsS3Backend) putStream(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error {
+	// The AWS SDK cannot compute a request-header checksum for an unseekable
+	// stream over plain HTTP ("unseekable stream is not supported without TLS
+	// and trailing checksum"), so streaming uploads against local MinIO and the
+	// Jepsen harness would fail and retry until the caller's context expires.
+	// Buffer unseekable readers (the diskless flush's concatenated in-memory
+	// batches) into a seekable bytes.Reader; seekable readers (bytes.Reader,
+	// *os.File) still stream without buffering.
+	body := io.Reader(r)
+	if _, ok := r.(io.ReadSeeker); !ok {
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return fmt.Errorf("s3 buffer stream %q: %w", key, err)
+		}
+		body = bytes.NewReader(buf)
+	}
 	input := &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
 		Key:           aws.String(key),
-		Body:          r,
+		Body:          body,
 		ContentLength: aws.Int64(size),
 	}
 	if opts.ContentType != "" {
