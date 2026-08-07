@@ -371,3 +371,52 @@ func TestInitPartitionAsLeader_FlushesRecoveredWALForReads(t *testing.T) {
 		t.Fatalf("index.HighWatermark() = %d, want 3", got)
 	}
 }
+
+// TestInitPartitionAsLeader_HealsRegressedEpochHistory reproduces the
+// recurring "invalid epoch history" wedge from production: the recorded
+// history places an epoch start far ahead of this node's durable log end
+// (epoch boundary 2@385160 is not after 1@1008506) because the node restarted
+// or lagged as a follower and its local tail sits below the committed prefix.
+// A plain Ensure rejects the boundary forever and the partition never gets a
+// leader. The fix derives the boundary from the durable log end (local tail +
+// object-store index) and heals the history instead of wedging.
+func TestInitPartitionAsLeader_HealsRegressedEpochHistory(t *testing.T) {
+	s := newTestServer(t)
+	tc := meta.TopicConfig{Name: "topic", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1}
+	if err := s.topicStore.Create(context.Background(), tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := s.partitionManager.InitTopic(context.Background(), tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+
+	// Seed the regressed history seen in production: epoch 1 recorded at an
+	// offset far beyond this node's durable log end.
+	regressed := &replication.EpochHistory{Entries: []replication.EpochEntry{
+		{Epoch: 1, StartOffset: 1008506},
+	}}
+	if err := s.isrStore.WriteEpochHistory(context.Background(), tc.Name, 0, regressed); err != nil {
+		t.Fatalf("seed regressed epoch history: %v", err)
+	}
+
+	ps := s.partitionManager.GetPartitionState(tc.Name, 0)
+	ps.mu.Lock()
+	ps.nextOffset = 385160 // local tail behind the recorded boundary
+	ps.mu.Unlock()
+
+	s.initPartitionAsLeader(context.Background(), tc.Name, 0, coordination.PartitionAssignment{
+		Replicas:    []string{s.instanceID},
+		Leader:      s.instanceID,
+		LeaderEpoch: 2,
+	})
+
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if !ps.isLeader {
+		t.Fatal("initPartitionAsLeader must heal the history and promote, not wedge")
+	}
+	want := []replication.EpochEntry{{Epoch: 2, StartOffset: 385160}}
+	if len(ps.epochHistory.Entries) != 1 || ps.epochHistory.Entries[0] != want[0] {
+		t.Fatalf("epoch history = %+v, want %+v", ps.epochHistory.Entries, want)
+	}
+}

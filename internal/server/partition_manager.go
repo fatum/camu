@@ -148,6 +148,28 @@ func (pm *PartitionManager) recoverLocalLogEnd(topic string, partitionID int) ui
 	return logEnd
 }
 
+// recoverTrueLogEnd returns the partition's durable log end: the higher of the
+// local native tail and the object-store index's next offset (after the index
+// was refreshed from S3). Leader-promotion paths must derive epoch boundaries
+// and next offsets from this value, never from the local tail alone: a node
+// that restarted or lagged as a follower has a local tail behind the committed
+// prefix, and a boundary recorded there regresses below prior epochs, which
+// corrupts the epoch history and wedges or resets promotion.
+func (pm *PartitionManager) recoverTrueLogEnd(topic string, partitionID int) uint64 {
+	logEnd := pm.recoverLocalLogEnd(topic, partitionID)
+	ps := pm.GetPartitionState(topic, partitionID)
+	if ps == nil {
+		return logEnd
+	}
+	ps.mu.RLock()
+	indexNext := ps.index.NextOffset()
+	ps.mu.RUnlock()
+	if indexNext > logEnd {
+		return indexNext
+	}
+	return logEnd
+}
+
 func (pm *PartitionManager) flushRecoveredTail(topic string, partitionID int) error {
 	ps := pm.GetPartitionState(topic, partitionID)
 	if ps == nil {

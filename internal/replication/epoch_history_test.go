@@ -287,3 +287,89 @@ func TestEpochHistory_GapEpochDiverges(t *testing.T) {
 		t.Fatalf("expected truncateTo=100 (earliest known), got %d", truncateTo)
 	}
 }
+
+// TestEpochHistory_EnsureBoundaryHealsRegressedBoundary verifies the recurring
+// wedge scenario: a history whose recorded boundary lies above the durable log
+// end (a promoted node's local tail lagged the committed prefix). A plain
+// Ensure rejects the new boundary forever; EnsureBoundary drops the bogus
+// entry and records the new epoch at the durable end.
+func TestEpochHistory_EnsureBoundaryHealsRegressedBoundary(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{{Epoch: 1, StartOffset: 1008506}}}
+	// Durable log end is 385160 — below the recorded epoch-1 start. This is
+	// the exact "epoch boundary 2@385160 is not after 1@1008506" failure.
+	if err := eh.Ensure(EpochEntry{Epoch: 2, StartOffset: 385160}); err == nil {
+		t.Fatal("plain Ensure must reject the regressed boundary")
+	}
+	if err := eh.EnsureBoundary(EpochEntry{Epoch: 2, StartOffset: 385160}); err != nil {
+		t.Fatalf("EnsureBoundary must heal and accept: %v", err)
+	}
+	want := []EpochEntry{{Epoch: 2, StartOffset: 385160}}
+	if len(eh.Entries) != 1 || eh.Entries[0] != want[0] {
+		t.Fatalf("entries = %+v, want %+v", eh.Entries, want)
+	}
+}
+
+// TestEpochHistory_EnsureBoundaryPreservesValidPrefix verifies that a clean
+// history is extended normally and that entries below the durable end survive.
+func TestEpochHistory_EnsureBoundaryPreservesValidPrefix(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 2, StartOffset: 100},
+	}}
+	if err := eh.EnsureBoundary(EpochEntry{Epoch: 3, StartOffset: 200}); err != nil {
+		t.Fatalf("EnsureBoundary: %v", err)
+	}
+	want := []EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 2, StartOffset: 100},
+		{Epoch: 3, StartOffset: 200},
+	}
+	if len(eh.Entries) != len(want) {
+		t.Fatalf("entries = %+v, want %+v", eh.Entries, want)
+	}
+	for i := range want {
+		if eh.Entries[i] != want[i] {
+			t.Fatalf("entries = %+v, want %+v", eh.Entries, want)
+		}
+	}
+}
+
+// TestEpochHistory_EnsureBoundaryDropsStaleGeneration verifies the
+// deleted-and-recreated-topic case: stale epochs from a previous topic
+// generation are dropped rather than nuking the whole history.
+func TestEpochHistory_EnsureBoundaryDropsStaleGeneration(t *testing.T) {
+	eh := &EpochHistory{Entries: []EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 5, StartOffset: 100}, // stale generation: epoch >= new epoch
+	}}
+	if err := eh.EnsureBoundary(EpochEntry{Epoch: 3, StartOffset: 200}); err != nil {
+		t.Fatalf("EnsureBoundary: %v", err)
+	}
+	want := []EpochEntry{
+		{Epoch: 1, StartOffset: 0},
+		{Epoch: 3, StartOffset: 200},
+	}
+	if len(eh.Entries) != len(want) {
+		t.Fatalf("entries = %+v, want %+v", eh.Entries, want)
+	}
+	for i := range want {
+		if eh.Entries[i] != want[i] {
+			t.Fatalf("entries = %+v, want %+v", eh.Entries, want)
+		}
+	}
+}
+
+// TestEpochHistory_EnsureBoundaryIdempotent verifies recording the same
+// boundary twice is a no-op (matching Ensure).
+func TestEpochHistory_EnsureBoundaryIdempotent(t *testing.T) {
+	eh := &EpochHistory{}
+	if err := eh.EnsureBoundary(EpochEntry{Epoch: 1, StartOffset: 0}); err != nil {
+		t.Fatalf("first EnsureBoundary: %v", err)
+	}
+	if err := eh.EnsureBoundary(EpochEntry{Epoch: 1, StartOffset: 0}); err != nil {
+		t.Fatalf("second EnsureBoundary: %v", err)
+	}
+	if len(eh.Entries) != 1 {
+		t.Fatalf("entries = %+v, want one entry", eh.Entries)
+	}
+}

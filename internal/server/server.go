@@ -1282,8 +1282,12 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		slog.Warn("initPartitionAsLeader: ensure active segment before recovery", "topic", topic, "partition", pid, "error", err)
 	}
 
-	// Recover true local log end from native storage.
-	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
+	// Recover the true durable log end: the local native tail plus any
+	// committed prefix materialized in the S3-refreshed index. A promoted node
+	// whose local tail lags the committed prefix (restart, crash, slow
+	// follower) must start its epoch at the durable end, or the boundary would
+	// regress below prior epochs and the history could never accept it.
+	logEnd := s.partitionManager.recoverTrueLogEnd(topic, pid)
 
 	// Load epoch history from S3 (authoritative), fall back to local file,
 	// or use existing epochHistory if S3 is unavailable.
@@ -1309,7 +1313,9 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	}
 	ehChanged := !hasCurrentEpoch
 	if !hasCurrentEpoch {
-		if err := eh.Ensure(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
+		// EnsureBoundary heals stale or regressed entries (see the method
+		// contract) instead of wedging the promotion like a plain Ensure.
+		if err := eh.EnsureBoundary(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
 			slog.Error("initPartitionAsLeader: invalid epoch history", "topic", topic, "partition", pid, "error", err)
 			return
 		}

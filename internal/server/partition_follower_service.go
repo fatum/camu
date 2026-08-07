@@ -181,7 +181,7 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 	indexHW := ps.index.HighWatermark()
 	flushedOffset := ps.flushedOffset
 	ps.mu.RUnlock()
-	logEnd := p.server.partitionManager.recoverLocalLogEnd(topic, pid)
+	logEnd := p.server.partitionManager.recoverTrueLogEnd(topic, pid)
 
 	slog.Info("failover_recovery_state",
 		"topic", topic,
@@ -229,7 +229,13 @@ func (p partitionFollowerService) attemptPartitionLeadership(topic string, pid i
 			eh = &replication.EpochHistory{}
 		}
 	}
-	eh.Append(replication.EpochEntry{Epoch: newEpoch, StartOffset: logEnd})
+	// EnsureBoundary (not a blind Append) validates the boundary against the
+	// durable log end and heals entries recorded above it, so a follower that
+	// lagged the committed prefix cannot write a backwards epoch boundary.
+	if err := eh.EnsureBoundary(replication.EpochEntry{Epoch: newEpoch, StartOffset: logEnd}); err != nil {
+		slog.Error("attemptPartitionLeadership: invalid epoch history", "topic", topic, "pid", pid, "epoch", newEpoch, "log_end", logEnd, "error", err)
+		return err
+	}
 	ps.mu.Lock()
 	ps.epochHistory = eh
 	ps.isLeader = true
