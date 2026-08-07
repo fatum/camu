@@ -406,6 +406,12 @@
     :default "1m"]
    [nil "--topic-retention DURATION" "TEST-ONLY topic retention for lifecycle scenarios"
     :default "24h"]
+   [nil "--retention-lifecycle BOOL" "Enable retention lifecycle testing"
+    :default false
+    :parse-fn #(Boolean/parseBoolean %)]
+   [nil "--typed BOOL" "Use typed topic with schema"
+    :default false
+    :parse-fn #(Boolean/parseBoolean %)]
    [nil "--read-mode MODE" "Read routing mode: leader, replica, or any"
     :default :leader
     :parse-fn keyword

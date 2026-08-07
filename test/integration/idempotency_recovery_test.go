@@ -8,11 +8,17 @@ import (
 	"time"
 
 	logstore "github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/config"
 	"github.com/maksim/camu/pkg/camutest"
 )
 
 func TestIdempotency_RestartPreservesRecoveredStateAndS3Checkpoint(t *testing.T) {
-	env := camutest.New(t, camutest.WithInstances(1))
+	env := camutest.New(t,
+		camutest.WithInstances(1),
+		camutest.WithConfigMutator(func(cfg *config.Config) {
+			cfg.Segments.MaxAge = "1s"
+		}),
+	)
 	defer env.Cleanup()
 
 	const (
@@ -45,23 +51,27 @@ func TestIdempotency_RestartPreservesRecoveredStateAndS3Checkpoint(t *testing.T)
 		t.Fatal("first idempotent produce unexpectedly marked duplicate")
 	}
 
-	time.Sleep(6 * time.Second)
-
 	checkpointKey := topic + "/0/producers.checkpoint"
-	if data, err := env.S3Client().Get(context.Background(), checkpointKey); err != nil {
-		t.Fatalf("Get(%q) error: %v", checkpointKey, err)
-	} else if len(data) == 0 {
-		t.Fatalf("Get(%q) returned empty checkpoint", checkpointKey)
-	}
-
 	stateKey := logstore.StateKey(topic, pid)
-	stateData, err := env.S3Client().Get(context.Background(), stateKey)
-	if err != nil {
-		t.Fatalf("Get(%q) error: %v", stateKey, err)
-	}
+
+	deadline := time.Now().Add(15 * time.Second)
 	var partState logstore.PartitionState
-	if err := partState.Unmarshal(stateData); err != nil {
-		t.Fatalf("PartitionState.Unmarshal() error: %v", err)
+	checkpointFound := false
+	for time.Now().Before(deadline) {
+		if !checkpointFound {
+			if data, err := env.S3Client().Get(context.Background(), checkpointKey); err == nil && len(data) > 0 {
+				checkpointFound = true
+			}
+		}
+		if data, err := env.S3Client().Get(context.Background(), stateKey); err == nil && len(data) > 0 {
+			if err := partState.Unmarshal(data); err == nil && partState.HighWatermark >= 2 {
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !checkpointFound {
+		t.Fatalf("checkpoint %q not found after 15s", checkpointKey)
 	}
 	if got, want := partState.HighWatermark, uint64(2); got != want {
 		t.Fatalf("state.HighWatermark = %d, want %d", got, want)
@@ -73,7 +83,7 @@ func TestIdempotency_RestartPreservesRecoveredStateAndS3Checkpoint(t *testing.T)
 		t.Fatalf("instance not ready after restart: %v", err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		snap, ok := env.Server(0).ProducerStateSnapshot(topic, pid, producer.ProducerID)
 		if ok && snap.NextSeq == 2 && snap.LastOffset == 1 {

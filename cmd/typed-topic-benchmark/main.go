@@ -626,45 +626,35 @@ func (c client) produce(ctx context.Context, cfg config, count int64, expected [
 	payloadText := payload(cfg.MessageBytes)
 	var wg sync.WaitGroup
 	errs := make(chan error, cfg.Partitions)
-	jobs := make(chan int)
-	workers := cfg.ProducerConcurrency
-	if workers > cfg.Partitions {
-		workers = cfg.Partitions
-	}
-	for w := 0; w < workers; w++ {
+	for w := 0; w < cfg.Partitions; w++ {
+		p := w
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for p := range jobs {
-				sequence := uint64(0)
-				for first := firstSequenceForPartition(cfg.SequenceStart, p, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
-					batch := make([]map[string]any, 0, cfg.BatchMessages)
-					for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
-						v := typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
-						batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(benchmarkEvent(cfg, v)))})
-						expected[p].add(v)
-					}
-					atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
-					path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(cfg.Topic), p)
-					partitionClient := c.nodeClient(cfg)
-					request := idempotentProduceRequest{ProducerID: producerID, Sequence: sequence, Messages: batch}
-					if err := retryProduce(ctx, fmt.Sprintf("produce HTTP partition %d sequence %d", p, sequence), func() error {
-						return partitionClient.request(ctx, http.MethodPost, path, request, nil)
-					}); err != nil {
-						errs <- err
-						return
-					}
-					sequence += uint64(len(batch))
-					atomic.AddInt64(&total, int64(len(batch)))
-					progress(int64(len(batch)))
+			sequence := uint64(0)
+			for first := firstSequenceForPartition(cfg.SequenceStart, p, cfg.Partitions); first < cfg.SequenceStart+count; first += int64(cfg.Partitions * cfg.BatchMessages) {
+				batch := make([]map[string]any, 0, cfg.BatchMessages)
+				for i := first; i < cfg.SequenceStart+count && len(batch) < cfg.BatchMessages; i += int64(cfg.Partitions) {
+					v := typedValue{RunID: cfg.RunID, ID: i, Payload: payloadText, PayloadBytes: cfg.MessageBytes, Sequence: i}
+					batch = append(batch, map[string]any{"key": cfg.RunID + ":" + strconv.FormatInt(i, 10), "value": string(mustJSON(benchmarkEvent(cfg, v)))})
+					expected[p].add(v)
 				}
+				atomic.AddInt64(&serialized, int64(len(mustJSON(batch))))
+				path := fmt.Sprintf("/v1/topics/%s/partitions/%d/messages", url.PathEscape(cfg.Topic), p)
+				partitionClient := c.nodeClient(cfg)
+				request := idempotentProduceRequest{ProducerID: producerID, Sequence: sequence, Messages: batch}
+				if err := retryProduce(ctx, fmt.Sprintf("produce HTTP partition %d sequence %d", p, sequence), func() error {
+					return partitionClient.request(ctx, http.MethodPost, path, request, nil)
+				}); err != nil {
+					errs <- err
+					return
+				}
+				sequence += uint64(len(batch))
+				atomic.AddInt64(&total, int64(len(batch)))
+				progress(int64(len(batch)))
 			}
 		}()
 	}
-	for p := 0; p < cfg.Partitions; p++ {
-		jobs <- p
-	}
-	close(jobs)
 	wg.Wait()
 	close(errs)
 	for err := range errs {

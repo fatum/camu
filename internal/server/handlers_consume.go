@@ -277,18 +277,17 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check for SSE flusher support.
-	if _, ok := w.(http.Flusher); !ok {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 
-	// Determine start offset: Last-Event-ID header takes precedence for reconnection.
 	var startOffset uint64
 	if lastID := r.Header.Get("Last-Event-ID"); lastID != "" {
 		parsed, err := strconv.ParseUint(lastID, 10, 64)
 		if err == nil {
-			startOffset = parsed + 1 // resume after last seen event
+			startOffset = parsed + 1
 		}
 	} else if v, present, err := consumeStartOffset(r); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -297,14 +296,6 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 		startOffset = v
 	}
 
-	// Get the partition index.
-	index := s.partitionManager.GetIndex(topicName, partitionID)
-	if index == nil {
-		writeError(w, http.StatusNotFound, "partition not found")
-		return
-	}
-
-	// Set HW header before streaming starts (headers must be sent before body).
 	ps := s.partitionManager.GetPartitionState(topicName, partitionID)
 	if ps != nil {
 		ps.mu.RLock()
@@ -314,13 +305,50 @@ func (s *Server) handleStreamLowLevel(w http.ResponseWriter, r *http.Request) {
 		ps.mu.RUnlock()
 	}
 
-	// Set SSE headers.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.(http.Flusher).Flush()
+	flusher.Flush()
 
-	consumer.StreamSSE(r.Context(), w, s.fetcher, index, topicName, partitionID, startOffset)
+	currentOffset := int64(startOffset)
+	const streamFetchBytes = 100 * 1024
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+
+		raw, _, err := s.partitionManager.ReadRawBatches(r.Context(), topicName, partitionID, currentOffset, streamFetchBytes)
+		if err != nil {
+			return
+		}
+
+		if len(raw) == 0 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+
+		msgs, err := log.ReadSegmentBatchesAsMessages(raw, uint64(currentOffset), 100)
+		if err != nil {
+			return
+		}
+		if len(msgs) == 0 {
+			continue
+		}
+
+		for _, msg := range msgs {
+			if err := consumer.WriteSSEEvent(w, msg); err != nil {
+				return
+			}
+		}
+		flusher.Flush()
+		currentOffset = int64(msgs[len(msgs)-1].Offset) + 1
+	}
 }
 
 const disklessConsumeFetchBytes = 64 * 1024
