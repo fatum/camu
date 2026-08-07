@@ -184,6 +184,9 @@ func (s *Server) processTopicDeletion(ctx context.Context, rec topicDeletionReco
 		return fmt.Errorf("delete topic s3 data: %w", err)
 	}
 	if rec.Topic.StorageMode == meta.StorageModeDiskless && s.disklessMeta != nil {
+		if err := s.deleteDisklessDataFiles(ctx, rec.Topic); err != nil {
+			return fmt.Errorf("delete diskless data files: %w", err)
+		}
 		if err := s.disklessMeta.DeleteTopic(ctx, rec.Topic.Name); err != nil {
 			return fmt.Errorf("delete diskless metadata: %w", err)
 		}
@@ -217,6 +220,30 @@ func (s *Server) deleteTopicPipelineCheckpoints(ctx context.Context, topic strin
 		prefix := fmt.Sprintf("_meta/pipelines/%s/%s/", pipeline, topic)
 		if err := s.deleteTopicPrefix(ctx, prefix); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// deleteDisklessDataFiles deletes all _diskless/ backing data files referenced
+// by the topic's segment catalogs, before the metadata is dropped so the
+// file→topic mapping is still intact.
+func (s *Server) deleteDisklessDataFiles(ctx context.Context, tc meta.TopicConfig) error {
+	seen := make(map[string]bool)
+	for partition := 0; partition < tc.Partitions; partition++ {
+		refs, err := s.disklessMeta.QuerySegments(ctx, tc.Name, partition, 0, 1<<30)
+		if err != nil {
+			return fmt.Errorf("query segments %s/%d: %w", tc.Name, partition, err)
+		}
+		for _, ref := range refs {
+			if ref.FileKey != "" {
+				seen[ref.FileKey] = true
+			}
+		}
+	}
+	for fileKey := range seen {
+		if err := s.s3Client.Delete(ctx, fileKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("delete diskless data %s: %w", fileKey, err)
 		}
 	}
 	return nil
