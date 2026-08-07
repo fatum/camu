@@ -119,7 +119,8 @@ formatters:
     gofmt:
       simplify: true
     goimports:
-      local-prefixes: github.com/maksim/camu
+      local-prefixes:
+        - github.com/maksim/camu
 
 output:
   formats:
