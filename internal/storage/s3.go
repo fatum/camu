@@ -567,6 +567,11 @@ func (m *memBackend) equalsFile(ctx context.Context, key string, file io.ReadSee
 
 // ---- Real AWS S3 backend ----
 
+// s3RetryMaxAttempts bounds the AWS SDK retryer. The Standard mode backs off
+// with jitter between attempts; a higher cap makes the diskless flush/commit
+// path survive throttling bursts (503 SlowDown) instead of failing a produce.
+const s3RetryMaxAttempts = 8
+
 type awsS3Backend struct {
 	client *s3.Client
 	bucket string
@@ -583,6 +588,15 @@ func newS3Backend(cfg S3Config) (*awsS3Backend, error) {
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
 		))
 	}
+	// Be resilient to object-store throttling (503 SlowDown) and transient
+	// network failures: the Standard retryer backs off with jitter, and the
+	// default 3 attempts is far too easy to exhaust during a throttle burst.
+	// This covers the diskless flush/commit path so a produce is not failed
+	// just because one S3 call hit a momentary rate limit.
+	optFns = append(optFns,
+		awsconfig.WithRetryMaxAttempts(s3RetryMaxAttempts),
+		awsconfig.WithRetryMode(aws.RetryModeStandard),
+	)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), optFns...)
 	if err != nil {

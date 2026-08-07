@@ -32,18 +32,20 @@ func mustJSON(v any) []byte {
 func newKafkaProducer(cfg serviceConfig) (*kgo.Client, error) {
 	return kgo.NewClient(
 		kgo.SeedBrokers(cfg.KafkaBrokers...),
-		kgo.RecordDeliveryTimeout(5 * time.Minute),
+		// Deliberately leave idempotency enabled (the default) and the record
+		// delivery timeout unlimited (the default). The idempotent producer
+		// retries each batch with the same producer sequence until it is
+		// delivered, deduplicating uncertain outcomes and never advancing past
+		// an undelivered batch. This makes the service tolerant to S3
+		// throttling: a flush that fails under a SlowDown burst is retried by
+		// kgo until S3 recovers, so no record is ever dropped and the consumer
+		// sees gapless, duplicate-free sequences. The produce rate simply
+		// pauses under backpressure and resumes when storage recovers. A
+		// finite delivery timeout or disabled idempotency would instead drop
+		// batches (gaps) or create invalid producer sequences (the server
+		// rejects every later batch with "sequence gap").
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-		// A long-running benchmark must survive transient broker failures
-		// (e.g. S3 throttling during a flush) without wedging: an idempotent
-		// producer whose sequence space gains a hole is rejected forever with
-		// sequence-gap errors until the client re-initializes. Disabling
-		// idempotency makes every failure an ordinary retry; the consumer's
-		// per-run seq validation still detects real data loss, and duplicates
-		// from uncertain retries surface as re-baselined validation errors
-		// rather than a permanent producer poison-pill.
-		kgo.DisableIdempotentWrite(),
 	)
 }
 
