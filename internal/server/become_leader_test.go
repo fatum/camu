@@ -412,3 +412,66 @@ func TestBecomeLeader_PersistsLeaderEpochSidecar(t *testing.T) {
 		t.Fatalf("epoch sidecar = %q, want %q (promotion must persist the leader epoch)", got, want)
 	}
 }
+
+// TestBecomeLeader_ResetsStaleEpochHistory verifies that a stale epoch history
+// from a previous topic generation (epochs higher than the current controller
+// epoch — the delete/recreate signature) cannot wedge leader initialization:
+// becomeLeader resets the history and promotes instead of failing, because the
+// ISR store's epoch CAS is the real fencing mechanism.
+func TestBecomeLeader_ResetsStaleEpochHistory(t *testing.T) {
+	srv, pm := newTestServerForBecomeLeader(t)
+
+	topic := "recreated"
+	tc := meta.TopicConfig{
+		Name:              topic,
+		Partitions:        1,
+		Retention:         time.Hour,
+		CreatedAt:         time.Now(),
+		ReplicationFactor: 1,
+		MinInsyncReplicas: 1,
+	}
+	ctx := context.Background()
+	if err := srv.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("Create topic: %v", err)
+	}
+	if err := pm.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic: %v", err)
+	}
+
+	// Seed a stale epoch history from the deleted topic's generation: a much
+	// higher epoch with an advanced start offset.
+	stale := &replication.EpochHistory{Entries: []replication.EpochEntry{
+		{Epoch: 11, StartOffset: 1901930},
+	}}
+	if err := srv.isrStore.WriteEpochHistory(ctx, topic, 0, stale); err != nil {
+		t.Fatalf("seed stale epoch history: %v", err)
+	}
+
+	req := pushAssignmentRequest{
+		Topic:       topic,
+		Partition:   0,
+		Leader:      "node-A",
+		Epoch:       1, // the recreated topic's fresh epoch
+		Replicas:    []string{"node-A"},
+		ISR:         []string{"node-A"},
+	}
+	if err := srv.becomeLeader(ctx, topic, 0, req); err != nil {
+		t.Fatalf("becomeLeader with stale epoch history must not fail, got: %v", err)
+	}
+
+	ps := pm.GetPartitionState(topic, 0)
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	if !ps.isLeader {
+		t.Fatal("expected the partition to be leader")
+	}
+
+	// The reset history must be persisted to S3 so the next recovery starts clean.
+	persisted, err := srv.isrStore.ReadEpochHistory(ctx, topic, 0)
+	if err != nil {
+		t.Fatalf("read persisted epoch history: %v", err)
+	}
+	if len(persisted.Entries) != 1 || persisted.Entries[0].Epoch != 1 {
+		t.Fatalf("persisted epoch history = %+v, want a single fresh entry for epoch 1", persisted.Entries)
+	}
+}

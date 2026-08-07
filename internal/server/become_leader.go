@@ -92,7 +92,19 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	}
 	if !hasCurrentEpoch {
 		if err := eh.Ensure(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd}); err != nil {
-			return fmt.Errorf("validate controller epoch history: %w", err)
+			// A stale epoch history from a previous topic generation (e.g. a
+			// topic deleted and recreated) can carry epochs higher than the
+			// current controller epoch; epochs only increase within a
+			// generation. A stale boundary must never wedge leader
+			// initialization (the ISR store's epoch CAS is the real fence), so
+			// drop the entire stale history and start fresh from this epoch.
+			slog.Warn("becomeLeader: resetting stale epoch history",
+				"topic", topic, "partition", pid,
+				"epoch", req.Epoch, "log_end", logEnd, "error", err)
+			eh = &replication.EpochHistory{}
+			if err := eh.Ensure(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd}); err != nil {
+				return fmt.Errorf("reset controller epoch history: %w", err)
+			}
 		}
 	}
 
