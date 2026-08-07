@@ -89,7 +89,22 @@ func (s *Server) enqueueTopicDeletion(ctx context.Context, tc meta.TopicConfig) 
 		return err
 	}
 	s.dropTopicRuntime(tc.Name)
+	// A pending deletion must stop the topic's activity: stop this node's
+	// parquet export consumers immediately, and rely on the maintenance pass
+	// (which reconciles pending deletions on every node) to stop consumers on
+	// the other nodes that lead the topic's partitions.
+	s.stopTopicParquetConsumers(tc)
 	return nil
+}
+
+// stopTopicParquetConsumers stops this node's Iceberg export consumers for all
+// partitions of tc. The per-partition maintenance only reconciles consumers
+// for topics present in the topic registry, so consumers of a deleted topic
+// would otherwise churn forever reloading a missing topic.
+func (s *Server) stopTopicParquetConsumers(tc meta.TopicConfig) {
+	for p := 0; p < tc.Partitions; p++ {
+		s.stopParquetConsumer(tc.Name, p)
+	}
 }
 
 func (s *Server) dropTopicRuntime(topic string) {
@@ -319,12 +334,22 @@ func (s *Server) spawnTopicDeletion(rec topicDeletionRecord) {
 
 func (s *Server) topicDeletionWorker() {
 	for rec := range s.topicDeletionCh {
-		if err := s.processTopicDeletion(s.topicDeletionCtx, rec); err != nil {
-			if s.topicDeletionCtx.Err() != nil {
-				slog.Warn("topic_delete_worker_aborted", "topic", rec.Topic.Name, "error", err)
-			} else {
-				slog.Warn("topic_delete_worker_failed", "topic", rec.Topic.Name, "error", err)
-			}
+		// Bound one cleanup so a stuck S3 step (e.g. under throttling) cannot
+		// occupy one of the topicDeletionWorkerCount workers forever and stall
+		// every queued deletion. processTopicDeletion is idempotent and
+		// crash-safe: on timeout the marker survives and a later GC tick
+		// re-spawns the cleanup.
+		ctx, cancel := context.WithTimeout(s.topicDeletionCtx, topicDeletionTimeout)
+		err := s.processTopicDeletion(ctx, rec)
+		cancel()
+		switch {
+		case err == nil:
+		case ctx.Err() == context.DeadlineExceeded:
+			slog.Warn("topic_delete_worker_timed_out", "topic", rec.Topic.Name, "error", err)
+		case s.topicDeletionCtx.Err() != nil:
+			slog.Warn("topic_delete_worker_aborted", "topic", rec.Topic.Name, "error", err)
+		default:
+			slog.Warn("topic_delete_worker_failed", "topic", rec.Topic.Name, "error", err)
 		}
 		s.topicDeletionMu.Lock()
 		delete(s.topicDeletionInflight, rec.Topic.Name)
@@ -337,6 +362,10 @@ const (
 	topicDeletionWorkerCount = 2
 	// topicDeletionQueueDepth bounds how many pending cleanups wait for a worker.
 	topicDeletionQueueDepth = 8
+	// topicDeletionTimeout bounds one cleanup so a stuck S3 step (e.g. under
+	// throttling) cannot occupy a worker forever; the marker survives a timeout
+	// and a later GC tick re-spawns the idempotent cleanup.
+	topicDeletionTimeout = 15 * time.Minute
 )
 
 // startTopicDeletionWorkers starts the bounded async cleanup workers. A long

@@ -1693,6 +1693,18 @@ func (s *Server) runMaintenancePass() {
 	}
 	fileIdx, idxErr := s.buildDisklessFileIndex(ctx)
 	s.runPartitionMaintenance(ctx, topics, fileIdx)
+	// Topics pending deletion are no longer in the topic registry, so the
+	// per-partition maintenance no longer reconciles their consumers. Stop this
+	// node's export consumers for every pending deletion; each node stops only
+	// its own consumers. A stale consumer would otherwise churn forever
+	// reloading a missing topic.
+	if pending, err := s.listTopicDeletions(ctx); err == nil {
+		for _, rec := range pending {
+			s.stopTopicParquetConsumers(rec.Topic)
+		}
+	} else {
+		slog.Warn("maintenance: list topic deletions", "error", err)
+	}
 	if s.amLeader() {
 		s.coordinationGC(ctx, topics)
 		if idxErr != nil {
