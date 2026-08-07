@@ -38,12 +38,13 @@ runcmd:
       metastore: s3
       compaction:
         enabled: true
-        target_bytes: 67108864
-        max_segments_per_merge: 1024
-        grace: 5s
-        delete_grace: 30s
+        target_bytes: 134217728
+        max_segments_per_merge: 4096
+        min_segments: 8
+        grace: 10s
+        delete_grace: 60s
     segments:
-      max_size: 67108864
+      max_size: 134217728
       max_age: 1m
       compression: snappy
     cache:
@@ -55,9 +56,10 @@ runcmd:
       rebalance_delay: 15s
     maintenance:
       parquet_export:
-        max_records: 16384
-        target_bytes: 536870912
+        max_records: 131072
+        target_bytes: 1073741824
         max_interval: 5m
+        max_duration: 5m
     CAMU_CONFIG
   - docker pull gcr.io/cadvisor/cadvisor:v0.49.2
   - docker rm -f cadvisor 2>/dev/null || true
