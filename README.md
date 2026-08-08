@@ -4,54 +4,57 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/fatum/camu.svg)](https://pkg.go.dev/github.com/fatum/camu)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
 
-> **Camu is the S3-native event log that turns your stream into a queryable Iceberg lake.**
->
-> Kafka-compatible produce/consume, an ISR quorum for acknowledged durability, and a
-> self-managed Apache Iceberg projection — all on plain object storage. No broker disk
-> fleet, no ZooKeeper, no CGO, no ETL pipeline.
+> **The S3-native event log.** Your Kafka-compatible stream, an ISR-quorum durability
+> story verified by a five-node Jepsen harness, and a self-managed Apache Iceberg lake —
+> all on plain object storage. One binary. No broker disk fleet. No ZooKeeper. No ETL.
 
 ```text
-  Kafka / HTTP producers ──▶ partition leader ──▶ ISR quorum (acknowledged durability)
-                                    │
-                                    └──▶ sealed segments ──▶ S3 / MinIO ──▶ Apache Iceberg tables
-                                                                                │
-                                                                                ▼
-                                                            DuckDB · Trino · Spark query directly
+ Kafka / HTTP producers
+        │
+        ├── classic ──▶ partition leader ──▶ ISR quorum ─────────▶ ack   (sub-ms)
+        │                    └──▶ seal + publish segments (off hot path)
+        │
+        └── diskless ──▶ buffer ──▶ upload to S3 ──▶ metastore commit ──▶ ack
+                                    │                 (memory · s3 · dynamodb)
+                                    ▼
+                             S3 / MinIO / R2 / B2   ◀── one durable data plane
+                                │                  │
+                                ▼                  ▼
+                        Apache Iceberg        coordination state
+                        (DuckDB · Trino)      (leases · ISR · groups)
 ```
 
-## Why Camu?
+Camu collapses the classic streaming stack — broker, archive, warehouse, and coordination
+cluster — into **one durable data plane**: object storage. The log *is* the archive, the
+archive *is* the analytics store, and even the coordination layer (leadership, ISR, consumer
+groups) runs on object-store conditional writes instead of a consensus cluster.
 
-Applications need an ordered, replayable event log. Camu is the alternative that makes
-object storage the shared durable data plane — so the log **is** the archive, and the
-archive **is** the analytics store.
-
-- **One storage tier, not three.** No broker-disk fleet, no separate archival pipeline,
-  no separate data warehouse. Immutable history lives once in S3-compatible storage, and
+- **One storage tier, not three.** No broker-disk fleet, no separate archival pipeline, no
+  separate data warehouse. Immutable history lives once in S3-compatible storage, and
   everything reads from it.
 - **Kafka-compatible, zero-copy.** Native `RecordBatch` bytes replicate unchanged and are
-  served over the Kafka wire protocol, so existing clients, CLIs, and tooling just work —
+  served over the Kafka wire protocol — existing clients, CLIs, and tooling just work,
   alongside a first-class HTTP + SSE API.
-- **Acknowledged durability you can trust.** Writes to replicated topics are confirmed
-  only after the configured ISR quorum holds them, and the whole model is exercised under
-  faults by a five-node Jepsen harness.
-- **Analytics with no ETL.** Turn a topic into a self-managed Apache Iceberg table with a
+- **Acknowledged durability you can trust.** Writes to replicated topics confirm only after
+  the ISR quorum holds them, and the whole model is exercised under faults by a five-node
+  Jepsen harness that runs **every day in CI**.
+- **Analytics with no ETL.** Turn any topic into a self-managed Apache Iceberg table with a
   single flag, then query it with DuckDB, Trino, or Spark directly — no copy jobs, no
-  warehouse.
+  warehouse to run.
 - **Typed topics with a schema registry.** Define JSON, Avro, or Protobuf schemas, evolve
   them backward-compatibly, and route decode failures to a dead-letter topic.
-- **Runs anywhere.** A single Go binary — [download a release](https://github.com/fatum/camu/releases)
-  for macOS or Linux, or build from source. `classic` mode for local fast tails,
-  `diskless` mode that needs no local disks at all; both speak the same APIs.
+- **Run it anywhere.** A single Go binary, no CGO, no JVM — [download a release](https://github.com/fatum/camu/releases)
+  for macOS or Linux, or build from source. Pick `classic` mode for sub-millisecond local
+  tails or `diskless` mode that needs **no local disks at all**; both speak the same APIs.
 
-Camu is a focused system, not a drop-in for every Kafka feature. It is the right choice
-when S3-native durability, simple replayable streams, and a queryable projection matter
-more than the full Kafka ecosystem. See the
-[API support matrix](docs/api-support-matrix.md) for exactly what is supported and what is
-intentionally out of scope.
+Camu is a focused system, not a drop-in for every Kafka feature. It is the right choice when
+S3-native durability, simple replayable streams, and a queryable projection matter more than
+the full Kafka ecosystem. The [API support matrix](docs/api-support-matrix.md) states exactly
+what is supported, what is verified, and what is intentionally out of scope.
 
-## Features
+## Feature highlights
 
-### An event log with real durability semantics
+### A Kafka-compatible log with real durability semantics
 
 - Topics with partitions, replication factor, and `min_insync_replicas`.
 - The partition leader appends native Kafka `RecordBatch` bytes; followers replicate them
@@ -67,6 +70,26 @@ intentionally out of scope.
 | --- | --- |
 | `rf=1`, `minISR=1` | The owner appended the record to its local active segment, and re-verified ownership against the assignment store. |
 | `rf>1` | The leader and the configured ISR quorum have the record. |
+
+### A coordination layer with no consensus cluster
+
+Leadership, failover, and consumer groups run on **S3 conditional writes and leases**, not
+ZooKeeper/etcd:
+
+- A single controller holds a lease with monotonic epochs; renewals are CAS bumps, so a
+  clock-skewed stale controller is fenced by epoch comparison, not wall-clock hope.
+- Partition leaders publish assignments; caught-up ISR followers **self-promote** with a CAS
+  bump on leader death — no controller round trip — and the controller is the backstop.
+- Epoch history fences stale leaders and detects divergence; ISR mutations are guarded by
+  the leader epoch so a fenced leader cannot acknowledge uncommitted writes.
+- Kafka consumer-group state (members, generation, offsets) is S3-backed JSON with
+  ETag-CAS versioning and controller-epoch stamping.
+- Background work — retention, segment merge, Iceberg export, topic deletion — runs as
+  **durable, resumable jobs** that survive restart and reassignment. Every job is idempotent:
+  re-execution converges, never double-publishes, never corrupts state.
+
+The design eliminates a whole class of infrastructure: no separate consensus cluster, no
+meta-store to patch, no leader-election wiring to get wrong. One less system to fail.
 
 ### Iceberg analytics built in
 
@@ -89,17 +112,139 @@ Parquet columns, and carries the schema through an embedded registry with Conflu
 ids so values decode against their own writer schema across versions. Add fields over time
 with backward-compatibility checks; failed decodes go to a configured dead-letter topic.
 
-### Two storage modes, one API
+## Two storage modes, one API
 
-- **`classic`** — a local active tail on the partition owner plus immutable sealed segments
-  in object storage.
-- **`diskless`** — the object-store-centric path: no local disks, atomic offset allocation
-  backed by an S3 head object or DynamoDB, background compaction that bounds the hot
-  window regardless of history.
+Both modes expose identical HTTP, SSE, and Kafka APIs — your producers and consumers don't
+know (or care) which mode a topic uses. The difference is the data path and the
+infrastructure each mode demands.
 
-Both modes expose identical HTTP, SSE, and Kafka APIs. See
-[Storage Modes](docs/storage-modes.md) for throughput characteristics,
-configuration, and guidance on choosing between them.
+### `diskless` — no disks, no data-plane ops
+
+**The headline mode.** Diskless topics write straight to object storage: records buffer in
+memory (linger + batch bytes), flush to S3 as one object, then commit offsets and segment
+refs in a metastore **after** the upload succeeds.
+
+```
+Produce ──▶ buffer ──▶ upload to S3 ──▶ metastore atomic commit (offsets + refs) ──▶ ack
+                                                    │
+                                    background compaction merges small segments
+```
+
+This **upload-then-allocate** order is the point: a failed upload leaves an orphan S3
+object, never a visible offset hole. Background compaction merges small flushes into
+64 MiB segments so reads stay efficient as history grows, and the S3 metastore archives old
+compaction-sized refs so commits cost O(window), not O(all history).
+
+**Pros.**
+
+- **No local disks.** Nodes are stateless — run them on anything, with zero storage
+  provisioning. Scale by adding instances, not disks.
+- **Any node can serve any partition.** Durable state is in S3 + the metastore, so ownership
+  is an assignment, not a pile of local data.
+- **Upload-then-allocate** makes offset holes from failed uploads impossible.
+- **Three metastore backends** to match your infrastructure (below), from zero extra services
+  to fully managed.
+- **Works behind any S3-compatible store** — MinIO, Cloudflare R2, Backblaze B2, AWS S3.
+
+**Cons.**
+
+- **Produce latency includes S3.** Each batch pays at least one S3 round trip (upload +
+  commit), plus `linger_ms` of batching (default 250 ms).
+- **Not replicated.** Diskless topics ignore `replication_factor` / `min_insync_replicas`;
+  durability rests on S3 + the metastore commit, not ISR quorums.
+- **Reads always hit S3.** No in-memory or local-disk read cache.
+
+**Metastore backends** control commit latency and infrastructure:
+
+| Backend | Commit latency | Infrastructure | Best for |
+|---------|----------------|----------------|----------|
+| `memory` | None (in-process counter) | None | Single-node development |
+| `s3` | S3 conditional PUT (~1 round trip) | Same S3 bucket | Multi-node with zero extra services |
+| `dynamodb` | Atomic DynamoDB transaction (~single-digit ms) | DynamoDB tables | Predictable latency at production throughput |
+
+### `classic` — lowest latency, full replication
+
+**The workhorse.** The partition leader appends to a local active segment — a sub-millisecond
+ack — and a background flusher seals segments and publishes them to S3 off the hot path.
+Replication (ISR quorum) is fully supported for `rf > 1`.
+
+```
+Produce ──▶ local active segment (sub-ms append) ──▶ replicate (rf>1) ──▶ ack
+                                    │
+                     background seal + publish to S3 (off hot path)
+```
+
+**Pros.**
+
+- **Lowest produce latency** — local disk write, no S3 round trip on the hot path.
+- **ISR-quorum replication** with the full Jepsen-verified durability matrix.
+- **Hot reads served from memory / local disk**, not S3.
+- **Flush is decoupled from produce** — object-store latency gates backpressure, not every ack.
+
+**Cons.**
+
+- **Requires local disk** — one active segment per owned partition; provisioning is tied to
+  partition count and segment size.
+- **Node failure loses the unflushed tail** (acks bound this window).
+- **Disks must be managed per node**, in addition to object storage.
+
+### Choosing a mode
+
+| Concern | `classic` | `diskless` |
+|---------|-----------|-----------|
+| Produce latency | Sub-millisecond (local disk) | S3 round trip per batch (~tens of ms) |
+| Local disk | Required | **Not required** |
+| Replication (ISR) | Supported | Not supported |
+| Read latency (hot data) | In-memory / local disk | S3 |
+| Nodes | Disk-provisioned | Stateless |
+| Object-store dependency | Async flush only | Synchronous produce path |
+| Jepsen evidence | Full fault matrix | S3-metastore correctness via integration tests |
+
+**Use `classic`** when you need the lowest latency, ISR-quorum durability, and sustained
+high throughput — and are willing to provision disks.
+
+**Use `diskless`** when you want stateless nodes, no disk fleet, and simpler operations —
+and can accept S3-latency produce acks with linger batching.
+
+See [Storage Modes](docs/storage-modes.md) for throughput characteristics, configuration,
+and metastore tuning.
+
+## Proven under faults — Jepsen
+
+Camu's distributed behavior isn't asserted, it's **exercised**. A five-node Jepsen harness
+(backed by MinIO) runs the full fault, read-mode, and recovery matrices **automatically
+every day in CI**, and writes every run's `results.edn`, history, and node logs under
+`jepsen/camu/store/`.
+
+Faults injected against both the HTTP and Kafka APIs:
+
+`kill` · `leader-kill` · `leader-pause-then-ack` · `partition` · `partition-ring` ·
+`pause` · `membership` · `rejoin` · `s3-partition` · `clock-skew` · combined faults
+
+Checkers run on every replicated run:
+
+`committed-durability` · `truncation-safety` · `single-leader` / `no-split-brain` ·
+`total-order` / `offset-monotonicity` · `hw-monotonicity` · `no-ghost-reads` ·
+`replica-convergence`
+
+What the evidence establishes:
+
+- **Acknowledged writes survive** the fault matrix — every acked produce appears in the
+  final partition drain after recovery.
+- **No ghost reads** — consumers never observe data that was never acknowledged.
+- **No split brain** — conflicting leadership is never observed; epoch fencing holds even
+  when a paused leader resumes after lease expiry (`leader-pause-then-ack`).
+- **Ordered, contiguous history** — offsets and the high watermark never duplicate, regress,
+  or gap.
+
+Two concrete, reproducible Kafka-API results: `leader-pause-then-ack` — **390 acked, 0
+lost**; `leader-kill` — **337 acked, 0 lost, 0 missing** (the base branch loses 81 records
+under the identical run). Availability stays in the **0.92–1.0** range even while nodes are
+being killed, partitioned, paused, and clock-skewed.
+
+This is verification in the open: the harness is [in-repo](jepsen/camu/README.md), the
+artifacts are persisted, and the [reliability doc](docs/reliability.md) tells you exactly
+what each checker establishes — and what it deliberately does not.
 
 ## Quick start
 
@@ -152,20 +297,20 @@ curl -X POST http://localhost:8080/v1/topics/events/messages \
 curl 'http://localhost:8080/v1/topics/events/partitions/0/messages?offset=0&limit=100'
 ```
 
-Create a typed, Iceberg-exported topic:
+Create a diskless, typed, Iceberg-exported topic:
 
 ```bash
 curl -X POST http://localhost:8080/v1/topics \
   -H 'Content-Type: application/json' \
   -d '{
-    "name":"orders","partitions":4,"export_enabled":true,
+    "name":"orders","partitions":4,"export_enabled":true,"storage_mode":"diskless",
     "schema":{"encoding":"json","fields":[{"name":"id","type":"int64","path":"$.id"},{"name":"sku","type":"string","path":"$.sku"}]}
   }'
 ```
 
-For a replicated topic, set `replication_factor` and `min_insync_replicas` at creation time.
-See the [API guide](docs/api.md) for request shapes, idempotent produce, typed schemas,
-Iceberg export, and Kafka behavior.
+For a replicated classic topic, set `replication_factor` and `min_insync_replicas` at
+creation time. See the [API guide](docs/api.md) for request shapes, idempotent produce,
+typed schemas, Iceberg export, and Kafka behavior.
 
 ## Documentation
 
@@ -176,19 +321,6 @@ Iceberg export, and Kafka behavior.
 - [Iceberg](docs/iceberg.md) — the export and query model.
 - [Reliability](docs/reliability.md) — guarantees, limits, and Jepsen evidence.
 - [Jepsen harness](jepsen/camu/README.md) — run commands and artifacts.
-
-## Verification
-
-Core distributed behavior is covered by integration tests and a five-node Jepsen harness
-backed by MinIO. The harness checks acknowledged-write durability, leader safety, ordering,
-high-watermark monotonicity, and replica convergence under faults — covering leader kills,
-pauses, partitions, clock skew, and object-store isolation across both the HTTP and Kafka
-APIs. The exact scope and latest reproducible runs are in
-[docs/reliability.md](docs/reliability.md).
-
-The `dynamodb` diskless metastore is exercised against a real DynamoDB in CI
-(`go test -tags dynamodb ./internal/diskless/` with `DYNAMODB_ENDPOINT` pointing at
-DynamoDB Local).
 
 ## License
 
