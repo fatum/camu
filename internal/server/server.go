@@ -129,6 +129,13 @@ type Server struct {
 	// stacking.
 	disklessCompactionBusy atomic.Bool
 
+	// disklessMergeExecSem bounds the number of concurrent diskless merge jobs
+	// executed across all partitions on this node. Merges are I/O-bound (S3
+	// reads/writes plus a catalog CAS) and each holds up to ~target_bytes in
+	// memory while concatenating sources, so a bound keeps a backlog drain from
+	// saturating the object store or ballooning memory.
+	disklessMergeExecSem chan struct{}
+
 	// topicDeletionCh is the bounded queue for async topic-deletion workers,
 	// so a long cleanup never blocks the leader's GC tick. topicDeletionInflight
 	// deduplicates markers already being cleaned.
@@ -209,13 +216,14 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	}
 
 	s := &Server{
-		cfg:              cfg,
-		s3Client:         s3Client,
-		topicStore:       meta.NewTopicStore(s3Client),
-		instanceID:       instanceID,
-		metrics:          metrics.NewRegistry(),
-		parquetConsumers: make(map[string]parquetConsumer),
-		schemaRegistry:   &schemaRegistry{s3: s3Client},
+		cfg:                  cfg,
+		s3Client:             s3Client,
+		topicStore:           meta.NewTopicStore(s3Client),
+		instanceID:           instanceID,
+		metrics:              metrics.NewRegistry(),
+		parquetConsumers:     make(map[string]parquetConsumer),
+		schemaRegistry:       &schemaRegistry{s3: s3Client},
+		disklessMergeExecSem: make(chan struct{}, cfg.Diskless.Compaction.MaxConcurrentMergesValue()),
 	}
 	s3Client.SetMetrics(s.metrics)
 	s.httpServer = &http.Server{Handler: s.publicRoutes()}

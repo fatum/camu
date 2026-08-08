@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/maksim/camu/internal/config"
@@ -79,10 +80,11 @@ func (s *Server) runDisklessCompactionTick(ctx context.Context) {
 }
 
 // runDisklessCompactionForPartition discovers merge runs and executes merge
-// jobs for one partition this node leads. Discovery is gated by
-// hasActiveSegmentMergeJob, which ignores delete_data-phase jobs so the next
-// merge can be scheduled as soon as the current one's refs are published; a
-// single per-partition job chain is what keeps runs strictly contiguous.
+// jobs for one partition this node leads. Discovery partitions eligible refs
+// into disjoint contiguous runs and enqueues one job per run; execution runs
+// all in-flight merge jobs concurrently under disklessMergeExecSem. Disjoint
+// jobs never touch the same refs, so each ReplaceSegmentRefs stays atomic and
+// a per-partition run chain is not needed.
 func (s *Server) runDisklessCompactionForPartition(ctx context.Context, tc meta.TopicConfig, partition int) {
 	if !s.isOwnedPartition(tc.Name, partition) {
 		return
@@ -106,12 +108,20 @@ func (s *Server) runDisklessCompactionForPartition(ctx context.Context, tc meta.
 		slog.Warn("diskless_compaction_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
 		return
 	}
+	var wg sync.WaitGroup
 	for _, job := range jobs {
 		if job.Type != PartitionJobTypeSegmentMerge {
 			continue
 		}
-		if err := s.partitionLeader().runJob(ctx, job); err != nil {
-			slog.Warn("diskless_compaction_job_failed", "topic", job.Topic, "partition", job.Partition, "job", job.ID, "error", err)
-		}
+		wg.Add(1)
+		go func(job PartitionJob) {
+			defer wg.Done()
+			s.disklessMergeExecSem <- struct{}{}
+			defer func() { <-s.disklessMergeExecSem }()
+			if err := s.partitionLeader().runJob(ctx, job); err != nil {
+				slog.Warn("diskless_compaction_job_failed", "topic", job.Topic, "partition", job.Partition, "job", job.ID, "error", err)
+			}
+		}(job)
 	}
+	wg.Wait()
 }
