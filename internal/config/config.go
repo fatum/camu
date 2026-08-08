@@ -123,6 +123,7 @@ type CompactionConfig struct {
 	MinSegments         int    `yaml:"min_segments"`           // merge only when at least this many eligible refs
 	TargetBytes         int64  `yaml:"target_bytes"`           // merge refs until approximately this total size
 	MaxSegmentsPerMerge int    `yaml:"max_segments_per_merge"` // cap a single merge (DynamoDB transactions allow at most 100)
+	MaxConcurrentMerges int    `yaml:"max_concurrent_merges"`  // bound on concurrent merge jobs across all partitions on a node
 	Grace               string `yaml:"grace"`                  // minimum age of a ref before it is eligible
 	DeleteGrace         string `yaml:"delete_grace"`           // delay before deleting compacted source data
 	Interval            string `yaml:"interval"`               // how often a node drives merge discovery and execution for the partitions it leads
@@ -132,6 +133,7 @@ const (
 	defaultCompactionMinSegments         = 4
 	defaultCompactionTargetBytes         = 64 << 20
 	defaultCompactionMaxSegmentsPerMerge = 90
+	defaultCompactionMaxConcurrentMerges = 4
 	defaultCompactionGrace               = 60 * time.Second
 	defaultCompactionDeleteGrace         = 5 * time.Minute
 	// DefaultCompactionInterval is how often the dedicated compaction loop
@@ -189,6 +191,17 @@ func (c CompactionConfig) MaxSegmentsPerMergeValue() int {
 		return maxCompactionSegmentsPerMerge
 	}
 	return max
+}
+
+// MaxConcurrentMergesValue returns the bound on concurrent merge jobs across
+// all partitions on a node. Parallel disjoint-range merges drain large
+// backlogs faster than a single serial chain while each job's
+// ReplaceSegmentRefs stays within the metastore's per-transaction item limit.
+func (c CompactionConfig) MaxConcurrentMergesValue() int {
+	if c.MaxConcurrentMerges <= 0 {
+		return defaultCompactionMaxConcurrentMerges
+	}
+	return c.MaxConcurrentMerges
 }
 
 func (c CompactionConfig) GraceDuration() (time.Duration, error) {

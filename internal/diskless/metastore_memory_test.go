@@ -83,13 +83,20 @@ func TestMemoryMetaStore_CommitDeduplicatesInWindowOldReplayAndRejectsRotatedOut
 	require.Equal(t, int64(6), head)
 }
 
-func TestMemoryMetaStore_CommitRequiresInitialProducerSequenceZero(t *testing.T) {
+func TestMemoryMetaStore_CommitBaselinesProducerAtFirstSequence(t *testing.T) {
 	ms := NewMemoryMetaStore()
-	_, err := ms.CommitUploadedBatches(context.Background(), []UploadedBatch{{BatchID: "object:0:10", FileKey: "object", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, ProducerID: 3, Sequence: 1}})
-	require.ErrorIs(t, err, ErrSequenceGap)
-	head, err := ms.GetCommittedHead(context.Background(), "t", 0)
+	ctx := context.Background()
+	// Kafka records the client's initial sequence and validates contiguity
+	// from there; a fresh producer may begin at any sequence.
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "object:0:10", FileKey: "object", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, ProducerID: 3, Sequence: 7}})
 	require.NoError(t, err)
-	require.Zero(t, head)
+	require.Equal(t, int64(0), first[0].BaseOffset)
+	// Contiguity is enforced from the baseline: skipping 8 is a gap.
+	_, err = ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "gap:0:10", FileKey: "gap", Topic: "t", Partition: 0, Count: 1, ByteLength: 10, ProducerID: 3, Sequence: 9}})
+	require.ErrorIs(t, err, ErrSequenceGap)
+	head, err := ms.GetCommittedHead(ctx, "t", 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), head)
 }
 
 func TestMemoryMetaStore_CommitMultipleBatchesAtomically(t *testing.T) {
@@ -123,15 +130,19 @@ func TestMemoryMetaStore_CommitRejectsCrossPartitionBatch(t *testing.T) {
 	require.Zero(t, head)
 }
 
-func TestMemoryMetaStore_ConcurrentProducerCannotCommitSequenceOneFirst(t *testing.T) {
+func TestMemoryMetaStore_ProducerBaselineAtNonZeroSequence(t *testing.T) {
 	ctx := context.Background()
 	ms := NewMemoryMetaStore()
-	_, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
-	require.ErrorIs(t, err, ErrSequenceGap)
-	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "zero", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 0}})
+	// A producer beginning at sequence 1 records its baseline and commits.
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
 	require.NoError(t, err)
 	require.Equal(t, int64(0), first[0].BaseOffset)
-	next, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
+	// The next contiguous batch commits normally.
+	next, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "two", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 2}})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), next[0].BaseOffset)
+	// An exact retry of the baseline is deduplicated.
+	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one-retry", FileKey: "f2", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
+	require.NoError(t, err)
+	require.True(t, retry[0].Duplicate)
 }

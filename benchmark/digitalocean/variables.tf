@@ -81,3 +81,45 @@ variable "droplet_size" {
   type        = string
   default     = "s-4vcpu-8gb"
 }
+
+variable "benchmark_droplet_size" {
+  description = "DigitalOcean droplet plan for benchmark client nodes."
+  type        = string
+  default     = "s-2vcpu-4gb"
+}
+
+variable "benchmark_image" {
+  description = "Docker image for the benchmark service."
+  type        = string
+  default     = ""
+}
+
+variable "benchmark_rate" {
+  description = "Records per second per topic for the benchmark service."
+  type        = number
+  default     = 10000
+}
+
+variable "benchmark_topics" {
+  description = "Comma-separated topic names for the benchmark service to test."
+  type        = string
+  default     = ""
+}
+
+variable "benchmark_storage_modes" {
+  description = "Comma-separated storage modes matching benchmark_topics."
+  type        = string
+  default     = ""
+}
+
+variable "benchmark_partitions" {
+  description = "Number of partitions for benchmark topics."
+  type        = number
+  default     = 12
+}
+
+variable "benchmark_message_bytes" {
+  description = "Record size in bytes for benchmark service."
+  type        = number
+  default     = 1024
+}

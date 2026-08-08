@@ -43,20 +43,21 @@ func (s *Server) rollDisklessMetadata(ctx context.Context, tc meta.TopicConfig, 
 	}
 }
 
-// discoverDisklessSegmentMergeJobs merges contiguous runs of small committed
-// segments below the committed watermark. It never advances the watermark and
-// only touches refs older than the grace period.
+// discoverDisklessSegmentMergeJobs partitions the eligible committed refs into
+// one or more disjoint contiguous runs below the committed watermark and
+// enqueues a merge job per run, so a large backlog is compacted by parallel
+// merges instead of one serial chain. It never advances the watermark and only
+// touches refs older than the grace period. Runs never overlap refs covered by
+// a merge job already in flight (owned by this leader, before delete_data), so
+// concurrent jobs stay disjoint and each ReplaceSegmentRefs remains atomic.
 func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.TopicConfig, identity PartitionIdentity, jobs []PartitionJob) {
 	cfg := s.cfg.Diskless.Compaction
 	if !cfg.Enabled || s.disklessMeta == nil {
 		return
 	}
-	active, err := s.hasActiveSegmentMergeJob(ctx, identity, jobs)
+	inFlight, err := s.disklessMergeInFlightRanges(ctx, identity, jobs)
 	if err != nil {
 		slog.Warn("diskless_merge_stale_cleanup_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
-		return
-	}
-	if active {
 		return
 	}
 	committed, err := s.disklessMeta.GetCommittedHead(ctx, tc.Name, identity.Partition)
@@ -86,53 +87,115 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 	graceCutoff := time.Now().Add(-grace)
 	retentionCutoff := time.Now().Add(-tc.Retention)
 	maxSegments := s.effectiveDisklessMergeMaxSegments(cfg)
+	minSegments := cfg.MinSegmentsValue()
 
 	var run []diskless.SegmentRef
 	var total int64
+	flushRun := func() {
+		if len(run) >= minSegments {
+			job, err := buildDisklessMergeJob(tc.Name, identity.Partition, identity, run)
+			if err != nil {
+				slog.Warn("diskless_merge_job_build_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
+			} else if err := s.putPartitionJob(ctx, job); err != nil {
+				slog.Warn("diskless_merge_enqueue_failed", "topic", tc.Name, "partition", identity.Partition, "job", job.ID, "error", err)
+			}
+		}
+		run = nil
+		total = 0
+	}
+
 	for _, ref := range refs {
 		if ref.EndOffset > committed {
 			break // beyond the committed watermark
 		}
 		if !ref.CreatedAt.After(retentionCutoff) {
 			// Retention will delete this ref and its data in the same tick;
-			// never merge a retention-pending source.
-			if len(run) > 0 {
-				break // retention-pending ref inside the run: stop.
-			}
-			continue // skip the retention-pending prefix
+			// never merge a retention-pending source. It is a run boundary.
+			flushRun()
+			continue
 		}
 		if ref.CreatedAt.After(graceCutoff) {
-			break // too recent; stop the run
+			break // too recent; everything after is the unmerged tail
+		}
+		if disklessRangeCovers(inFlight, ref.BaseOffset) {
+			// A merge job in flight owns this range; never schedule overlapping
+			// work. The covered refs are a boundary for the current run.
+			flushRun()
+			continue
 		}
 		if ref.ByteLength >= target {
-			// Already compaction-sized: skip an oversized prefix so a prior
-			// run's merged object never blocks the small refs behind it, and
-			// terminate a run that reaches one.
-			if len(run) > 0 {
-				break
-			}
+			// Already compaction-sized: a boundary. Skip the oversized ref so a
+			// prior run's merged object never blocks the small refs behind it.
+			flushRun()
 			continue
 		}
 		if len(run) > 0 && ref.BaseOffset != run[len(run)-1].EndOffset {
-			break // gap; stop the run
+			flushRun() // gap: terminate the run, keep scanning after it
 		}
 		run = append(run, ref)
 		total += ref.ByteLength
-		if len(run) >= maxSegments || total >= target {
-			break
+		if len(run) >= maxSegments {
+			flushRun()
+			continue
+		}
+		// The byte target is approximate; never let it starve the run below
+		// min_segments. A frontier ref just under the target otherwise fills
+		// the byte budget and leaves room for only a couple of small refs, so
+		// the run is rejected below the minimum and the partition stalls
+		// until enough new data happens to accumulate.
+		if total >= target && len(run) >= minSegments {
+			flushRun()
+			continue
 		}
 	}
-	if len(run) < cfg.MinSegmentsValue() {
-		return
+	flushRun()
+}
+
+// disklessMergeInFlightRanges returns the offset ranges covered by diskless
+// merge jobs that are still in flight: owned by the current leader and not yet
+// past publish_meta. Jobs whose owner or epoch no longer match the current
+// leader can never run (CanRunOwnerJob requires an exact match), so they are
+// stale: deleting them unblocks compaction. A job in the delete_data phase has
+// already published its merged ref (publish_meta is done) and only awaits
+// source-data deletion, so its range is no longer part of the ref list and must
+// not gate discovery.
+func (s *Server) disklessMergeInFlightRanges(ctx context.Context, identity PartitionIdentity, jobs []PartitionJob) ([][2]int64, error) {
+	var inFlight [][2]int64
+	for _, job := range jobs {
+		if job.Type != PartitionJobTypeSegmentMerge {
+			continue
+		}
+		if job.ExpectedOwner != identity.Leader || job.ExpectedEpoch != identity.LeaderEpoch {
+			slog.Warn("segment_merge_job_stale",
+				"topic", job.Topic, "partition", job.Partition, "job", job.ID,
+				"expected_owner", job.ExpectedOwner, "expected_epoch", job.ExpectedEpoch,
+				"leader", identity.Leader, "epoch", identity.LeaderEpoch)
+			if err := s.deletePartitionJob(ctx, job.Topic, job.Partition, job.ID); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if job.Phase == PartitionJobPhaseDeleteData {
+			continue // merged ref is authoritative; sources are no longer refs
+		}
+		var payload DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil || len(payload.Sources) == 0 {
+			continue // not a diskless merge job (e.g. classic) or malformed
+		}
+		inFlight = append(inFlight, [2]int64{payload.Sources[0].BaseOffset, payload.Sources[len(payload.Sources)-1].EndOffset})
 	}
-	job, err := buildDisklessMergeJob(tc.Name, identity.Partition, identity, run)
-	if err != nil {
-		slog.Warn("diskless_merge_job_build_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
-		return
+	return inFlight, nil
+}
+
+// disklessRangeCovers reports whether any in-flight merge range contains the
+// ref starting at baseOffset.
+func disklessRangeCovers(inFlight [][2]int64, baseOffset int64) bool {
+	for _, r := range inFlight {
+		if baseOffset >= r[0] && baseOffset < r[1] {
+			return true
+		}
 	}
-	if err := s.putPartitionJob(ctx, job); err != nil {
-		slog.Warn("diskless_merge_enqueue_failed", "topic", tc.Name, "partition", identity.Partition, "job", job.ID, "error", err)
-	}
+	return false
 }
 
 // maxDisklessMergeSegmentsUnbounded is the per-run file-count safety cap for

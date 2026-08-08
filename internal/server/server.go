@@ -129,6 +129,13 @@ type Server struct {
 	// stacking.
 	disklessCompactionBusy atomic.Bool
 
+	// disklessMergeExecSem bounds the number of concurrent diskless merge jobs
+	// executed across all partitions on this node. Merges are I/O-bound (S3
+	// reads/writes plus a catalog CAS) and each holds up to ~target_bytes in
+	// memory while concatenating sources, so a bound keeps a backlog drain from
+	// saturating the object store or ballooning memory.
+	disklessMergeExecSem chan struct{}
+
 	// topicDeletionCh is the bounded queue for async topic-deletion workers,
 	// so a long cleanup never blocks the leader's GC tick. topicDeletionInflight
 	// deduplicates markers already being cleaned.
@@ -209,13 +216,14 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	}
 
 	s := &Server{
-		cfg:              cfg,
-		s3Client:         s3Client,
-		topicStore:       meta.NewTopicStore(s3Client),
-		instanceID:       instanceID,
-		metrics:          metrics.NewRegistry(),
-		parquetConsumers: make(map[string]parquetConsumer),
-		schemaRegistry:   &schemaRegistry{s3: s3Client},
+		cfg:                  cfg,
+		s3Client:             s3Client,
+		topicStore:           meta.NewTopicStore(s3Client),
+		instanceID:           instanceID,
+		metrics:              metrics.NewRegistry(),
+		parquetConsumers:     make(map[string]parquetConsumer),
+		schemaRegistry:       &schemaRegistry{s3: s3Client},
+		disklessMergeExecSem: make(chan struct{}, cfg.Diskless.Compaction.MaxConcurrentMergesValue()),
 	}
 	s3Client.SetMetrics(s.metrics)
 	s.httpServer = &http.Server{Handler: s.publicRoutes()}
@@ -1282,8 +1290,12 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 		slog.Warn("initPartitionAsLeader: ensure active segment before recovery", "topic", topic, "partition", pid, "error", err)
 	}
 
-	// Recover true local log end from native storage.
-	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
+	// Recover the true durable log end: the local native tail plus any
+	// committed prefix materialized in the S3-refreshed index. A promoted node
+	// whose local tail lags the committed prefix (restart, crash, slow
+	// follower) must start its epoch at the durable end, or the boundary would
+	// regress below prior epochs and the history could never accept it.
+	logEnd := s.partitionManager.recoverTrueLogEnd(topic, pid)
 
 	// Load epoch history from S3 (authoritative), fall back to local file,
 	// or use existing epochHistory if S3 is unavailable.
@@ -1309,7 +1321,9 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	}
 	ehChanged := !hasCurrentEpoch
 	if !hasCurrentEpoch {
-		if err := eh.Ensure(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
+		// EnsureBoundary heals stale or regressed entries (see the method
+		// contract) instead of wedging the promotion like a plain Ensure.
+		if err := eh.EnsureBoundary(replication.EpochEntry{Epoch: pa.LeaderEpoch, StartOffset: logEnd}); err != nil {
 			slog.Error("initPartitionAsLeader: invalid epoch history", "topic", topic, "partition", pid, "error", err)
 			return
 		}
@@ -1691,10 +1705,33 @@ func (s *Server) runMaintenancePass() {
 		slog.Warn("maintenance: list topics", "error", err)
 		return
 	}
-	fileIdx := s.buildDisklessFileIndex(ctx)
+	fileIdx, idxErr := s.buildDisklessFileIndex(ctx)
 	s.runPartitionMaintenance(ctx, topics, fileIdx)
+	// Topics pending deletion are no longer in the topic registry, so the
+	// per-partition maintenance no longer reconciles them. Each node must stop
+	// its own export consumers AND drop its local partition runtime state
+	// (segments, epoch sidecars, in-memory partition state) for every pending
+	// deletion. Otherwise a recreated topic's partitions recover the stale
+	// local segments and epoch history of the deleted topic, breaking leader
+	// initialization ("invalid epoch history") so the ISR never forms and
+	// acks=all produce hangs.
+	if pending, err := s.listTopicDeletions(ctx); err == nil {
+		for _, rec := range pending {
+			s.stopTopicParquetConsumers(rec.Topic)
+			s.dropTopicRuntime(rec.Topic.Name)
+		}
+	} else {
+		slog.Warn("maintenance: list topic deletions", "error", err)
+	}
 	if s.amLeader() {
 		s.coordinationGC(ctx, topics)
+		if idxErr != nil {
+			// Fail closed: an incomplete reference index would make the orphan
+			// sweeps treat checkpoint-referenced data files as unreferenced and
+			// delete them, permanently losing committed records.
+			slog.Warn("diskless_orphan_sweep_skipped_index_failed", "error", idxErr)
+			return
+		}
 		s.sweepDisklessOrphans(ctx, fileIdx)
 		s.sweepDisklessArchiveOrphans(ctx, fileIdx)
 	}

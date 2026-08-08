@@ -310,6 +310,24 @@
     (teardown! [this test]
       (c/on-nodes test (:nodes test) (fn [_ _] (unblock-s3! s3-host))))))
 
+(defn s3-unavailable-nemesis
+  "A nemesis that blocks EVERY node's access to MinIO port 9000, simulating a
+   full object-store outage rather than a single-node partition. All camu
+   nodes lose S3 simultaneously; produces must pause (diskless flush/commit
+   cannot reach S3) instead of dropping data, and after S3 returns every
+   acknowledged record must be durable and gapless."
+  [s3-host]
+  (reify nemesis/Nemesis
+    (setup! [this test] this)
+    (invoke! [this test op]
+      (case (:value op)
+        :start (do (c/on-nodes test (:nodes test) (fn [_ _] (block-s3! s3-host)))
+                   (assoc op :value :s3-unavailable))
+        :stop  (do (c/on-nodes test (:nodes test) (fn [_ _] (unblock-s3! s3-host)))
+                   (assoc op :value :s3-available))))
+    (teardown! [this test]
+      (c/on-nodes test (:nodes test) (fn [_ _] (unblock-s3! s3-host))))))
+
 (defn clock-skew-nemesis
   "A nemesis that introduces clock drift on nodes."
   []
@@ -418,8 +436,8 @@
 (defn composed-nemesis
   "Returns a nemesis that composes fault types specified in the faults set.
    Supported fault keys: :kill :partition :pause :rejoin :leave :membership
-                         :s3-partition :clock-skew :leader-kill :partition-ring
-                         :leader-pause-then-ack
+                         :s3-partition :s3-unavailable :clock-skew :leader-kill
+                         :partition-ring :leader-pause-then-ack
 
    For :kill — start = SIGKILL process, stop = restart process
    For :leave — start = graceful SIGTERM (deregister), stop = restart (rejoin)
@@ -455,6 +473,9 @@
 
       (:s3-partition faults)
       (assoc #{:s3-partition} (s3-partition-nemesis "minio"))
+
+      (:s3-unavailable faults)
+      (assoc #{:s3-unavailable} (s3-unavailable-nemesis "minio"))
 
       (:clock-skew faults)
       (assoc #{:clock-skew} (clock-skew-nemesis))

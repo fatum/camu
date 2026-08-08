@@ -64,4 +64,21 @@ func TestIdempotentSequenceValidation(t *testing.T) {
 
 		})
 	}
+
+	// A fresh producer may begin at any sequence: Kafka records the client's
+	// initial sequence and validates contiguity from there. Requiring 0 would
+	// reject valid clients that increment before their first send.
+	for name, meta := range map[string]MetaStore{
+		"memory": NewMemoryMetaStore(),
+		"s3":     NewS3MetaStore(testS3Client(t)),
+	} {
+		t.Run("initial-"+name, func(t *testing.T) {
+			results, err := meta.CommitUploadedBatches(ctx, []UploadedBatch{
+				{BatchID: "fresh", FileKey: "uploaded", Topic: "t2", Partition: 0, Count: 5, ProducerID: 99, Sequence: 7},
+			})
+			require.NoError(t, err)
+			require.Equal(t, int64(0), results[0].BaseOffset)
+			require.False(t, results[0].Duplicate)
+		})
+	}
 }

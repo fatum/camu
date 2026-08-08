@@ -5,6 +5,7 @@ package diskless
 import (
 	"context"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,11 @@ func dynamoTestStore(t *testing.T) *DynamoMetaStore {
 	if endpoint == "" {
 		endpoint = "http://localhost:8000"
 	}
-	prefix := "test_" + strings.ReplaceAll(strings.ToLower(t.Name()), "/", "_")
+	// DynamoDB Local persists tables across runs (Close is a no-op), so a
+	// name-derived prefix alone would leak state into the next run: the first
+	// commit of a fresh producer would be mistaken for an idempotent retry.
+	// A per-invocation suffix guarantees each test sees an empty table.
+	prefix := "test_" + strings.ReplaceAll(strings.ToLower(t.Name()), "/", "_") + "_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	ctx := context.Background()
 	store, err := NewDynamoMetaStore(ctx, DynamoMetaStoreConfig{
 		TablePrefix: prefix,
@@ -97,23 +102,27 @@ func TestDynamoMetaStore_CommitIdempotentRetryDeduplicatesAcrossBatches(t *testi
 	assert.Equal(t, int64(2), head)
 }
 
-// TestDynamoMetaStore_CommitRequiresInitialProducerSequenceZero verifies a
-// producer's first committed batch must carry sequence 0, which enforces
-// cross-node ordering of a single producer's batches.
-func TestDynamoMetaStore_CommitRequiresInitialProducerSequenceZero(t *testing.T) {
+// TestDynamoMetaStore_ProducerBaselineAtNonZeroSequence verifies a producer may
+// begin at any initial sequence: the first committed batch records the baseline
+// and commits, contiguity is enforced from there, and an exact retry of the
+// baseline is deduplicated. (The old invariant that the initial sequence must
+// be zero was removed in favor of accepting any baseline.)
+func TestDynamoMetaStore_ProducerBaselineAtNonZeroSequence(t *testing.T) {
 	ctx := context.Background()
 	ms := dynamoTestStore(t)
 
-	_, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
-	require.Error(t, err, "initial sequence 1 must be rejected")
-
-	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "zero", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 0}})
-	require.NoError(t, err)
+	first, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
+	require.NoError(t, err, "initial sequence 1 must record the baseline and commit")
 	require.Len(t, first, 1)
 	assert.Equal(t, int64(0), first[0].BaseOffset)
 
-	next, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
+	next, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "two", FileKey: "f", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 2}})
 	require.NoError(t, err)
 	require.Len(t, next, 1)
 	assert.Equal(t, int64(1), next[0].BaseOffset)
+
+	retry, err := ms.CommitUploadedBatches(ctx, []UploadedBatch{{BatchID: "one-retry", FileKey: "f2", Topic: "t", Partition: 0, Count: 1, ByteLength: 1, ProducerID: 7, Sequence: 1}})
+	require.NoError(t, err)
+	require.Len(t, retry, 1)
+	assert.True(t, retry[0].Duplicate, "exact retry of the baseline must be deduplicated")
 }

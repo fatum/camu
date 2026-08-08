@@ -390,6 +390,13 @@
    [nil "--num-partitions N" "Number of partitions in the Jepsen topic"
     :default default-partitions
     :parse-fn #(Integer/parseInt %)]
+   [nil "--storage-mode MODE" "Topic storage mode: classic or diskless"
+    :default :classic
+    :parse-fn (fn [s]
+                (let [m (keyword s)]
+                  (if (#{:classic :diskless} m)
+                    m
+                    (throw (IllegalArgumentException. (str "invalid storage mode: " s))))))]
    [nil "--faults FAULTS" "Comma-separated fault types: kill,partition,partition-ring,pause,leader-kill,leader-pause-then-ack"
     :default #{:kill}
     :parse-fn (fn [s] (set (map keyword (clojure.string/split s #","))))]

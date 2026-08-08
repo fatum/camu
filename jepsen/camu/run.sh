@@ -16,6 +16,7 @@ SEGMENT_MAX_AGE="${SEGMENT_MAX_AGE:-1m}"
 TOPIC_RETENTION="${TOPIC_RETENTION:-24h}"
 RETENTION_LIFECYCLE="${RETENTION_LIFECYCLE:-false}"
 TYPED="${TYPED:-false}"
+STORAGE_MODE="${STORAGE_MODE:-classic}"
 MINIO_USER="${MINIO_USER:-minioadmin}"
 MINIO_PASS="${MINIO_PASS:-minioadmin}"
 MINIO_BUCKET="${MINIO_BUCKET:-camu-data}"
@@ -101,6 +102,7 @@ compose run --rm \
     --camu-binary /jepsen/camu/camu \
     --faults $FAULTS \
     --api $API \
+    --storage-mode $STORAGE_MODE \
     --workload $WORKLOAD \
     --read-mode $READ_MODE \
     --kafka-port $KAFKA_PORT \

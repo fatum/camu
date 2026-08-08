@@ -34,6 +34,7 @@ const (
 	kafkaErrorUnknownTopicPartition int16 = 3
 	kafkaErrorLeaderNotAvailable    int16 = 5
 	kafkaErrorNotLeader             int16 = 6
+	kafkaErrorRequestTimedOut       int16 = 7
 	kafkaErrorTopicAlreadyExists    int16 = 36
 	kafkaErrorInvalidPartitions     int16 = 37
 	kafkaErrorInvalidReplication    int16 = 38
@@ -42,6 +43,7 @@ const (
 	kafkaErrorNotController         int16 = 41
 	kafkaErrorInvalidRequest        int16 = 42
 	kafkaErrorOutOfOrderSequence    int16 = 45
+	kafkaErrorDuplicateSequence     int16 = 46
 	kafkaErrorUnknownProducerID     int16 = 59
 )
 

@@ -49,8 +49,10 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 		slog.Warn("becomeLeader: ensure active segment", "topic", topic, "partition", pid, "error", err)
 	}
 
-	// 4. Recover the true local log end from native storage.
-	logEnd := s.partitionManager.recoverLocalLogEnd(topic, pid)
+	// 4. Recover the true durable log end (local tail plus object-store
+	// index). A promoted node whose local tail lags the committed prefix must
+	// start its epoch at the durable end, never at the local tail alone.
+	logEnd := s.partitionManager.recoverTrueLogEnd(topic, pid)
 
 	// 5. Recover the most advanced local ISR tail. The persisted controller HW
 	// is asynchronous and can lag acknowledged replicated writes.
@@ -91,8 +93,12 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 		}
 	}
 	if !hasCurrentEpoch {
-		if err := eh.Ensure(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd}); err != nil {
-			return fmt.Errorf("validate controller epoch history: %w", err)
+		// EnsureBoundary re-bases the history on the durable log end: it drops
+		// entries recorded above it (a peer's local-tail boundary, retention, or
+		// a previous topic generation) instead of wedging promotion or nuking
+		// the whole history and losing the valid prefix.
+		if err := eh.EnsureBoundary(replication.EpochEntry{Epoch: req.Epoch, StartOffset: logEnd}); err != nil {
+			return fmt.Errorf("record controller epoch history: %w", err)
 		}
 	}
 

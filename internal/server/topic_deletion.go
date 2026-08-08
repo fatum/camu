@@ -89,7 +89,22 @@ func (s *Server) enqueueTopicDeletion(ctx context.Context, tc meta.TopicConfig) 
 		return err
 	}
 	s.dropTopicRuntime(tc.Name)
+	// A pending deletion must stop the topic's activity: stop this node's
+	// parquet export consumers immediately, and rely on the maintenance pass
+	// (which reconciles pending deletions on every node) to stop consumers on
+	// the other nodes that lead the topic's partitions.
+	s.stopTopicParquetConsumers(tc)
 	return nil
+}
+
+// stopTopicParquetConsumers stops this node's Iceberg export consumers for all
+// partitions of tc. The per-partition maintenance only reconciles consumers
+// for topics present in the topic registry, so consumers of a deleted topic
+// would otherwise churn forever reloading a missing topic.
+func (s *Server) stopTopicParquetConsumers(tc meta.TopicConfig) {
+	for p := 0; p < tc.Partitions; p++ {
+		s.stopParquetConsumer(tc.Name, p)
+	}
 }
 
 func (s *Server) dropTopicRuntime(topic string) {
@@ -184,15 +199,94 @@ func (s *Server) processTopicDeletion(ctx context.Context, rec topicDeletionReco
 		return fmt.Errorf("delete topic s3 data: %w", err)
 	}
 	if rec.Topic.StorageMode == meta.StorageModeDiskless && s.disklessMeta != nil {
+		if err := s.deleteDisklessDataFiles(ctx, rec.Topic); err != nil {
+			return fmt.Errorf("delete diskless data files: %w", err)
+		}
 		if err := s.disklessMeta.DeleteTopic(ctx, rec.Topic.Name); err != nil {
 			return fmt.Errorf("delete diskless metadata: %w", err)
 		}
+	}
+	if err := s.deleteTopicPartitionJobs(ctx, rec.Topic.Name); err != nil {
+		return fmt.Errorf("delete partition jobs: %w", err)
+	}
+	if err := s.deleteTopicPipelineCheckpoints(ctx, rec.Topic.Name); err != nil {
+		return fmt.Errorf("delete pipeline checkpoints: %w", err)
+	}
+	if err := s.deleteTopicPrefix(ctx, "_diskless_merge/"+rec.Topic.Name+"/"); err != nil {
+		return fmt.Errorf("delete diskless merge data: %w", err)
 	}
 	s.dropTopicRuntime(rec.Topic.Name)
 	if err := s.s3Client.Delete(ctx, topicDeletionKey(rec.Topic.Name)); err != nil {
 		return fmt.Errorf("delete topic deletion marker: %w", err)
 	}
 	slog.Info("topic_delete_completed", "topic", rec.Topic.Name)
+	return nil
+}
+
+// deleteTopicPartitionJobs removes all partition jobs for topic from S3.
+func (s *Server) deleteTopicPartitionJobs(ctx context.Context, topic string) error {
+	prefix := partitionJobPrefix + topic + "/"
+	return s.deleteTopicPrefix(ctx, prefix)
+}
+
+// deleteTopicPipelineCheckpoints removes all pipeline checkpoints for topic.
+func (s *Server) deleteTopicPipelineCheckpoints(ctx context.Context, topic string) error {
+	for _, pipeline := range []string{"iceberg-export"} {
+		prefix := fmt.Sprintf("_meta/pipelines/%s/%s/", pipeline, topic)
+		if err := s.deleteTopicPrefix(ctx, prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteDisklessDataFiles deletes _diskless/ backing data files that are
+// referenced by the topic's segment catalogs and have no references from any
+// other topic (a single flush file may contain batches from multiple topics).
+func (s *Server) deleteDisklessDataFiles(ctx context.Context, tc meta.TopicConfig) error {
+	seen := make(map[string]bool)
+	for partition := 0; partition < tc.Partitions; partition++ {
+		refs, err := s.disklessMeta.QuerySegments(ctx, tc.Name, partition, 0, 1<<30)
+		if err != nil {
+			return fmt.Errorf("query segments %s/%d: %w", tc.Name, partition, err)
+		}
+		for _, ref := range refs {
+			if ref.FileKey != "" {
+				seen[ref.FileKey] = true
+			}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	fileKeys := make([]string, 0, len(seen))
+	for k := range seen {
+		fileKeys = append(fileKeys, k)
+	}
+	deletable, err := s.disklessMeta.PlanUnreferencedFileDeletes(ctx, fileKeys)
+	if err != nil {
+		return fmt.Errorf("plan unreferenced deletes: %w", err)
+	}
+	for _, fileKey := range deletable {
+		if err := s.s3Client.Delete(ctx, fileKey); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("delete diskless data %s: %w", fileKey, err)
+		}
+	}
+	return nil
+}
+
+// deleteTopicPrefix deletes all S3 objects under prefix. Missing objects are
+// ignored so re-creation after a partial cleanup is safe.
+func (s *Server) deleteTopicPrefix(ctx context.Context, prefix string) error {
+	keys, err := s.s3Client.List(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", prefix, err)
+	}
+	for _, key := range keys {
+		if err := s.s3Client.Delete(ctx, key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("delete %s: %w", key, err)
+		}
+	}
 	return nil
 }
 
@@ -240,12 +334,22 @@ func (s *Server) spawnTopicDeletion(rec topicDeletionRecord) {
 
 func (s *Server) topicDeletionWorker() {
 	for rec := range s.topicDeletionCh {
-		if err := s.processTopicDeletion(s.topicDeletionCtx, rec); err != nil {
-			if s.topicDeletionCtx.Err() != nil {
-				slog.Warn("topic_delete_worker_aborted", "topic", rec.Topic.Name, "error", err)
-			} else {
-				slog.Warn("topic_delete_worker_failed", "topic", rec.Topic.Name, "error", err)
-			}
+		// Bound one cleanup so a stuck S3 step (e.g. under throttling) cannot
+		// occupy one of the topicDeletionWorkerCount workers forever and stall
+		// every queued deletion. processTopicDeletion is idempotent and
+		// crash-safe: on timeout the marker survives and a later GC tick
+		// re-spawns the cleanup.
+		ctx, cancel := context.WithTimeout(s.topicDeletionCtx, topicDeletionTimeout)
+		err := s.processTopicDeletion(ctx, rec)
+		cancel()
+		switch {
+		case err == nil:
+		case ctx.Err() == context.DeadlineExceeded:
+			slog.Warn("topic_delete_worker_timed_out", "topic", rec.Topic.Name, "error", err)
+		case s.topicDeletionCtx.Err() != nil:
+			slog.Warn("topic_delete_worker_aborted", "topic", rec.Topic.Name, "error", err)
+		default:
+			slog.Warn("topic_delete_worker_failed", "topic", rec.Topic.Name, "error", err)
 		}
 		s.topicDeletionMu.Lock()
 		delete(s.topicDeletionInflight, rec.Topic.Name)
@@ -258,6 +362,10 @@ const (
 	topicDeletionWorkerCount = 2
 	// topicDeletionQueueDepth bounds how many pending cleanups wait for a worker.
 	topicDeletionQueueDepth = 8
+	// topicDeletionTimeout bounds one cleanup so a stuck S3 step (e.g. under
+	// throttling) cannot occupy a worker forever; the marker survives a timeout
+	// and a later GC tick re-spawns the idempotent cleanup.
+	topicDeletionTimeout = 15 * time.Minute
 )
 
 // startTopicDeletionWorkers starts the bounded async cleanup workers. A long

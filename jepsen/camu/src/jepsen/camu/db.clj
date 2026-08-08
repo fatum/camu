@@ -22,6 +22,18 @@
         kafka-port  (:kafka-port test 9092)
         segment-max-size (:segment-max-size test 104857600)
         segment-max-age (:segment-max-age test "1m")
+        storage-mode (:storage-mode test :classic)
+        ;; Diskless topics are served entirely from the object store, so the
+        ;; nodes need the diskless metastore + compaction config.
+        diskless-cfg (when (= storage-mode :diskless)
+                       (str "diskless:\n"
+                            "  metastore: s3\n"
+                            "  compaction:\n"
+                            "    enabled: true\n"
+                            "    target_bytes: 67108864\n"
+                            "    max_segments_per_merge: 1024\n"
+                            "    grace: 5s\n"
+                            "    delete_grace: 30s\n"))
         ;; Always turn on async parquet/Iceberg export; external engines
         ;; query the exported projection.
         config      (str "server:\n"
@@ -38,6 +50,7 @@
                          "    access_key: \"minioadmin\"\n"
                          "    secret_key: \"minioadmin\"\n"
                          "\n"
+                         diskless-cfg
                          "maintenance:\n"
                          "  parquet_export:\n"
                          "    enabled: true\n"

@@ -5,6 +5,14 @@ import (
 	"fmt"
 )
 
+// ErrProduceRetryable marks a diskless produce failure where the batch was
+// NOT recorded in the metastore (upload/commit aborted by a transient
+// object-store error or deadline). Kafka clients must retry such a batch with
+// the same producer sequence, so the produce path maps it to a retriable
+// Kafka error. Surfacing it as a non-retriable error would make an idempotent
+// client advance past the unrecorded batch and create a permanent gap.
+var ErrProduceRetryable = errors.New("diskless produce retryable failure")
+
 // Idempotent-produce sequence errors. They mirror the classic path's
 // ErrSequenceGap / out-of-order rejection so HTTP produce maps them to 422.
 var (
@@ -37,8 +45,10 @@ func checkProducerSequence(producerID int64, allocSequence int64, _ int, prevFir
 }
 
 func checkInitialProducerSequence(producerID, sequence int64) error {
-	if sequence != 0 {
-		return fmt.Errorf("%w: producer %d sent initial sequence %d, expected 0", ErrSequenceGap, producerID, sequence)
-	}
+	// Kafka's idempotent protocol does not require a producer's first batch to
+	// carry sequence 0: the broker records whatever sequence the client starts
+	// at and validates contiguity from there. Requiring 0 would reject valid
+	// clients (e.g. clients that increment before their first send), so any
+	// initial sequence is accepted.
 	return nil
 }

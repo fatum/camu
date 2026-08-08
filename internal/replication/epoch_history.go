@@ -56,6 +56,27 @@ func (eh *EpochHistory) Ensure(entry EpochEntry) error {
 	return nil
 }
 
+// EnsureBoundary records the start of a new leader epoch at startOffset,
+// healing any history entries that disagree with the durable log. Entries
+// whose start offset is beyond startOffset describe data the durable log does
+// not contain (a node behind the committed prefix recorded them, or retention
+// or topic recreation removed the data), and entries at or beyond the new
+// epoch belong to a stale topic generation. Both would make Ensure reject the
+// boundary forever, wedging leader promotion; dropping them re-bases the
+// history on the data that actually exists while preserving the valid prefix
+// for divergence checks. Callers must pass the durable log end (local tail
+// plus object-store index), never the local tail alone.
+func (eh *EpochHistory) EnsureBoundary(entry EpochEntry) error {
+	kept := eh.Entries[:0]
+	for _, existing := range eh.Entries {
+		if existing.StartOffset <= entry.StartOffset && existing.Epoch < entry.Epoch {
+			kept = append(kept, existing)
+		}
+	}
+	eh.Entries = kept
+	return eh.Ensure(entry)
+}
+
 // EpochAt returns the leader epoch containing offset. An epoch begins at its
 // StartOffset and remains current until the next entry begins.
 func (eh *EpochHistory) EpochAt(offset uint64) (uint64, bool) {

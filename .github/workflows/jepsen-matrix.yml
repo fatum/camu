@@ -1,0 +1,85 @@
+name: Jepsen Matrix
+
+# Daily correctness matrix: runs the full Jepsen fault, read-mode, and
+# recovery matrices against the latest main commit. Each matrix script loops
+# through its own cases (see jepsen/camu/scripts/ for per-case faults and
+# durations) and tears down/rebuilds the local Docker cluster between cases.
+#
+# A run is considered failed when any Jepsen checker reports invalid results
+# (the Jepsen CLI exits nonzero, which `set -euo pipefail` in run.sh
+# propagates). A red daily job therefore means a real correctness regression.
+#
+# Trigger manually with "Run workflow" to run the matrix on demand
+# (e.g. before a release).
+on:
+  schedule:
+    # Every day at 05:00 UTC.
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jepsen-matrix:
+    name: ${{ matrix.script }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false # one failing matrix must not cancel the others
+      matrix:
+        script:
+          - fault-matrix-smoke.sh
+          - read-mode-matrix-smoke.sh
+          - recovery-matrix-smoke.sh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Run Jepsen matrix
+        run: bash jepsen/camu/scripts/${{ matrix.script }}
+        timeout-minutes: 100
+
+      - name: Summarize matrix results
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Jepsen matrix: ${{ matrix.script }}"
+            echo
+            found=0
+            while IFS= read -r results; do
+              found=1
+              run_dir="$(dirname "$results")"
+              name="${run_dir#jepsen/camu/store/}"
+              fails="$(grep -c ':valid? false' "$results" || true)"
+              unknown="$(grep -c ':valid? :unknown' "$results" || true)"
+              if [ "$fails" -gt 0 ]; then
+                status="FAIL"
+              elif [ "$unknown" -gt 0 ]; then
+                status="UNKNOWN"
+              else
+                status="PASS"
+              fi
+              echo "- \`$name\` — **$status**"
+            done < <(find jepsen/camu/store -name results.edn 2>/dev/null | sort)
+            [ "$found" -eq 1 ] || echo "_no results.edn found_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # store/latest and store/current are symlinks to the last run; drop them
+      # so artifact upload captures the real per-case timestamped run dirs only.
+      - name: Remove store convenience symlinks before upload
+        if: always()
+        run: rm -f jepsen/camu/store/latest jepsen/camu/store/current
+
+      - name: Upload Jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-matrix-${{ matrix.script }}
+          path: jepsen/camu/store/
+          retention-days: 14
+          if-no-files-found: warn

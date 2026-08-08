@@ -567,6 +567,11 @@ func (m *memBackend) equalsFile(ctx context.Context, key string, file io.ReadSee
 
 // ---- Real AWS S3 backend ----
 
+// s3RetryMaxAttempts bounds the AWS SDK retryer. The Standard mode backs off
+// with jitter between attempts; a higher cap makes the diskless flush/commit
+// path survive throttling bursts (503 SlowDown) instead of failing a produce.
+const s3RetryMaxAttempts = 8
+
 type awsS3Backend struct {
 	client *s3.Client
 	bucket string
@@ -583,6 +588,15 @@ func newS3Backend(cfg S3Config) (*awsS3Backend, error) {
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
 		))
 	}
+	// Be resilient to object-store throttling (503 SlowDown) and transient
+	// network failures: the Standard retryer backs off with jitter, and the
+	// default 3 attempts is far too easy to exhaust during a throttle burst.
+	// This covers the diskless flush/commit path so a produce is not failed
+	// just because one S3 call hit a momentary rate limit.
+	optFns = append(optFns,
+		awsconfig.WithRetryMaxAttempts(s3RetryMaxAttempts),
+		awsconfig.WithRetryMode(aws.RetryModeStandard),
+	)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), optFns...)
 	if err != nil {
@@ -624,10 +638,25 @@ func (b *awsS3Backend) put(ctx context.Context, key string, data []byte, opts Pu
 }
 
 func (b *awsS3Backend) putStream(ctx context.Context, key string, r io.Reader, size int64, opts PutOpts) error {
+	// The AWS SDK cannot compute a request-header checksum for an unseekable
+	// stream over plain HTTP ("unseekable stream is not supported without TLS
+	// and trailing checksum"), so streaming uploads against local MinIO and the
+	// Jepsen harness would fail and retry until the caller's context expires.
+	// Buffer unseekable readers (the diskless flush's concatenated in-memory
+	// batches) into a seekable bytes.Reader; seekable readers (bytes.Reader,
+	// *os.File) still stream without buffering.
+	body := r
+	if _, ok := r.(io.ReadSeeker); !ok {
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return fmt.Errorf("s3 buffer stream %q: %w", key, err)
+		}
+		body = bytes.NewReader(buf)
+	}
 	input := &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
 		Key:           aws.String(key),
-		Body:          r,
+		Body:          body,
 		ContentLength: aws.Int64(size),
 	}
 	if opts.ContentType != "" {

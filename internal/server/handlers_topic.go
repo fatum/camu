@@ -389,6 +389,14 @@ func (s *Server) handleListTopics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetTopic(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("topic")
+	// A topic pending deletion has its registry entry removed; surface the
+	// deletion state explicitly instead of a bare 404 so operators and tooling
+	// can distinguish "never existed" from "being deleted" and know that
+	// produce/consume/compaction/export for it are stopped.
+	if err := s.getTopicDeletion(r.Context(), name); err == nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"name": name, "status": "deleting"})
+		return
+	}
 	tc, err := s.topicStore.Get(r.Context(), name)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {

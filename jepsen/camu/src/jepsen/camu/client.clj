@@ -42,13 +42,16 @@
 
 (defn create-topic!
   "Creates the test topic. Idempotent — ignores 409 Conflict.
-   Accepts optional replication-factor and min-insync-replicas from test opts."
+   Accepts optional replication-factor, min-insync-replicas, and storage-mode
+   from test opts. Diskless topics are created with storage_mode diskless and
+   forced rf=1/minISR=1 (diskless topics do not replicate)."
   ([node topic]
    (create-topic! node topic {}))
   ([node topic opts]
    (try
-     (let [rf  (get opts :replication-factor 1)
-           mir (get opts :min-insync-replicas 1)
+     (let [diskless?  (= :diskless (get opts :storage-mode :classic))
+           rf  (if diskless? 1 (get opts :replication-factor 1))
+           mir (if diskless? 1 (get opts :min-insync-replicas 1))
            partitions (get opts :num-partitions 4)
            body (cond-> {:name       topic
                          :partitions partitions
@@ -56,6 +59,7 @@
                          ;; SQL workloads read the asynchronous Parquet view;
                          ;; exporting is explicitly opt-in per topic.
                          :export_enabled true}
+                  diskless? (assoc :storage_mode "diskless")
                   (> rf 1) (assoc :replication_factor  rf
                                   :min_insync_replicas mir))
            resp (http/post (str (base-url node) "/v1/topics")
@@ -321,18 +325,22 @@
 (defn s3-coordination-ready?
   "Returns true when S3 coordination state exists for every partition:
    the cluster leader lease exists, assignments cover all partitions, and
-   epoch/ISR objects exist per partition."
-  [topic num-partitions replication-factor]
+   epoch/ISR objects exist per partition. Diskless topics do not replicate,
+   so they have no epoch/ISR objects; assignments plus routing coverage is
+   their readiness signal."
+  [topic num-partitions replication-factor storage-mode]
   (let [{:keys [exit out]} (mc "cat" (s3-key (str "_coordination/assignments/" topic ".json")))]
     (when (zero? exit)
       (let [assignment (json/parse-string out true)
             partitions (:partitions assignment)
+            diskless?  (= storage-mode :diskless)
             epoch-files (mc-find-lines (str "_coordination/epochs/" topic))
             isr-files   (mc-find-lines (str "_coordination/isr/" topic))]
         (and (leader-lease-ready?)
              (= num-partitions (count partitions))
-             (= num-partitions (count epoch-files))
-             (= num-partitions (count isr-files))
+             (or diskless?
+                 (and (= num-partitions (count epoch-files))
+                      (= num-partitions (count isr-files))))
              (every?
               (fn [partition]
                 (when-let [entry (routing-partition assignment partition)]
@@ -493,7 +501,7 @@
 (defn wait-for-topic-ready!
   "Waits until at least one node reports complete routing for all partitions,
    then verifies the produce path works with a successful probe."
-  [nodes topic num-partitions replication-factor timeout-ms]
+  [nodes topic num-partitions replication-factor storage-mode timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
     (loop [last-state nil]
       (let [routing-ready (some (fn [n]
@@ -507,7 +515,7 @@
                                     (catch Exception _ false)))
                                 nodes)
             _ (mc-init!)
-            s3-ready (s3-coordination-ready? topic num-partitions replication-factor)
+            s3-ready (s3-coordination-ready? topic num-partitions replication-factor storage-mode)
             _ (maybe-info "S3 coordination readiness for" topic ":" s3-ready)
             produce-ready (and routing-ready
                                s3-ready
@@ -581,7 +589,8 @@
       ;; Topic names are unique per test run, so setup can be idempotent.
       (ensure-topic-created! (:nodes test) topic
                              (select-keys test [:replication-factor :min-insync-replicas
-                                                :num-partitions :topic-retention])
+                                                :num-partitions :topic-retention
+                                                :storage-mode])
                              60000)
       ;; All clients wait until routing exposes every partition and a probe produce
       ;; succeeds, so large-partition runs do not start against partial assignments.
@@ -589,6 +598,7 @@
                              topic
                              (get test :num-partitions 4)
                              (get test :replication-factor 1)
+                             (get test :storage-mode :classic)
                              60000
 ))
     this)

@@ -44,3 +44,13 @@ output "registry_name" {
 output "registry_endpoint" {
   value = digitalocean_container_registry.benchmark.endpoint
 }
+
+output "benchmark_client_ips" {
+  value = {
+    for name, node in digitalocean_droplet.benchmark_client : name => node.ipv4_address
+  }
+}
+
+output "kafka_brokers" {
+  value = join(",", [for node in digitalocean_droplet.camu : "${node.ipv4_address}:9092"])
+}

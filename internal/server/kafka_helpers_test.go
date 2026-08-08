@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/producer"
 )
@@ -26,6 +27,12 @@ func TestMapKafkaError(t *testing.T) {
 		{"backpressure wrapped", fmt.Errorf("batcher append: %w", producer.ErrBackpressure), kafkaErrorLeaderNotAvailable},
 		{"unknown producer", idempotency.ErrUnknownProducer, kafkaErrorUnknownProducerID},
 		{"sequence gap", idempotency.ErrSequenceGap, kafkaErrorOutOfOrderSequence},
+		{"duplicate sequence", idempotency.ErrDuplicateSequence, kafkaErrorDuplicateSequence},
+		{"diskless sequence gap", diskless.ErrSequenceGap, kafkaErrorOutOfOrderSequence},
+		{"diskless sequence gap wrapped", fmt.Errorf("diskless commit phase file_key=x topic=t partition=0: %w", diskless.ErrSequenceGap), kafkaErrorOutOfOrderSequence},
+		{"diskless out-of-order sequence", diskless.ErrOutOfOrderSequence, kafkaErrorOutOfOrderSequence},
+		{"diskless retryable produce", diskless.ErrProduceRetryable, kafkaErrorRequestTimedOut},
+		{"diskless retryable produce wrapped", fmt.Errorf("%w: commit uploaded batches t/0: s3 SlowDown", diskless.ErrProduceRetryable), kafkaErrorRequestTimedOut},
 		{"unmapped falls to unknown server", fmt.Errorf("some internal failure"), kafkaErrorUnknownServer},
 	}
 	for _, tc := range tests {
@@ -34,6 +41,17 @@ func TestMapKafkaError(t *testing.T) {
 				t.Fatalf("mapKafkaError(%v) = %d, want %d", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestMapKafkaErrorDisklessRetryableIsRetriableByClients pins the contract that
+// a failed-but-unrecorded diskless produce must map to a retriable Kafka error
+// (franz-go retries these with the same producer sequence). A non-retriable
+// code would make an idempotent client advance past the unrecorded batch and
+// permanently gap the partition.
+func TestMapKafkaErrorDisklessRetryableIsRetriableByClients(t *testing.T) {
+	if got := mapKafkaError(fmt.Errorf("%w: get upload manifest t/0: s3 SlowDown", diskless.ErrProduceRetryable)); got != kafkaErrorRequestTimedOut {
+		t.Fatalf("diskless transient failure = %d, want retriable REQUEST_TIMED_OUT (%d)", got, kafkaErrorRequestTimedOut)
 	}
 }
 

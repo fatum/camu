@@ -23,6 +23,12 @@ type Writer struct {
 	commitTails map[string]chan struct{}
 }
 
+// DisklessShardCount is the number of key prefixes under _diskless/ that raw
+// flush objects are spread across (seq % DisklessShardCount). The orphan sweep
+// lists these fixed shards in parallel instead of listing every flush object at
+// once, so listing cost and page count stay bounded as the log grows.
+const DisklessShardCount = 64
+
 type pendingBatch struct {
 	topic      string
 	partition  int
@@ -187,9 +193,13 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 	}
 
 	// 3. Upload before assigning a logical offset. The key is fixed across PUT
-	// retries; a failed PUT cannot change metadata.
+	// retries; a failed PUT cannot change metadata. The key carries the upload
+	// millis and a monotonic per-writer sequence for uniqueness (two flushes in
+	// the same millisecond must not collide), and is sharded by seq % N so the
+	// orphan sweep can list bounded prefixes in parallel instead of one giant
+	// listing. Nothing parses the key back; refs treat it as opaque.
 	seq := w.seq.Add(1) - 1
-	fileKey := fmt.Sprintf("_diskless/%s/%d-%d.data", w.nodeID, time.Now().UnixMilli(), seq)
+	fileKey := fmt.Sprintf("_diskless/%03d/%s-%d-%d.data", seq%DisklessShardCount, w.nodeID, time.Now().UnixMilli(), seq)
 	concat := newBatchConcatReader(entries)
 	backoff := 100 * time.Millisecond
 	var uploadErr error
@@ -202,9 +212,10 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 		}
 		select {
 		case <-ctx.Done():
-			w.sendError(entries, fmt.Errorf("diskless upload phase file_key=%s: %w (last upload error: %v)", fileKey, ctx.Err(), uploadErr))
+			err := fmt.Errorf("%w: diskless upload phase file_key=%s: %v (last upload error: %v)", ErrProduceRetryable, fileKey, ctx.Err(), uploadErr)
+			w.sendError(entries, err)
 			finishAllTurns()
-			return ctx.Err()
+			return err
 		case <-time.After(backoff):
 		}
 		if backoff < maxFlushRetryBackoff {
@@ -232,7 +243,7 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 				select {
 				case <-turn.previous:
 				case <-ctx.Done():
-					w.failChunk(entries, c.indexes, ctx.Err())
+					w.failChunk(entries, c.indexes, fmt.Errorf("%w: waiting to commit: %v", ErrProduceRetryable, ctx.Err()))
 					finishTurn(turn)
 					return
 				}
@@ -240,7 +251,7 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				w.failChunk(entries, c.indexes, ctx.Err())
+				w.failChunk(entries, c.indexes, fmt.Errorf("%w: waiting for commit slot: %v", ErrProduceRetryable, ctx.Err()))
 				finishTurn(turn)
 				return
 			}

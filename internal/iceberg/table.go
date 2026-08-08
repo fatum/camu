@@ -134,7 +134,9 @@ func (ts *TableStore) Create(ctx context.Context, topic string, topicSchema *met
 }
 
 // Load returns the current table metadata, or ErrNotFound when the table has
-// not been created.
+// not been created. When the version-hint points to a non-existent metadata
+// file, it scans backwards to self-heal from a CAS that succeeded server-side
+// while the client deleted the metadata file.
 func (ts *TableStore) Load(ctx context.Context, topic string) (*TableMetadata, error) {
 	hint, err := ts.objects.Get(ctx, ts.versionHintKey(topic))
 	if err != nil {
@@ -149,7 +151,27 @@ func (ts *TableStore) Load(ctx context.Context, topic string) (*TableMetadata, e
 	}
 	key, err := ts.metadataFileKeyForVersion(ctx, topic, version)
 	if err != nil {
-		return nil, err
+		if !isMetadataVersionNotFound(err) {
+			return nil, err
+		}
+		// Version-hint points to a version whose metadata file was lost
+		// (CAS race). Scan backwards to find the last reachable version.
+		for version > 0 {
+			version--
+			key, err = ts.metadataFileKeyForVersion(ctx, topic, version)
+			if err == nil {
+				break
+			}
+			if !isMetadataVersionNotFound(err) {
+				return nil, err
+			}
+		}
+		if version <= 0 && err != nil {
+			return nil, fmt.Errorf("iceberg table %q: no reachable metadata version found", topic)
+		}
+		// Self-heal the version hint. A blank etag makes this a best-effort
+		// overwrite; a concurrent commit may advance it further.
+		_, _ = ts.objects.ConditionalPut(ctx, ts.versionHintKey(topic), []byte(strconv.Itoa(version)), "")
 	}
 	encoded, err := ts.objects.Get(ctx, key)
 	if err != nil {
@@ -165,6 +187,10 @@ func (ts *TableStore) Load(ctx context.Context, topic string) (*TableMetadata, e
 		return nil, fmt.Errorf("iceberg table %q: %w", topic, err)
 	}
 	return &md, nil
+}
+
+func isMetadataVersionNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound) && strings.Contains(err.Error(), "metadata version")
 }
 
 // metadataFileKeyForVersion finds the metadata file for a version by listing
@@ -411,12 +437,26 @@ func (ts *TableStore) commitCAS(ctx context.Context, topic string, current, next
 		return nil, fmt.Errorf("read iceberg version hint %q: %w", topic, err)
 	}
 	if _, err := ts.objects.ConditionalPut(ctx, hintKey, []byte(strconv.Itoa(nextVersion)), hintETag); err != nil {
-		// Best-effort removal of the just-written metadata file: it is the
-		// loser of a concurrent commit and would otherwise linger as an orphan
-		// at the winning version, where a reader listing by version prefix
-		// could pick it. A reader never observed it while it was current: the
-		// version hint still pointed at the previous version.
+		// The CAS reported failure, but S3 eventual consistency may mean the
+		// write succeeded on the server while the client got an error (network
+		// timeout, reset, etc.). Re-read the version hint to confirm. If it
+		// advanced to nextVersion or beyond, the CAS actually committed and a
+		// concurrent writer may even have advanced it further. Only delete the
+		// metadata file when the hint is truly stale.
 		_ = ts.objects.Delete(ctx, fileKey)
+		if actual, readErr := ts.objects.Get(ctx, hintKey); readErr == nil {
+			if actualVersion, _ := strconv.Atoi(strings.TrimSpace(string(actual))); actualVersion >= nextVersion {
+				// CAS succeeded despite the error response. The concurrently
+				// written metadata file was our best-effort delete victim, but
+				// we still have the correct state in next. Reload to pick up
+				// the canonical metadata file key.
+				reloaded, reloadErr := ts.Load(ctx, topic)
+				if reloadErr == nil {
+					return reloaded, nil
+				}
+				return next, nil
+			}
+		}
 		return nil, fmt.Errorf("commit iceberg version hint %q: %w", topic, err)
 	}
 	// The commit won: remove any sibling metadata file a concurrent loser wrote

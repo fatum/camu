@@ -8,6 +8,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kmsg"
 
+	"github.com/maksim/camu/internal/diskless"
 	"github.com/maksim/camu/internal/idempotency"
 	"github.com/maksim/camu/internal/meta"
 	"github.com/maksim/camu/internal/producer"
@@ -88,6 +89,18 @@ func mapKafkaError(err error) int16 {
 		return kafkaErrorUnknownProducerID
 	case errors.Is(err, idempotency.ErrSequenceGap):
 		return kafkaErrorOutOfOrderSequence
+	case errors.Is(err, idempotency.ErrDuplicateSequence):
+		return kafkaErrorDuplicateSequence
+	case errors.Is(err, diskless.ErrSequenceGap), errors.Is(err, diskless.ErrOutOfOrderSequence):
+		return kafkaErrorOutOfOrderSequence
+	case errors.Is(err, diskless.ErrProduceRetryable):
+		// The batch was not recorded in the object-store metastore (transient
+		// S3 failure or deadline). This must be retriable: an idempotent
+		// client re-sends the same batch with the same producer sequence and
+		// the retry either commits it or deduplicates it as an exact retry.
+		// A non-retriable code here would make the client advance past the
+		// unrecorded batch and permanently gap the partition.
+		return kafkaErrorRequestTimedOut
 	default:
 		return kafkaErrorUnknownServer
 	}

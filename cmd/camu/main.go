@@ -15,6 +15,8 @@ import (
 	"github.com/maksim/camu/internal/server"
 )
 
+var version = "dev"
+
 func main() {
 	level := slog.LevelInfo
 	if value := strings.ToLower(os.Getenv("CAMU_LOG_LEVEL")); value != "" {
@@ -34,6 +36,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "serve":
+		slog.Info("camu_starting", "version", version)
 		configPath := "camu.yaml"
 		if len(os.Args) > 2 {
 			for i := 2; i < len(os.Args); i++ {

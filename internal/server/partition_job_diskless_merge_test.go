@@ -557,15 +557,131 @@ func TestDisklessSegmentMergeReachesByteTargetInOnePass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
 	}
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 merge job, got %d", len(jobs))
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 merge jobs (300 refs in runs of 100), got %d", len(jobs))
 	}
-	var payload DisklessMergePayload
-	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
-		t.Fatalf("decode merge payload: %v", err)
+	// Each run must reach the byte target in one pass (100 refs, not the
+	// DynamoDB-tuned 90-file cap), and the parallel runs must be disjoint and
+	// contiguous, jointly covering [0,300).
+	prevEnd := int64(0)
+	for i, job := range jobs {
+		var payload DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			t.Fatalf("decode merge payload %d: %v", i, err)
+		}
+		if len(payload.Sources) != 100 {
+			t.Fatalf("run %d covers %d sources, want 100 (byte target must bound the run, not the 90-file cap)", i, len(payload.Sources))
+		}
+		if payload.Sources[0].BaseOffset != prevEnd {
+			t.Fatalf("run %d starts at %d, want %d (runs must be disjoint and contiguous)", i, payload.Sources[0].BaseOffset, prevEnd)
+		}
+		prevEnd = payload.Sources[len(payload.Sources)-1].EndOffset
 	}
-	if len(payload.Sources) != 100 {
-		t.Fatalf("run covers %d sources, want 100 (byte target must bound the run, not the 90-file cap)", len(payload.Sources))
+	if prevEnd != 300 {
+		t.Fatalf("runs cover [0,%d), want [0,300)", prevEnd)
+	}
+}
+
+// TestDisklessSegmentMergeNearTargetFrontierRefDoesNotStall verifies that a
+// frontier ref just under the byte target cannot wedge the partition. Such a
+// ref fills nearly the whole merge budget, leaving room for only a couple of
+// small refs before total crosses target; if the byte budget stopped the run
+// there, it would fall below min_segments and discovery would never schedule
+// another merge for the partition (reproducing the live-cluster stall where
+// merged frontiers froze just under 64 MiB while committed offsets kept
+// climbing). The run must extend past the byte target to reach min_segments.
+func TestDisklessSegmentMergeNearTargetFrontierRefDoesNotStall(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 4
+	s.cfg.Diskless.Compaction.TargetBytes = 10000
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// Frontier ref lands just under the 10,000-byte target: only two 100-byte
+	// refs fit before total crosses target, which would leave a 3-ref run below
+	// min_segments without the fix. Four more small refs trail behind it.
+	frontier := 9800
+	if err := s.s3Client.Put(ctx, "_diskless/test-node/frontier.data", bytes.Repeat([]byte{'f'}, frontier), storage.PutOpts{}); err != nil {
+		t.Fatalf("put frontier source: %v", err)
+	}
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: "frontier:0", FileKey: "_diskless/test-node/frontier.data", Topic: "t", Partition: 0, Count: 1, ByteLength: int64(frontier), CreatedAt: now}}); err != nil {
+		t.Fatalf("commit frontier [0,1): %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/s%d.data", i)
+		data := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i+1, i+2, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 merge jobs (frontier run [0,4) + trailing [4,9)), got %d", len(jobs))
+	}
+	var frontierRun, trailingRun DisklessMergePayload
+	for _, job := range jobs {
+		var p DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &p); err != nil {
+			t.Fatalf("decode merge payload: %v", err)
+		}
+		if p.Sources[0].BaseOffset == 0 {
+			frontierRun = p
+		} else {
+			trailingRun = p
+		}
+	}
+	// The frontier run must extend past the byte target (9800 + 2x100 already
+	// crosses 10000) to gather min_segments refs: frontier + three small refs.
+	if len(frontierRun.Sources) != 4 || frontierRun.Sources[0].BaseOffset != 0 || frontierRun.Sources[3].EndOffset != 4 {
+		t.Fatalf("frontier run = %+v, want the 4-ref run [0,4)", frontierRun.Sources)
+	}
+	// The trailing refs form a disjoint run enqueued in the same pass: the
+	// pipeline must keep moving instead of freezing at the frontier.
+	if len(trailingRun.Sources) != 5 || trailingRun.Sources[0].BaseOffset != 4 || trailingRun.Sources[4].EndOffset != 9 {
+		t.Fatalf("trailing run = %+v, want the 5 small refs [4,9)", trailingRun.Sources)
+	}
+	for _, job := range jobs {
+		if err := s.runSegmentMergeJob(ctx, job); err != nil {
+			t.Fatalf("runSegmentMergeJob() error = %v", err)
+		}
+	}
+	// The merged [0,4) ref is now >= target (byte-final) and the merged [4,9)
+	// is a single small ref below min_segments: two contiguous refs remain.
+	refs, err := s.disklessMeta.QuerySegments(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 2 || refs[0].BaseOffset != 0 || refs[0].EndOffset != 4 || refs[1].BaseOffset != 4 || refs[1].EndOffset != 9 {
+		t.Fatalf("refs after both merges = %+v, want contiguous [0,4) + [4,9)", refs)
 	}
 }
 
@@ -620,42 +736,69 @@ func TestDisklessSegmentMergeDeleteDataDoesNotBlockDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
 	}
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 merge job, got %d", len(jobs))
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 merge jobs for the [0,12) runs, got %d", len(jobs))
 	}
 	if err := s.runSegmentMergeJob(ctx, jobs[0]); err != nil {
 		t.Fatalf("runSegmentMergeJob() error = %v", err)
 	}
 
-	// The job now sits in delete_data (delete grace has not elapsed). Discovery
-	// must still schedule the next run instead of returning early.
+	// The first job now sits in delete_data (delete grace has not elapsed);
+	// the other two are pending with their ranges in flight. Discovery must
+	// neither duplicate the in-flight runs nor stall on the delete_data job.
 	jobs, err = s.listPartitionJobs(ctx, "t", 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
 	}
-	if len(jobs) != 1 || jobs[0].Phase != PartitionJobPhaseDeleteData {
-		t.Fatalf("after first merge: jobs = %+v, want 1 job in delete_data", jobs)
+	if len(jobs) != 3 {
+		t.Fatalf("after first merge: %d jobs, want 3 (delete_data + 2 pending)", len(jobs))
 	}
 	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
 	jobs, err = s.listPartitionJobs(ctx, "t", 0)
 	if err != nil {
 		t.Fatalf("listPartitionJobs: %v", err)
 	}
-	if len(jobs) != 2 {
-		t.Fatalf("expected the delete_data job plus a new merge job, got %d", len(jobs))
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 jobs after re-discovery (delete_data + 2 in-flight, no duplicates), got %d", len(jobs))
+	}
+
+	// New eligible refs beyond the in-flight ranges must still be scheduled
+	// even while the delete_data job awaits its grace.
+	for i := 12; i < 16; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
+		data := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
+	jobs, err = s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("expected delete_data + 2 pending jobs plus a new [12,16) job, got %d", len(jobs))
 	}
 	var next DisklessMergePayload
 	found := false
 	for _, job := range jobs {
-		if job.Phase != PartitionJobPhaseDeleteData {
-			if err := json.Unmarshal(job.Payload, &next); err != nil {
-				t.Fatalf("decode next merge payload: %v", err)
-			}
+		if job.Phase == PartitionJobPhaseDeleteData {
+			continue
+		}
+		var p DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &p); err != nil {
+			t.Fatalf("decode merge payload: %v", err)
+		}
+		if p.Sources[0].BaseOffset == 12 {
+			next = p
 			found = true
 		}
 	}
-	if !found || len(next.Sources) != 4 || next.Sources[0].BaseOffset != 4 || next.Sources[3].EndOffset != 8 {
-		t.Fatalf("next merge run = %+v, want the contiguous [4,8) run", next.Sources)
+	if !found || len(next.Sources) != 4 || next.Sources[0].BaseOffset != 12 || next.Sources[3].EndOffset != 16 {
+		t.Fatalf("new run = %+v (found=%t), want the fresh [12,16) run", next.Sources, found)
 	}
 }
 
@@ -753,5 +896,111 @@ func TestDisklessCompactionLoopCatchUp(t *testing.T) {
 		if _, err := s.s3Client.Get(ctx, fmt.Sprintf("_diskless/test-node/f%d.data", i)); !errors.Is(err, storage.ErrNotFound) {
 			t.Fatalf("expected source %d to be deleted, got %v", i, err)
 		}
+	}
+}
+
+// TestDisklessParallelDiscoveryEnqueuesDisjointRuns verifies that a single
+// discovery pass partitions a large backlog into multiple disjoint contiguous
+// merge jobs (each bounded by the byte target) rather than one serial chain,
+// and that re-discovery while those jobs are in flight does not schedule
+// overlapping work.
+func TestDisklessParallelDiscoveryEnqueuesDisjointRuns(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 4
+	s.cfg.Diskless.Compaction.TargetBytes = 300
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// 16 refs of 100 bytes: with a 300-byte target and min_segments 4, each run
+	// must extend past the target to gather 4 refs, so one pass enqueues 4
+	// disjoint runs ([0,4) [4,8) [8,12) [12,16)) instead of one serial chain.
+	for i := 0; i < 16; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
+		data := bytes.Repeat([]byte{byte('a' + i)}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("expected 4 disjoint merge jobs, got %d", len(jobs))
+	}
+	prevEnd := int64(0)
+	for i, job := range jobs {
+		var payload DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			t.Fatalf("decode merge payload %d: %v", i, err)
+		}
+		if payload.Sources[0].BaseOffset != prevEnd {
+			t.Fatalf("job %d starts at %d, want %d (disjoint, contiguous runs)", i, payload.Sources[0].BaseOffset, prevEnd)
+		}
+		if len(payload.Sources) != 4 {
+			t.Fatalf("job %d covers %d sources, want 4 (run extends past the byte target to min_segments)", i, len(payload.Sources))
+		}
+		prevEnd = payload.Sources[len(payload.Sources)-1].EndOffset
+	}
+	if prevEnd != 16 {
+		t.Fatalf("runs cover [0,%d), want [0,16)", prevEnd)
+	}
+
+	// Re-discovery while all four jobs are in flight must not duplicate them.
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
+	jobs, err = s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 4 {
+		t.Fatalf("expected still 4 jobs after re-discovery, got %d", len(jobs))
+	}
+
+	// Executing the parallel jobs through the compaction loop must converge to
+	// contiguous, byte-final merged refs covering [0,16).
+	s.runDisklessCompactionForPartition(ctx, tc, 0)
+	s.runDisklessCompactionForPartition(ctx, tc, 0)
+	refs, err := s.disklessMeta.QuerySegments(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 4 {
+		t.Fatalf("refs after parallel compaction = %d, want 4 byte-final refs", len(refs))
+	}
+	prevEnd = 0
+	for _, ref := range refs {
+		if ref.BaseOffset != prevEnd {
+			t.Fatalf("non-contiguous refs: %+v", refs)
+		}
+		prevEnd = ref.EndOffset
+	}
+	if prevEnd != 16 {
+		t.Fatalf("compacted range ends at %d, want 16", prevEnd)
 	}
 }

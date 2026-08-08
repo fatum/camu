@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/replication"
 )
 
 func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceRequest) kmsg.Response {
@@ -92,9 +94,22 @@ func (ks *KafkaServer) handleProduce(ctx context.Context, req *kmsg.ProduceReque
 			// Replicated topics must not acknowledge a produce before the ISR
 			// quorum holds the data. acks=0 is fire-and-forget and returns
 			// immediately; every other ack level waits for the high watermark.
+			// The batch is already appended and idempotently deduplicated, so a
+			// wait timeout is safe to surface as a retriable error: the client
+			// re-sends the same batch and either gets the original offset (exact
+			// retry) or a duplicate-sequence ack. Never report it as
+			// UNKNOWN_SERVER_ERROR, which clients treat as permanent and would
+			// abandon.
 			if errorCode == 0 && firstOffset >= 0 && req.Acks != 0 && ks.cfg.WaitForReplicatedFunc != nil {
 				if err := ks.cfg.WaitForReplicatedFunc(ctx, topic.Topic, int(partition.Partition), lastOffset); err != nil {
-					errorCode = kafkaErrorUnknownServer
+					switch {
+					case errors.Is(err, replication.ErrReplicationTimeout),
+						errors.Is(err, context.DeadlineExceeded),
+						errors.Is(err, context.Canceled):
+						errorCode = kafkaErrorRequestTimedOut
+					default:
+						errorCode = kafkaErrorUnknownServer
+					}
 				}
 			}
 			if firstOffset >= 0 {

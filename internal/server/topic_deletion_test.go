@@ -32,13 +32,13 @@ func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
 
 	// One referenced data object: a committed ref points at it.
 	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
-		BatchID: "ref:0:10", FileKey: "_diskless/node1/ref.data", Topic: "t", Partition: 0,
+		BatchID: "ref:0:10", FileKey: "_diskless/000/node1-1234567890000-1.data", Topic: "t", Partition: 0,
 		Count: 1, ByteLength: 10, CreatedAt: time.Now(),
 	}}); err != nil {
 		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
-	referenced := "_diskless/node1/ref.data"
-	orphanData := "_diskless/node1/orphan.data"
+	referenced := "_diskless/000/node1-1234567890000-1.data"
+	orphanData := "_diskless/001/node1-1234567890000-2.data"
 	orphanMerge := "_diskless_merge/t/0/orphan.data"
 	for _, key := range []string{referenced, orphanData, orphanMerge} {
 		if err := s.s3Client.Put(ctx, key, []byte("x"), storage.PutOpts{}); err != nil {
@@ -46,7 +46,8 @@ func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
 		}
 	}
 
-	s.sweepDisklessOrphans(ctx, s.buildDisklessFileIndex(ctx))
+	idx, _ := s.buildDisklessFileIndex(ctx)
+	s.sweepDisklessOrphans(ctx, idx)
 
 	if _, err := s.s3Client.Get(ctx, referenced); err != nil {
 		t.Fatalf("referenced object %s must survive the sweep, got %v", referenced, err)
@@ -94,7 +95,8 @@ func TestSweepDisklessArchiveOrphansUsesIndex(t *testing.T) {
 		t.Fatalf("put stray checkpoint: %v", err)
 	}
 
-	s.sweepDisklessArchiveOrphans(ctx, s.buildDisklessFileIndex(ctx))
+	idx, _ := s.buildDisklessFileIndex(ctx)
+	s.sweepDisklessArchiveOrphans(ctx, idx)
 
 	// The referenced checkpoint survives; the stray is deleted.
 	orphans, err := s.s3Client.List(ctx, "_diskless_meta/archive/t/0/")
@@ -390,7 +392,7 @@ func TestPlanExpiredFilesFromIndexMatchesFallback(t *testing.T) {
 	commit("B", 0, old)
 	commit("C", 0, now)
 
-	idx := s.buildDisklessFileIndex(ctx)
+	idx, _ := s.buildDisklessFileIndex(ctx)
 	if idx == nil {
 		t.Fatal("expected a file index for the S3 metastore")
 	}

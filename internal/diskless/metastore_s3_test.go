@@ -309,6 +309,64 @@ func TestS3MetaStore_BuildFileIndex(t *testing.T) {
 	}
 }
 
+// TestS3MetaStore_BrokenCheckpointChainFailsClosed verifies that a missing
+// checkpoint in the archive chain is an error for every reference enumeration
+// (loadCheckpoints, loadCheckpointKeys, BuildFileIndex), never a silent end of
+// the chain. A silent truncation drops the older checkpoints from the
+// reference index, which makes the orphan sweep delete their data files — the
+// data-loss path observed under S3 throttling.
+func TestS3MetaStore_BrokenCheckpointChainFailsClosed(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 2
+	ctx := context.Background()
+	now := time.Now()
+
+	// Two archive runs -> two chained checkpoints.
+	for i := 0; i < 2; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	if n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil || n != 2 {
+		t.Fatalf("first archive = %d, %v; want 2", n, err)
+	}
+	for i := 2; i < 4; i++ {
+		commitS3Batch(t, m, fmt.Sprintf("obj%d", i), 1, 100, now)
+	}
+	if n, err := m.ArchiveCommitted(ctx, "t", 0, 10, now.Add(-time.Hour)); err != nil || n != 2 {
+		t.Fatalf("second archive = %d, %v; want 2", n, err)
+	}
+
+	head, err := m.readUploadManifest(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("read head: %v", err)
+	}
+	if head.Archive == nil {
+		t.Fatal("expected an archive chain")
+	}
+	newest, err := m.readCheckpoint(ctx, head.Archive.Key)
+	if err != nil || newest == nil {
+		t.Fatalf("read newest checkpoint: %v", err)
+	}
+	if newest.PrevKey == "" {
+		t.Fatalf("expected a chained older checkpoint, prev_key empty")
+	}
+	// Simulate an interrupted cleanup: the older chained checkpoint vanishes.
+	if err := m.s3.Delete(ctx, newest.PrevKey); err != nil {
+		t.Fatalf("delete older checkpoint: %v", err)
+	}
+
+	// Every reference enumeration must fail closed instead of silently
+	// truncating the chain and hiding the older checkpoints' data files.
+	if _, err := m.loadCheckpoints(ctx, head); err == nil {
+		t.Fatal("loadCheckpoints: expected error for missing chained checkpoint")
+	}
+	if _, err := m.loadCheckpointKeys(ctx, head); err == nil {
+		t.Fatal("loadCheckpointKeys: expected error for missing chained checkpoint")
+	}
+	if _, err := m.BuildFileIndex(ctx); err == nil {
+		t.Fatal("BuildFileIndex: expected error for missing chained checkpoint")
+	}
+}
+
 // TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange verifies compaction
 // cannot silently rewrite a range that has been archived.
 func TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange(t *testing.T) {
@@ -443,5 +501,61 @@ func TestS3MetaStore_CommitNonIdempotentRetryAppends(t *testing.T) {
 	refs, err := m.QuerySegments(ctx, "t", 0, 0, 1024)
 	if err != nil || len(refs) != 2 {
 		t.Fatalf("refs = %+v, %v; want 2", refs, err)
+	}
+}
+
+// TestS3MetaStore_CommitTransientErrorIsRetryable verifies that an S3 failure
+// during the commit read-modify-write is reported as a retryable produce
+// failure (batch not recorded), never as a sequence error. The Kafka produce
+// path maps this to a retriable error so an idempotent client re-sends the
+// same batch instead of advancing past an unrecorded gap.
+func TestS3MetaStore_CommitTransientErrorIsRetryable(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	// Fail every S3 operation (both the manifest read and the CAS write).
+	m.s3.SetFaultInjector(func(op string) error {
+		return errors.New("operation error S3: SlowDown: Please reduce your request rate")
+	})
+	_, err := m.CommitUploadedBatches(context.Background(), []UploadedBatch{{
+		BatchID: "f:0:10", FileKey: "f", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 10, CreatedAt: time.Now(),
+	}})
+	if err == nil {
+		t.Fatal("expected error from fault-injected S3 backend")
+	}
+	if !errors.Is(err, ErrProduceRetryable) {
+		t.Fatalf("commit error = %v, want wrap of ErrProduceRetryable", err)
+	}
+	if errors.Is(err, ErrSequenceGap) || errors.Is(err, ErrOutOfOrderSequence) {
+		t.Fatalf("commit error must not be misreported as a sequence error: %v", err)
+	}
+}
+
+// TestS3MetaStore_CommitSequenceGapIsNotRetryable pins that a genuine producer
+// sequence gap stays a sequence error (mapped to OUT_OF_ORDER_SEQUENCE by the
+// Kafka path, which makes the client reset its producer session and replay),
+// and is never conflated with the retryable-transient failure class.
+func TestS3MetaStore_CommitSequenceGapIsNotRetryable(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "a:0:10", FileKey: "a", Topic: "t", Partition: 0,
+		Count: 10, ByteLength: 10, ProducerID: 7, Sequence: 0, CreatedAt: now,
+	}}); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	// Producer 7 recorded [0,10); a batch starting at 20 skips [10,20).
+	_, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "b:0:10", FileKey: "b", Topic: "t", Partition: 0,
+		Count: 10, ByteLength: 10, ProducerID: 7, Sequence: 20, CreatedAt: now,
+	}})
+	if err == nil {
+		t.Fatal("expected sequence gap error")
+	}
+	if !errors.Is(err, ErrSequenceGap) {
+		t.Fatalf("commit error = %v, want ErrSequenceGap", err)
+	}
+	if errors.Is(err, ErrProduceRetryable) {
+		t.Fatalf("sequence gap must not be marked retryable: %v", err)
 	}
 }

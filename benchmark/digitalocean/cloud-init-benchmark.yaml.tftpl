@@ -1,0 +1,39 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - docker.io
+
+runcmd:
+  - systemctl enable --now docker
+  - echo '${digitalocean_token}' | docker login --username doctl --password-stdin ${registry_endpoint}
+  - |
+    public_ip="$(curl -fsS http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)"
+    test -n "$public_ip"
+    cat >/etc/camu/benchmark-env <<ENV
+    BENCHMARK_RATE=${benchmark_rate}
+    TOPICS=${benchmark_topics}
+    STORAGE_MODES=${benchmark_storage_modes}
+    PARTITIONS=${benchmark_partitions}
+    MESSAGE_BYTES=${benchmark_message_bytes}
+    KAFKA_BROKERS=${kafka_brokers}
+    STATS_INTERVAL=5m
+    S3_BUCKET=${bucket_name}
+    S3_PREFIX=benchmark-stats
+    S3_ENDPOINT=https://${spaces_region}.digitaloceanspaces.com
+    S3_REGION=${spaces_region}
+    NODE_ID=${node_name}
+    AWS_ACCESS_KEY_ID=${spaces_access_key}
+    AWS_SECRET_ACCESS_KEY=${spaces_secret_key}
+    CAMU_STORAGE_ACCESS_KEY=${spaces_access_key}
+    CAMU_STORAGE_SECRET_KEY=${spaces_secret_key}
+    ENV
+  - docker pull ${benchmark_image}
+  - docker rm -f benchmark-service 2>/dev/null || true
+  - >-
+    docker run -d --name benchmark-service --restart unless-stopped --network host
+    --label=io.camu.component=benchmark
+    --entrypoint /usr/local/bin/benchmark-service
+    --env-file /etc/camu/benchmark-env
+    ${benchmark_image}
