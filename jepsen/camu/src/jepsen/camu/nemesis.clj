@@ -1,5 +1,6 @@
 (ns jepsen.camu.nemesis
-  (:require [clojure.set :as set]
+  (:require [clojure.java.shell :as sh]
+            [clojure.set :as set]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [nemesis :as nemesis]
                     [generator :as gen]
@@ -7,7 +8,8 @@
             [jepsen.control.util :as cu]
             [jepsen.nemesis.combined :as nc]
             [jepsen.camu.client :as client]
-            [jepsen.camu.db :as db]))
+            [jepsen.camu.db :as db]
+            [cheshire.core :as json]))
 
 (defn signal-camu!
   [signal]
@@ -102,6 +104,135 @@
         (let [to-restart (vec @killed)]
           (when (seq to-restart)
             (Thread/sleep 3000)
+            (doseq [node to-restart]
+              (try
+                (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                (catch Exception _)))))))))
+
+(defn wipe-camu-local-state!
+  "Deletes camu's local data directory (active segments, cache, epoch sidecar)
+   so a restarted node must rebuild its view entirely from S3."
+  []
+  (c/exec :bash :-lc
+          (str "rm -rf " db/camu-data "; mkdir -p " db/camu-data "/cache")))
+
+(defn plant-failed-s3-state!
+  "Writes failed/orphaned state directly into the S3 bucket that a redeployed
+   node must tolerate and that the cluster's GC must clean up: an orphaned
+   segment object under the test topic (no metadata/index references it), a
+   stale instance registration for a phantom node, and a stale ISR entry naming
+   a dead leader. A redeployed node joining with this existing+failed bucket
+   state must never serve the orphaned segment or be confused by the stale
+   coordination objects; the object-store GC must reclaim them."
+  [test]
+  (let [topic (:topic test)
+        mc-fn (fn [& args]
+                (sh/sh "mc" "--config-dir" "/tmp/.mc-jepsen" "alias" "set"
+                       "local" "http://minio:9000" "minioadmin" "minioadmin")
+                (apply sh/sh (concat ["mc" "--config-dir" "/tmp/.mc-jepsen"] args)))]
+    ;; Orphaned segment object under the topic's data prefix, referenced by no
+    ;; .meta.json, so reads must never surface it.
+    (let [key (str "local/camu-data/segments/" topic "/0/9007199254740991.log")]
+      (mc-fn "pipe" key :in "orphaned segment data that must never be served"))
+    ;; Stale instance registration for a node that no longer exists.
+    (let [key (str "local/camu-data/_coordination/instances/phantom-node.json")]
+      (mc-fn "pipe" key :in
+             (json/generate-string
+              {:instance_id "phantom-node"
+               :address "10.0.0.99:8080"
+               :internal_address "10.0.0.99:8081"
+               :heartbeat_at "2000-01-01T00:00:00Z"})))
+    ;; Stale ISR entry naming a dead leader at a lower epoch; the real leader's
+    ;; epoch-guarded update must overwrite it.
+    (let [key (str "local/camu-data/_coordination/isr/" topic "/0.json")]
+      (mc-fn "pipe" key :in
+             (json/generate-string
+              {:partition 0
+               :isr ["phantom-node"]
+               :leader "phantom-node"
+               :leader_epoch 0
+               :high_watermark 0
+               :updated_at "2000-01-01T00:00:00Z"})))))
+
+(defn restart-wipe-nemesis
+  "A nemesis that kills a node and wipes its local data directory before
+   restarting it. This simulates a node whose local disk state is lost or a
+   full re-deploy on the same host: the restarted node must recover all topics,
+   assignments, ISR, and committed segments from S3 alone, and must not lose or
+   duplicate acknowledged writes across the restart. Unlike kill-nemesis (which
+   restarts with local state intact), this exercises the S3-only recovery path
+   that a redeployed node goes through."
+  []
+  (let [wiped (atom #{})]
+    (reify nemesis/Nemesis
+      (setup! [this test] this)
+      (invoke! [this test op]
+        (case (:value op)
+          :start (let [node (rand-nth (:nodes test))]
+                   (info "Restart-wipe nemesis: killing and wiping" node)
+                   (c/on-nodes test [node] (fn [_ _] (kill-camu!)))
+                   ;; Give the killed process time to fully die before wiping.
+                   (Thread/sleep 2000)
+                   (c/on-nodes test [node] (fn [_ _] (wipe-camu-local-state!)))
+                   (swap! wiped conj node)
+                   (assoc op :value [:wiped node]))
+          :stop  (let [to-restart (vec @wiped)]
+                   (reset! wiped #{})
+                   (when (seq to-restart)
+                     (Thread/sleep 3000)
+                     (doseq [node to-restart]
+                       (try
+                         (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                         (catch Exception e
+                           (info "Failed to restart" node (.getMessage e))))))
+                   (assoc op :value [:restarted to-restart]))))
+      (teardown! [this test]
+        (let [to-restart (vec @wiped)]
+          (when (seq to-restart)
+            (Thread/sleep 3000)
+            (doseq [node to-restart]
+              (try
+                (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                (catch Exception _)))))))))
+
+(defn redeploy-nemesis
+  "A nemesis that re-deploys a node against S3 state that already exists AND
+   contains failed/orphaned objects. The node is stopped, its local state is
+   wiped, and failed state is planted directly in the bucket (an orphaned
+   segment, a phantom instance registration, and a stale ISR). The node then
+   restarts under its same identity and must adopt the existing topic, recover
+   committed segments, tolerate the failed objects (never serving the orphan or
+   trusting the stale coordination), and let the object-store GC reclaim them —
+   all without losing acknowledged writes or serving ghosts."
+  []
+  (let [redeployed (atom #{})]
+    (reify nemesis/Nemesis
+      (setup! [this test] this)
+      (invoke! [this test op]
+        (case (:value op)
+          :start (let [node (rand-nth (:nodes test))]
+                   (info "Redeploy nemesis: stopping" node "and planting failed S3 state")
+                   (c/on-nodes test [node] (fn [_ _] (stop-camu!)))
+                   (Thread/sleep 2000)
+                   (c/on-nodes test [node]
+                               (fn [_ _]
+                                 (wipe-camu-local-state!)))
+                   ;; Plant failed state directly into the bucket from the
+                   ;; control node (mc is available there).
+                   (plant-failed-s3-state! test)
+                   (swap! redeployed conj node)
+                   (assoc op :value [:redeployed node]))
+          :stop  (let [to-restart (vec @redeployed)]
+                   (doseq [node to-restart]
+                     (try
+                       (c/on-nodes test [node] (fn [_ _] (start-camu!)))
+                       (catch Exception e
+                         (info "Failed to redeploy" node (.getMessage e)))))
+                   (reset! redeployed #{})
+                   (assoc op :value [:redeployed-restarted to-restart]))))
+      (teardown! [this test]
+        (let [to-restart (vec @redeployed)]
+          (when (seq to-restart)
             (doseq [node to-restart]
               (try
                 (c/on-nodes test [node] (fn [_ _] (start-camu!)))
@@ -453,6 +584,12 @@
       (:kill faults)
       (assoc #{:kill} (kill-nemesis))
 
+      (:restart-wipe faults)
+      (assoc #{:restart-wipe} (restart-wipe-nemesis))
+
+      (:redeploy faults)
+      (assoc #{:redeploy} (redeploy-nemesis))
+
       (:partition faults)
       (assoc #{:partition} (partition-nemesis))
 
@@ -507,6 +644,16 @@
                    {:type :info :f fault :value :start}
                    (gen/sleep 20)
                    {:type :info :f fault :value :stop}])
+    :restart-wipe (gen/cycle
+                   [(gen/sleep 8)
+                    {:type :info :f fault :value :start}
+                    (gen/sleep 15)
+                    {:type :info :f fault :value :stop}])
+    :redeploy (gen/cycle
+               [(gen/sleep 8)
+                {:type :info :f fault :value :start}
+                (gen/sleep 20)
+                {:type :info :f fault :value :stop}])
     :leader-pause-then-ack (gen/cycle
                             [(gen/sleep 8)
                              {:type :info :f fault :value :start}

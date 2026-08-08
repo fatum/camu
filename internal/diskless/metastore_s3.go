@@ -63,6 +63,16 @@ const (
 	s3HeadMaxRefBytes = 1 << 17 // 128KiB
 	// s3CheckpointMaxRefs bounds one archived checkpoint.
 	s3CheckpointMaxRefs = 4096
+	// s3HeadMaxProducerEntries bounds the total number of idempotent producer
+	// history entries kept in the head object. Per-producer history is already
+	// trimmed to uploadedProducerHistory, but the number of distinct producers
+	// is unbounded; without a cap the head would grow with producer count and
+	// every commit would rewrite the growing object. When the cap is crossed
+	// the least-recently-active producers (smallest last batch base offset) are
+	// evicted, so a stale retry of an evicted producer is rejected as
+	// out-of-order rather than duplicated — the same contract as a producer
+	// whose history rotated out of the per-producer window.
+	s3HeadMaxProducerEntries = 4096
 )
 
 // s3UploadManifest is the head: the complete ordering authority for a
@@ -103,6 +113,49 @@ type s3ProducerBatch struct {
 	FirstSequence int64 `json:"first_sequence"`
 	BaseOffset    int64 `json:"base_offset"`
 	Count         int   `json:"count"`
+}
+
+// evictExcessProducerEntries trims a partition's producer history map to at
+// most maxEntries total history entries. It is called before every head write
+// so the head object stays bounded regardless of how many distinct idempotent
+// producers have ever written to the partition. Producers whose last batch has
+// the smallest base offset (the least recently active) are evicted first; an
+// exact retry of an evicted producer is then rejected as out-of-order by
+// checkProducerSequence instead of being re-allocated, which is the same
+// fail-closed contract as a retry that rotated out of the per-producer window.
+func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, maxEntries int) {
+	total := 0
+	for _, h := range producers {
+		total += len(h)
+	}
+	if total <= maxEntries {
+		return
+	}
+	// Order producers by the base offset of their last recorded batch, oldest
+	// first, and drop them whole until the total fits.
+	lastBase := make([]struct {
+		id    string
+		base  int64
+		count int
+	}, 0, len(producers))
+	for id, h := range producers {
+		if len(h) == 0 {
+			continue
+		}
+		lastBase = append(lastBase, struct {
+			id    string
+			base  int64
+			count int
+		}{id: id, base: h[len(h)-1].BaseOffset, count: len(h)})
+	}
+	sort.Slice(lastBase, func(i, j int) bool { return lastBase[i].base < lastBase[j].base })
+	for _, e := range lastBase {
+		if total <= maxEntries {
+			break
+		}
+		delete(producers, e.id)
+		total -= e.count
+	}
 }
 
 // s3CatalogRef is one materialized segment reference within a partition catalog.
@@ -239,6 +292,7 @@ manifestLoop:
 		if !changed {
 			return results, nil // every batch was a duplicate
 		}
+		evictExcessProducerEntries(manifest.Producers, s3HeadMaxProducerEntries)
 		manifest.Version++
 		encoded, err := json.Marshal(manifest)
 		if err != nil {
@@ -614,6 +668,24 @@ func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition
 		if !appendRef(r) {
 			break
 		}
+	}
+	return refs, nil
+}
+
+// QueryHeadSegments returns only the head-window refs of a partition, never
+// archived checkpoints. Compaction discovery uses this: archived refs are
+// compaction-final (they were rolled out of the head once they reached target
+// size) so they can never be merged again, and ReplaceSegmentRefs refuses to
+// touch them. Querying the head only also avoids walking the checkpoint chain
+// on every compaction tick.
+func (m *S3MetaStore) QueryHeadSegments(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
+	manifest, err := m.readUploadManifest(ctx, topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]SegmentRef, 0, len(manifest.Refs))
+	for _, r := range manifest.Refs {
+		refs = append(refs, SegmentRef(r))
 	}
 	return refs, nil
 }

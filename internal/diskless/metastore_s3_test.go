@@ -386,6 +386,40 @@ func TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange(t *testing.T) {
 	}
 }
 
+// TestS3MetaStore_QueryHeadSegmentsExcludesArchived verifies that compaction
+// discovery never sees archived refs: the head-window query returns only refs
+// still in the head object, so a previously-archived ref can never be scheduled
+// into a merge run (ReplaceSegmentRefs would reject it forever and block the
+// partition's compaction).
+func TestS3MetaStore_QueryHeadSegmentsExcludesArchived(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 1
+	ctx := context.Background()
+	now := time.Now()
+	// First ref is compaction-final (>= targetBytes); second is small and stays
+	// in the head awaiting a merge.
+	commitS3Batch(t, m, "big", 1, 100, now)
+	commitS3Batch(t, m, "small", 1, 10, now)
+	if _, err := m.ArchiveCommitted(ctx, "t", 0, 100, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	head, err := m.QueryHeadSegments(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("query head: %v", err)
+	}
+	if len(head) != 1 || head[0].BaseOffset != 1 {
+		t.Fatalf("head refs = %+v, want only [1,2) (archived [0,1) must be excluded)", head)
+	}
+	// The full query still sees both, so reads of old data work.
+	all, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query all: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all refs = %+v, want 2", all)
+	}
+}
+
 // TestS3MetaStore_CommitUploadedBatchIsReadableAndDeduplicated verifies a
 // committed batch is readable and that an idempotent retry is deduplicated by
 // the producer-sequence history (retroactive tombstone): the retry, even as a
@@ -557,5 +591,76 @@ func TestS3MetaStore_CommitSequenceGapIsNotRetryable(t *testing.T) {
 	}
 	if errors.Is(err, ErrProduceRetryable) {
 		t.Fatalf("sequence gap must not be marked retryable: %v", err)
+	}
+}
+
+// TestS3MetaStore_ProducerHistoryBounded verifies that the head object's total
+// idempotent-producer history stays bounded when a partition accumulates many
+// distinct producers, so commit cost stays O(window) rather than growing with
+// producer count.
+func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Commit batches from far more distinct producers than the head allows.
+	for p := int64(0); p < s3HeadMaxProducerEntries+10; p++ {
+		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+			BatchID:    fmt.Sprintf("obj-%d:0:10", p),
+			FileKey:    fmt.Sprintf("obj-%d", p),
+			Topic:      "t",
+			Partition:  0,
+			Count:      1,
+			ByteLength: 10,
+			ProducerID: p,
+			Sequence:   0,
+			CreatedAt:  now,
+		}}); err != nil {
+			t.Fatalf("commit producer %d: %v", p, err)
+		}
+	}
+
+	data, _, err := m.s3.GetWithETag(ctx, s3ManifestKey("t", 0))
+	if err != nil {
+		t.Fatalf("read head: %v", err)
+	}
+	var manifest s3UploadManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("parse head: %v", err)
+	}
+	total := 0
+	for _, h := range manifest.Producers {
+		total += len(h)
+	}
+	if total > s3HeadMaxProducerEntries {
+		t.Fatalf("producer history = %d entries, want <= %d", total, s3HeadMaxProducerEntries)
+	}
+	// Committed offsets must be unaffected by eviction.
+	if got, want := manifest.CommittedOffset, int64(s3HeadMaxProducerEntries+10); got != want {
+		t.Fatalf("committed offset = %d, want %d", got, want)
+	}
+}
+
+// TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst verifies the
+// eviction helper drops the least-recently-active producers before the
+// recently-active ones.
+func TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst(t *testing.T) {
+	producers := map[string][]s3ProducerBatch{
+		"1": {{FirstSequence: 0, BaseOffset: 0, Count: 1}},
+		"2": {{FirstSequence: 0, BaseOffset: 10, Count: 1}},
+		"3": {{FirstSequence: 0, BaseOffset: 20, Count: 1}},
+	}
+	evictExcessProducerEntries(producers, 2)
+	if len(producers) != 2 {
+		t.Fatalf("producers after evict = %d, want 2", len(producers))
+	}
+	if _, ok := producers["1"]; ok {
+		t.Fatal("oldest producer (base 0) must be evicted first")
+	}
+	if _, ok := producers["2"]; !ok {
+		t.Fatal("producer 2 (base 10) must survive")
+	}
+	if _, ok := producers["3"]; !ok {
+		t.Fatal("producer 3 (base 20) must survive")
 	}
 }

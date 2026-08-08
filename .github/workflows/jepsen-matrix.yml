@@ -1,7 +1,7 @@
 name: Jepsen Matrix
 
-# Daily correctness matrix: runs the full Jepsen fault, read-mode, and
-# recovery matrices against the latest main commit. Each matrix script loops
+# Daily correctness matrix: runs the full Jepsen fault, read-mode, recovery,
+# and redeploy matrices against the latest main commit. Each matrix script loops
 # through its own cases (see jepsen/camu/scripts/ for per-case faults and
 # durations) and tears down/rebuilds the local Docker cluster between cases.
 #
@@ -32,6 +32,7 @@ jobs:
           - fault-matrix-smoke.sh
           - read-mode-matrix-smoke.sh
           - recovery-matrix-smoke.sh
+          - redeploy-matrix-smoke.sh
     steps:
       - uses: actions/checkout@v4
 

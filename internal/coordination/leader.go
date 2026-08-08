@@ -109,12 +109,17 @@ func (le *LeaderElection) TryAcquire(ctx context.Context) (LeaderLease, bool, er
 // Renew extends the leader lease TTL. Only works if this instance is the
 // current leader (verified via ETag). As defense-in-depth beyond the CAS, Renew
 // re-reads the stored lease and rejects with ErrLeaseFenced when the stored
-// epoch has advanced past the caller's held epoch.
+// lease has advanced past the caller's held epoch. The stored lease is only
+// fencing when it belongs to a DIFFERENT instance: an epoch bump recorded by
+// this instance's own prior renew (whose response was lost) is our own
+// advance, not another holder taking over, so it must not trigger a spurious
+// handoff.
 func (le *LeaderElection) Renew(ctx context.Context, lease LeaderLease) (LeaderLease, error) {
 	cur, _, err := le.s3Client.GetWithETag(ctx, leaderKey)
 	if err == nil {
 		var curLease LeaderLease
-		if jsonErr := json.Unmarshal(cur, &curLease); jsonErr == nil && curLease.LeaseEpoch > lease.LeaseEpoch {
+		if jsonErr := json.Unmarshal(cur, &curLease); jsonErr == nil &&
+			curLease.InstanceID != le.instanceID && curLease.LeaseEpoch > lease.LeaseEpoch {
 			return LeaderLease{}, fmt.Errorf("%w: stored epoch %d, held epoch %d", ErrLeaseFenced, curLease.LeaseEpoch, lease.LeaseEpoch)
 		}
 	} else if !errors.Is(err, storage.ErrNotFound) {

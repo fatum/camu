@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"strings"
 	"time"
 
@@ -69,12 +68,13 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		return
 	}
 	target := cfg.TargetBytesValue()
-	// Query refs from the partition start without a byte cap. A single ref can
-	// exceed target (e.g. the merged object of a prior run), and capping the
-	// query at target bytes would return only that oversized ref, hiding the
-	// small refs behind it and stalling compaction. The refs below the committed
-	// watermark stay bounded because compaction replaces whole runs with one ref.
-	refs, err := s.disklessMeta.QuerySegments(ctx, tc.Name, identity.Partition, 0, math.MaxInt)
+	// Query only the metastore's hot head window, never archived checkpoints.
+	// Archived refs are compaction-final (they were rolled out of the head once
+	// they reached target size) so ReplaceSegmentRefs refuses to merge them;
+	// including them in a run would make the job fail forever and block
+	// discovery. Querying the head only also avoids walking the checkpoint
+	// chain on every compaction tick.
+	refs, err := s.disklessMeta.QueryHeadSegments(ctx, tc.Name, identity.Partition)
 	if err != nil {
 		slog.Warn("diskless_merge_query_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
 		return
@@ -147,6 +147,14 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 			flushRun()
 			continue
 		}
+		// Hard byte ceiling: a pathological run of many small files must never
+		// accumulate unbounded total source bytes (the merged artifact holds
+		// them all in memory). This overrides even a very large configured
+		// target.
+		if total >= maxDisklessMergeBytes && len(run) >= minSegments {
+			flushRun()
+			continue
+		}
 	}
 	flushRun()
 }
@@ -204,6 +212,16 @@ func disklessRangeCovers(inFlight [][2]int64, baseOffset int64) bool {
 // bounds the run and a merged chunk reaches target in one pass, while still
 // bounding pathological runs of very small files.
 const maxDisklessMergeSegmentsUnbounded = 4096
+
+// maxDisklessMergeBytes is the hard byte ceiling on a single merge run. The
+// byte target is approximate (configurable and honored per run), but a
+// pathological backlog of very small files could otherwise accumulate up to
+// maxDisklessMergeSegmentsUnbounded sources of arbitrary size, and
+// buildDisklessMergeArtifact concatenates every source into one in-memory
+// buffer (MaxConcurrentMerges of them concurrently). Capping total source bytes
+// bounds that memory regardless of how the target and file-count caps are
+// configured.
+const maxDisklessMergeBytes = 512 << 20 // 512 MiB
 
 // effectiveDisklessMergeMaxSegments returns the per-run file-count cap. The
 // configured default (90) exists to fit DynamoDB's 100-item TransactWriteItems
@@ -379,6 +397,9 @@ func (s *Server) buildDisklessMergeArtifact(ctx context.Context, topic string, p
 	var total int64
 	for _, ref := range sources {
 		total += ref.ByteLength
+	}
+	if total > maxDisklessMergeBytes {
+		return disklessMergeArtifact{}, fmt.Errorf("diskless merge sources total %d bytes exceeds ceiling %d", total, maxDisklessMergeBytes)
 	}
 	data := make([]byte, total)
 	pos := int64(0)
