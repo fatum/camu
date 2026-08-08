@@ -448,12 +448,12 @@ func TestBecomeLeader_ResetsStaleEpochHistory(t *testing.T) {
 	}
 
 	req := pushAssignmentRequest{
-		Topic:       topic,
-		Partition:   0,
-		Leader:      "node-A",
-		Epoch:       1, // the recreated topic's fresh epoch
-		Replicas:    []string{"node-A"},
-		ISR:         []string{"node-A"},
+		Topic:     topic,
+		Partition: 0,
+		Leader:    "node-A",
+		Epoch:     1, // the recreated topic's fresh epoch
+		Replicas:  []string{"node-A"},
+		ISR:       []string{"node-A"},
 	}
 	if err := srv.becomeLeader(ctx, topic, 0, req); err != nil {
 		t.Fatalf("becomeLeader with stale epoch history must not fail, got: %v", err)

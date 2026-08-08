@@ -627,11 +627,9 @@ func TestDisklessSegmentMergeNearTargetFrontierRefDoesNotStall(t *testing.T) {
 	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: "frontier:0", FileKey: "_diskless/test-node/frontier.data", Topic: "t", Partition: 0, Count: 1, ByteLength: int64(frontier), CreatedAt: now}}); err != nil {
 		t.Fatalf("commit frontier [0,1): %v", err)
 	}
-	var smallData []byte
 	for i := 0; i < 8; i++ {
 		fileKey := fmt.Sprintf("_diskless/test-node/s%d.data", i)
 		data := bytes.Repeat([]byte{byte('a' + i)}, 100)
-		smallData = append(smallData, data...)
 		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
 			t.Fatalf("put source %s: %v", fileKey, err)
 		}

@@ -317,7 +317,7 @@ func batchSizesOf(t *testing.T, data []byte) []int {
 // them with a single merged ref covering [0, batches*recs), returning the
 // merged object bytes and the ref. This is the compacted shape that previously
 // forced whole-ref downloads and broke mid-ref reads.
-func makeMergedRef(t *testing.T, s3 *storage.S3Client, meta MetaStore, batches, recs int) ([]byte, SegmentRef) {
+func makeMergedRef(t *testing.T, s3 *storage.S3Client, meta MetaStore, batches, recs int) []byte {
 	t.Helper()
 	w := NewWriter(s3, meta, "node1")
 	ctx := context.Background()
@@ -361,7 +361,7 @@ func makeMergedRef(t *testing.T, s3 *storage.S3Client, meta MetaStore, batches, 
 	if err := meta.ReplaceSegmentRefs(ctx, "t1", 0, remove, []SegmentRef{mergedRef}); err != nil {
 		t.Fatalf("replace refs: %v", err)
 	}
-	return merged, mergedRef
+	return merged
 }
 
 // TestReader_FetchFromMidMergedRef verifies that a fetch whose start offset
@@ -372,7 +372,7 @@ func makeMergedRef(t *testing.T, s3 *storage.S3Client, meta MetaStore, batches, 
 func TestReader_FetchFromMidMergedRef(t *testing.T) {
 	s3 := testS3Client(t)
 	meta := NewMemoryMetaStore()
-	merged, _ := makeMergedRef(t, s3, meta, 6, 10) // [0, 60), batches of 10
+	merged := makeMergedRef(t, s3, meta, 6, 10) // [0, 60), batches of 10
 	reader := NewReader(s3, meta)
 	ctx := context.Background()
 
@@ -406,7 +406,7 @@ func TestReader_FetchFromMidMergedRef(t *testing.T) {
 func TestReader_FetchFromMidMergedRefBoundedBudget(t *testing.T) {
 	s3 := testS3Client(t)
 	meta := NewMemoryMetaStore()
-	merged, _ := makeMergedRef(t, s3, meta, 8, 25) // [0, 200), batches of 25
+	merged := makeMergedRef(t, s3, meta, 8, 25) // [0, 200), batches of 25
 	reader := NewReader(s3, meta)
 	ctx := context.Background()
 

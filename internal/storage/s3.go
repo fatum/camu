@@ -645,7 +645,7 @@ func (b *awsS3Backend) putStream(ctx context.Context, key string, r io.Reader, s
 	// Buffer unseekable readers (the diskless flush's concatenated in-memory
 	// batches) into a seekable bytes.Reader; seekable readers (bytes.Reader,
 	// *os.File) still stream without buffering.
-	body := io.Reader(r)
+	body := r
 	if _, ok := r.(io.ReadSeeker); !ok {
 		buf := make([]byte, size)
 		if _, err := io.ReadFull(r, buf); err != nil {
