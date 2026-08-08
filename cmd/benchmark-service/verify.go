@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/parquet-go/parquet-go"
 )
 
 type verificationReport struct {
@@ -199,134 +202,28 @@ func countParquetFiles(topic string) (int, int64, int64, int64) {
 	return int(files), bytes, rows, rows
 }
 
-// readParquetFooter reads the footer metadata length from the last 8 bytes
-// of the file, then parses the footer to extract row group count and total row count.
+// readParquetFooter reads the footer metadata of a parquet file and returns
+// the footer length, the number of row groups, and the total number of rows.
+// It relies on the parquet-go library rather than hand-parsing the Thrift
+// footer, which previously always returned zero rows.
 func readParquetFooter(data []byte) (footerLen int, rowGroups int, totalRows int64) {
 	if len(data) < 12 {
 		return 0, 0, 0
 	}
 	// Last 4 bytes: "PAR1" magic
-	magic := string(data[len(data)-4:])
-	if magic != "PAR1" {
+	if string(data[len(data)-4:]) != "PAR1" {
 		return 0, 0, 0
 	}
-	// 4 bytes before magic: footer length (little-endian int32)
 	fl := int(binary.LittleEndian.Uint32(data[len(data)-8 : len(data)-4]))
 	if fl <= 0 || fl > len(data)-8 {
 		return 0, 0, 0
 	}
-	footerStart := len(data) - 8 - fl
-	footerBytes := data[footerStart : footerStart+fl]
-
-	// Quick scan for "num_rows" in the Thrift-compact footer.
-	// Parquet FileMetaData thrift struct: version(1) -> schema -> num_rows -> row_groups
-	// num_rows is field 2 (i64) after schema. We do a simple search.
-	totalRows = scanThriftI64Field(footerBytes, 2)
-	rowGroupCount := countRowGroups(footerBytes)
-	return fl, rowGroupCount, totalRows
-}
-
-func scanThriftI64Field(footer []byte, fieldID int) int64 {
-	// Simple ThriftCompactProtocol scanner for i64 field.
-	// Format: field header (fieldID<<3 | type), then zigzag-encoded i64.
-	pos := 0
-	skipStructHeader := true
-	for pos < len(footer) {
-		if skipStructHeader {
-			// Struct header: 1 byte version + name string
-			skipStructHeader = false
-			if pos >= len(footer) {
-				break
-			}
-			nameLen := int(footer[pos])
-			pos += 1 + nameLen
-			continue
-		}
-		if pos >= len(footer) {
-			break
-		}
-		fh := footer[pos]
-		pos++
-		fID := int(fh >> 3 & 0x0F)
-		fType := fh & 0x07
-		
-		// Handle 2-byte field headers (field ID >= 16)
-		if fID == 0 && fType != 0 {
-			// delta-encoded field ID
-			delta := int(footer[pos])
-			pos++
-			fID += delta
-		}
-
-		if fType == 0 { // STOP
-			break
-		}
-
-		switch fType {
-		case 10: // i64
-			if fID == fieldID {
-				val, _ := readZigZagI64(footer[pos:])
-				return val
-			}
-			_, n := readZigZagI64(footer[pos:])
-			pos += n
-		case 8: // i32
-			_, n := readZigZagI32(footer[pos:])
-			pos += n
-		case 11: // binary/string
-			size, n := readZigZagI32(footer[pos:])
-			pos += n + int(size)
-		case 12: // struct
-			pos++ // skip struct header byte
-		case 15: // list
-			// elem type + size
-			pos++ // elem type byte
-			size, n := readZigZagI32(footer[pos:])
-			pos += n + int(size)
-		default:
-			return 0
-		}
+	pf, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fl, 0, 0
 	}
-	return 0
-}
-
-func readZigZagI64(buf []byte) (int64, int) {
-	var u uint64
-	var shift uint
-	for i := 0; i < 10; i++ {
-		b := buf[i]
-		u |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			return int64(u>>1) ^ -int64(u&1), i + 1
-		}
-		shift += 7
-	}
-	return 0, 0
-}
-
-func readZigZagI32(buf []byte) (int32, int) {
-	var u uint32
-	var shift uint
-	for i := 0; i < 5; i++ {
-		b := buf[i]
-		u |= uint32(b&0x7F) << shift
-		if b&0x80 == 0 {
-			return int32(u>>1) ^ -int32(u&1), i + 1
-		}
-		shift += 7
-	}
-	return 0, 0
-}
-
-func countRowGroups(footer []byte) int {
-	// Count "row_groups" entries by scanning for list markers
-	count := 0
-	for i := 0; i < len(footer)-4; i++ {
-		if footer[i] == 'r' && footer[i+1] == 'o' && footer[i+2] == 'w' {
-			count++
-		}
-	}
-	return count
+	md := pf.Metadata()
+	return fl, len(md.RowGroups), md.NumRows
 }
 
 func checkIcebergMetadata(ctx context.Context, topic string) (version int, snapshots int) {

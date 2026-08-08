@@ -29,6 +29,7 @@ func consumeLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 		pid := int32(p)
 		validators[pid] = newPartitionValidator()
 	}
+	offsets := newOffsetTracker()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -46,6 +47,15 @@ func consumeLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 			continue
 		}
 		fetches.EachRecord(func(record *kgo.Record) {
+			// Offset-contiguity is checked on every record regardless of which
+			// producer wrote it: a partition's offsets are dense by assignment
+			// (0,1,2,...), so any missing offset means a record never landed in
+			// the log. This is immune to producer interleaving and client
+			// restarts, unlike per-run sequence validation.
+			if missing := offsets.check(record.Partition, record.Offset); missing > 0 {
+				stats.recordError(topic, int(record.Partition), "offset")
+				slog.Warn("offset_gap", "topic", topic, "partition", record.Partition, "offset", record.Offset, "missing", missing)
+			}
 			var value typedRecord
 			if err := json.Unmarshal(record.Value, &value); err != nil {
 				stats.recordError(topic, int(record.Partition), "decode")
@@ -73,11 +83,60 @@ func consumeLoop(ctx context.Context, cfg serviceConfig, topic string, stats *st
 	}
 }
 
+// consumerFetchMaxBytes bounds how much data the client may hold in flight
+// per broker. Large windows let the consumer prefetch far ahead of processing
+// during a backlog catch-up, which balloons memory on small client droplets;
+// small windows trade a little throughput for a hard ceiling on buffering.
+const (
+	consumerFetchMaxBytes     = 8 << 20
+	consumerFetchMaxPartBytes = 2 << 20
+)
+
+// offsetTracker verifies that a partition's Kafka offsets are dense: records
+// must arrive in strictly increasing, gap-free order (0,1,2,...). Because a
+// partition's offset space is shared by all producers and assigned in append
+// order, this check is valid even when multiple clients write the same
+// partition and regardless of producer restarts. A returned value > 0 is the
+// number of records that are missing from the log.
+type offsetTracker struct {
+	next map[int32]int64
+}
+
+func newOffsetTracker() *offsetTracker {
+	return &offsetTracker{next: make(map[int32]int64)}
+}
+
+func (t *offsetTracker) check(partition int32, offset int64) int64 {
+	next, ok := t.next[partition]
+	if !ok {
+		// First record of the partition establishes the baseline at the log
+		// start. The log may legitimately begin after offset 0 (segment
+		// trimming, compaction), so the first record itself is never a gap;
+		// contiguity is verified from the log start forward.
+		t.next[partition] = offset + 1
+		return 0
+	}
+	if offset < next {
+		// Out-of-order delivery within a partition should not happen; guard
+		// against negative gaps and re-baseline on the record actually present.
+		t.next[partition] = offset + 1
+		return 0
+	}
+	t.next[partition] = offset + 1
+	if offset > next {
+		return offset - next
+	}
+	return 0
+}
+
 // partitionValidator checks that a single producer run's records arrive on a
 // partition in monotonic sequence order: partition p carries seqs p, p+P,
 // p+2P, ... This is robust to multiple producers sharing the partition (their
-// Kafka offsets interleave, so offset-contiguity validation was a false
-// positive) while still catching dropped or reordered records of this run.
+// Kafka offsets interleave, so sequence-contiguity per producer is only valid
+// when each partition has a single writer, as here) while still catching
+// dropped or reordered records of this run. Unlike offset gaps, sequence gaps
+// can be reported as false positives when a producer restarts and renumbers
+// from zero, so they are tracked separately from offset gaps.
 type partitionValidator struct {
 	nextSeq map[int]int64
 }

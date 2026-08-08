@@ -39,6 +39,7 @@ type partitionCounters struct {
 	bytes        int64
 	consumed     int64
 	offsetGaps   int64
+	seqGaps      int64
 	decodeErrors int64
 }
 
@@ -70,6 +71,7 @@ type partitionSnapshot struct {
 	Bytes        int64 `json:"bytes"`
 	Consumed     int64 `json:"consumed,omitempty"`
 	OffsetGaps   int64 `json:"offset_gaps"`
+	SeqGaps      int64 `json:"seq_gaps,omitempty"`
 	DecodeErrors int64 `json:"decode_errors"`
 }
 
@@ -158,8 +160,10 @@ func (s *statsAccumulator) recordError(topic string, partition int, phase string
 		tc.partitions[partition] = p
 	}
 	switch phase {
-	case "validate":
+	case "offset":
 		p.offsetGaps++
+	case "validate":
+		p.seqGaps++
 	case "decode":
 		p.decodeErrors++
 	}
@@ -202,6 +206,7 @@ func (s *statsAccumulator) snapshot(start, end time.Time) snapshot {
 				Bytes:        pc.bytes,
 				Consumed:     pc.consumed,
 				OffsetGaps:   pc.offsetGaps,
+				SeqGaps:      pc.seqGaps,
 				DecodeErrors: pc.decodeErrors,
 			}
 		}

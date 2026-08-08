@@ -20,4 +20,4 @@ superpowers
 bin
 .local/minio/
 benchmark/digitalocean/monitoring/runtime/
-benchmark-service
+/benchmark-service

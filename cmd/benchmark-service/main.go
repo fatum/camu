@@ -121,6 +121,18 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "analyze" {
 		os.Exit(runAnalyze())
 	}
+	if len(os.Args) > 1 && os.Args[1] == "check-offsets" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: benchmark-service check-offsets <topic>")
+			os.Exit(2)
+		}
+		cfg, err := loadServiceConfig()
+		if err != nil {
+			slog.Error("configuration error", "error", err)
+			os.Exit(2)
+		}
+		os.Exit(runOffsetCheck(cfg, os.Args[2]))
+	}
 
 	cfg, err := loadServiceConfig()
 	if err != nil {
@@ -212,8 +224,17 @@ func newKafkaConsumer(cfg serviceConfig, topic string) (*kgo.Client, error) {
 	}
 	return kgo.NewClient(
 		kgo.SeedBrokers(cfg.KafkaBrokers...),
-		kgo.FetchMaxPartitionBytes(16<<20),
-		kgo.FetchMaxBytes(64<<20),
+		// Bound the consumer's in-memory footprint: the client cannot cap
+		// buffered consume bytes itself (decompression), so fetch small pages
+		// one at a time. Total buffered data stays ~one fetch page instead of
+		// hundreds of MB when draining a long backlog. The consume loop
+		// processes each record immediately (offset contiguity + sequence
+		// validation + counters) and retains only per-partition offset and
+		// sequence state.
+		kgo.FetchMaxPartitionBytes(consumerFetchMaxPartBytes),
+		kgo.FetchMaxBytes(consumerFetchMaxBytes),
+		kgo.FetchMaxWait(200*time.Millisecond),
+		kgo.MaxConcurrentFetches(1),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: assign}),
 	)
 }

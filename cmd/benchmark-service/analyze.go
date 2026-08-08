@@ -38,6 +38,7 @@ type partition struct {
 	Consumed     int64 `json:"consumed"`
 	Errors       int64 `json:"errors"`
 	OffsetGaps   int64 `json:"offset_gaps"`
+	SeqGaps      int64 `json:"seq_gaps"`
 	DecodeErrors int64 `json:"decode_errors"`
 }
 
@@ -152,16 +153,35 @@ func buildReport(windows []snapshot) analysisReport {
 				}
 				p.Records += ps.Records
 				p.Consumed += ps.Consumed
-				p.Errors += ps.OffsetGaps + ps.DecodeErrors
+				p.Errors += ps.OffsetGaps + ps.SeqGaps + ps.DecodeErrors
 				p.OffsetGaps += ps.OffsetGaps
+				p.SeqGaps += ps.SeqGaps
 				p.DecodeErrors += ps.DecodeErrors
-				if ps.OffsetGaps > 0 || ps.DecodeErrors > 0 {
+				if ps.OffsetGaps > 0 {
 					report.Anomalies = append(report.Anomalies, anomaly{
 						Topic:    topic,
 						Node:     snap.NodeID,
 						Window:   snap.Start.UTC().Format(time.RFC3339),
 						Severity: "error",
-						Message:  fmt.Sprintf("partition %d: %d offset gaps, %d decode errors", pid, ps.OffsetGaps, ps.DecodeErrors),
+						Message:  fmt.Sprintf("partition %d: %d offset gaps (missing records)", pid, ps.OffsetGaps),
+					})
+				}
+				if ps.SeqGaps > 0 {
+					report.Anomalies = append(report.Anomalies, anomaly{
+						Topic:    topic,
+						Node:     snap.NodeID,
+						Window:   snap.Start.UTC().Format(time.RFC3339),
+						Severity: "warning",
+						Message:  fmt.Sprintf("partition %d: %d sequence gaps (may be producer restarts)", pid, ps.SeqGaps),
+					})
+				}
+				if ps.DecodeErrors > 0 {
+					report.Anomalies = append(report.Anomalies, anomaly{
+						Topic:    topic,
+						Node:     snap.NodeID,
+						Window:   snap.Start.UTC().Format(time.RFC3339),
+						Severity: "error",
+						Message:  fmt.Sprintf("partition %d: %d decode errors", pid, ps.DecodeErrors),
 					})
 				}
 			}
