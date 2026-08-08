@@ -16,13 +16,13 @@ import (
 // A single consumer scans the whole partition stream, so the check is
 // independent of how many producers wrote the topic and of producer restarts.
 type offsetCheckReport struct {
-	Topic      string                     `json:"topic"`
-	CheckedAt  time.Time                  `json:"checked_at"`
-	Duration   time.Duration              `json:"duration"`
-	Partitions map[int]partitionCheck     `json:"partitions"`
-	Total      int64                      `json:"total_records"`
-	Missing    int64                      `json:"total_missing_offsets"`
-	OK         bool                       `json:"ok"`
+	Topic      string                 `json:"topic"`
+	CheckedAt  time.Time              `json:"checked_at"`
+	Duration   time.Duration          `json:"duration"`
+	Partitions map[int]partitionCheck `json:"partitions"`
+	Total      int64                  `json:"total_records"`
+	Missing    int64                  `json:"total_missing_offsets"`
+	OK         bool                   `json:"ok"`
 }
 
 type partitionCheck struct {
@@ -108,10 +108,7 @@ func runOffsetCheck(cfg serviceConfig, topic string) int {
 	next := make(map[int32]int64)
 	lastActivity := time.Now()
 
-	for {
-		if ctx.Err() != nil {
-			break
-		}
+	for ctx.Err() == nil {
 		fetches := cl.PollFetches(ctx)
 		if errs := fetches.Errors(); len(errs) > 0 {
 			for _, e := range errs {

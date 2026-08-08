@@ -43,11 +43,11 @@ type partition struct {
 }
 
 type anomaly struct {
-	Topic     string `json:"topic"`
-	Node      string `json:"node"`
-	Window    string `json:"window"`
-	Severity  string `json:"severity"`
-	Message   string `json:"message"`
+	Topic    string `json:"topic"`
+	Node     string `json:"node"`
+	Window   string `json:"window"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
 }
 
 func runAnalyze() int {
@@ -210,9 +210,4 @@ func buildReport(windows []snapshot) analysisReport {
 		}
 	}
 	return report
-}
-
-// runAnalyzeCmd is the entry point when the binary is invoked as "analyze".
-func runAnalyzeCmd() {
-	os.Exit(runAnalyze())
 }

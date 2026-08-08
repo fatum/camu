@@ -10,14 +10,13 @@ import (
 )
 
 type statsAccumulator struct {
-	mu            sync.Mutex
-	produceSeq    int64
-	produceTimes  map[int64]time.Time // seq -> wall clock when produced
-	topics        map[string]*topicCounters
-	cfg           serviceConfig
-	totalProd     atomic.Int64
-	totalCons     atomic.Int64
-	totalErr      atomic.Int64
+	mu           sync.Mutex
+	produceTimes map[int64]time.Time // seq -> wall clock when produced
+	topics       map[string]*topicCounters
+	cfg          serviceConfig
+	totalProd    atomic.Int64
+	totalCons    atomic.Int64
+	totalErr     atomic.Int64
 }
 
 type topicCounters struct {
@@ -44,11 +43,11 @@ type partitionCounters struct {
 }
 
 type snapshot struct {
-	Start  time.Time                  `json:"start"`
-	End    time.Time                  `json:"end"`
-	NodeID string                     `json:"node_id"`
-	RunID  string                     `json:"run_id"`
-	Topics map[string]topicSnapshot   `json:"topics"`
+	Start  time.Time                `json:"start"`
+	End    time.Time                `json:"end"`
+	NodeID string                   `json:"node_id"`
+	RunID  string                   `json:"run_id"`
+	Topics map[string]topicSnapshot `json:"topics"`
 }
 
 type topicSnapshot struct {
@@ -241,16 +240,6 @@ func (s *statsAccumulator) uploadSnapshot(snap snapshot) {
 		return
 	}
 	slog.Info("stats_uploaded", "key", key, "bytes", len(b))
-}
-
-func (s *statsAccumulator) summary() map[string]any {
-	return map[string]any{
-		"run_id":         s.cfg.RunID,
-		"node_id":        s.cfg.NodeID,
-		"total_produced": s.totalProd.Load(),
-		"total_consumed": s.totalCons.Load(),
-		"total_errors":   s.totalErr.Load(),
-	}
 }
 
 // produceTime returns the wall clock time when approximately seq records had

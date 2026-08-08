@@ -37,15 +37,15 @@ type topicVerify struct {
 }
 
 type delayStats struct {
-	MergeDelaySec   float64 `json:"merge_delay_sec"`
-	ExportDelaySec  float64 `json:"export_delay_sec"`
-	CommitDelaySec  float64 `json:"commit_delay_sec"`
-	LatestProduced  int64   `json:"latest_produced"`
-	LatestMerged    int64   `json:"latest_merged"`
-	LatestExported  int64   `json:"latest_exported"`
+	MergeDelaySec  float64 `json:"merge_delay_sec"`
+	ExportDelaySec float64 `json:"export_delay_sec"`
+	CommitDelaySec float64 `json:"commit_delay_sec"`
+	LatestProduced int64   `json:"latest_produced"`
+	LatestMerged   int64   `json:"latest_merged"`
+	LatestExported int64   `json:"latest_exported"`
 }
 
-func runVerificationPass(ctx context.Context, cfg serviceConfig, stats *statsAccumulator) {
+func runVerificationPass(cfg serviceConfig, stats *statsAccumulator) {
 	slog.Info("verification_pass_starting")
 	started := time.Now()
 	report := verificationReport{
@@ -61,7 +61,7 @@ func runVerificationPass(ctx context.Context, cfg serviceConfig, stats *statsAcc
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tv := verifyTopic(ctx, cfg, topic, stats)
+			tv := verifyTopic(topic, stats)
 			mu.Lock()
 			report.Topics[topic] = tv
 			if tv.DataLoss {
@@ -87,7 +87,7 @@ func runVerificationPass(ctx context.Context, cfg serviceConfig, stats *statsAcc
 	}
 }
 
-func verifyTopic(ctx context.Context, cfg serviceConfig, topic string, stats *statsAccumulator) *topicVerify {
+func verifyTopic(topic string, stats *statsAccumulator) *topicVerify {
 	tv := &topicVerify{Name: topic}
 
 	var latestMerged, latestExported int64
@@ -99,7 +99,7 @@ func verifyTopic(ctx context.Context, cfg serviceConfig, topic string, stats *st
 	tv.ParquetFiles, tv.ParquetBytes, tv.ParquetRows, latestExported = countParquetFiles(topic)
 
 	// 3. Check Iceberg table metadata
-	tv.IcebergVersion, tv.IcebergSnapshots = checkIcebergMetadata(ctx, topic)
+	tv.IcebergVersion, tv.IcebergSnapshots = checkIcebergMetadata(topic)
 
 	// 4. Compute delays
 	latestProduced := stats.totalProd.Load()
@@ -226,7 +226,7 @@ func readParquetFooter(data []byte) (footerLen int, rowGroups int, totalRows int
 	return fl, len(md.RowGroups), md.NumRows
 }
 
-func checkIcebergMetadata(ctx context.Context, topic string) (version int, snapshots int) {
+func checkIcebergMetadata(topic string) (version int, snapshots int) {
 	prefix := fmt.Sprintf("warehouse/%s/metadata/", topic)
 	keys, err := s3ListRetry(prefix)
 	if err != nil {
@@ -273,7 +273,7 @@ func startVerificationLoop(ctx context.Context, cfg serviceConfig, stats *statsA
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runVerificationPass(ctx, cfg, stats)
+			runVerificationPass(cfg, stats)
 		}
 	}
 }
