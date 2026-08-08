@@ -23,6 +23,12 @@ type Writer struct {
 	commitTails map[string]chan struct{}
 }
 
+// DisklessShardCount is the number of key prefixes under _diskless/ that raw
+// flush objects are spread across (seq % DisklessShardCount). The orphan sweep
+// lists these fixed shards in parallel instead of listing every flush object at
+// once, so listing cost and page count stay bounded as the log grows.
+const DisklessShardCount = 64
+
 type pendingBatch struct {
 	topic      string
 	partition  int
@@ -187,9 +193,13 @@ func (w *Writer) Flush(ctx context.Context, entries []BufferEntry) error {
 	}
 
 	// 3. Upload before assigning a logical offset. The key is fixed across PUT
-	// retries; a failed PUT cannot change metadata.
+	// retries; a failed PUT cannot change metadata. The key carries the upload
+	// millis and a monotonic per-writer sequence for uniqueness (two flushes in
+	// the same millisecond must not collide), and is sharded by seq % N so the
+	// orphan sweep can list bounded prefixes in parallel instead of one giant
+	// listing. Nothing parses the key back; refs treat it as opaque.
 	seq := w.seq.Add(1) - 1
-	fileKey := fmt.Sprintf("_diskless/%s/%d-%d.data", w.nodeID, time.Now().UnixMilli(), seq)
+	fileKey := fmt.Sprintf("_diskless/%03d/%s-%d-%d.data", seq%DisklessShardCount, w.nodeID, time.Now().UnixMilli(), seq)
 	concat := newBatchConcatReader(entries)
 	backoff := 100 * time.Millisecond
 	var uploadErr error

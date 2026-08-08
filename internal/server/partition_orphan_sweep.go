@@ -3,7 +3,12 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/maksim/camu/internal/diskless"
@@ -152,32 +157,80 @@ func (s *Server) sweepDisklessOrphans(ctx context.Context, fileIdx *diskless.Fil
 	}
 	cutoff := time.Now().Add(-disklessOrphanGrace)
 	var candidates []string
-	for _, prefix := range []string{"_diskless/", "_diskless_merge/"} {
-		keys, err := s.s3Client.List(ctx, prefix)
-		if err != nil {
-			slog.Warn("diskless_orphan_list_failed", "prefix", prefix, "error", err)
-			continue
-		}
-		// Only consider objects older than the grace period so an in-flight
-		// upload (uploaded but about to be committed) is never deleted.
-		for _, key := range keys {
-			if len(candidates) >= maxDisklessOrphansPerSweep {
-				break
-			}
-			mod, err := s.s3Client.Stat(ctx, key)
+	var mu sync.Mutex
+
+	// _diskless/ flush objects carry their upload millis in the key
+	// (_diskless/{shard}/{node}-{ms}-{seq}.data), so the grace filter needs no
+	// per-object Stat. List the fixed shard prefixes in parallel instead of one
+	// giant listing; a bounded worker pool keeps the request burst in check.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for shard := 0; shard < diskless.DisklessShardCount; shard++ {
+		wg.Add(1)
+		go func(shard int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			prefix := fmt.Sprintf("_diskless/%03d/", shard)
+			keys, err := s.s3Client.List(ctx, prefix)
 			if err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
+				slog.Warn("diskless_orphan_list_failed", "prefix", prefix, "error", err)
+				return
+			}
+			for _, key := range keys {
+				mu.Lock()
+				if len(candidates) >= maxDisklessOrphansPerSweep {
+					mu.Unlock()
+					return
+				}
+				mu.Unlock()
+				ms, ok := disklessFlushUploadMs(key)
+				if !ok {
+					continue // not a flush object; never treated as a candidate
+				}
+				if time.UnixMilli(ms).After(cutoff) {
+					continue // still inside the in-flight grace window
+				}
+				mu.Lock()
+				candidates = append(candidates, key)
+				mu.Unlock()
+			}
+		}(shard)
+	}
+	wg.Wait()
+
+	// _diskless_merge/ objects carry no timestamp in their key, so keep the
+	// Stat-based grace filter for them; there are orders of magnitude fewer.
+	{
+		keys, err := s.s3Client.List(ctx, "_diskless_merge/")
+		if err != nil {
+			slog.Warn("diskless_orphan_list_failed", "prefix", "_diskless_merge/", "error", err)
+		} else {
+			for _, key := range keys {
+				mu.Lock()
+				if len(candidates) >= maxDisklessOrphansPerSweep {
+					mu.Unlock()
+					break
+				}
+				mu.Unlock()
+				mod, err := s.s3Client.Stat(ctx, key)
+				if err != nil {
+					if errors.Is(err, storage.ErrNotFound) {
+						continue
+					}
+					slog.Warn("diskless_orphan_stat_failed", "key", key, "error", err)
 					continue
 				}
-				slog.Warn("diskless_orphan_stat_failed", "key", key, "error", err)
-				continue
+				if mod.After(cutoff) {
+					continue
+				}
+				mu.Lock()
+				candidates = append(candidates, key)
+				mu.Unlock()
 			}
-			if mod.After(cutoff) {
-				continue
-			}
-			candidates = append(candidates, key)
 		}
 	}
+
 	if len(candidates) == 0 {
 		return
 	}
@@ -204,4 +257,20 @@ func (s *Server) sweepDisklessOrphans(ctx context.Context, fileIdx *diskless.Fil
 	if len(unreferenced) > 0 {
 		slog.Info("diskless_orphan_sweep_deleted", "count", len(unreferenced))
 	}
+}
+
+// disklessFlushUploadMs extracts the upload millis from a raw flush object key
+// of the form _diskless/{shard}/{node}-{ms}-{seq}.data. The node id may itself
+// contain dashes, so the millis are taken as the second-to-last component.
+func disklessFlushUploadMs(key string) (int64, bool) {
+	base := strings.TrimSuffix(filepath.Base(key), ".data")
+	parts := strings.Split(base, "-")
+	if len(parts) < 3 {
+		return 0, false
+	}
+	ms, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+	if err != nil || ms <= 0 {
+		return 0, false
+	}
+	return ms, true
 }

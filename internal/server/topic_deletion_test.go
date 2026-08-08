@@ -32,13 +32,13 @@ func TestSweepDisklessOrphansCoversDataAndMergePrefixes(t *testing.T) {
 
 	// One referenced data object: a committed ref points at it.
 	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
-		BatchID: "ref:0:10", FileKey: "_diskless/node1/ref.data", Topic: "t", Partition: 0,
+		BatchID: "ref:0:10", FileKey: "_diskless/000/node1-1234567890000-1.data", Topic: "t", Partition: 0,
 		Count: 1, ByteLength: 10, CreatedAt: time.Now(),
 	}}); err != nil {
 		t.Fatalf("CommitUploadedBatches() error = %v", err)
 	}
-	referenced := "_diskless/node1/ref.data"
-	orphanData := "_diskless/node1/orphan.data"
+	referenced := "_diskless/000/node1-1234567890000-1.data"
+	orphanData := "_diskless/001/node1-1234567890000-2.data"
 	orphanMerge := "_diskless_merge/t/0/orphan.data"
 	for _, key := range []string{referenced, orphanData, orphanMerge} {
 		if err := s.s3Client.Put(ctx, key, []byte("x"), storage.PutOpts{}); err != nil {
