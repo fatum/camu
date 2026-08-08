@@ -19,7 +19,13 @@ func (s *Server) coordinationGC(ctx context.Context, topics []meta.TopicConfig) 
 }
 
 // gcStaleInstances deletes instance registration files whose heartbeat
-// has expired beyond the registry TTL.
+// has expired far beyond the registry TTL. The threshold is a multiple of the
+// instance TTL (which itself is 3x the lease TTL): a node is only garbage
+// collected when its heartbeat is older than 2x the liveness window, so a
+// healthy node with a slow-but-working heartbeat write is never deleted while
+// still registered and active. Instances referenced by a partition assignment
+// (leader or replica) are always kept: deleting them would orphan the
+// assignment and force a full reassignment on the next publish cycle.
 func (s *Server) gcStaleInstances(ctx context.Context) {
 	keys, err := s.s3Client.List(ctx, "_coordination/instances/")
 	if err != nil {
@@ -27,6 +33,38 @@ func (s *Server) gcStaleInstances(ctx context.Context) {
 		return
 	}
 	now := time.Now()
+	gcThreshold := 2 * s.instanceTTL
+	if gcThreshold <= 0 {
+		gcThreshold = 2 * s.leaseTTL * 3
+	}
+	if gcThreshold <= 0 {
+		gcThreshold = 5 * time.Minute // safe floor for bare test servers
+	}
+
+	// Build the set of instance IDs still referenced by any assignment so a
+	// referenced (but currently stale-heartbeating) instance is never deleted.
+	referenced := make(map[string]struct{})
+	if referencedKeys, err := s.s3Client.List(ctx, "_coordination/assignments/"); err == nil {
+		for _, ak := range referencedKeys {
+			data, err := s.s3Client.Get(ctx, ak)
+			if err != nil {
+				continue
+			}
+			var ta coordination.TopicAssignments
+			if err := json.Unmarshal(data, &ta); err != nil {
+				continue
+			}
+			for _, pa := range ta.Partitions {
+				referenced[pa.Leader] = struct{}{}
+				for _, r := range pa.Replicas {
+					referenced[r] = struct{}{}
+				}
+			}
+		}
+	} else {
+		slog.Warn("coordinationGC: list assignments for instance GC", "error", err)
+	}
+
 	for _, key := range keys {
 		data, err := s.s3Client.Get(ctx, key)
 		if err != nil {
@@ -36,7 +74,10 @@ func (s *Server) gcStaleInstances(ctx context.Context) {
 		if err := json.Unmarshal(data, &info); err != nil {
 			continue
 		}
-		if now.Sub(info.HeartbeatAt) > s.leaseTTL*3 {
+		if _, used := referenced[info.InstanceID]; used {
+			continue
+		}
+		if now.Sub(info.HeartbeatAt) > gcThreshold {
 			if err := s.s3Client.Delete(ctx, key); err != nil {
 				slog.Warn("coordinationGC: delete stale instance", "key", key, "error", err)
 			} else {

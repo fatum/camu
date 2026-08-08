@@ -94,6 +94,8 @@ Pass `--faults` as a comma-separated list or use `run.sh <faults> <seconds>`.
 | `clock-skew` | Inject clock drift | Lease timing assumptions |
 | `leader-kill` | Kill the active leader for busy partitions | Promoted-leader recovery and readable failover |
 | `leader-pause-then-ack` | Pause the active leader past lease expiry, let a new leader be elected, then resume the stale leader | Stale-leader fencing: a resumed leader must not acknowledge a write the current ISR quorum does not hold |
+| `restart-wipe` | SIGKILL a process, wipe its local data directory, then restart it | S3-only recovery: a redeployed node must rebuild topics, assignments, ISR, and committed segments from the object store alone, without losing acknowledged writes or serving ghosts |
+| `redeploy` | Gracefully stop a node, wipe its local state, plant failed/orphaned objects in the bucket, then restart the same identity | Re-deploy against existing S3 state: the node must adopt the topic and committed segments already in the bucket, tolerate orphaned/stale coordination objects (never serving them), and let the object-store GC reclaim them without data loss |
 
 ## Kafka API Status
 

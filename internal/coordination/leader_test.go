@@ -216,3 +216,44 @@ func TestLeaderElection_RenewFencedByHigherEpoch(t *testing.T) {
 		t.Fatalf("Renew err = %v, want ErrLeaseFenced", err)
 	}
 }
+
+// TestLeaderElection_RenewOwnAdvanceNotFenced verifies that an epoch bump
+// recorded by this instance's own prior renew (whose response was lost — the
+// local copy lags the stored lease) is not treated as fencing by a different
+// holder. The stored lease belongs to the same instance, so Renew must proceed
+// with its CAS rather than spuriously ceding the controller lease.
+func TestLeaderElection_RenewOwnAdvanceNotFenced(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le := NewLeaderElection(s3, "instance-1", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire: acquired=%v err=%v", acquired, err)
+	}
+
+	// The caller holds a stale local copy (epoch 0) but the stored lease has
+	// already advanced to epoch 5 by this same instance (a prior renew whose
+	// response was lost). The CAS below must fail on ETag mismatch, but the
+	// error must NOT be ErrLeaseFenced.
+	advanced := LeaderLease{
+		InstanceID: "instance-1",
+		ExpiresAt:  time.Now().Add(time.Minute),
+		LeaseEpoch: 5,
+	}
+	data, err := json.Marshal(advanced)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s3.Put(ctx, leaderKey, data, storage.PutOpts{}); err != nil {
+		t.Fatalf("put advanced lease: %v", err)
+	}
+
+	_, err = le.Renew(ctx, lease)
+	if errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("Renew must not fence on own advance, got ErrLeaseFenced")
+	}
+	if err == nil {
+		t.Fatal("expected CAS conflict error from stale ETag, got nil")
+	}
+}

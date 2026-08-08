@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -106,7 +107,10 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 	for attempt := 0; ; attempt++ {
 		out, err := d.client.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.offsetsTable, Key: map[string]ddbtypes.AttributeValue{"pk": &ddbtypes.AttributeValueMemberS{Value: pk}}, ProjectionExpression: aws.String("upload_state")})
 		if err != nil {
-			return nil, fmt.Errorf("read upload state %s: %w", pk, err)
+			// A failed read leaves the batch unrecorded: mark it retryable so
+			// Kafka clients re-send the same batch instead of advancing past a
+			// gap (same contract as the S3 metastore).
+			return nil, fmt.Errorf("%w: read upload state %s: %v", ErrProduceRetryable, pk, err)
 		}
 		state := dynamoUploadState{Producers: map[string][]dynamoProducerBatch{}}
 		var old string
@@ -209,11 +213,15 @@ func (d *DynamoMetaStore) CommitUploadedBatches(ctx context.Context, batches []U
 			return results, nil
 		}
 		if attempt >= 7 {
-			return nil, fmt.Errorf("commit uploaded batches %s: %w", pk, err)
+			// The transaction failed to commit, so nothing in this invocation
+			// was recorded: mark it retryable so the client re-sends the same
+			// batch. A retry either commits the batch fresh or deduplicates it
+			// as an exact retry; it can never burn the producer sequence.
+			return nil, fmt.Errorf("%w: commit uploaded batches %s: %v", ErrProduceRetryable, pk, err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("%w: commit uploaded batches %s: %v", ErrProduceRetryable, pk, ctx.Err())
 		case <-time.After(allocateRetryBackoff(attempt)):
 		}
 	}
@@ -379,6 +387,13 @@ func itemToSegmentRef(item map[string]ddbtypes.AttributeValue) SegmentRef {
 		}
 	}
 	return ref
+}
+
+// QueryHeadSegments returns every segment reference of a partition. DynamoDB
+// has no archive concept (refs are per-item rows), so the full catalog is the
+// head window.
+func (d *DynamoMetaStore) QueryHeadSegments(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
+	return d.QuerySegments(ctx, topic, partition, 0, math.MaxInt)
 }
 
 // GetPartitionHead returns the next offset for a partition, or 0 if none allocated.

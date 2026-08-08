@@ -30,6 +30,14 @@ type MetaStore interface {
 	QuerySegments(ctx context.Context, topic string, partition int,
 		fromOffset int64, maxBytes int) ([]SegmentRef, error)
 
+	// QueryHeadSegments returns only the segment references currently in the
+	// backend's hot head window, never archived refs. Compaction must only
+	// ever merge head-window refs: archived refs are compaction-final (they
+	// were rolled out of the head once they reached target size) and are never
+	// eligible for another merge. Backends without an archive concept (memory,
+	// DynamoDB) return their full catalog.
+	QueryHeadSegments(ctx context.Context, topic string, partition int) ([]SegmentRef, error)
+
 	// ReplaceSegmentRefs atomically removes the references identified by remove
 	// and inserts add into the partition's segment catalog. Readers must never
 	// observe a gap or a duplicate for the affected range: add must exactly

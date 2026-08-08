@@ -90,6 +90,7 @@ type Server struct {
 	leaseRenewalInterval time.Duration
 	replicationTimeout   time.Duration
 	fenceInterval        time.Duration
+	instanceTTL          time.Duration
 
 	// fenceMu guards fenceVerified, the per-partition last-verified timestamps
 	// for rf=1 ack-time ownership checks.
@@ -135,6 +136,23 @@ type Server struct {
 	// memory while concatenating sources, so a bound keeps a backlog drain from
 	// saturating the object store or ballooning memory.
 	disklessMergeExecSem chan struct{}
+
+	// lastISRWrite tracks the last high watermark persisted to the S3 ISR
+	// object per partition, so checkISRLag can persist HW advances on a cadence
+	// even when ISR membership is unchanged (the ISR object is otherwise only
+	// written on membership change, leaving its HW stale for failover
+	// recovery). Guarded by isrWriteMu.
+	isrWriteMu   sync.Mutex
+	lastISRWrite map[string]uint64 // "topic/pid" -> last HW persisted
+
+	// compactionHint caches, per diskless partition, the committed head and the
+	// last discovery time so the dedicated compaction loop can skip the
+	// discovery head-query and run-building for idle partitions (no new commits,
+	// and no ref can have newly crossed the grace boundary since the last scan).
+	// In-flight merge jobs are still listed and executed on every tick; only the
+	// discovery read is elided. Guarded by compactionHintMu.
+	compactionHintMu sync.Mutex
+	compactionHints  map[string]disklessCompactionHint // "topic/pid" -> hint
 
 	// topicDeletionCh is the bounded queue for async topic-deletion workers,
 	// so a long cleanup never blocks the leader's GC tick. topicDeletionInflight
@@ -289,6 +307,8 @@ func newServer(cfg *config.Config, s3Client *storage.S3Client) (*Server, error) 
 	s.isrStore = replication.NewISRStore(s3Client)
 	s.idempotencyManager = idempotencyMgr
 	s.myPartitions = make(map[string]map[int]localPartitionAssignment)
+	s.lastISRWrite = make(map[string]uint64)
+	s.compactionHints = make(map[string]disklessCompactionHint)
 	s.leaseStop = make(chan struct{})
 	s.maintenanceCtx, s.maintenanceCancel = context.WithCancel(context.Background())
 	s.leaseTTL = leaseTTL
@@ -369,6 +389,7 @@ func (s *Server) startWithListener(ln net.Listener) error {
 	if err != nil {
 		return fmt.Errorf("parsing coordination.instance_ttl: %w", err)
 	}
+	s.instanceTTL = instanceTTL
 	kafkaAddr := ""
 	if s.cfg.Server.KafkaPort > 0 {
 		kafkaAddr = kafkaAdvertiseAddr(s.instanceID, s.Address(), s.cfg.Server.KafkaPort, s.cfg.Server.KafkaAdvertiseAddress)
@@ -398,6 +419,18 @@ func (s *Server) startWithListener(ln net.Listener) error {
 		s.disklessMeta = dms
 	default:
 		s.disklessMeta = diskless.NewMemoryMetaStore()
+		// The memory metastore is single-node development only: offsets, refs,
+		// and the committed head all live in process. Two instances would each
+		// allocate independent offset ranges and silently diverge. This is a
+		// documented limitation, but a loud startup warning prevents a confusing
+		// production incident when the default is used in a multi-node cluster.
+		slog.Warn("diskless_metastore_memory_is_single_node_only",
+			"metastore", s.cfg.Diskless.MetaStore,
+			"set", "diskless.metastore",
+			"to", "s3",
+			"or", "dynamodb",
+			"for", "multi-node",
+		)
 	}
 	s.disklessEngine = diskless.NewEngine(s.s3Client, s.disklessMeta, s.instanceID, diskless.EngineConfig{
 		LingerMs:      s.cfg.Diskless.LingerMs,
@@ -1056,6 +1089,15 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 		newPartitions := coordination.AssignReplicated(active, tc.Partitions, tc.ReplicationFactor, currentPartitions)
 		if tc.StorageMode == meta.StorageModeDiskless {
 			newPartitions = coordination.AssignDiskless(active, tc.Partitions, currentPartitions)
+		} else if tc.ReplicationFactor > 1 {
+			// Prefer active ISR members when a leader must be reassigned. The
+			// planner's firstActiveReplica pick can name a replica that has
+			// fallen out of the ISR; the node-side promotion gate would then
+			// refuse it, leaving the partition leaderless even though an ISR
+			// member is available. Read the authoritative ISR for partitions
+			// whose leader is changing and steer the assignment to an active
+			// ISR member instead.
+			newPartitions = s.preferISRLeaders(ctx, tc.Name, tc.Partitions, active, currentPartitions, newPartitions)
 		}
 
 		if err == nil {
@@ -1079,6 +1121,8 @@ func (s *Server) publishAssignmentsForTopics(ctx context.Context, topics []meta.
 				ta.Partitions = coordination.AssignReplicated(active, tc.Partitions, tc.ReplicationFactor, existing2.Partitions)
 				if tc.StorageMode == meta.StorageModeDiskless {
 					ta.Partitions = coordination.AssignDiskless(active, tc.Partitions, existing2.Partitions)
+				} else if tc.ReplicationFactor > 1 {
+					ta.Partitions = s.preferISRLeaders(ctx, tc.Name, tc.Partitions, active, existing2.Partitions, ta.Partitions)
 				}
 				if retryErr := s.assignmentStore.Write(ctx, tc.Name, ta, existing2.ETag); retryErr != nil {
 					slog.Warn("publishAssignments: retry failed", "topic", tc.Name, "error", retryErr)
@@ -1112,6 +1156,59 @@ func partitionAssignmentsChanged(existing, next map[int]coordination.PartitionAs
 		}
 	}
 	return false
+}
+
+// preferISRLeaders steers the leader of reassigned partitions toward an active
+// ISR member. AssignReplicated's firstActiveReplica pick can name a replica
+// that has fallen out of the ISR (it only checks liveness, not sync state); the
+// node-side promotion gate would then refuse it, leaving the partition
+// leaderless even though an ISR member is available. For each partition whose
+// leader is changing, read the authoritative ISR and, when an active ISR member
+// other than the failed leader exists, use it. When no active ISR member is
+// available the planner's pick is kept (the promotion gate still refuses a
+// non-ISR node; with unclean election enabled the planner's pick may be the
+// only option).
+//
+// Only partitions whose leader is changing are consulted, so a stable
+// assignment costs no ISR reads.
+func (s *Server) preferISRLeaders(ctx context.Context, topic string, numPartitions int, active []string, existing, next map[int]coordination.PartitionAssignment) map[int]coordination.PartitionAssignment {
+	if s.isrStore == nil {
+		return next
+	}
+	activeSet := make(map[string]struct{}, len(active))
+	for _, id := range active {
+		activeSet[id] = struct{}{}
+	}
+	for pid := 0; pid < numPartitions; pid++ {
+		cur, ok := existing[pid]
+		nxt, ok2 := next[pid]
+		if !ok2 {
+			continue
+		}
+		if ok && cur.Leader == nxt.Leader {
+			continue // leader unchanged — nothing to steer
+		}
+		isrState, err := s.isrStore.Read(ctx, topic, pid)
+		if err != nil {
+			continue // no ISR yet (bootstrap) or read failure: keep planner pick
+		}
+		for _, member := range isrState.ISR {
+			if _, active := activeSet[member]; !active {
+				continue
+			}
+			if ok && member == cur.Leader {
+				continue // the failed leader
+			}
+			if member == nxt.Leader {
+				break // planner already picked an active ISR member
+			}
+			nxt.Leader = member
+			nxt.LeaderEpoch++
+			next[pid] = nxt
+			break
+		}
+	}
+	return next
 }
 
 // applyAssignmentsForTopics reads assignments from S3 and acquires/releases leases
@@ -1296,6 +1393,19 @@ func (s *Server) initPartitionAsLeader(ctx context.Context, topic string, pid in
 	// follower) must start its epoch at the durable end, or the boundary would
 	// regress below prior epochs and the history could never accept it.
 	logEnd := s.partitionManager.recoverTrueLogEnd(topic, pid)
+
+	// A node whose durable log end is below the committed high watermark must
+	// not be promoted: its epoch boundary would follow its (shorter) log end
+	// and truncate committed data held by remaining ISR members. The
+	// assignment store is the controller's reconciliation-time view; the
+	// authoritative committed watermark is read from the ISR store here.
+	// Bootstrap (no ISR yet) and unclean leader election are allowed, so the
+	// first leader of a fresh partition still promotes.
+	if !s.canBecomeLeader(ctx, topic, pid, logEnd) {
+		slog.Warn("initPartitionAsLeader: not eligible: durable log end below committed watermark",
+			"topic", topic, "partition", pid, "log_end", logEnd, "leader_epoch", pa.LeaderEpoch)
+		return
+	}
 
 	// Load epoch history from S3 (authoritative), fall back to local file,
 	// or use existing epochHistory if S3 is unavailable.
@@ -1977,7 +2087,10 @@ func (s *Server) proxyToLeader(w http.ResponseWriter, r *http.Request, leaderAdd
 
 // checkISRLag iterates over all leader partitions and removes followers from
 // the ISR set if they have not contacted the leader within the lag timeout.
-// When the ISR changes, the updated set is written to S3.
+// The updated ISR set is written to S3 whenever membership changes OR when the
+// high watermark has advanced past the last persisted value, so the S3 ISR
+// object's HW stays fresh for failover recovery instead of going stale between
+// membership changes.
 func (s *Server) checkISRLag(ctx context.Context) {
 	s.partitionManager.mu.RLock()
 	defer s.partitionManager.mu.RUnlock()
@@ -1994,13 +2107,27 @@ func (s *Server) checkISRLag(ctx context.Context) {
 			// CheckISRLag mutates the ISR set, so it must run under the same
 			// partition lock as the replica fetch path (UpdateFollower).
 			changed := rs.CheckISRLag(30*time.Second) || rs.ISRChanged()
-			if !changed {
+			hw := rs.HighWatermark()
+
+			// Decide whether an ISR write is needed: membership changed, or the
+			// HW advanced past the last persisted value (so the S3 ISR object's
+			// HW does not go stale between membership changes).
+			isrWriteKey := fmt.Sprintf("%s/%d", topic, pid)
+			s.isrWriteMu.Lock()
+			lastHW := s.lastISRWrite[isrWriteKey]
+			needsHWWrite := hw > lastHW
+			s.isrWriteMu.Unlock()
+
+			if !changed && !needsHWWrite {
 				ps.mu.Unlock()
 				continue
 			}
+			// Capture the ISR set and HW under the partition lock; the S3 write
+			// happens after the lock is released, so a follower may advance HW
+			// between capture and write — that is fine, we never write a lower
+			// watermark than the one captured.
 			rs.ClearISRChanged()
 			isr := rs.GetISRMembers()
-			hw := rs.HighWatermark()
 			ps.mu.Unlock()
 
 			if err := s.isrStore.Update(ctx, topic, pid, epoch, func(_ replication.ISRState) (replication.ISRState, error) {
@@ -2011,7 +2138,13 @@ func (s *Server) checkISRLag(ctx context.Context) {
 				}, nil
 			}); err != nil {
 				s.onISRWriteError(topic, pid, err)
+				continue
 			}
+			s.isrWriteMu.Lock()
+			if hw > s.lastISRWrite[isrWriteKey] {
+				s.lastISRWrite[isrWriteKey] = hw
+			}
+			s.isrWriteMu.Unlock()
 		}
 	}
 }
