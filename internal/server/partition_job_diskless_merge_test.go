@@ -1182,3 +1182,88 @@ func TestDisklessMergeCeilingNonDivisorRunEnqueuesUnderCeiling(t *testing.T) {
 		}
 	}
 }
+
+// TestDisklessMergeSingleOversizedRefNeverWedges pins the boundary for a single
+// ref larger than the byte ceiling (but below an unboundedly large target): such
+// a ref can never be merged (buildDisklessMergeArtifact rejects runs over the
+// ceiling), so discovery must skip it as a boundary rather than enqueue it (a
+// job that would fail forever and wedge the partition's compaction). The small
+// refs behind it must still be compacted.
+func TestDisklessMergeSingleOversizedRefNeverWedges(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 2
+	s.cfg.Diskless.Compaction.TargetBytes = 1 << 60 // unbounded: only the ceiling can reject
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// Ref [0,1) is oversized (no data object is written; discovery only reads
+	// manifest metadata, and the oversized ref is never merged so no read occurs).
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "big:0", FileKey: "big", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: maxDisklessMergeBytes + 1, CreatedAt: now,
+	}}); err != nil {
+		t.Fatalf("commit oversized ref: %v", err)
+	}
+	// Two small refs behind it, each a mergeable size.
+	for i := 1; i < 3; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/o%d.data", i)
+		data := bytes.Repeat([]byte{'z'}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 merge job over the small refs, got %d", len(jobs))
+	}
+	var payload DisklessMergePayload
+	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
+		t.Fatalf("decode merge payload: %v", err)
+	}
+	if len(payload.Sources) != 2 || payload.Sources[0].BaseOffset != 1 || payload.Sources[1].BaseOffset != 2 {
+		t.Fatalf("job sources = %+v, want the two small refs at [1,2),[2,3)", payload.Sources)
+	}
+	if err := s.runSegmentMergeJob(ctx, jobs[0]); err != nil {
+		t.Fatalf("merge of small refs must succeed: %v", err)
+	}
+	// The oversized ref is untouched and still readable in the head.
+	refs, err := s.disklessMeta.QueryHeadSegments(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("refs after merge = %d, want 2 (oversized ref + merged small refs)", len(refs))
+	}
+	if refs[0].ByteLength != maxDisklessMergeBytes+1 {
+		t.Fatalf("oversized ref byte length = %d, want %d", refs[0].ByteLength, maxDisklessMergeBytes+1)
+	}
+}

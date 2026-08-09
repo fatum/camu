@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,12 +140,22 @@ type s3ProducerBatch struct {
 // (its most recent batch); CommitUploadedBatches consults it for dedup and
 // sequence validation. Producers whose last batch has the smallest base offset
 // (the least recently active) are evicted first.
+//
+// Tombstones themselves are bounded to maxEntries: the tombstone map would
+// otherwise grow by one per distinct evicted producer and the head would grow
+// with producer cardinality — the unbounded growth this eviction exists to
+// prevent, merely shifted into the tombstone set. When the tombstone set
+// overflows, the oldest tombstones (smallest base offset) are dropped. An
+// exact retry of a producer whose tombstone was dropped re-allocates at a fresh
+// offset (the pre-eviction behavior); this is the accepted tradeoff at extreme
+// cardinality, and it keeps the head object size bounded.
 func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, tombstones map[string]s3ProducerBatch, maxEntries int) {
 	total := 0
 	for _, h := range producers {
 		total += len(h)
 	}
 	if total <= maxEntries {
+		evictExcessTombstones(tombstones, maxEntries)
 		return
 	}
 	// Order producers by the base offset of their last recorded batch, oldest
@@ -176,6 +187,24 @@ func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, tombston
 		tombstones[e.id] = h[len(h)-1]
 		delete(producers, e.id)
 		total -= e.count
+	}
+	evictExcessTombstones(tombstones, maxEntries)
+}
+
+// evictExcessTombstones bounds the tombstone set to maxEntries, dropping the
+// oldest tombstones (smallest base offset) when the set overflows. This keeps
+// the head object size bounded even when an unbounded number of distinct
+// producers is evicted over the partition's lifetime.
+func evictExcessTombstones(tombstones map[string]s3ProducerBatch, maxEntries int) {
+	for len(tombstones) > maxEntries {
+		var oldest string
+		var oldestBase int64 = math.MaxInt64
+		for id, t := range tombstones {
+			if t.BaseOffset < oldestBase {
+				oldest, oldestBase = id, t.BaseOffset
+			}
+		}
+		delete(tombstones, oldest)
 	}
 }
 

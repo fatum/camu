@@ -603,8 +603,11 @@ func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	// Commit batches from far more distinct producers than the head allows.
-	for p := int64(0); p < s3HeadMaxProducerEntries+10; p++ {
+	// Commit batches from far more distinct producers than the head allows —
+	// enough that the tombstone set itself overflows its bound (one tombstone
+	// per evicted producer).
+	const nProducers = 2*s3HeadMaxProducerEntries + 10
+	for p := int64(0); p < nProducers; p++ {
 		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
 			BatchID:    fmt.Sprintf("obj-%d:0:10", p),
 			FileKey:    fmt.Sprintf("obj-%d", p),
@@ -635,8 +638,14 @@ func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
 	if total > s3HeadMaxProducerEntries {
 		t.Fatalf("producer history = %d entries, want <= %d", total, s3HeadMaxProducerEntries)
 	}
+	// Tombstones must be bounded too: the tombstone set would otherwise grow by
+	// one per distinct evicted producer, re-introducing the unbounded head
+	// growth the eviction exists to prevent.
+	if got := len(manifest.Tombstones); got > s3HeadMaxProducerEntries {
+		t.Fatalf("tombstones = %d, want <= %d", got, s3HeadMaxProducerEntries)
+	}
 	// Committed offsets must be unaffected by eviction.
-	if got, want := manifest.CommittedOffset, int64(s3HeadMaxProducerEntries+10); got != want {
+	if got, want := manifest.CommittedOffset, int64(nProducers); got != want {
 		t.Fatalf("committed offset = %d, want %d", got, want)
 	}
 }
@@ -673,6 +682,34 @@ func TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst(t *testing.T) {
 	}
 	if ts.FirstSequence != 0 || ts.BaseOffset != 0 {
 		t.Fatalf("tombstone = %+v, want the producer's last batch", ts)
+	}
+}
+
+// TestEvictExcessTombstonesBounded verifies the tombstone set is capped: when
+// more producers are evicted than the bound allows, the oldest tombstones
+// (smallest base offset) are dropped so the head cannot grow without bound.
+func TestEvictExcessTombstonesBounded(t *testing.T) {
+	tombstones := map[string]s3ProducerBatch{
+		"1": {FirstSequence: 0, BaseOffset: 0, Count: 1},
+		"2": {FirstSequence: 0, BaseOffset: 10, Count: 1},
+		"3": {FirstSequence: 0, BaseOffset: 20, Count: 1},
+		"4": {FirstSequence: 0, BaseOffset: 30, Count: 1},
+	}
+	evictExcessTombstones(tombstones, 2)
+	if len(tombstones) != 2 {
+		t.Fatalf("tombstones after evict = %d, want 2", len(tombstones))
+	}
+	if _, ok := tombstones["1"]; ok {
+		t.Fatal("oldest tombstone (base 0) must be dropped first")
+	}
+	if _, ok := tombstones["2"]; ok {
+		t.Fatal("second-oldest tombstone (base 10) must be dropped")
+	}
+	if _, ok := tombstones["3"]; !ok {
+		t.Fatal("newer tombstone (base 20) must survive")
+	}
+	if _, ok := tombstones["4"]; !ok {
+		t.Fatal("newest tombstone (base 30) must survive")
 	}
 }
 

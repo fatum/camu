@@ -123,9 +123,15 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 			flushRun()
 			continue
 		}
-		if ref.ByteLength >= target {
-			// Already compaction-sized: a boundary. Skip the oversized ref so a
-			// prior run's merged object never blocks the small refs behind it.
+		if ref.ByteLength >= target || ref.ByteLength > maxDisklessMergeBytes {
+			// Already compaction-sized (>= target): a boundary. Skip the
+			// oversized ref so a prior run's merged object never blocks the
+			// small refs behind it. A single ref larger than the byte ceiling
+			// is likewise never mergeable (buildDisklessMergeArtifact rejects
+			// runs over the ceiling), so skipping it as a boundary is required
+			// too: enqueuing it would fail forever and wedge the partition's
+			// compaction. Such a ref stays unmerged in the head until it
+			// reaches target size and is archived.
 			flushRun()
 			continue
 		}
