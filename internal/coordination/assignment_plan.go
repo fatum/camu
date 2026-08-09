@@ -141,7 +141,7 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 				// cannot actually hold the committed prefix is refused there,
 				// not by the planner.
 				switch {
-				case containsReplica(instances, leader):
+				case containsReplica(instances, leader) && containsReplica(replicas, leader):
 					// leader unchanged
 				default:
 					if nextLeader, ok := firstNativeActiveReplica(replicas, native, activeSet); ok {
