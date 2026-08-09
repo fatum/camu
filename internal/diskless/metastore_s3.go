@@ -41,6 +41,9 @@ type S3MetaStore struct {
 	headMaxRefCount   int
 	headMaxRefBytes   int64
 	checkpointMaxRefs int
+	// headMaxProducerEntries bounds the idempotent producer history + tombstone
+	// sets kept in the head object.
+	headMaxProducerEntries int
 }
 
 const (
@@ -230,10 +233,11 @@ type s3Catalog struct {
 // NewS3MetaStore creates a MetaStore backed by s3.
 func NewS3MetaStore(s3 *storage.S3Client) *S3MetaStore {
 	return &S3MetaStore{
-		s3:                s3,
-		headMaxRefCount:   s3HeadMaxRefCount,
-		headMaxRefBytes:   s3HeadMaxRefBytes,
-		checkpointMaxRefs: s3CheckpointMaxRefs,
+		s3:                     s3,
+		headMaxRefCount:        s3HeadMaxRefCount,
+		headMaxRefBytes:        s3HeadMaxRefBytes,
+		checkpointMaxRefs:      s3CheckpointMaxRefs,
+		headMaxProducerEntries: s3HeadMaxProducerEntries,
 	}
 }
 
@@ -368,7 +372,7 @@ manifestLoop:
 		if !changed {
 			return results, nil // every batch was a duplicate
 		}
-		evictExcessProducerEntries(manifest.Producers, manifest.Tombstones, s3HeadMaxProducerEntries)
+		evictExcessProducerEntries(manifest.Producers, manifest.Tombstones, m.headMaxProducerEntries)
 		manifest.Version++
 		encoded, err := json.Marshal(manifest)
 		if err != nil {

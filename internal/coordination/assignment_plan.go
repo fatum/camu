@@ -131,11 +131,17 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 				leader = cur.Leader
 				leaderEpoch = cur.LeaderEpoch
 
-				// Keep the current leader only if it is still active, present,
-				// and a native (pre-existing) replica. Never promote a
-				// backfilled node: it does not hold the committed prefix.
+				// Keep the current leader while it is still active. Native
+				// exclusivity governs who is promoted to leader, never who is
+				// already leading: preferISRLeaders may have steered leadership
+				// to a caught-up (ISR) backfill, and reverting it to a native
+				// replica that has fallen out of the ISR would leave the
+				// partition leaderless despite an eligible leader existing. The
+				// node-side promotion gate remains the backstop: a leader that
+				// cannot actually hold the committed prefix is refused there,
+				// not by the planner.
 				switch {
-				case containsReplica(instances, leader) && native[leader]:
+				case containsReplica(instances, leader):
 					// leader unchanged
 				default:
 					if nextLeader, ok := firstNativeActiveReplica(replicas, native, activeSet); ok {
@@ -288,6 +294,17 @@ func rebalanceLeaders(assignments map[int]PartitionAssignment, active map[string
 				assignments[pid] = assignment
 			}
 			leaders[leader]++
+			continue
+		}
+
+		// A non-native current leader is left in place: preferISRLeaders may
+		// have steered it to a caught-up ISR member, and rebalancing it onto a
+		// native replica that has fallen out of the ISR would leave the
+		// partition leaderless despite an eligible leader existing. Native
+		// exclusivity governs who is promoted to leader, never who is already
+		// leading.
+		if assignment.Leader != "" && !native[assignment.Leader] {
+			leaders[assignment.Leader]++
 			continue
 		}
 

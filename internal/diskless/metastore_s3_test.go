@@ -600,13 +600,16 @@ func TestS3MetaStore_CommitSequenceGapIsNotRetryable(t *testing.T) {
 // producer count.
 func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
 	m := newTestS3MetaStore(t)
+	// Use a small injectable cap so the overflow needs few producers (the test
+	// runs under -race, where thousands of manifest commits are too slow).
+	m.headMaxProducerEntries = 64
 	ctx := context.Background()
 	now := time.Now()
 
 	// Commit batches from far more distinct producers than the head allows —
 	// enough that the tombstone set itself overflows its bound (one tombstone
 	// per evicted producer).
-	const nProducers = 2*s3HeadMaxProducerEntries + 10
+	const nProducers = 2*64 + 10
 	for p := int64(0); p < nProducers; p++ {
 		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
 			BatchID:    fmt.Sprintf("obj-%d:0:10", p),
@@ -635,14 +638,14 @@ func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
 	for _, h := range manifest.Producers {
 		total += len(h)
 	}
-	if total > s3HeadMaxProducerEntries {
-		t.Fatalf("producer history = %d entries, want <= %d", total, s3HeadMaxProducerEntries)
+	if total > m.headMaxProducerEntries {
+		t.Fatalf("producer history = %d entries, want <= %d", total, m.headMaxProducerEntries)
 	}
 	// Tombstones must be bounded too: the tombstone set would otherwise grow by
 	// one per distinct evicted producer, re-introducing the unbounded head
 	// growth the eviction exists to prevent.
-	if got := len(manifest.Tombstones); got > s3HeadMaxProducerEntries {
-		t.Fatalf("tombstones = %d, want <= %d", got, s3HeadMaxProducerEntries)
+	if got := len(manifest.Tombstones); got > m.headMaxProducerEntries {
+		t.Fatalf("tombstones = %d, want <= %d", got, m.headMaxProducerEntries)
 	}
 	// Committed offsets must be unaffected by eviction.
 	if got, want := manifest.CommittedOffset, int64(nProducers); got != want {
@@ -720,6 +723,8 @@ func TestEvictExcessTombstonesBounded(t *testing.T) {
 // fresh offset (a duplicate committed record).
 func TestEvictedProducerRetryNotDuplicated(t *testing.T) {
 	m := newTestS3MetaStore(t)
+	// Small injectable cap: the flood must exceed it but stay fast under -race.
+	m.headMaxProducerEntries = 64
 	ctx := context.Background()
 	now := time.Now()
 
@@ -733,7 +738,7 @@ func TestEvictedProducerRetryNotDuplicated(t *testing.T) {
 
 	// Flood the head with enough distinct producers to cross the eviction
 	// threshold, forcing producer 1 (oldest base offset) to be tombstoned.
-	for p := int64(2); p <= s3HeadMaxProducerEntries+2; p++ {
+	for p := int64(2); p <= 64+2; p++ {
 		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
 			BatchID:    fmt.Sprintf("flood-%d:0:10", p),
 			FileKey:    fmt.Sprintf("flood-%d", p),

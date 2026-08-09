@@ -110,19 +110,21 @@ func (r *Registry) refreshCache(ctx context.Context) error {
 		r.cacheMu.Unlock()
 		return nil
 	}
-	old := r.infoCache
+	// Snapshot the cache under the lock into a private map: Register/Deregister
+	// mutate the live cache, so the map must not be iterated after the lock is
+	// released.
+	fresh := make(map[string]InstanceInfo, len(r.infoCache)+16)
+	for id, info := range r.infoCache {
+		fresh[id] = info
+	}
 	r.cacheMu.Unlock()
 
 	keys, err := r.s3Client.List(ctx, "_coordination/instances/")
 	if err != nil {
 		return fmt.Errorf("registry: list: %w", err)
 	}
-	// Seed from the previous cache so an unreadable registration keeps its last
-	// known address; unlisted nodes (deregistered) are removed below.
-	fresh := make(map[string]InstanceInfo, len(old)+len(keys))
-	for id, info := range old {
-		fresh[id] = info
-	}
+	// The private copy keeps an unreadable registration's last known address;
+	// unlisted nodes (deregistered) are removed below.
 	listed := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		id := strings.TrimSuffix(strings.TrimPrefix(key, "_coordination/instances/"), ".json")

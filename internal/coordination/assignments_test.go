@@ -305,6 +305,40 @@ func TestAssignReplicated_BackfillStaysNonNativeAcrossCycles(t *testing.T) {
 	}
 }
 
+// TestAssignReplicated_KeepsNonNativeCurrentLeader verifies a non-native
+// current leader is not reverted: preferISRLeaders may have steered leadership
+// to a caught-up (ISR) backfill, and reverting it to a native replica that has
+// fallen out of the ISR would leave the partition leaderless despite an
+// eligible leader existing. Native exclusivity governs who is promoted to
+// leader, never who is already leading.
+func TestAssignReplicated_KeepsNonNativeCurrentLeader(t *testing.T) {
+	// n3 was backfilled (not native); preferISRLeaders steered leadership to it
+	// after n1 died. n2 is native but has fallen out of the ISR.
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n2", "n3"},
+			Native:      []string{"n2"},
+			Leader:      "n3",
+			LeaderEpoch: 5,
+		},
+	}
+
+	got := AssignReplicated([]string{"n2", "n3"}, 1, 2, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if partition.Leader != "n3" {
+		t.Fatalf("leader = %q, want n3 (non-native current leader must not be reverted to a possibly-ineligible native)", partition.Leader)
+	}
+	if partition.LeaderEpoch != 5 {
+		t.Fatalf("leader_epoch = %d, want 5 (no churn)", partition.LeaderEpoch)
+	}
+	if containsReplica(partition.Native, "n3") {
+		t.Fatalf("n3 must stay non-native, native = %v", partition.Native)
+	}
+}
+
 // TestAssignReplicated_PrunesDeadLeaderPromotesNativeSurvivor verifies that a
 // dead leader is replaced by an active native (pre-existing) survivor. The
 // freed slot is backfilled to maintain RF, but the backfilled node is a
