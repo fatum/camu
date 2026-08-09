@@ -132,6 +132,16 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		if len(run) > 0 && ref.BaseOffset != run[len(run)-1].EndOffset {
 			flushRun() // gap: terminate the run, keep scanning after it
 		}
+		// Hard byte ceiling: a pathological run of many small files must never
+		// accumulate unbounded total source bytes (the merged artifact holds
+		// them all in memory). This overrides even a very large configured
+		// target, and must be enforced BEFORE appending so a run never totals
+		// more than maxDisklessMergeBytes (buildDisklessMergeArtifact rejects
+		// runs over the ceiling; enqueuing one would make the job fail forever
+		// and wedge the partition).
+		if len(run) >= minSegments && total+ref.ByteLength > maxDisklessMergeBytes {
+			flushRun()
+		}
 		run = append(run, ref)
 		total += ref.ByteLength
 		if len(run) >= maxSegments {
@@ -144,14 +154,6 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		// the run is rejected below the minimum and the partition stalls
 		// until enough new data happens to accumulate.
 		if total >= target && len(run) >= minSegments {
-			flushRun()
-			continue
-		}
-		// Hard byte ceiling: a pathological run of many small files must never
-		// accumulate unbounded total source bytes (the merged artifact holds
-		// them all in memory). This overrides even a very large configured
-		// target.
-		if total >= maxDisklessMergeBytes && len(run) >= minSegments {
 			flushRun()
 			continue
 		}

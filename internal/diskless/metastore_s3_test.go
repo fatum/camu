@@ -642,15 +642,17 @@ func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
 }
 
 // TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst verifies the
-// eviction helper drops the least-recently-active producers before the
-// recently-active ones.
+// eviction helper tombstones the least-recently-active producers before the
+// recently-active ones, keeping a tombstone for the evicted producer so its
+// exact retries still deduplicate.
 func TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst(t *testing.T) {
 	producers := map[string][]s3ProducerBatch{
 		"1": {{FirstSequence: 0, BaseOffset: 0, Count: 1}},
 		"2": {{FirstSequence: 0, BaseOffset: 10, Count: 1}},
 		"3": {{FirstSequence: 0, BaseOffset: 20, Count: 1}},
 	}
-	evictExcessProducerEntries(producers, 2)
+	tombstones := map[string]s3ProducerBatch{}
+	evictExcessProducerEntries(producers, tombstones, 2)
 	if len(producers) != 2 {
 		t.Fatalf("producers after evict = %d, want 2", len(producers))
 	}
@@ -662,5 +664,77 @@ func TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst(t *testing.T) {
 	}
 	if _, ok := producers["3"]; !ok {
 		t.Fatal("producer 3 (base 20) must survive")
+	}
+	// The evicted producer must leave a tombstone recording its last batch so
+	// an exact retry still deduplicates instead of being re-allocated.
+	ts, ok := tombstones["1"]
+	if !ok {
+		t.Fatal("evicted producer must leave a tombstone")
+	}
+	if ts.FirstSequence != 0 || ts.BaseOffset != 0 {
+		t.Fatalf("tombstone = %+v, want the producer's last batch", ts)
+	}
+}
+
+// TestEvictedProducerRetryNotDuplicated verifies exactly-once survives
+// producer-history eviction: after the head's producer-history cap forces an
+// idempotent producer out of the live window, an exact retry of its batch must
+// deduplicate to the original offset — never be silently re-allocated at a
+// fresh offset (a duplicate committed record).
+func TestEvictedProducerRetryNotDuplicated(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Producer 1 commits an idempotent batch.
+	if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "p1:0:10", FileKey: "p1", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 10, ProducerID: 1, Sequence: 0, CreatedAt: now,
+	}}); err != nil {
+		t.Fatalf("commit p1: %v", err)
+	}
+
+	// Flood the head with enough distinct producers to cross the eviction
+	// threshold, forcing producer 1 (oldest base offset) to be tombstoned.
+	for p := int64(2); p <= s3HeadMaxProducerEntries+2; p++ {
+		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+			BatchID:    fmt.Sprintf("flood-%d:0:10", p),
+			FileKey:    fmt.Sprintf("flood-%d", p),
+			Topic:      "t",
+			Partition:  0,
+			Count:      1,
+			ByteLength: 10,
+			ProducerID: p,
+			Sequence:   0,
+			CreatedAt:  now,
+		}}); err != nil {
+			t.Fatalf("flood commit %d: %v", p, err)
+		}
+	}
+
+	// Producer 1 retries its exact batch (same producer, same sequence).
+	retry, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "p1-retry:0:10", FileKey: "p1-retry", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 10, ProducerID: 1, Sequence: 0, CreatedAt: now,
+	}})
+	if err != nil {
+		t.Fatalf("retry p1: %v", err)
+	}
+	if !retry[0].Duplicate {
+		t.Fatalf("evicted producer retry: duplicate=%v base=%d, want dedup to original offset 0", retry[0].Duplicate, retry[0].BaseOffset)
+	}
+	if retry[0].BaseOffset != 0 {
+		t.Fatalf("evicted producer retry base offset = %d, want 0 (original commit)", retry[0].BaseOffset)
+	}
+
+	// A stale retry below the tombstone must be rejected, not re-allocated.
+	// Producer 1's tombstone records first_sequence 0, so a retry of a
+	// non-existent earlier batch is invalid — but an exact retry (seq 0) is the
+	// only valid path. Verify a retry with a different count is rejected.
+	if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "p1-badcount:0:10", FileKey: "p1-badcount", Topic: "t", Partition: 0,
+		Count: 2, ByteLength: 10, ProducerID: 1, Sequence: 0, CreatedAt: now,
+	}}); err == nil {
+		t.Fatal("retry with mismatched count must be rejected")
 	}
 }

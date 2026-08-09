@@ -47,13 +47,10 @@ type Registry struct {
 
 // NewRegistry creates a new Registry.
 func NewRegistry(s3 *storage.S3Client, instanceID, address, internalAddress, replicationAddress, kafkaAddress string, ttl time.Duration) *Registry {
-	refresh := ttl / 6
-	if refresh < time.Second {
-		refresh = time.Second
-	}
-	if refresh > 5*time.Second {
-		refresh = 5 * time.Second
-	}
+	// Per-instance address lookups are served from a 1s cache: short enough
+	// that a node restart with a new address is visible to peers quickly (the
+	// routing hot path resolves addresses from here), while still amortizing
+	// the list+get across the many routing/read requests between refreshes.
 	return &Registry{
 		s3Client:           s3,
 		instanceID:         instanceID,
@@ -62,7 +59,7 @@ func NewRegistry(s3 *storage.S3Client, instanceID, address, internalAddress, rep
 		replicationAddress: replicationAddress,
 		kafkaAddress:       kafkaAddress,
 		ttl:                ttl,
-		cacheRefresh:       refresh,
+		cacheRefresh:       time.Second,
 		infoCache:          make(map[string]InstanceInfo),
 	}
 }

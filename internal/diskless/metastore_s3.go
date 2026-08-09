@@ -83,8 +83,17 @@ type s3UploadManifest struct {
 	NextOffset      int64                        `json:"next_offset"`
 	CommittedOffset int64                        `json:"committed_offset"`
 	Producers       map[string][]s3ProducerBatch `json:"producers,omitempty"`
-	Archive         *s3ArchivePointer            `json:"archive,omitempty"`
-	Refs            []s3CatalogRef               `json:"refs"`
+	// Tombstones records the most recent committed batch of each producer that
+	// was evicted from Producers by evictExcessProducerEntries. It preserves the
+	// fail-closed exactly-once contract for an evicted producer: an exact retry
+	// of its last batch deduplicates to the original offset, and any retry at or
+	// below the tombstoned first sequence is rejected as out-of-order rather
+	// than silently re-allocated at a fresh offset (which would duplicate a
+	// committed record). Without it, deleting the producer's history wholesale
+	// would make a stale retry indistinguishable from a brand-new producer.
+	Tombstones map[string]s3ProducerBatch `json:"tombstones,omitempty"`
+	Archive    *s3ArchivePointer          `json:"archive,omitempty"`
+	Refs       []s3CatalogRef             `json:"refs"`
 }
 
 // s3ArchivePointer names the newest archived checkpoint and the offset where
@@ -116,14 +125,21 @@ type s3ProducerBatch struct {
 }
 
 // evictExcessProducerEntries trims a partition's producer history map to at
-// most maxEntries total history entries. It is called before every head write
-// so the head object stays bounded regardless of how many distinct idempotent
-// producers have ever written to the partition. Producers whose last batch has
-// the smallest base offset (the least recently active) are evicted first; an
-// exact retry of an evicted producer is then rejected as out-of-order by
-// checkProducerSequence instead of being re-allocated, which is the same
-// fail-closed contract as a retry that rotated out of the per-producer window.
-func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, maxEntries int) {
+// most maxEntries total history entries, keeping a single tombstone per evicted
+// producer. It is called before every head write so the head object stays
+// bounded regardless of how many distinct idempotent producers have ever written
+// to the partition.
+//
+// The fail-closed exactly-once contract must hold even after eviction: an exact
+// retry of a committed batch must deduplicate to its original offset, and a
+// stale retry must be rejected as out-of-order — never silently re-allocated at
+// a fresh offset (a duplicate committed record). Deleting a producer's history
+// wholesale would break this, because a retry would then be indistinguishable
+// from a brand-new producer. So each evicted producer leaves a single tombstone
+// (its most recent batch); CommitUploadedBatches consults it for dedup and
+// sequence validation. Producers whose last batch has the smallest base offset
+// (the least recently active) are evicted first.
+func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, tombstones map[string]s3ProducerBatch, maxEntries int) {
 	total := 0
 	for _, h := range producers {
 		total += len(h)
@@ -132,7 +148,7 @@ func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, maxEntri
 		return
 	}
 	// Order producers by the base offset of their last recorded batch, oldest
-	// first, and drop them whole until the total fits.
+	// first, and tombstone them whole until the total fits.
 	lastBase := make([]struct {
 		id    string
 		base  int64
@@ -153,6 +169,11 @@ func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, maxEntri
 		if total <= maxEntries {
 			break
 		}
+		h := producers[e.id]
+		// Preserve the producer's most recent committed batch as a tombstone so
+		// an exact retry still deduplicates and a stale retry is still rejected
+		// as out-of-order (never re-allocated at a fresh offset).
+		tombstones[e.id] = h[len(h)-1]
 		delete(producers, e.id)
 		total -= e.count
 	}
@@ -220,10 +241,19 @@ manifestLoop:
 	for {
 		key := s3ManifestKey(topic, partition)
 		data, etag, err := m.s3.GetWithETag(ctx, key)
-		manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}}
+		manifest := s3UploadManifest{
+			Producers:  map[string][]s3ProducerBatch{},
+			Tombstones: map[string]s3ProducerBatch{},
+		}
 		if err == nil {
 			if err := json.Unmarshal(data, &manifest); err != nil {
 				return nil, fmt.Errorf("parse upload manifest %s/%d: %w", topic, partition, err)
+			}
+			if manifest.Producers == nil {
+				manifest.Producers = map[string][]s3ProducerBatch{}
+			}
+			if manifest.Tombstones == nil {
+				manifest.Tombstones = map[string]s3ProducerBatch{}
 			}
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			// A failed read leaves the batch unrecorded: mark it retryable so
@@ -241,6 +271,18 @@ manifestLoop:
 			duplicate := false
 			if batch.ProducerID != 0 {
 				h := manifest.Producers[pid]
+				// When the producer's live history was evicted, fall back to its
+				// tombstone (the most recent committed batch before eviction).
+				// This keeps the fail-closed exactly-once contract after
+				// eviction: an exact retry deduplicates to the original offset,
+				// and a stale retry at or below the tombstone is rejected as
+				// out-of-order instead of being silently re-allocated at a fresh
+				// offset.
+				if len(h) == 0 {
+					if t, ok := manifest.Tombstones[pid]; ok {
+						h = []s3ProducerBatch{t}
+					}
+				}
 				for _, old := range h {
 					if old.FirstSequence != batch.Sequence {
 						continue
@@ -279,6 +321,11 @@ manifestLoop:
 			manifest.NextOffset, manifest.CommittedOffset = end, end
 			manifest.Refs = append(manifest.Refs, s3CatalogRef{FileKey: batch.FileKey, ByteOffset: batch.ByteOffset, ByteLength: batch.ByteLength, BaseOffset: base, EndOffset: end, CreatedAt: batch.CreatedAt})
 			if batch.ProducerID != 0 {
+				// A live commit supersedes any tombstone: the live history is now
+				// the authoritative record for this producer, so a retry of the
+				// just-committed batch dedups against it (not the older
+				// tombstone), and the tombstone can be dropped.
+				delete(manifest.Tombstones, pid)
 				h := manifest.Producers[pid]
 				h = append(h, s3ProducerBatch{FirstSequence: batch.Sequence, BaseOffset: base, Count: batch.Count})
 				if len(h) > uploadedProducerHistory {
@@ -292,7 +339,7 @@ manifestLoop:
 		if !changed {
 			return results, nil // every batch was a duplicate
 		}
-		evictExcessProducerEntries(manifest.Producers, s3HeadMaxProducerEntries)
+		evictExcessProducerEntries(manifest.Producers, manifest.Tombstones, s3HeadMaxProducerEntries)
 		manifest.Version++
 		encoded, err := json.Marshal(manifest)
 		if err != nil {
