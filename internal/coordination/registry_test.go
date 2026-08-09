@@ -3,6 +3,7 @@ package coordination
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -101,6 +102,81 @@ func TestRegistry_ActiveInstancesSeesNewRegistration(t *testing.T) {
 	}
 	if len(active) != 2 {
 		t.Fatalf("active = %v, want both reader and peer (new registration must be visible immediately)", active)
+	}
+}
+
+// TestRegistry_GetInstanceInfoServesStaleOnRefreshFailure verifies the routing
+// hot path does not fail on a transient refresh error: GetInstanceInfo serves
+// the last-known address from the cache when the refresh itself fails.
+func TestRegistry_GetInstanceInfoServesStaleOnRefreshFailure(t *testing.T) {
+	s3 := newRegistryTestS3(t)
+	ctx := context.Background()
+
+	reg := NewRegistry(s3, "node", "n:8080", "n:8081", "n:8082", "k:9092", time.Minute)
+	if err := reg.Register(ctx); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Prime the cache.
+	if _, err := reg.GetInstanceInfo(ctx, "node"); err != nil {
+		t.Fatalf("prime GetInstanceInfo: %v", err)
+	}
+
+	// Make the refresh's list fail after the cache has aged past cacheRefresh.
+	s3.SetFaultInjector(func(op string) error {
+		if op == "list" {
+			return errors.New("injected list failure")
+		}
+		return nil
+	})
+	defer s3.SetFaultInjector(nil)
+	time.Sleep(1100 * time.Millisecond) // cacheRefresh is 1s
+
+	info, err := reg.GetInstanceInfo(ctx, "node")
+	if err != nil {
+		t.Fatalf("GetInstanceInfo with failing refresh must serve stale cache, got error: %v", err)
+	}
+	if info.Address != "n:8080" {
+		t.Fatalf("stale info = %+v, want the cached address", info)
+	}
+}
+
+// TestRegistry_RefreshKeepsUnreadableRegistrations verifies a refresh whose
+// reads fail transiently does not wipe the cache: each registration keeps its
+// last-known address instead of vanishing from routing.
+func TestRegistry_RefreshKeepsUnreadableRegistrations(t *testing.T) {
+	s3 := newRegistryTestS3(t)
+	ctx := context.Background()
+
+	reg := NewRegistry(s3, "self", "s:8080", "s:8081", "s:8082", "", time.Minute)
+	if err := reg.Register(ctx); err != nil {
+		t.Fatalf("register self: %v", err)
+	}
+	peer := NewRegistry(s3, "peer", "p:8080", "p:8081", "p:8082", "", time.Minute)
+	if err := peer.Register(ctx); err != nil {
+		t.Fatalf("register peer: %v", err)
+	}
+	// Prime the cache with both instances.
+	if _, err := reg.GetInstanceInfo(ctx, "peer"); err != nil {
+		t.Fatalf("prime GetInstanceInfo(peer): %v", err)
+	}
+
+	// After the cache ages, the refresh's reads all fail: the cached entry must
+	// survive rather than being dropped from routing.
+	s3.SetFaultInjector(func(op string) error {
+		if op == "get" {
+			return errors.New("injected read failure")
+		}
+		return nil
+	})
+	defer s3.SetFaultInjector(nil)
+	time.Sleep(1100 * time.Millisecond) // cacheRefresh is 1s
+
+	info, err := reg.GetInstanceInfo(ctx, "peer")
+	if err != nil {
+		t.Fatalf("GetInstanceInfo(peer) after failed refresh reads = %v, want the retained cached entry", err)
+	}
+	if info.Address != "p:8080" {
+		t.Fatalf("retained info = %+v, want the cached peer address", info)
 	}
 }
 

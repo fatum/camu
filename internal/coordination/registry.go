@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,30 +100,47 @@ func (r *Registry) Deregister(ctx context.Context) error {
 }
 
 // refreshCache reloads all instance registrations when the cache has aged past
-// cacheRefresh. Callers must not hold cacheMu.
+// cacheRefresh. Callers must not hold cacheMu. The refreshed set is seeded from
+// the current cache so a registration whose read fails transiently keeps its
+// last-known address instead of vanishing from routing; nodes no longer listed
+// are dropped.
 func (r *Registry) refreshCache(ctx context.Context) error {
 	r.cacheMu.Lock()
 	if time.Since(r.cacheLoaded) < r.cacheRefresh {
 		r.cacheMu.Unlock()
 		return nil
 	}
+	old := r.infoCache
 	r.cacheMu.Unlock()
 
 	keys, err := r.s3Client.List(ctx, "_coordination/instances/")
 	if err != nil {
 		return fmt.Errorf("registry: list: %w", err)
 	}
-	fresh := make(map[string]InstanceInfo, len(keys))
+	// Seed from the previous cache so an unreadable registration keeps its last
+	// known address; unlisted nodes (deregistered) are removed below.
+	fresh := make(map[string]InstanceInfo, len(old)+len(keys))
+	for id, info := range old {
+		fresh[id] = info
+	}
+	listed := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
+		id := strings.TrimSuffix(strings.TrimPrefix(key, "_coordination/instances/"), ".json")
+		listed[id] = struct{}{}
 		data, err := r.s3Client.Get(ctx, key)
 		if err != nil {
-			continue
+			continue // keep the previous cache entry for this instance
 		}
 		var info InstanceInfo
 		if err := json.Unmarshal(data, &info); err != nil {
 			continue
 		}
 		fresh[info.InstanceID] = info
+	}
+	for id := range fresh {
+		if _, ok := listed[id]; !ok {
+			delete(fresh, id)
+		}
 	}
 	r.cacheMu.Lock()
 	r.infoCache = fresh
@@ -171,9 +189,18 @@ func (r *Registry) ActiveInstances(ctx context.Context) ([]string, error) {
 }
 
 // GetInstanceInfo reads an instance's registration, serving the address from a
-// short-lived cache to avoid one GET per replica per routing request.
+// short-lived cache to avoid one GET per replica per routing request. A
+// transient refresh failure is not fatal to the routing hot path: the last
+// known address is served from the cache, since addresses change rarely.
 func (r *Registry) GetInstanceInfo(ctx context.Context, instanceID string) (InstanceInfo, error) {
 	if err := r.refreshCache(ctx); err != nil {
+		// Serve the stale cache on refresh failure instead of failing routing.
+		r.cacheMu.Lock()
+		info, ok := r.infoCache[instanceID]
+		r.cacheMu.Unlock()
+		if ok {
+			return info, nil
+		}
 		return InstanceInfo{}, fmt.Errorf("registry: get instance %s: %w", instanceID, err)
 	}
 	r.cacheMu.Lock()

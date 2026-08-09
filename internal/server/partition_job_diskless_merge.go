@@ -241,16 +241,19 @@ const maxDisklessMergeSegmentsUnbounded = 4096
 const maxDisklessMergeBytes = 512 << 20 // 512 MiB
 
 // effectiveDisklessMergeTargetBytes returns the byte target for diskless merge
-// discovery and head archiving, clamped to maxDisklessMergeBytes. A configured
-// target above the ceiling could never be reached by a single merge run (the
-// artifact is capped at maxDisklessMergeBytes), so a merged ref would stay
-// below the target forever and never become compaction-final: ArchiveCommitted
-// would stop at it and the head would grow without bound. Clamping keeps the
-// target achievable, so merged refs reach it and are rolled into checkpoints.
+// discovery and head archiving, clamped to half the merge ceiling. A configured
+// target above the ceiling could never be reached by a single run; and even a
+// target between ceiling/2 and the ceiling strands large sub-target refs: two
+// refs each below the target may not fit one ceiling-capped run together, so
+// neither can reach the target and ArchiveCommitted (which only rolls refs at
+// or above the target) would stop at them, growing the head without bound.
+// Clamping to ceiling/2 restores the invariant that any two sub-target refs fit
+// in a single run, so every ref is eventually mergeable to the target and
+// archivable. The default target (64MiB) is unaffected.
 func effectiveDisklessMergeTargetBytes(cfg config.CompactionConfig) int64 {
 	target := cfg.TargetBytesValue()
-	if target > maxDisklessMergeBytes {
-		return maxDisklessMergeBytes
+	if limit := int64(maxDisklessMergeBytes / 2); target > limit {
+		return limit
 	}
 	return target
 }

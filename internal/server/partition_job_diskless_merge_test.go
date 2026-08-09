@@ -598,20 +598,22 @@ func TestDisklessMergeHighMinSegmentsDoesNotStarve(t *testing.T) {
 }
 
 // TestEffectiveDisklessMergeTargetBytes verifies the byte target is clamped to
-// the merge ceiling: a configured target above maxDisklessMergeBytes could never
-// be reached by a single run, so a merged ref would stay below target forever
-// and never become compaction-final — ArchiveCommitted would stop at it and the
-// head would grow without bound. The clamp keeps the target achievable.
+// half the merge ceiling. A target above the ceiling could never be reached by
+// a single run; and a target between ceiling/2 and the ceiling strands large
+// sub-target refs (two sub-target refs may not fit one ceiling-capped run, so
+// neither reaches the target and ArchiveCommitted stops at them, growing the
+// head). Clamping to ceiling/2 keeps every sub-target ref mergeable and
+// archivable.
 func TestEffectiveDisklessMergeTargetBytes(t *testing.T) {
-	// A target below the ceiling is honored.
+	// A target below the ceiling half is honored.
 	if got := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 64 << 20}); got != 64<<20 {
 		t.Fatalf("target below ceiling = %d, want %d", got, int64(64<<20))
 	}
-	// A target above the ceiling is clamped so merged refs can reach it.
-	if got := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 1 << 60}); got != maxDisklessMergeBytes {
-		t.Fatalf("target above ceiling = %d, want %d", got, maxDisklessMergeBytes)
+	// A target above the ceiling half is clamped so no ref strands the head.
+	if got, want := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 1 << 60}), int64(maxDisklessMergeBytes/2); got != want {
+		t.Fatalf("target above ceiling = %d, want %d", got, want)
 	}
-	// The default (<=0) resolves to the default target (64MiB, below the ceiling).
+	// The default (<=0) resolves to the default target (64MiB, below the clamp).
 	if got := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 0}); got != 64<<20 {
 		t.Fatalf("default target = %d, want %d", got, int64(64<<20))
 	}

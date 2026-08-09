@@ -163,9 +163,12 @@ func (le *LeaderElection) Renew(ctx context.Context, lease LeaderLease) (LeaderL
 }
 
 // adoptOwnLease re-reads the stored lease after a renew CAS conflict and
-// reports whether it belongs to this instance. When it does, it returns the
-// stored lease (with its ETag) so the caller can continue renewing from the
-// adopted epoch instead of spuriously ceding the controller lease.
+// reports whether it belongs to this instance AND is still valid. When it is,
+// it returns the stored lease (with its ETag) so the caller can continue
+// renewing from the adopted epoch instead of spuriously ceding the controller
+// lease. An expired lease is not adopted: a lapsed lease is fair game for
+// takeover, and acting on it would keep two controllers alive until the next
+// renew fences the stale one.
 func (le *LeaderElection) adoptOwnLease(ctx context.Context) (LeaderLease, bool) {
 	cur, etag, err := le.s3Client.GetWithETag(ctx, leaderKey)
 	if err != nil {
@@ -176,6 +179,9 @@ func (le *LeaderElection) adoptOwnLease(ctx context.Context) (LeaderLease, bool)
 		return LeaderLease{}, false
 	}
 	if curLease.InstanceID != le.instanceID {
+		return LeaderLease{}, false
+	}
+	if !curLease.ExpiresAt.After(time.Now()) {
 		return LeaderLease{}, false
 	}
 	curLease.ETag = etag
