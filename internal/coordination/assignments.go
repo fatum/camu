@@ -10,8 +10,18 @@ import (
 )
 
 // PartitionAssignment holds the replica set and leader for a single partition.
+//
+// Native records the pre-existing replicas of the partition: the nodes that
+// held the committed prefix before any backfill. Leadership is restricted to
+// native replicas, because a node backfilled into the replica set to maintain
+// RF is a follower only until it catches up. Persisting the set (rather than
+// reconstructing it from Replicas each cycle) keeps a backfill from being
+// mistaken for a native survivor on a later cycle and promoted. Assignments
+// written before this field existed (or fresh ones) carry no Native set and are
+// treated as all-native by AssignReplicated.
 type PartitionAssignment struct {
 	Replicas    []string `json:"replicas"`
+	Native      []string `json:"native,omitempty"`
 	Leader      string   `json:"leader"`
 	LeaderEpoch uint64   `json:"leader_epoch"`
 }

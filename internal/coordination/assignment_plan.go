@@ -53,6 +53,21 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 					activeSet[id] = struct{}{}
 				}
 
+				// The native (pre-existing) replicas are the only leadership
+				// candidates: a node backfilled into the replica set to
+				// maintain RF is a follower only until it catches up, and
+				// promoting it before then would truncate committed data. The
+				// native set is taken from the persisted assignment, NOT
+				// reconstructed from the replica set, so a backfill is never
+				// mistaken for a native survivor on a later cycle and promoted.
+				// Assignments without a persisted native set (fresh, or written
+				// before the field existed) conservatively treat the whole
+				// replica set as native.
+				prevNative := cur.Native
+				if len(prevNative) == 0 {
+					prevNative = cur.Replicas
+				}
+
 				// Prune replicas that are no longer active so a vanished node
 				// does not linger in the assignment forever (it would keep its
 				// instance registration referenced — never garbage collected —
@@ -70,7 +85,7 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 				// against the configured replicationFactor.)
 				native := make(map[string]bool)
 				if n >= replicationFactor {
-					for _, r := range cur.Replicas {
+					for _, r := range prevNative {
 						if _, ok := activeSet[r]; ok {
 							replicas = append(replicas, r)
 							native[r] = true
@@ -78,7 +93,7 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 					}
 				} else {
 					replicas = append(replicas, cur.Replicas...)
-					for _, r := range cur.Replicas {
+					for _, r := range prevNative {
 						native[r] = true
 					}
 				}
@@ -90,7 +105,7 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 				// collect them while the cluster is degraded.
 				if len(replicas) == 0 {
 					replicas = append(replicas, cur.Replicas...)
-					for _, r := range cur.Replicas {
+					for _, r := range prevNative {
 						native[r] = true
 					}
 				}
@@ -146,6 +161,7 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 				if len(replicas) > 0 {
 					result[pid] = PartitionAssignment{
 						Replicas:    replicas,
+						Native:      nativeInReplicaOrder(replicas, native),
 						Leader:      leader,
 						LeaderEpoch: leaderEpoch,
 					}
@@ -160,6 +176,7 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 		leader = replicas[0]
 		result[pid] = PartitionAssignment{
 			Replicas:    replicas,
+			Native:      append([]string(nil), replicas...),
 			Leader:      leader,
 			LeaderEpoch: leaderEpoch,
 		}
@@ -167,6 +184,17 @@ func AssignReplicated(instances []string, numPartitions int, replicationFactor i
 	}
 	rebalanceLeaders(result, activeSet(instances), eligible)
 	return result
+}
+
+// nativeInReplicaOrder returns the native members of replicas in replica order.
+func nativeInReplicaOrder(replicas []string, native map[string]bool) []string {
+	out := make([]string, 0, len(native))
+	for _, r := range replicas {
+		if native[r] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 func activeSet(instances []string) map[string]struct{} {
@@ -218,6 +246,7 @@ func AssignDiskless(instances []string, numPartitions int, current map[int]Parti
 		}
 		result[pid] = PartitionAssignment{
 			Replicas:    []string{leader},
+			Native:      []string{leader},
 			Leader:      leader,
 			LeaderEpoch: epoch,
 		}

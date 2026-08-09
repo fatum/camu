@@ -257,6 +257,54 @@ func TestAssignReplicated_PrunesDeadReplicaBackfillsFollower(t *testing.T) {
 	}
 }
 
+// TestAssignReplicated_BackfillStaysNonNativeAcrossCycles verifies the native
+// set is persisted so a backfilled follower is never mistaken for a native
+// survivor on a later cycle and promoted. Reconstructing native-ness from the
+// replica set would mark the backfill native the cycle after it was added, and
+// a later rebalance (or the all-natives-dead rescue) could then promote a node
+// that never held the committed prefix.
+func TestAssignReplicated_BackfillStaysNonNativeAcrossCycles(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 7,
+		},
+	}
+
+	// Cycle 1: n3 dies, n4 is backfilled as a follower-only slot.
+	got1 := AssignReplicated([]string{"n1", "n2", "n4"}, 1, 3, current)
+	p1 := got1[0]
+	if !containsReplica(p1.Replicas, "n4") {
+		t.Fatalf("replicas = %v, want n4 backfilled", p1.Replicas)
+	}
+	if containsReplica(p1.Native, "n4") {
+		t.Fatalf("backfilled n4 must not be native, native = %v", p1.Native)
+	}
+
+	// Cycle 2: all replicas active. The backfill must STILL be non-native, so
+	// rebalance never promotes it.
+	got2 := AssignReplicated([]string{"n1", "n2", "n4"}, 1, 3, got1)
+	p2 := got2[0]
+	if containsReplica(p2.Native, "n4") {
+		t.Fatalf("backfilled n4 became native on a later cycle, native = %v", p2.Native)
+	}
+	if p2.Leader == "n4" {
+		t.Fatalf("backfilled n4 promoted as leader on a healthy cycle, leader = %q", p2.Leader)
+	}
+
+	// Cycle 3: the natives die, leaving only the backfill active. It must not be
+	// promoted; the assignment keeps the (returning) native replicas instead.
+	got3 := AssignReplicated([]string{"n4"}, 1, 3, got2)
+	p3 := got3[0]
+	if p3.Leader == "n4" {
+		t.Fatalf("backfilled n4 promoted when all natives are gone, leader = %q", p3.Leader)
+	}
+	if containsReplica(p3.Native, "n4") {
+		t.Fatalf("backfilled n4 marked native in the rescue path, native = %v", p3.Native)
+	}
+}
+
 // TestAssignReplicated_PrunesDeadLeaderPromotesNativeSurvivor verifies that a
 // dead leader is replaced by an active native (pre-existing) survivor. The
 // freed slot is backfilled to maintain RF, but the backfilled node is a
