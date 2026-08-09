@@ -35,7 +35,7 @@ func (s *Server) rollDisklessMetadata(ctx context.Context, tc meta.TopicConfig, 
 	}
 	targetBytes := int64(0)
 	if s.cfg.Diskless.Compaction.Enabled {
-		targetBytes = s.cfg.Diskless.Compaction.TargetBytesValue()
+		targetBytes = effectiveDisklessMergeTargetBytes(s.cfg.Diskless.Compaction)
 	}
 	if _, err := s.disklessMeta.ArchiveCommitted(ctx, tc.Name, identity.Partition, targetBytes, time.Now().Add(-tc.Retention)); err != nil {
 		slog.Warn("diskless_archive_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
@@ -67,7 +67,7 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 	if committed <= 0 {
 		return
 	}
-	target := cfg.TargetBytesValue()
+	target := effectiveDisklessMergeTargetBytes(cfg)
 	// Query only the metastore's hot head window, never archived checkpoints.
 	// Archived refs are compaction-final (they were rolled out of the head once
 	// they reached target size) so ReplaceSegmentRefs refuses to merge them;
@@ -91,8 +91,14 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 
 	var run []diskless.SegmentRef
 	var total int64
-	flushRun := func() {
-		if len(run) >= minSegments {
+	// flushRun ends the current run and enqueues a merge job for it. A run is
+	// normally enqueued only once it reaches minSegments, so tiny runs are not
+	// merged. The one exception is the hard byte ceiling: a ceiling split may
+	// cut a run short of minSegments, and such a run must still be merged
+	// (sources are mergeable from 2 up) or compaction starves and the head
+	// grows without bound. force overrides minSegments for that case.
+	flushRun := func(force bool) {
+		if len(run) >= minSegments || (force && len(run) >= 2) {
 			job, err := buildDisklessMergeJob(tc.Name, identity.Partition, identity, run)
 			if err != nil {
 				slog.Warn("diskless_merge_job_build_failed", "topic", tc.Name, "partition", identity.Partition, "error", err)
@@ -111,7 +117,7 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		if !ref.CreatedAt.After(retentionCutoff) {
 			// Retention will delete this ref and its data in the same tick;
 			// never merge a retention-pending source. It is a run boundary.
-			flushRun()
+			flushRun(false)
 			continue
 		}
 		if ref.CreatedAt.After(graceCutoff) {
@@ -120,7 +126,7 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		if disklessRangeCovers(inFlight, ref.BaseOffset) {
 			// A merge job in flight owns this range; never schedule overlapping
 			// work. The covered refs are a boundary for the current run.
-			flushRun()
+			flushRun(false)
 			continue
 		}
 		if ref.ByteLength >= target || ref.ByteLength > maxDisklessMergeBytes {
@@ -132,11 +138,11 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 			// too: enqueuing it would fail forever and wedge the partition's
 			// compaction. Such a ref stays unmerged in the head until it
 			// reaches target size and is archived.
-			flushRun()
+			flushRun(false)
 			continue
 		}
 		if len(run) > 0 && ref.BaseOffset != run[len(run)-1].EndOffset {
-			flushRun() // gap: terminate the run, keep scanning after it
+			flushRun(false) // gap: terminate the run, keep scanning after it
 		}
 		// Hard byte ceiling: a pathological run of many small files must never
 		// accumulate unbounded total source bytes (the merged artifact holds
@@ -144,14 +150,17 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		// target, and must be enforced BEFORE appending so a run never totals
 		// more than maxDisklessMergeBytes (buildDisklessMergeArtifact rejects
 		// runs over the ceiling; enqueuing one would make the job fail forever
-		// and wedge the partition).
-		if len(run) >= minSegments && total+ref.ByteLength > maxDisklessMergeBytes {
-			flushRun()
+		// and wedge the partition). A ceiling split may cut a run short of
+		// minSegments, so the flush is forced: leaving such a run unmerged
+		// would starve compaction (min_segments unreachable before the ceiling)
+		// and let the head grow without bound.
+		if total+ref.ByteLength > maxDisklessMergeBytes {
+			flushRun(true)
 		}
 		run = append(run, ref)
 		total += ref.ByteLength
 		if len(run) >= maxSegments {
-			flushRun()
+			flushRun(false)
 			continue
 		}
 		// The byte target is approximate; never let it starve the run below
@@ -160,11 +169,11 @@ func (s *Server) discoverDisklessSegmentMergeJobs(ctx context.Context, tc meta.T
 		// the run is rejected below the minimum and the partition stalls
 		// until enough new data happens to accumulate.
 		if total >= target && len(run) >= minSegments {
-			flushRun()
+			flushRun(false)
 			continue
 		}
 	}
-	flushRun()
+	flushRun(false)
 }
 
 // disklessMergeInFlightRanges returns the offset ranges covered by diskless
@@ -230,6 +239,21 @@ const maxDisklessMergeSegmentsUnbounded = 4096
 // bounds that memory regardless of how the target and file-count caps are
 // configured.
 const maxDisklessMergeBytes = 512 << 20 // 512 MiB
+
+// effectiveDisklessMergeTargetBytes returns the byte target for diskless merge
+// discovery and head archiving, clamped to maxDisklessMergeBytes. A configured
+// target above the ceiling could never be reached by a single merge run (the
+// artifact is capped at maxDisklessMergeBytes), so a merged ref would stay
+// below the target forever and never become compaction-final: ArchiveCommitted
+// would stop at it and the head would grow without bound. Clamping keeps the
+// target achievable, so merged refs reach it and are rolled into checkpoints.
+func effectiveDisklessMergeTargetBytes(cfg config.CompactionConfig) int64 {
+	target := cfg.TargetBytesValue()
+	if target > maxDisklessMergeBytes {
+		return maxDisklessMergeBytes
+	}
+	return target
+}
 
 // effectiveDisklessMergeMaxSegments returns the per-run file-count cap. The
 // configured default (90) exists to fit DynamoDB's 100-item TransactWriteItems
