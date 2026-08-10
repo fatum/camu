@@ -89,18 +89,21 @@ func (s *Server) CanRunOwnerJob(topic string, partition int, expectedOwner strin
 
 // canBecomeLeader reports whether this node may become the partition leader,
 // given its durable log end. A replica may only lead a replicated partition
-// while its durable log end covers the partition's committed high watermark:
-// promoting a node whose log end is below the committed prefix would let it set
-// an epoch boundary at that (shorter) log end and truncate committed data held
-// by remaining ISR members.
+// while it is a current in-sync replica whose durable log end covers the
+// partition's committed high watermark: promoting a node whose log end is below
+// the committed prefix would let it set an epoch boundary at that (shorter) log
+// end and truncate committed data held by remaining ISR members.
 //
-// The committed watermark is read from the authoritative ISR store (the
-// controller's in-memory view is only a reconciliation-time snapshot that is
-// never refreshed during operation, so it cannot be trusted for a fencing
-// decision). Membership in the ISR is NOT required: the ISR store is only
-// written on membership change, so a caught-up follower can legitimately be
-// absent from it at failover time. What matters is that the node's durable log
-// end covers the committed prefix.
+// The committed watermark and membership are read from the authoritative ISR
+// store (the controller's in-memory view is only a reconciliation-time snapshot
+// that is never refreshed during operation, so it cannot be trusted for a
+// fencing decision). Membership in the ISR is required as well as log-end
+// coverage: checkISRLag persists the ISR record (membership + high watermark)
+// every heartbeat, so a caught-up follower is recorded within a heartbeat of
+// catching up; requiring membership closes the window where a node that has
+// fallen out of sync could be promoted against a stale (low) recorded watermark
+// and truncate acked records committed after it fell behind. This matches the
+// follower self-promotion path, which already requires ISR membership.
 //
 // A partition with no ISR yet (first leader bootstrap) is allowed: the first
 // leader creates the ISR. rf=1 topics have no ISR tracking and are allowed. An
@@ -124,6 +127,19 @@ func (s *Server) canBecomeLeader(ctx context.Context, topic string, pid int, dur
 			return true // bootstrap: the first leader creates the ISR
 		}
 		slog.Warn("can_become_leader_isr_failed", "topic", topic, "partition", pid, "error", err)
+		return false
+	}
+	inISR := false
+	for _, member := range isrState.ISR {
+		if member == s.instanceID {
+			inISR = true
+			break
+		}
+	}
+	if !inISR {
+		slog.Warn("can_become_leader_not_in_isr",
+			"topic", topic, "partition", pid,
+			"isr", isrState.ISR, "log_end", durableLogEnd, "committed_hw", isrState.HighWatermark)
 		return false
 	}
 	if durableLogEnd >= isrState.HighWatermark {

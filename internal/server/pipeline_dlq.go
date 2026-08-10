@@ -153,7 +153,7 @@ func (a *serverDLQAppender) WaitDurable(ctx context.Context, sourceTopic string,
 	if ps == nil {
 		return fmt.Errorf("dead-letter partition %s/%d unavailable", a.destination, partition)
 	}
-	if err := waitForReplicatedOffsetFn(ctx, ps, offset, a.server.replicationTimeout); err != nil {
+	if err := waitForReplicatedOffsetFn(ctx, a.server, ps, a.destination, partition, offset, a.server.replicationTimeout); err != nil {
 		return err
 	}
 	destinationIdentity, err := a.server.ResolvePartitionIdentity(ctx, a.destination, partition)

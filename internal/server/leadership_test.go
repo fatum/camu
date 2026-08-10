@@ -420,3 +420,46 @@ func TestInitPartitionAsLeader_HealsRegressedEpochHistory(t *testing.T) {
 		t.Fatalf("epoch history = %+v, want %+v", ps.epochHistory.Entries, want)
 	}
 }
+
+// TestPersistCommittedHW verifies the ack-path durability: persistCommittedHW
+// records the partition's high watermark in the ISR store so a produce ack is
+// only given after the committed watermark it advanced is durable (a later
+// takeover can never truncate acked records against a stale recorded HW).
+func TestPersistCommittedHW(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	tc := meta.TopicConfig{Name: "topic", Partitions: 1, ReplicationFactor: 3, MinInsyncReplicas: 2}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.partitionManager.InitTopic(ctx, tc, map[int]uint64{}); err != nil {
+		t.Fatalf("InitTopic() error = %v", err)
+	}
+
+	ps := s.partitionManager.GetPartitionState("topic", 0)
+	if ps == nil {
+		t.Fatal("no partition state")
+	}
+	// Simulate a leader that has committed up to offset 100.
+	ps.mu.Lock()
+	ps.isLeader = true
+	ps.epoch = 1
+	ps.replicaState = replication.NewReplicaState(s.instanceID, 100, 2, 1000)
+	ps.mu.Unlock()
+
+	if err := s.persistCommittedHW(ctx, ps, "topic", 0); err != nil {
+		t.Fatalf("persistCommittedHW: %v", err)
+	}
+	isrState, err := s.isrStore.Read(ctx, "topic", 0)
+	if err != nil {
+		t.Fatalf("read isr: %v", err)
+	}
+	if isrState.HighWatermark != 100 {
+		t.Fatalf("persisted HW = %d, want 100", isrState.HighWatermark)
+	}
+
+	// A second call with no advance must be a no-op, not an error.
+	if err := s.persistCommittedHW(ctx, ps, "topic", 0); err != nil {
+		t.Fatalf("persistCommittedHW (no advance): %v", err)
+	}
+}

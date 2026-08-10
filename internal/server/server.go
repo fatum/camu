@@ -626,7 +626,7 @@ func (s *Server) waitForKafkaReplicated(ctx context.Context, topic string, parti
 	if ps == nil {
 		return nil
 	}
-	return waitForReplicatedOffset(ctx, ps, offset, s.replicationTimeout)
+	return waitForReplicatedOffset(ctx, s, ps, topic, partition, offset, s.replicationTimeout)
 }
 
 func (s *Server) handleKafkaInitProducerID(ctx context.Context, req *kmsg.InitProducerIDRequest) (*kmsg.InitProducerIDResponse, error) {

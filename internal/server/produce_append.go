@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/maksim/camu/internal/log"
+	"github.com/maksim/camu/internal/replication"
 )
 
 // appendHTTPMessagesAsRecordBatch is the HTTP produce fast path:
@@ -69,8 +71,12 @@ func isRawBatchUnavailable(err error) bool {
 }
 
 // waitForReplicatedOffset blocks until the given offset has been replicated
-// to enough ISR members or the timeout expires.
-func waitForReplicatedOffset(ctx context.Context, ps *partitionState, offset uint64, timeout time.Duration) error {
+// to enough ISR members or the timeout expires. Once the offset is committed,
+// the leader persists its high watermark to the ISR store BEFORE returning, so
+// a produce is only acknowledged after the committed watermark it advanced is
+// durable: a later takeover can never truncate acked records based on a stale
+// recorded watermark. rf=1 topics have no ISR tracking and skip both.
+func waitForReplicatedOffset(ctx context.Context, s *Server, ps *partitionState, topic string, pid int, offset uint64, timeout time.Duration) error {
 	if ps == nil || ps.replicaState == nil {
 		return nil
 	}
@@ -80,8 +86,51 @@ func waitForReplicatedOffset(ctx context.Context, ps *partitionState, offset uin
 	replicaState := ps.replicaState
 	ps.mu.RUnlock()
 
-	if hwOK && hw > offset {
+	if !(hwOK && hw > offset) {
+		if err := replicaState.Purgatory().Wait(ctx, offset, timeout); err != nil {
+			return err
+		}
+	}
+	return s.persistCommittedHW(ctx, ps, topic, pid)
+}
+
+// persistCommittedHW durably records the partition's current high watermark in
+// the ISR store (raising it if it advanced past the last persisted value), so
+// the committed watermark a produce acknowledges is never stale in the object
+// store. It is called on the ack path before the produce returns.
+func (s *Server) persistCommittedHW(ctx context.Context, ps *partitionState, topic string, pid int) error {
+	if s.isrStore == nil {
 		return nil
 	}
-	return replicaState.Purgatory().Wait(ctx, offset, timeout)
+	ps.mu.RLock()
+	rs := ps.replicaState
+	if rs == nil {
+		ps.mu.RUnlock()
+		return nil
+	}
+	hw := rs.HighWatermark()
+	epoch := ps.epoch
+	ps.mu.RUnlock()
+
+	key := fmt.Sprintf("%s/%d", topic, pid)
+	s.isrWriteMu.Lock()
+	last := s.lastISRWrite[key]
+	s.isrWriteMu.Unlock()
+	if hw <= last {
+		return nil // already durable
+	}
+	if err := s.isrStore.Update(ctx, topic, pid, epoch, func(cur replication.ISRState) (replication.ISRState, error) {
+		if hw > cur.HighWatermark {
+			cur.HighWatermark = hw
+		}
+		return cur, nil
+	}); err != nil {
+		return fmt.Errorf("persist committed hw %s/%d: %w", topic, pid, err)
+	}
+	s.isrWriteMu.Lock()
+	if hw > s.lastISRWrite[key] {
+		s.lastISRWrite[key] = hw
+	}
+	s.isrWriteMu.Unlock()
+	return nil
 }

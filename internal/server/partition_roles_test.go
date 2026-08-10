@@ -81,7 +81,8 @@ func TestCanBecomeLeader(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := s.isrStore.Update(ctx, "t", 0, 1, func(_ replication.ISRState) (replication.ISRState, error) {
-			return replication.ISRState{ISR: []string{"node-A"}, Leader: "node-A", HighWatermark: 100}, nil
+			// node-B (this server) is a current in-sync replica.
+			return replication.ISRState{ISR: []string{"node-A", "node-B"}, Leader: "node-A", HighWatermark: 100}, nil
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -132,7 +133,8 @@ func TestCanBecomeLeader(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := s.isrStore.Update(ctx, "t", 0, 1, func(_ replication.ISRState) (replication.ISRState, error) {
-			return replication.ISRState{ISR: []string{"node-A"}, Leader: "node-A", HighWatermark: 0}, nil
+			// node-B (this server) is a current in-sync replica.
+			return replication.ISRState{ISR: []string{"node-A", "node-B"}, Leader: "node-A", HighWatermark: 0}, nil
 		}); err != nil {
 			t.Fatal(err)
 		}
