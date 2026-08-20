@@ -216,3 +216,131 @@ func TestLeaderElection_RenewFencedByHigherEpoch(t *testing.T) {
 		t.Fatalf("Renew err = %v, want ErrLeaseFenced", err)
 	}
 }
+
+// TestLeaderElection_RenewOwnAdvanceNotFenced verifies that an epoch bump
+// recorded by this instance's own prior renew (whose response was lost — the
+// local copy lags the stored lease) is not treated as fencing by a different
+// holder. The stored lease belongs to the same instance, so Renew must adopt it
+// and return it as the current lease rather than spuriously ceding the
+// controller lease.
+func TestLeaderElection_RenewOwnAdvanceNotFenced(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le := NewLeaderElection(s3, "instance-1", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire: acquired=%v err=%v", acquired, err)
+	}
+
+	// The caller holds a stale local copy (epoch 0) but the stored lease has
+	// already advanced to epoch 5 by this same instance (a prior renew whose
+	// response was lost). Renew must not fence, and must adopt the stored lease
+	// so the node keeps the controller role.
+	advanced := LeaderLease{
+		InstanceID: "instance-1",
+		ExpiresAt:  time.Now().Add(time.Minute),
+		LeaseEpoch: 5,
+	}
+	data, err := json.Marshal(advanced)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s3.Put(ctx, leaderKey, data, storage.PutOpts{}); err != nil {
+		t.Fatalf("put advanced lease: %v", err)
+	}
+
+	adopted, err := le.Renew(ctx, lease)
+	if errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("Renew must not fence on own advance, got ErrLeaseFenced")
+	}
+	if err != nil {
+		t.Fatalf("Renew must adopt its own advanced lease, got error: %v", err)
+	}
+	if adopted.InstanceID != "instance-1" {
+		t.Fatalf("adopted lease instance = %q, want instance-1", adopted.InstanceID)
+	}
+	if adopted.LeaseEpoch < 5 {
+		t.Fatalf("adopted lease epoch = %d, want >= 5 (must not regress)", adopted.LeaseEpoch)
+	}
+	if adopted.ETag == "" {
+		t.Fatal("adopted lease must carry the current ETag so the next renew succeeds")
+	}
+
+	// A subsequent renew from the adopted lease must succeed (the caller keeps
+	// the controller role without a handoff).
+	if _, err := le.Renew(ctx, adopted); err != nil {
+		t.Fatalf("renew after adopt failed: %v", err)
+	}
+}
+
+// TestLeaderElection_RenewOtherInstanceStillFences verifies that a CAS conflict
+// caused by a DIFFERENT instance taking over still reports the conflict (and
+// the fence pre-check) rather than adopting a foreign lease.
+func TestLeaderElection_RenewOtherInstanceStillFences(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le := NewLeaderElection(s3, "instance-1", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire: acquired=%v err=%v", acquired, err)
+	}
+
+	// Another instance holds a higher-epoch lease: a genuine fence.
+	fence := LeaderLease{
+		InstanceID: "instance-2",
+		ExpiresAt:  time.Now().Add(time.Minute),
+		LeaseEpoch: lease.LeaseEpoch + 10,
+	}
+	data, err := json.Marshal(fence)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s3.Put(ctx, leaderKey, data, storage.PutOpts{}); err != nil {
+		t.Fatalf("put fenced lease: %v", err)
+	}
+
+	if _, err := le.Renew(ctx, lease); !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("Renew with a different holder = %v, want ErrLeaseFenced", err)
+	}
+}
+
+// TestLeaderElection_RenewOwnExpiredAdvanceCedes verifies that a CAS conflict
+// caused by our own prior renew does NOT adopt the stored lease when that
+// advance has since EXPIRED: a lapsed lease is fair game for takeover, and
+// adopting it would keep a stale controller alive alongside the new one until
+// the next renew fences it.
+func TestLeaderElection_RenewOwnExpiredAdvanceCedes(t *testing.T) {
+	s3 := newTestS3Client(t)
+	le := NewLeaderElection(s3, "instance-1", 5*time.Second)
+	ctx := context.Background()
+
+	lease, acquired, err := le.TryAcquire(ctx)
+	if err != nil || !acquired {
+		t.Fatalf("TryAcquire: acquired=%v err=%v", acquired, err)
+	}
+
+	// Our own prior renew advanced the stored lease, but that advance has long
+	// since lapsed (a stalled controller past TTL).
+	expired := LeaderLease{
+		InstanceID: "instance-1",
+		ExpiresAt:  time.Now().Add(-time.Minute),
+		LeaseEpoch: lease.LeaseEpoch + 10,
+	}
+	data, err := json.Marshal(expired)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := s3.Put(ctx, leaderKey, data, storage.PutOpts{}); err != nil {
+		t.Fatalf("put expired own lease: %v", err)
+	}
+
+	// Renew must report the conflict rather than adopt the expired lease: an
+	// expired controller must cede so another instance can take over.
+	if _, err := le.Renew(ctx, lease); errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("Renew of own expired advance = %v, want a non-fence conflict (cede, not adopt)", err)
+	} else if err == nil {
+		t.Fatal("Renew of own expired advance must not succeed/adopt")
+	}
+}

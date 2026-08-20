@@ -48,9 +48,12 @@ func TestRebalancer_Empty(t *testing.T) {
 	}
 }
 
-func TestAssignReplicated_DeadReplicaSetReassigned(t *testing.T) {
-	// When all replicas in the existing assignment are dead (not in active instances),
-	// the partition should be reassigned to active instances.
+// TestAssignReplicated_DeadReplicaSetPreservedWhenNoSurvivor verifies that an
+// existing partition whose replicas are all gone is NOT handed to a brand-new
+// node: a node introduced out of nowhere would not hold the partition's
+// committed prefix, and promoting it would truncate committed data. The
+// partition stays on its (returning) replica set instead.
+func TestAssignReplicated_DeadReplicaSetPreservedWhenNoSurvivor(t *testing.T) {
 	current := map[int]PartitionAssignment{
 		0: {Replicas: []string{"dead-1"}, Leader: "dead-1", LeaderEpoch: 1},
 		1: {Replicas: []string{"dead-1"}, Leader: "dead-1", LeaderEpoch: 1},
@@ -58,14 +61,14 @@ func TestAssignReplicated_DeadReplicaSetReassigned(t *testing.T) {
 	result := AssignReplicated([]string{"alive-1"}, 2, 1, current)
 
 	for pid, pa := range result {
-		if pa.Leader != "alive-1" {
-			t.Fatalf("partition %d: leader = %q, want alive-1", pid, pa.Leader)
+		if pa.Leader != "dead-1" {
+			t.Fatalf("partition %d: leader = %q, want dead-1 (existing partition must not be reassigned to a brand-new node)", pid, pa.Leader)
 		}
-		if len(pa.Replicas) != 1 || pa.Replicas[0] != "alive-1" {
-			t.Fatalf("partition %d: replicas = %v, want [alive-1]", pid, pa.Replicas)
+		if len(pa.Replicas) != 1 || pa.Replicas[0] != "dead-1" {
+			t.Fatalf("partition %d: replicas = %v, want [dead-1]", pid, pa.Replicas)
 		}
-		if pa.LeaderEpoch != 2 {
-			t.Fatalf("partition %d: epoch = %d, want 2", pid, pa.LeaderEpoch)
+		if pa.LeaderEpoch != 1 {
+			t.Fatalf("partition %d: epoch = %d, want 1", pid, pa.LeaderEpoch)
 		}
 	}
 }

@@ -205,7 +205,7 @@ func (s *Server) handleProduceHighLevel(w http.ResponseWriter, r *http.Request) 
 				"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
 				"isr_size", ps.replicaState.ISRSize())
 
-			if err := waitForReplicatedOffset(r.Context(), ps, lastOffset, s.replicationTimeout); err != nil {
+			if err := waitForReplicatedOffset(r.Context(), s, ps, topicName, partitionID, lastOffset, s.replicationTimeout); err != nil {
 				slog.Warn("produce_replication_timeout",
 					"topic", topicName, "partition", partitionID,
 					"offset", lastOffset, "hw", ps.replicaState.HighWatermark(),
@@ -382,7 +382,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 				Sequence: sequence,
 			})
 			if errors.Is(err, idempotency.ErrDuplicateSequence) {
-				s.handleDuplicateSequence(w, r, ps, partitionID, producerID)
+				s.handleDuplicateSequence(w, r, ps, topicName, partitionID, producerID)
 				return
 			}
 		}
@@ -420,7 +420,7 @@ func (s *Server) handleProduceLowLevel(w http.ResponseWriter, r *http.Request) {
 
 	if ps != nil && ps.replicaState != nil {
 		lastOffset := assignedOffsets[len(assignedOffsets)-1]
-		if writeReplicationError(w, waitForReplicatedOffset(r.Context(), ps, lastOffset, s.replicationTimeout)) {
+		if writeReplicationError(w, waitForReplicatedOffset(r.Context(), s, ps, topicName, partitionID, lastOffset, s.replicationTimeout)) {
 			return
 		}
 	}
@@ -465,7 +465,7 @@ func (s *Server) appendDisklessMessagesWithMeta(ctx context.Context, topic strin
 
 // handleDuplicateSequence handles the ErrDuplicateSequence case for idempotent
 // produce. It waits for the original batch to be replicated before confirming.
-func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request, ps *partitionState, partition int, producerID uint64) {
+func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request, ps *partitionState, topic string, partition int, producerID uint64) {
 	if ps == nil {
 		writeJSON(w, http.StatusOK, struct {
 			Duplicate bool         `json:"duplicate"`
@@ -488,7 +488,7 @@ func (s *Server) handleDuplicateSequence(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if ok && replicaState != nil {
-		if err := waitForReplicatedOffset(r.Context(), ps, lastOff, s.replicationTimeout); err != nil {
+		if err := waitForReplicatedOffset(r.Context(), s, ps, topic, partition, lastOff, s.replicationTimeout); err != nil {
 			writeReplicationError(w, err)
 			return
 		}

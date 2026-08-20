@@ -66,7 +66,7 @@ func TestServerDLQAppenderWaitDurableFencesSource(t *testing.T) {
 	a := serverDLQAppender{server: s, destination: "events-dlq"}
 	original := waitForReplicatedOffsetFn
 	t.Cleanup(func() { waitForReplicatedOffsetFn = original })
-	waitForReplicatedOffsetFn = func(context.Context, *partitionState, uint64, time.Duration) error { return nil }
+	waitForReplicatedOffsetFn = func(context.Context, *Server, *partitionState, string, int, uint64, time.Duration) error { return nil }
 	s.assignmentsMu.Lock()
 	assignment := s.myPartitions["events"][0]
 	assignment.Owned = false
@@ -83,7 +83,7 @@ func TestServerDLQAppenderWaitDurablePropagatesFailure(t *testing.T) {
 	original := waitForReplicatedOffsetFn
 	t.Cleanup(func() { waitForReplicatedOffsetFn = original })
 	want := errors.New("replication timeout")
-	waitForReplicatedOffsetFn = func(context.Context, *partitionState, uint64, time.Duration) error { return want }
+	waitForReplicatedOffsetFn = func(context.Context, *Server, *partitionState, string, int, uint64, time.Duration) error { return want }
 	if err := a.WaitDurable(context.Background(), "events", 0, 1, 0); !errors.Is(err, want) {
 		t.Fatalf("WaitDurable error = %v, want %v", err, want)
 	}
@@ -94,7 +94,7 @@ func TestServerDLQAppenderWaitDurableFencesEpochZeroReassignment(t *testing.T) {
 	a := serverDLQAppender{server: s, destination: "events-dlq", destinationEpoch: 0, destinationEpochSet: true}
 	original := waitForReplicatedOffsetFn
 	t.Cleanup(func() { waitForReplicatedOffsetFn = original })
-	waitForReplicatedOffsetFn = func(context.Context, *partitionState, uint64, time.Duration) error { return nil }
+	waitForReplicatedOffsetFn = func(context.Context, *Server, *partitionState, string, int, uint64, time.Duration) error { return nil }
 	s.assignmentsMu.Lock()
 	assignment := s.myPartitions["events-dlq"][0]
 	assignment.LeaderEpoch = 1

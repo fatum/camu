@@ -109,12 +109,23 @@ func (le *LeaderElection) TryAcquire(ctx context.Context) (LeaderLease, bool, er
 // Renew extends the leader lease TTL. Only works if this instance is the
 // current leader (verified via ETag). As defense-in-depth beyond the CAS, Renew
 // re-reads the stored lease and rejects with ErrLeaseFenced when the stored
-// epoch has advanced past the caller's held epoch.
+// lease has advanced past the caller's held epoch. The stored lease is only
+// fencing when it belongs to a DIFFERENT instance: an epoch bump recorded by
+// this instance's own prior renew (whose response was lost) is our own advance,
+// not another holder taking over, so it must not trigger a spurious handoff.
+//
+// When the CAS fails because this instance's own prior renew already advanced
+// the stored lease (our held ETag is stale but the stored lease is still ours),
+// Renew adopts the stored lease and returns it as the current lease instead of
+// failing: ceding the controller lease over a lost response would cause a
+// spurious handoff, and the next renew will then proceed from the adopted
+// epoch.
 func (le *LeaderElection) Renew(ctx context.Context, lease LeaderLease) (LeaderLease, error) {
 	cur, _, err := le.s3Client.GetWithETag(ctx, leaderKey)
 	if err == nil {
 		var curLease LeaderLease
-		if jsonErr := json.Unmarshal(cur, &curLease); jsonErr == nil && curLease.LeaseEpoch > lease.LeaseEpoch {
+		if jsonErr := json.Unmarshal(cur, &curLease); jsonErr == nil &&
+			curLease.InstanceID != le.instanceID && curLease.LeaseEpoch > lease.LeaseEpoch {
 			return LeaderLease{}, fmt.Errorf("%w: stored epoch %d, held epoch %d", ErrLeaseFenced, curLease.LeaseEpoch, lease.LeaseEpoch)
 		}
 	} else if !errors.Is(err, storage.ErrNotFound) {
@@ -133,11 +144,48 @@ func (le *LeaderElection) Renew(ctx context.Context, lease LeaderLease) (LeaderL
 
 	newETag, err := le.s3Client.ConditionalPut(ctx, leaderKey, encoded, lease.ETag)
 	if err != nil {
+		if errors.Is(err, storage.ErrConflict) {
+			// The CAS failed because the stored object changed since our held
+			// read. If the change was our own prior renew (same instance, same
+			// instance id), adopt the stored lease rather than ceding
+			// leadership: the response to that renew was simply lost, and a
+			// handoff here would be spurious.
+			if adopted, ok := le.adoptOwnLease(ctx); ok {
+				return adopted, nil
+			}
+			return LeaderLease{}, fmt.Errorf("leader: renew: %w", err)
+		}
 		return LeaderLease{}, fmt.Errorf("leader: renew: %w", err)
 	}
 
 	renewed.ETag = newETag
 	return renewed, nil
+}
+
+// adoptOwnLease re-reads the stored lease after a renew CAS conflict and
+// reports whether it belongs to this instance AND is still valid. When it is,
+// it returns the stored lease (with its ETag) so the caller can continue
+// renewing from the adopted epoch instead of spuriously ceding the controller
+// lease. An expired lease is not adopted: a lapsed lease is fair game for
+// takeover, and acting on it would keep two controllers alive until the next
+// renew fences the stale one.
+func (le *LeaderElection) adoptOwnLease(ctx context.Context) (LeaderLease, bool) {
+	cur, etag, err := le.s3Client.GetWithETag(ctx, leaderKey)
+	if err != nil {
+		return LeaderLease{}, false
+	}
+	var curLease LeaderLease
+	if err := json.Unmarshal(cur, &curLease); err != nil {
+		return LeaderLease{}, false
+	}
+	if curLease.InstanceID != le.instanceID {
+		return LeaderLease{}, false
+	}
+	if !curLease.ExpiresAt.After(time.Now()) {
+		return LeaderLease{}, false
+	}
+	curLease.ETag = etag
+	return curLease, true
 }
 
 // GetLeader returns the current leader lease.

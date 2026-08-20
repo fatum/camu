@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -79,6 +80,39 @@ func (s *Server) runDisklessCompactionTick(ctx context.Context) {
 	})
 }
 
+// disklessCompactionHint is the per-partition discovery cache. Discovery
+// (QueryHeadSegments + run building) is the expensive part of a compaction tick
+// and is elided when the committed head is unchanged and no ref can have newly
+// crossed the grace boundary since the last scan. Execution of in-flight jobs
+// is never gated on this hint.
+type disklessCompactionHint struct {
+	committed   int64
+	lastScanned time.Time
+}
+
+// disklessCompactionCanSkipDiscovery reports whether discovery can be skipped
+// for a partition. The committed head and the last scan time are the hint: when
+// both are set and the head is unchanged, discovery is elided. Because refs
+// only become eligible by aging past the grace cutoff (time-based, never
+// offset-based), a partition that has not advanced its committed head has no
+// NEW refs to merge; the only cost of skipping is that an already-scanned ref
+// that crosses the grace boundary is merged on the next scan instead of
+// immediately, which is bounded and acceptable for background compaction. The
+// grace-window check keeps scans at least once per grace period for idle
+// partitions rather than every tick.
+func disklessCompactionCanSkipDiscovery(hint disklessCompactionHint, hasHint bool, committed int64, grace time.Duration, now time.Time) bool {
+	if !hasHint {
+		return false
+	}
+	if committed != hint.committed {
+		return false
+	}
+	if now.Sub(hint.lastScanned) < grace {
+		return true
+	}
+	return false
+}
+
 // runDisklessCompactionForPartition discovers merge runs and executes merge
 // jobs for one partition this node leads. Discovery partitions eligible refs
 // into disjoint contiguous runs and enqueues one job per run; execution runs
@@ -97,16 +131,43 @@ func (s *Server) runDisklessCompactionForPartition(ctx context.Context, tc meta.
 	if identity.Role != PartitionRoleLeader {
 		return
 	}
+
+	// Read the committed head once; it doubles as the discovery-skip hint. A
+	// partition whose head has not moved since the last scan (and that was
+	// scanned within the grace window) needs no discovery re-read, because the
+	// same refs were evaluated already and no new ref can have aged past grace.
+	hintKey := fmt.Sprintf("%s/%d", tc.Name, partition)
+	cfg := s.cfg.Diskless.Compaction
+	grace, graceErr := cfg.GraceDuration()
+	committed, committedErr := s.disklessMeta.GetCommittedHead(ctx, tc.Name, partition)
+	if committedErr != nil {
+		slog.Warn("diskless_compaction_committed_failed", "topic", tc.Name, "partition", partition, "error", committedErr)
+		return
+	}
+	now := time.Now()
+	skipDiscovery := false
+	if graceErr == nil {
+		s.compactionHintMu.Lock()
+		hint, hasHint := s.compactionHints[hintKey]
+		skipDiscovery = disklessCompactionCanSkipDiscovery(hint, hasHint, committed, grace, now)
+		s.compactionHintMu.Unlock()
+	}
+
 	jobs, err := s.listPartitionJobs(ctx, tc.Name, partition)
 	if err != nil {
 		slog.Warn("diskless_compaction_list_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
 		return
 	}
-	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
-	jobs, err = s.listPartitionJobs(ctx, tc.Name, partition)
-	if err != nil {
-		slog.Warn("diskless_compaction_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
-		return
+	if !skipDiscovery {
+		s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, jobs)
+		s.compactionHintMu.Lock()
+		s.compactionHints[hintKey] = disklessCompactionHint{committed: committed, lastScanned: now}
+		s.compactionHintMu.Unlock()
+		jobs, err = s.listPartitionJobs(ctx, tc.Name, partition)
+		if err != nil {
+			slog.Warn("diskless_compaction_relist_jobs_failed", "topic", tc.Name, "partition", partition, "error", err)
+			return
+		}
 	}
 	var wg sync.WaitGroup
 	for _, job := range jobs {

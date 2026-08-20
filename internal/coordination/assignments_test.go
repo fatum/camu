@@ -160,7 +160,11 @@ func TestAssignmentStore_CASOverwrite(t *testing.T) {
 	}
 }
 
-func TestAssignReplicated_PreservesReplicaSetWhenActiveShrinks(t *testing.T) {
+// TestAssignReplicated_PrunesInactiveReplicasWhenSurvivorExists verifies F5:
+// when there are enough active instances to maintain RF but some replicas have
+// vanished, the inactive replicas are pruned from the assignment (so their
+// registrations can be garbage-collected) and a surviving replica remains.
+func TestAssignReplicated_PrunesInactiveReplicasWhenSurvivorExists(t *testing.T) {
 	current := map[int]PartitionAssignment{
 		0: {
 			Replicas:    []string{"n1", "n2", "n3"},
@@ -169,19 +173,23 @@ func TestAssignReplicated_PreservesReplicaSetWhenActiveShrinks(t *testing.T) {
 		},
 	}
 
-	got := AssignReplicated([]string{"n3"}, 1, 3, current)
+	// n2 and n3 are gone; n1, n4, n5 are active (enough for RF=3).
+	got := AssignReplicated([]string{"n1", "n4", "n5"}, 1, 3, current)
 	partition, ok := got[0]
 	if !ok {
 		t.Fatal("missing partition 0 assignment")
 	}
-	if !reflect.DeepEqual(partition.Replicas, []string{"n1", "n2", "n3"}) {
-		t.Fatalf("replicas = %v, want [n1 n2 n3]", partition.Replicas)
+	if containsReplica(partition.Replicas, "n2") || containsReplica(partition.Replicas, "n3") {
+		t.Fatalf("inactive replicas must be pruned, replicas = %v", partition.Replicas)
 	}
-	if partition.Leader != "n3" {
-		t.Fatalf("leader = %q, want %q", partition.Leader, "n3")
+	if !containsReplica(partition.Replicas, "n1") {
+		t.Fatalf("native survivor n1 must remain, replicas = %v", partition.Replicas)
 	}
-	if partition.LeaderEpoch != 8 {
-		t.Fatalf("leader_epoch = %d, want 8", partition.LeaderEpoch)
+	if partition.Leader != "n1" {
+		t.Fatalf("leader = %q, want n1 (native survivor)", partition.Leader)
+	}
+	if partition.LeaderEpoch != 7 {
+		t.Fatalf("leader_epoch = %d, want 7 (leader unchanged)", partition.LeaderEpoch)
 	}
 }
 
@@ -207,5 +215,194 @@ func TestAssignReplicated_KeepsAssignmentWhenNoReplicaIsActive(t *testing.T) {
 	}
 	if partition.LeaderEpoch != 4 {
 		t.Fatalf("leader_epoch = %d, want 4", partition.LeaderEpoch)
+	}
+}
+
+// TestAssignReplicated_PrunesDeadReplicaBackfillsFollower verifies F5: a
+// replica that has vanished is pruned from the preserved set so its instance
+// registration is no longer referenced by the assignment and can be
+// garbage-collected. The freed slot is backfilled with an active instance so
+// routing keeps advertising full RF, but the backfilled node is a follower
+// only — it never becomes leader, because it has not held the partition's
+// committed prefix.
+func TestAssignReplicated_PrunesDeadReplicaBackfillsFollower(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 7,
+		},
+	}
+
+	// n3 is gone; active instances n1, n2, n4 remain.
+	got := AssignReplicated([]string{"n1", "n2", "n4"}, 1, 3, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if containsReplica(partition.Replicas, "n3") {
+		t.Fatalf("dead replica n3 must be pruned, replicas = %v", partition.Replicas)
+	}
+	if len(partition.Replicas) != 3 {
+		t.Fatalf("replicas = %v, want 3 (RF maintained by backfill)", partition.Replicas)
+	}
+	if !containsReplica(partition.Replicas, "n4") {
+		t.Fatalf("expected active instance n4 to backfill the freed slot, replicas = %v", partition.Replicas)
+	}
+	if partition.Leader != "n1" {
+		t.Fatalf("leader = %q, want n1 (native survivor, never a backfilled node)", partition.Leader)
+	}
+	if partition.LeaderEpoch != 7 {
+		t.Fatalf("leader_epoch = %d, want 7 (leader unchanged)", partition.LeaderEpoch)
+	}
+}
+
+// TestAssignReplicated_BackfillStaysNonNativeAcrossCycles verifies the native
+// set is persisted so a backfilled follower is never mistaken for a native
+// survivor on a later cycle and promoted. Reconstructing native-ness from the
+// replica set would mark the backfill native the cycle after it was added, and
+// a later rebalance (or the all-natives-dead rescue) could then promote a node
+// that never held the committed prefix.
+func TestAssignReplicated_BackfillStaysNonNativeAcrossCycles(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 7,
+		},
+	}
+
+	// Cycle 1: n3 dies, n4 is backfilled as a follower-only slot.
+	got1 := AssignReplicated([]string{"n1", "n2", "n4"}, 1, 3, current)
+	p1 := got1[0]
+	if !containsReplica(p1.Replicas, "n4") {
+		t.Fatalf("replicas = %v, want n4 backfilled", p1.Replicas)
+	}
+	if containsReplica(p1.Native, "n4") {
+		t.Fatalf("backfilled n4 must not be native, native = %v", p1.Native)
+	}
+
+	// Cycle 2: all replicas active. The backfill must STILL be non-native, so
+	// rebalance never promotes it.
+	got2 := AssignReplicated([]string{"n1", "n2", "n4"}, 1, 3, got1)
+	p2 := got2[0]
+	if containsReplica(p2.Native, "n4") {
+		t.Fatalf("backfilled n4 became native on a later cycle, native = %v", p2.Native)
+	}
+	if p2.Leader == "n4" {
+		t.Fatalf("backfilled n4 promoted as leader on a healthy cycle, leader = %q", p2.Leader)
+	}
+
+	// Cycle 3: the natives die, leaving only the backfill active. It must not be
+	// promoted; the assignment keeps the (returning) native replicas instead.
+	got3 := AssignReplicated([]string{"n4"}, 1, 3, got2)
+	p3 := got3[0]
+	if p3.Leader == "n4" {
+		t.Fatalf("backfilled n4 promoted when all natives are gone, leader = %q", p3.Leader)
+	}
+	if containsReplica(p3.Native, "n4") {
+		t.Fatalf("backfilled n4 marked native in the rescue path, native = %v", p3.Native)
+	}
+}
+
+// TestAssignReplicated_KeepsNonNativeCurrentLeader verifies a non-native
+// current leader is not reverted: preferISRLeaders may have steered leadership
+// to a caught-up (ISR) backfill, and reverting it to a native replica that has
+// fallen out of the ISR would leave the partition leaderless despite an
+// eligible leader existing. Native exclusivity governs who is promoted to
+// leader, never who is already leading.
+func TestAssignReplicated_KeepsNonNativeCurrentLeader(t *testing.T) {
+	// n3 was backfilled (not native); preferISRLeaders steered leadership to it
+	// after n1 died. n2 is native but has fallen out of the ISR.
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n2", "n3"},
+			Native:      []string{"n2"},
+			Leader:      "n3",
+			LeaderEpoch: 5,
+		},
+	}
+
+	got := AssignReplicated([]string{"n2", "n3"}, 1, 2, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if partition.Leader != "n3" {
+		t.Fatalf("leader = %q, want n3 (non-native current leader must not be reverted to a possibly-ineligible native)", partition.Leader)
+	}
+	if partition.LeaderEpoch != 5 {
+		t.Fatalf("leader_epoch = %d, want 5 (no churn)", partition.LeaderEpoch)
+	}
+	if containsReplica(partition.Native, "n3") {
+		t.Fatalf("n3 must stay non-native, native = %v", partition.Native)
+	}
+}
+
+// TestAssignReplicated_PrunesDeadLeaderPromotesNativeSurvivor verifies that a
+// dead leader is replaced by an active native (pre-existing) survivor. The
+// freed slot is backfilled to maintain RF, but the backfilled node is a
+// follower only and never becomes leader.
+func TestAssignReplicated_PrunesDeadLeaderPromotesNativeSurvivor(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 4,
+		},
+	}
+
+	got := AssignReplicated([]string{"n2", "n3", "n4"}, 1, 3, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if containsReplica(partition.Replicas, "n1") {
+		t.Fatalf("dead leader n1 must be pruned, replicas = %v", partition.Replicas)
+	}
+	if len(partition.Replicas) != 3 {
+		t.Fatalf("replicas = %v, want 3 (RF maintained by backfill)", partition.Replicas)
+	}
+	if partition.Leader == "n1" {
+		t.Fatalf("dead leader must be replaced, leader = %q", partition.Leader)
+	}
+	if partition.Leader == "n4" {
+		t.Fatalf("backfilled node n4 must not become leader, leader = %q", partition.Leader)
+	}
+	if partition.Leader != "n2" && partition.Leader != "n3" {
+		t.Fatalf("leader = %q, want a native survivor (n2 or n3)", partition.Leader)
+	}
+	if partition.LeaderEpoch <= 4 {
+		t.Fatalf("leader_epoch = %d, want > 4 after leader change", partition.LeaderEpoch)
+	}
+}
+
+// TestAssignReplicated_TransientShortagePromotesSurvivor verifies that when the
+// active set is smaller than RF (transient outage) but at least one existing
+// replica survives, the assignment keeps the surviving replica as leader rather
+// than leaving the partition without a present leader.
+func TestAssignReplicated_TransientShortagePromotesSurvivor(t *testing.T) {
+	current := map[int]PartitionAssignment{
+		0: {
+			Replicas:    []string{"n1", "n2", "n3"},
+			Leader:      "n1",
+			LeaderEpoch: 4,
+		},
+	}
+
+	// Only n2 is active; n1 (leader) is gone but n2 is an existing replica.
+	got := AssignReplicated([]string{"n2"}, 1, 3, current)
+	partition, ok := got[0]
+	if !ok {
+		t.Fatal("missing partition 0 assignment")
+	}
+	if partition.Leader != "n2" {
+		t.Fatalf("leader = %q, want n2 (promote surviving replica)", partition.Leader)
+	}
+	if partition.LeaderEpoch <= 4 {
+		t.Fatalf("leader_epoch = %d, want > 4 after leader change", partition.LeaderEpoch)
+	}
+	if !containsReplica(partition.Replicas, "n2") {
+		t.Fatalf("replicas = %v, want n2 present", partition.Replicas)
 	}
 }

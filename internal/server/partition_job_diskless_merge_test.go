@@ -28,6 +28,9 @@ func (s *stubLimitedMetaStore) CommitUploadedBatches(context.Context, []diskless
 func (s *stubLimitedMetaStore) QuerySegments(context.Context, string, int, int64, int) ([]diskless.SegmentRef, error) {
 	return nil, nil
 }
+func (s *stubLimitedMetaStore) QueryHeadSegments(context.Context, string, int) ([]diskless.SegmentRef, error) {
+	return nil, nil
+}
 func (s *stubLimitedMetaStore) ReplaceSegmentRefs(context.Context, string, int, []diskless.RefKey, []diskless.SegmentRef) error {
 	return nil
 }
@@ -133,7 +136,6 @@ func TestDisklessSegmentMerge(t *testing.T) {
 	if committed != 4 {
 		t.Fatalf("committed after compaction = %d, want 4 (compaction must not move the watermark)", committed)
 	}
-
 	merged, err := s.s3Client.Get(ctx, refs[0].FileKey)
 	if err != nil {
 		t.Fatalf("merged object %s missing: %v", refs[0].FileKey, err)
@@ -508,6 +510,115 @@ func TestEffectiveDisklessMergeMaxSegments(t *testing.T) {
 	}
 }
 
+// TestDisklessMergeHighMinSegmentsDoesNotStarve verifies a high min_segments
+// cannot starve compaction: when the byte ceiling forces a run flush before it
+// reaches min_segments, the partial run must still be merged (forced flush), or
+// the refs would pile up in the head unmerged and grow it without bound.
+func TestDisklessMergeHighMinSegmentsDoesNotStarve(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	// min_segments clamps to the 99-segment maximum; refs are large enough that
+	// the byte ceiling (512MiB) forces a flush before 99 sources accumulate
+	// (85 × 6MiB = 510MiB). Without a forced flush on the ceiling split, the
+	// run would never reach min_segments and compaction would starve, letting
+	// the head grow without bound.
+	s.cfg.Diskless.Compaction.MinSegments = 4096
+	s.cfg.Diskless.Compaction.MaxSegmentsPerMerge = 4096
+	s.cfg.Diskless.Compaction.TargetBytes = 64 << 20
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// 90 refs of 6MiB: 85 hit the byte ceiling (510MiB); the remaining 5 are a
+	// sub-min_segments tail that stays unmerged. No data objects are written;
+	// discovery reads only manifest metadata.
+	for i := 0; i < 90; i++ {
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+			BatchID:    fmt.Sprintf("big-%d:0", i),
+			FileKey:    fmt.Sprintf("big-%d", i),
+			Topic:      "t",
+			Partition:  0,
+			Count:      1,
+			ByteLength: 6 << 20,
+			CreatedAt:  now,
+		}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) == 0 {
+		t.Fatal("expected at least one merge job; high min_segments must not starve compaction")
+	}
+	for i, job := range jobs {
+		var payload DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			t.Fatalf("decode merge payload %d: %v", i, err)
+		}
+		var total int64
+		for _, ref := range payload.Sources {
+			total += ref.ByteLength
+		}
+		if total > maxDisklessMergeBytes {
+			t.Fatalf("run %d totals %d bytes, exceeds ceiling %d", i, total, maxDisklessMergeBytes)
+		}
+	}
+	// The ceiling-split run must be enqueued despite being below min_segments
+	// (85 < 99).
+	var payload DisklessMergePayload
+	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
+		t.Fatalf("decode merge payload: %v", err)
+	}
+	if len(payload.Sources) != 85 {
+		t.Fatalf("first run covers %d sources, want 85 (ceiling-capped run)", len(payload.Sources))
+	}
+}
+
+// TestEffectiveDisklessMergeTargetBytes verifies the byte target is clamped to
+// half the merge ceiling. A target above the ceiling could never be reached by
+// a single run; and a target between ceiling/2 and the ceiling strands large
+// sub-target refs (two sub-target refs may not fit one ceiling-capped run, so
+// neither reaches the target and ArchiveCommitted stops at them, growing the
+// head). Clamping to ceiling/2 keeps every sub-target ref mergeable and
+// archivable.
+func TestEffectiveDisklessMergeTargetBytes(t *testing.T) {
+	// A target below the ceiling half is honored.
+	if got := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 64 << 20}); got != 64<<20 {
+		t.Fatalf("target below ceiling = %d, want %d", got, int64(64<<20))
+	}
+	// A target above the ceiling half is clamped so no ref strands the head.
+	if got, want := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 1 << 60}), int64(maxDisklessMergeBytes/2); got != want {
+		t.Fatalf("target above ceiling = %d, want %d", got, want)
+	}
+	// The default (<=0) resolves to the default target (64MiB, below the clamp).
+	if got := effectiveDisklessMergeTargetBytes(config.CompactionConfig{TargetBytes: 0}); got != 64<<20 {
+		t.Fatalf("default target = %d, want %d", got, int64(64<<20))
+	}
+}
+
 // TestDisklessSegmentMergeReachesByteTargetInOnePass verifies that on the S3
 // metastore a discovery run is bounded by the byte target rather than the
 // DynamoDB-tuned 90-file cap, so a merged chunk reaches target in a single
@@ -579,6 +690,81 @@ func TestDisklessSegmentMergeReachesByteTargetInOnePass(t *testing.T) {
 	}
 	if prevEnd != 300 {
 		t.Fatalf("runs cover [0,%d), want [0,300)", prevEnd)
+	}
+}
+
+// TestDisklessSegmentMergeByteCeilingBindsRun verifies the hard byte ceiling:
+// a run accumulates at most maxDisklessMergeBytes of source data even when the
+// configured byte target is effectively unbounded, so buildDisklessMergeArtifact
+// never allocates an arbitrarily large in-memory buffer.
+func TestDisklessSegmentMergeByteCeilingBindsRun(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 2
+	s.cfg.Diskless.Compaction.TargetBytes = 1 << 60 // effectively unbounded
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// maxDisklessMergeBytes / 8MiB = 64 refs to exceed the ceiling at ~8MiB each.
+	const refBytes = 8 << 20
+	nRefs := int(maxDisklessMergeBytes/refBytes) + 5
+	for i := 0; i < nRefs; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/f%d.data", i)
+		if err := s.s3Client.Put(ctx, fileKey, bytes.Repeat([]byte{'x'}, refBytes), storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: refBytes, CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) == 0 {
+		t.Fatal("expected at least one merge job")
+	}
+	for i, job := range jobs {
+		var payload DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			t.Fatalf("decode merge payload %d: %v", i, err)
+		}
+		var total int64
+		for _, ref := range payload.Sources {
+			total += ref.ByteLength
+		}
+		if total > maxDisklessMergeBytes {
+			t.Fatalf("run %d totals %d bytes, exceeds ceiling %d", i, total, maxDisklessMergeBytes)
+		}
+		// A run at or under the ceiling must execute successfully. Before the
+		// fix, discovery could enqueue a run whose total landed between the
+		// ceiling checks (>= in discovery, > in the builder); such a job would
+		// fail at artifact build forever and wedge the partition's compaction.
+		if err := s.runSegmentMergeJob(ctx, job); err != nil {
+			t.Fatalf("merge job %s (run %d, total %d bytes) failed: %v", job.ID, i, total, err)
+		}
 	}
 }
 
@@ -1002,5 +1188,191 @@ func TestDisklessParallelDiscoveryEnqueuesDisjointRuns(t *testing.T) {
 	}
 	if prevEnd != 16 {
 		t.Fatalf("compacted range ends at %d, want 16", prevEnd)
+	}
+}
+
+// TestDisklessCompactionCanSkipDiscovery pins the discovery-skip hint: the head
+// query and run building are elided for an idle partition (committed head
+// unchanged, scanned within grace), and forced again once the committed head
+// advances or the grace window elapses.
+func TestDisklessCompactionCanSkipDiscovery(t *testing.T) {
+	now := time.Now()
+	grace := time.Minute
+
+	// No hint yet -> must discover.
+	if disklessCompactionCanSkipDiscovery(disklessCompactionHint{}, false, 10, grace, now) {
+		t.Fatal("no hint must not skip discovery")
+	}
+	// Same committed head, scanned just now -> skip.
+	if !disklessCompactionCanSkipDiscovery(disklessCompactionHint{committed: 10, lastScanned: now}, true, 10, grace, now) {
+		t.Fatal("unchanged head within grace must skip discovery")
+	}
+	// Committed head advanced -> must discover.
+	if disklessCompactionCanSkipDiscovery(disklessCompactionHint{committed: 10, lastScanned: now}, true, 11, grace, now) {
+		t.Fatal("committed head advance must force discovery")
+	}
+	// Grace elapsed -> must discover (a ref may have newly aged past grace).
+	if disklessCompactionCanSkipDiscovery(disklessCompactionHint{committed: 10, lastScanned: now.Add(-2 * grace)}, true, 10, grace, now) {
+		t.Fatal("grace elapsed must force discovery")
+	}
+}
+
+// TestDisklessMergeCeilingNonDivisorRunEnqueuesUnderCeiling verifies the
+// ceiling boundary is consistent between discovery and the artifact builder
+// when ref sizes do not divide evenly into maxDisklessMergeBytes. Discovery
+// must flush a run before appending a ref that would push it over the ceiling,
+// so the resulting job always totals <= maxDisklessMergeBytes and the artifact
+// build never rejects it (which would wedge the partition's compaction).
+func TestDisklessMergeCeilingNonDivisorRunEnqueuesUnderCeiling(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 2
+	s.cfg.Diskless.Compaction.TargetBytes = 1 << 60 // effectively unbounded
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// 7MiB refs do not divide maxDisklessMergeBytes (512MiB) evenly: a run of
+	// 73 refs = 511MiB, then the 74th would be 518MiB (> ceiling). Discovery
+	// must flush at 73 and start a new run, so no single job exceeds the ceiling.
+	const refBytes = 7 << 20
+	nRefs := 74
+	for i := 0; i < nRefs; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/n%d.data", i)
+		if err := s.s3Client.Put(ctx, fileKey, bytes.Repeat([]byte{'y'}, refBytes), storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: refBytes, CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) == 0 {
+		t.Fatal("expected at least one merge job")
+	}
+	for i, job := range jobs {
+		var payload DisklessMergePayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			t.Fatalf("decode merge payload %d: %v", i, err)
+		}
+		var total int64
+		for _, ref := range payload.Sources {
+			total += ref.ByteLength
+		}
+		if total > maxDisklessMergeBytes {
+			t.Fatalf("run %d totals %d bytes, exceeds ceiling %d", i, total, maxDisklessMergeBytes)
+		}
+		if err := s.runSegmentMergeJob(ctx, job); err != nil {
+			t.Fatalf("merge job %s (run %d, total %d bytes) failed: %v", job.ID, i, total, err)
+		}
+	}
+}
+
+// TestDisklessMergeSingleOversizedRefNeverWedges pins the boundary for a single
+// ref larger than the byte ceiling (but below an unboundedly large target): such
+// a ref can never be merged (buildDisklessMergeArtifact rejects runs over the
+// ceiling), so discovery must skip it as a boundary rather than enqueue it (a
+// job that would fail forever and wedge the partition's compaction). The small
+// refs behind it must still be compacted.
+func TestDisklessMergeSingleOversizedRefNeverWedges(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	s.disklessMeta = diskless.NewS3MetaStore(s.s3Client)
+	s.cfg.Diskless.Compaction.Enabled = true
+	s.cfg.Diskless.Compaction.Grace = "0s"
+	s.cfg.Diskless.Compaction.DeleteGrace = "0s"
+	s.cfg.Diskless.Compaction.MinSegments = 2
+	s.cfg.Diskless.Compaction.TargetBytes = 1 << 60 // unbounded: only the ceiling can reject
+
+	tc := meta.TopicConfig{Name: "t", Partitions: 1, Retention: time.Hour, CreatedAt: time.Now(), ReplicationFactor: 1, MinInsyncReplicas: 1, StorageMode: meta.StorageModeDiskless}
+	if err := s.topicStore.Create(ctx, tc); err != nil {
+		t.Fatalf("topicStore.Create() error = %v", err)
+	}
+	if err := s.assignmentStore.Write(ctx, "t", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: s.instanceID, Replicas: []string{s.instanceID}, LeaderEpoch: 1},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("assignmentStore.Write() error = %v", err)
+	}
+	s.assignmentsMu.Lock()
+	s.myPartitions["t"] = map[int]localPartitionAssignment{0: {Owned: true, LeaderEpoch: 1}}
+	s.assignmentsMu.Unlock()
+
+	now := time.Now()
+	// Ref [0,1) is oversized (no data object is written; discovery only reads
+	// manifest metadata, and the oversized ref is never merged so no read occurs).
+	if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{
+		BatchID: "big:0", FileKey: "big", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: maxDisklessMergeBytes + 1, CreatedAt: now,
+	}}); err != nil {
+		t.Fatalf("commit oversized ref: %v", err)
+	}
+	// Two small refs behind it, each a mergeable size.
+	for i := 1; i < 3; i++ {
+		fileKey := fmt.Sprintf("_diskless/test-node/o%d.data", i)
+		data := bytes.Repeat([]byte{'z'}, 100)
+		if err := s.s3Client.Put(ctx, fileKey, data, storage.PutOpts{}); err != nil {
+			t.Fatalf("put source %s: %v", fileKey, err)
+		}
+		if _, err := s.disklessMeta.CommitUploadedBatches(ctx, []diskless.UploadedBatch{{BatchID: fmt.Sprintf("%s:0", fileKey), FileKey: fileKey, Topic: "t", Partition: 0, Count: 1, ByteLength: int64(len(data)), CreatedAt: now}}); err != nil {
+			t.Fatalf("commit [%d,%d): %v", i, i+1, err)
+		}
+	}
+
+	identity := PartitionIdentity{Topic: "t", Partition: 0, Role: PartitionRoleLeader, Leader: s.instanceID, LeaderEpoch: 1}
+	s.discoverDisklessSegmentMergeJobs(ctx, tc, identity, nil)
+	jobs, err := s.listPartitionJobs(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("listPartitionJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 merge job over the small refs, got %d", len(jobs))
+	}
+	var payload DisklessMergePayload
+	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
+		t.Fatalf("decode merge payload: %v", err)
+	}
+	if len(payload.Sources) != 2 || payload.Sources[0].BaseOffset != 1 || payload.Sources[1].BaseOffset != 2 {
+		t.Fatalf("job sources = %+v, want the two small refs at [1,2),[2,3)", payload.Sources)
+	}
+	if err := s.runSegmentMergeJob(ctx, jobs[0]); err != nil {
+		t.Fatalf("merge of small refs must succeed: %v", err)
+	}
+	// The oversized ref is untouched and still readable in the head.
+	refs, err := s.disklessMeta.QueryHeadSegments(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("query segments: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("refs after merge = %d, want 2 (oversized ref + merged small refs)", len(refs))
+	}
+	if refs[0].ByteLength != maxDisklessMergeBytes+1 {
+		t.Fatalf("oversized ref byte length = %d, want %d", refs[0].ByteLength, maxDisklessMergeBytes+1)
 	}
 }

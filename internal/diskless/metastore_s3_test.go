@@ -386,6 +386,40 @@ func TestS3MetaStore_ReplaceSegmentRefsRejectsArchivedRange(t *testing.T) {
 	}
 }
 
+// TestS3MetaStore_QueryHeadSegmentsExcludesArchived verifies that compaction
+// discovery never sees archived refs: the head-window query returns only refs
+// still in the head object, so a previously-archived ref can never be scheduled
+// into a merge run (ReplaceSegmentRefs would reject it forever and block the
+// partition's compaction).
+func TestS3MetaStore_QueryHeadSegmentsExcludesArchived(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	m.headMaxRefCount = 1
+	ctx := context.Background()
+	now := time.Now()
+	// First ref is compaction-final (>= targetBytes); second is small and stays
+	// in the head awaiting a merge.
+	commitS3Batch(t, m, "big", 1, 100, now)
+	commitS3Batch(t, m, "small", 1, 10, now)
+	if _, err := m.ArchiveCommitted(ctx, "t", 0, 100, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	head, err := m.QueryHeadSegments(ctx, "t", 0)
+	if err != nil {
+		t.Fatalf("query head: %v", err)
+	}
+	if len(head) != 1 || head[0].BaseOffset != 1 {
+		t.Fatalf("head refs = %+v, want only [1,2) (archived [0,1) must be excluded)", head)
+	}
+	// The full query still sees both, so reads of old data work.
+	all, err := m.QuerySegments(ctx, "t", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("query all: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("all refs = %+v, want 2", all)
+	}
+}
+
 // TestS3MetaStore_CommitUploadedBatchIsReadableAndDeduplicated verifies a
 // committed batch is readable and that an idempotent retry is deduplicated by
 // the producer-sequence history (retroactive tombstone): the retry, even as a
@@ -557,5 +591,192 @@ func TestS3MetaStore_CommitSequenceGapIsNotRetryable(t *testing.T) {
 	}
 	if errors.Is(err, ErrProduceRetryable) {
 		t.Fatalf("sequence gap must not be marked retryable: %v", err)
+	}
+}
+
+// TestS3MetaStore_ProducerHistoryBounded verifies that the head object's total
+// idempotent-producer history stays bounded when a partition accumulates many
+// distinct producers, so commit cost stays O(window) rather than growing with
+// producer count.
+func TestS3MetaStore_ProducerHistoryBounded(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	// Use a small injectable cap so the overflow needs few producers (the test
+	// runs under -race, where thousands of manifest commits are too slow).
+	m.headMaxProducerEntries = 64
+	ctx := context.Background()
+	now := time.Now()
+
+	// Commit batches from far more distinct producers than the head allows —
+	// enough that the tombstone set itself overflows its bound (one tombstone
+	// per evicted producer).
+	const nProducers = 2*64 + 10
+	for p := int64(0); p < nProducers; p++ {
+		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+			BatchID:    fmt.Sprintf("obj-%d:0:10", p),
+			FileKey:    fmt.Sprintf("obj-%d", p),
+			Topic:      "t",
+			Partition:  0,
+			Count:      1,
+			ByteLength: 10,
+			ProducerID: p,
+			Sequence:   0,
+			CreatedAt:  now,
+		}}); err != nil {
+			t.Fatalf("commit producer %d: %v", p, err)
+		}
+	}
+
+	data, _, err := m.s3.GetWithETag(ctx, s3ManifestKey("t", 0))
+	if err != nil {
+		t.Fatalf("read head: %v", err)
+	}
+	var manifest s3UploadManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("parse head: %v", err)
+	}
+	total := 0
+	for _, h := range manifest.Producers {
+		total += len(h)
+	}
+	if total > m.headMaxProducerEntries {
+		t.Fatalf("producer history = %d entries, want <= %d", total, m.headMaxProducerEntries)
+	}
+	// Tombstones must be bounded too: the tombstone set would otherwise grow by
+	// one per distinct evicted producer, re-introducing the unbounded head
+	// growth the eviction exists to prevent.
+	if got := len(manifest.Tombstones); got > m.headMaxProducerEntries {
+		t.Fatalf("tombstones = %d, want <= %d", got, m.headMaxProducerEntries)
+	}
+	// Committed offsets must be unaffected by eviction.
+	if got, want := manifest.CommittedOffset, int64(nProducers); got != want {
+		t.Fatalf("committed offset = %d, want %d", got, want)
+	}
+}
+
+// TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst verifies the
+// eviction helper tombstones the least-recently-active producers before the
+// recently-active ones, keeping a tombstone for the evicted producer so its
+// exact retries still deduplicate.
+func TestS3MetaStore_EvictExcessProducerEntriesPinsOldestFirst(t *testing.T) {
+	producers := map[string][]s3ProducerBatch{
+		"1": {{FirstSequence: 0, BaseOffset: 0, Count: 1}},
+		"2": {{FirstSequence: 0, BaseOffset: 10, Count: 1}},
+		"3": {{FirstSequence: 0, BaseOffset: 20, Count: 1}},
+	}
+	tombstones := map[string]s3ProducerBatch{}
+	evictExcessProducerEntries(producers, tombstones, 2)
+	if len(producers) != 2 {
+		t.Fatalf("producers after evict = %d, want 2", len(producers))
+	}
+	if _, ok := producers["1"]; ok {
+		t.Fatal("oldest producer (base 0) must be evicted first")
+	}
+	if _, ok := producers["2"]; !ok {
+		t.Fatal("producer 2 (base 10) must survive")
+	}
+	if _, ok := producers["3"]; !ok {
+		t.Fatal("producer 3 (base 20) must survive")
+	}
+	// The evicted producer must leave a tombstone recording its last batch so
+	// an exact retry still deduplicates instead of being re-allocated.
+	ts, ok := tombstones["1"]
+	if !ok {
+		t.Fatal("evicted producer must leave a tombstone")
+	}
+	if ts.FirstSequence != 0 || ts.BaseOffset != 0 {
+		t.Fatalf("tombstone = %+v, want the producer's last batch", ts)
+	}
+}
+
+// TestEvictExcessTombstonesBounded verifies the tombstone set is capped: when
+// more producers are evicted than the bound allows, the oldest tombstones
+// (smallest base offset) are dropped so the head cannot grow without bound.
+func TestEvictExcessTombstonesBounded(t *testing.T) {
+	tombstones := map[string]s3ProducerBatch{
+		"1": {FirstSequence: 0, BaseOffset: 0, Count: 1},
+		"2": {FirstSequence: 0, BaseOffset: 10, Count: 1},
+		"3": {FirstSequence: 0, BaseOffset: 20, Count: 1},
+		"4": {FirstSequence: 0, BaseOffset: 30, Count: 1},
+	}
+	evictExcessTombstones(tombstones, 2)
+	if len(tombstones) != 2 {
+		t.Fatalf("tombstones after evict = %d, want 2", len(tombstones))
+	}
+	if _, ok := tombstones["1"]; ok {
+		t.Fatal("oldest tombstone (base 0) must be dropped first")
+	}
+	if _, ok := tombstones["2"]; ok {
+		t.Fatal("second-oldest tombstone (base 10) must be dropped")
+	}
+	if _, ok := tombstones["3"]; !ok {
+		t.Fatal("newer tombstone (base 20) must survive")
+	}
+	if _, ok := tombstones["4"]; !ok {
+		t.Fatal("newest tombstone (base 30) must survive")
+	}
+}
+
+// TestEvictedProducerRetryNotDuplicated verifies exactly-once survives
+// producer-history eviction: after the head's producer-history cap forces an
+// idempotent producer out of the live window, an exact retry of its batch must
+// deduplicate to the original offset — never be silently re-allocated at a
+// fresh offset (a duplicate committed record).
+func TestEvictedProducerRetryNotDuplicated(t *testing.T) {
+	m := newTestS3MetaStore(t)
+	// Small injectable cap: the flood must exceed it but stay fast under -race.
+	m.headMaxProducerEntries = 64
+	ctx := context.Background()
+	now := time.Now()
+
+	// Producer 1 commits an idempotent batch.
+	if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "p1:0:10", FileKey: "p1", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 10, ProducerID: 1, Sequence: 0, CreatedAt: now,
+	}}); err != nil {
+		t.Fatalf("commit p1: %v", err)
+	}
+
+	// Flood the head with enough distinct producers to cross the eviction
+	// threshold, forcing producer 1 (oldest base offset) to be tombstoned.
+	for p := int64(2); p <= 64+2; p++ {
+		if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+			BatchID:    fmt.Sprintf("flood-%d:0:10", p),
+			FileKey:    fmt.Sprintf("flood-%d", p),
+			Topic:      "t",
+			Partition:  0,
+			Count:      1,
+			ByteLength: 10,
+			ProducerID: p,
+			Sequence:   0,
+			CreatedAt:  now,
+		}}); err != nil {
+			t.Fatalf("flood commit %d: %v", p, err)
+		}
+	}
+
+	// Producer 1 retries its exact batch (same producer, same sequence).
+	retry, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "p1-retry:0:10", FileKey: "p1-retry", Topic: "t", Partition: 0,
+		Count: 1, ByteLength: 10, ProducerID: 1, Sequence: 0, CreatedAt: now,
+	}})
+	if err != nil {
+		t.Fatalf("retry p1: %v", err)
+	}
+	if !retry[0].Duplicate {
+		t.Fatalf("evicted producer retry: duplicate=%v base=%d, want dedup to original offset 0", retry[0].Duplicate, retry[0].BaseOffset)
+	}
+	if retry[0].BaseOffset != 0 {
+		t.Fatalf("evicted producer retry base offset = %d, want 0 (original commit)", retry[0].BaseOffset)
+	}
+
+	// A stale retry below the tombstone must be rejected, not re-allocated.
+	// Producer 1's tombstone records first_sequence 0, so a retry of a
+	// non-existent earlier batch is invalid — but an exact retry (seq 0) is the
+	// only valid path. Verify a retry with a different count is rejected.
+	if _, err := m.CommitUploadedBatches(ctx, []UploadedBatch{{
+		BatchID: "p1-badcount:0:10", FileKey: "p1-badcount", Topic: "t", Partition: 0,
+		Count: 2, ByteLength: 10, ProducerID: 1, Sequence: 0, CreatedAt: now,
+	}}); err == nil {
+		t.Fatal("retry with mismatched count must be rejected")
 	}
 }

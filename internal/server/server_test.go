@@ -2336,6 +2336,59 @@ func TestGCStaleInstances(t *testing.T) {
 	}
 }
 
+// TestGCStaleInstances_KeepsReferenced verifies that an instance whose
+// heartbeat is stale but which is still referenced by a partition assignment
+// (as leader or replica) is not garbage-collected: deleting it would orphan the
+// assignment and force a full reassignment on the next publish cycle.
+func TestGCStaleInstances_KeepsReferenced(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// A stale instance referenced by an assignment.
+	staleInfo := coordination.InstanceInfo{
+		InstanceID:  "assigned-dead-node",
+		Address:     "10.0.0.99:8080",
+		HeartbeatAt: time.Now().Add(-24 * time.Hour),
+	}
+	staleData, _ := json.Marshal(staleInfo)
+	if err := s.s3Client.Put(ctx, "_coordination/instances/assigned-dead-node.json", staleData, storage.PutOpts{}); err != nil {
+		t.Fatalf("Put stale instance: %v", err)
+	}
+	// An unassigned stale instance that must be deleted.
+	orphanInfo := coordination.InstanceInfo{
+		InstanceID:  "orphan-dead-node",
+		Address:     "10.0.0.98:8080",
+		HeartbeatAt: time.Now().Add(-24 * time.Hour),
+	}
+	orphanData, _ := json.Marshal(orphanInfo)
+	if err := s.s3Client.Put(ctx, "_coordination/instances/orphan-dead-node.json", orphanData, storage.PutOpts{}); err != nil {
+		t.Fatalf("Put orphan instance: %v", err)
+	}
+	// An assignment that references the first stale node.
+	if err := s.assignmentStore.Write(ctx, "orders", coordination.TopicAssignments{
+		Partitions: map[int]coordination.PartitionAssignment{
+			0: {Leader: "assigned-dead-node", LeaderEpoch: 1, Replicas: []string{"assigned-dead-node", "n1"}},
+		},
+		Version: 1,
+	}, ""); err != nil {
+		t.Fatalf("write assignments: %v", err)
+	}
+
+	s.gcStaleInstances(ctx)
+
+	keys, _ := s.s3Client.List(ctx, "_coordination/instances/")
+	got := map[string]bool{}
+	for _, k := range keys {
+		got[k] = true
+	}
+	if !got["_coordination/instances/assigned-dead-node.json"] {
+		t.Fatal("assigned stale instance must be kept")
+	}
+	if got["_coordination/instances/orphan-dead-node.json"] {
+		t.Fatal("unassigned stale instance must be deleted")
+	}
+}
+
 func TestInitProducer(t *testing.T) {
 	s := newTestServer(t)
 	handler := s.publicRoutes()

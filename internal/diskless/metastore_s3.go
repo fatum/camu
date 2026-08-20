@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,9 @@ type S3MetaStore struct {
 	headMaxRefCount   int
 	headMaxRefBytes   int64
 	checkpointMaxRefs int
+	// headMaxProducerEntries bounds the idempotent producer history + tombstone
+	// sets kept in the head object.
+	headMaxProducerEntries int
 }
 
 const (
@@ -63,6 +67,16 @@ const (
 	s3HeadMaxRefBytes = 1 << 17 // 128KiB
 	// s3CheckpointMaxRefs bounds one archived checkpoint.
 	s3CheckpointMaxRefs = 4096
+	// s3HeadMaxProducerEntries bounds the total number of idempotent producer
+	// history entries kept in the head object. Per-producer history is already
+	// trimmed to uploadedProducerHistory, but the number of distinct producers
+	// is unbounded; without a cap the head would grow with producer count and
+	// every commit would rewrite the growing object. When the cap is crossed
+	// the least-recently-active producers (smallest last batch base offset) are
+	// evicted, so a stale retry of an evicted producer is rejected as
+	// out-of-order rather than duplicated — the same contract as a producer
+	// whose history rotated out of the per-producer window.
+	s3HeadMaxProducerEntries = 4096
 )
 
 // s3UploadManifest is the head: the complete ordering authority for a
@@ -73,8 +87,17 @@ type s3UploadManifest struct {
 	NextOffset      int64                        `json:"next_offset"`
 	CommittedOffset int64                        `json:"committed_offset"`
 	Producers       map[string][]s3ProducerBatch `json:"producers,omitempty"`
-	Archive         *s3ArchivePointer            `json:"archive,omitempty"`
-	Refs            []s3CatalogRef               `json:"refs"`
+	// Tombstones records the most recent committed batch of each producer that
+	// was evicted from Producers by evictExcessProducerEntries. It preserves the
+	// fail-closed exactly-once contract for an evicted producer: an exact retry
+	// of its last batch deduplicates to the original offset, and any retry at or
+	// below the tombstoned first sequence is rejected as out-of-order rather
+	// than silently re-allocated at a fresh offset (which would duplicate a
+	// committed record). Without it, deleting the producer's history wholesale
+	// would make a stale retry indistinguishable from a brand-new producer.
+	Tombstones map[string]s3ProducerBatch `json:"tombstones,omitempty"`
+	Archive    *s3ArchivePointer          `json:"archive,omitempty"`
+	Refs       []s3CatalogRef             `json:"refs"`
 }
 
 // s3ArchivePointer names the newest archived checkpoint and the offset where
@@ -105,6 +128,89 @@ type s3ProducerBatch struct {
 	Count         int   `json:"count"`
 }
 
+// evictExcessProducerEntries trims a partition's producer history map to at
+// most maxEntries total history entries, keeping a single tombstone per evicted
+// producer. It is called before every head write so the head object stays
+// bounded regardless of how many distinct idempotent producers have ever written
+// to the partition.
+//
+// The fail-closed exactly-once contract must hold even after eviction: an exact
+// retry of a committed batch must deduplicate to its original offset, and a
+// stale retry must be rejected as out-of-order — never silently re-allocated at
+// a fresh offset (a duplicate committed record). Deleting a producer's history
+// wholesale would break this, because a retry would then be indistinguishable
+// from a brand-new producer. So each evicted producer leaves a single tombstone
+// (its most recent batch); CommitUploadedBatches consults it for dedup and
+// sequence validation. Producers whose last batch has the smallest base offset
+// (the least recently active) are evicted first.
+//
+// Tombstones themselves are bounded to maxEntries: the tombstone map would
+// otherwise grow by one per distinct evicted producer and the head would grow
+// with producer cardinality — the unbounded growth this eviction exists to
+// prevent, merely shifted into the tombstone set. When the tombstone set
+// overflows, the oldest tombstones (smallest base offset) are dropped. An
+// exact retry of a producer whose tombstone was dropped re-allocates at a fresh
+// offset (the pre-eviction behavior); this is the accepted tradeoff at extreme
+// cardinality, and it keeps the head object size bounded.
+func evictExcessProducerEntries(producers map[string][]s3ProducerBatch, tombstones map[string]s3ProducerBatch, maxEntries int) {
+	total := 0
+	for _, h := range producers {
+		total += len(h)
+	}
+	if total <= maxEntries {
+		evictExcessTombstones(tombstones, maxEntries)
+		return
+	}
+	// Order producers by the base offset of their last recorded batch, oldest
+	// first, and tombstone them whole until the total fits.
+	lastBase := make([]struct {
+		id    string
+		base  int64
+		count int
+	}, 0, len(producers))
+	for id, h := range producers {
+		if len(h) == 0 {
+			continue
+		}
+		lastBase = append(lastBase, struct {
+			id    string
+			base  int64
+			count int
+		}{id: id, base: h[len(h)-1].BaseOffset, count: len(h)})
+	}
+	sort.Slice(lastBase, func(i, j int) bool { return lastBase[i].base < lastBase[j].base })
+	for _, e := range lastBase {
+		if total <= maxEntries {
+			break
+		}
+		h := producers[e.id]
+		// Preserve the producer's most recent committed batch as a tombstone so
+		// an exact retry still deduplicates and a stale retry is still rejected
+		// as out-of-order (never re-allocated at a fresh offset).
+		tombstones[e.id] = h[len(h)-1]
+		delete(producers, e.id)
+		total -= e.count
+	}
+	evictExcessTombstones(tombstones, maxEntries)
+}
+
+// evictExcessTombstones bounds the tombstone set to maxEntries, dropping the
+// oldest tombstones (smallest base offset) when the set overflows. This keeps
+// the head object size bounded even when an unbounded number of distinct
+// producers is evicted over the partition's lifetime.
+func evictExcessTombstones(tombstones map[string]s3ProducerBatch, maxEntries int) {
+	for len(tombstones) > maxEntries {
+		var oldest string
+		var oldestBase int64 = math.MaxInt64
+		for id, t := range tombstones {
+			if t.BaseOffset < oldestBase {
+				oldest, oldestBase = id, t.BaseOffset
+			}
+		}
+		delete(tombstones, oldest)
+	}
+}
+
 // s3CatalogRef is one materialized segment reference within a partition catalog.
 type s3CatalogRef struct {
 	FileKey    string    `json:"file_key"`
@@ -127,10 +233,11 @@ type s3Catalog struct {
 // NewS3MetaStore creates a MetaStore backed by s3.
 func NewS3MetaStore(s3 *storage.S3Client) *S3MetaStore {
 	return &S3MetaStore{
-		s3:                s3,
-		headMaxRefCount:   s3HeadMaxRefCount,
-		headMaxRefBytes:   s3HeadMaxRefBytes,
-		checkpointMaxRefs: s3CheckpointMaxRefs,
+		s3:                     s3,
+		headMaxRefCount:        s3HeadMaxRefCount,
+		headMaxRefBytes:        s3HeadMaxRefBytes,
+		checkpointMaxRefs:      s3CheckpointMaxRefs,
+		headMaxProducerEntries: s3HeadMaxProducerEntries,
 	}
 }
 
@@ -167,10 +274,19 @@ manifestLoop:
 	for {
 		key := s3ManifestKey(topic, partition)
 		data, etag, err := m.s3.GetWithETag(ctx, key)
-		manifest := s3UploadManifest{Producers: map[string][]s3ProducerBatch{}}
+		manifest := s3UploadManifest{
+			Producers:  map[string][]s3ProducerBatch{},
+			Tombstones: map[string]s3ProducerBatch{},
+		}
 		if err == nil {
 			if err := json.Unmarshal(data, &manifest); err != nil {
 				return nil, fmt.Errorf("parse upload manifest %s/%d: %w", topic, partition, err)
+			}
+			if manifest.Producers == nil {
+				manifest.Producers = map[string][]s3ProducerBatch{}
+			}
+			if manifest.Tombstones == nil {
+				manifest.Tombstones = map[string]s3ProducerBatch{}
 			}
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			// A failed read leaves the batch unrecorded: mark it retryable so
@@ -188,6 +304,18 @@ manifestLoop:
 			duplicate := false
 			if batch.ProducerID != 0 {
 				h := manifest.Producers[pid]
+				// When the producer's live history was evicted, fall back to its
+				// tombstone (the most recent committed batch before eviction).
+				// This keeps the fail-closed exactly-once contract after
+				// eviction: an exact retry deduplicates to the original offset,
+				// and a stale retry at or below the tombstone is rejected as
+				// out-of-order instead of being silently re-allocated at a fresh
+				// offset.
+				if len(h) == 0 {
+					if t, ok := manifest.Tombstones[pid]; ok {
+						h = []s3ProducerBatch{t}
+					}
+				}
 				for _, old := range h {
 					if old.FirstSequence != batch.Sequence {
 						continue
@@ -226,6 +354,11 @@ manifestLoop:
 			manifest.NextOffset, manifest.CommittedOffset = end, end
 			manifest.Refs = append(manifest.Refs, s3CatalogRef{FileKey: batch.FileKey, ByteOffset: batch.ByteOffset, ByteLength: batch.ByteLength, BaseOffset: base, EndOffset: end, CreatedAt: batch.CreatedAt})
 			if batch.ProducerID != 0 {
+				// A live commit supersedes any tombstone: the live history is now
+				// the authoritative record for this producer, so a retry of the
+				// just-committed batch dedups against it (not the older
+				// tombstone), and the tombstone can be dropped.
+				delete(manifest.Tombstones, pid)
 				h := manifest.Producers[pid]
 				h = append(h, s3ProducerBatch{FirstSequence: batch.Sequence, BaseOffset: base, Count: batch.Count})
 				if len(h) > uploadedProducerHistory {
@@ -239,6 +372,7 @@ manifestLoop:
 		if !changed {
 			return results, nil // every batch was a duplicate
 		}
+		evictExcessProducerEntries(manifest.Producers, manifest.Tombstones, m.headMaxProducerEntries)
 		manifest.Version++
 		encoded, err := json.Marshal(manifest)
 		if err != nil {
@@ -614,6 +748,24 @@ func (m *S3MetaStore) QuerySegments(ctx context.Context, topic string, partition
 		if !appendRef(r) {
 			break
 		}
+	}
+	return refs, nil
+}
+
+// QueryHeadSegments returns only the head-window refs of a partition, never
+// archived checkpoints. Compaction discovery uses this: archived refs are
+// compaction-final (they were rolled out of the head once they reached target
+// size) so they can never be merged again, and ReplaceSegmentRefs refuses to
+// touch them. Querying the head only also avoids walking the checkpoint chain
+// on every compaction tick.
+func (m *S3MetaStore) QueryHeadSegments(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
+	manifest, err := m.readUploadManifest(ctx, topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]SegmentRef, 0, len(manifest.Refs))
+	for _, r := range manifest.Refs {
+		refs = append(refs, SegmentRef(r))
 	}
 	return refs, nil
 }

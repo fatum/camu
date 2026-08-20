@@ -3,6 +3,7 @@ package diskless
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -198,6 +199,12 @@ func (m *MemoryMetaStore) QuerySegments(_ context.Context, topic string, partiti
 		totalBytes += e.byteLength
 	}
 	return refs, nil
+}
+
+// QueryHeadSegments returns every segment reference of a partition. The memory
+// metastore has no archive concept, so the full catalog is the head window.
+func (m *MemoryMetaStore) QueryHeadSegments(ctx context.Context, topic string, partition int) ([]SegmentRef, error) {
+	return m.QuerySegments(ctx, topic, partition, 0, math.MaxInt)
 }
 
 // GetPartitionHead returns the next offset that will be allocated for a partition.

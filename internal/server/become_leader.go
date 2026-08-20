@@ -54,6 +54,17 @@ func (s *Server) becomeLeader(ctx context.Context, topic string, pid int, req pu
 	// start its epoch at the durable end, never at the local tail alone.
 	logEnd := s.partitionManager.recoverTrueLogEnd(topic, pid)
 
+	// Gate the promotion on durability against the authoritative ISR store.
+	// A node whose durable log end is below the committed high watermark must
+	// not be promoted: its epoch boundary would follow its (shorter) log end
+	// and truncate committed data held by remaining ISR members. The
+	// controller push carries its own ISR view, but it is a stale
+	// reconciliation-time snapshot, so the promotion reads the ISR store
+	// directly. Bootstrap (no ISR yet) and unclean leader election are allowed.
+	if !s.canBecomeLeader(ctx, topic, pid, logEnd) {
+		return fmt.Errorf("becomeLeader: %s/%d not eligible: durable log end %d below committed watermark", topic, pid, logEnd)
+	}
+
 	// 5. Recover the most advanced local ISR tail. The persisted controller HW
 	// is asynchronous and can lag acknowledged replicated writes.
 	recoveredHW := req.HW
